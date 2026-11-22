@@ -1,0 +1,26 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.DS_Store
+.local/
+coverage/
+*.log
+
+# Local secrets, certificates & environment overrides
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+
+# Runtime state, credential caches & workspace artifacts
+open-platform-session.json
+user-oauth-tokens.json
+cli-endpoint.json
+state.json
+.dsh-lark-bridge/
+.worktrees/
+*.tgz

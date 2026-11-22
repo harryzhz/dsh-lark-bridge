@@ -1,0 +1,17 @@
+# DeepSeekHarness Self-Hosted Web Profile Patch for Lark Bridge
+# Uses DSH native presets by default. To add external CLI runtimes (Codex / Antigravity /
+# Claude Code / TRAE CLI), install the companion `dsh-external-agents` plugin via:
+#   dsh-lark-ctl install-profile --external-agents <npm-pkg-or-local-path>
+
+- insert:
+    - id: dsh-lark-bridge
+      name: '@dsh-lark/dsh-lark-bridge'
+      config:
+        publicBaseUrl: ''
+    - id: dsh-lark-ui
+      name: '@dsh-lark/dsh-lark-ui'
+
+- id: ui-settings-general
+  name: '@deepseek-ai/dsh-client-ui-settings-general'
+  config:
+    welcomeNoticeVersion: 2026-09-28.1

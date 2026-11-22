@@ -1,0 +1,83 @@
+Non-Commercial Software License (非商业软件许可协议)
+
+Copyright (c) 2026 harryzhang (harryzhz)
+Project: dsh-lark-bridge
+
+================================================================================
+中文说明（Chinese Version）
+================================================================================
+
+特此授予任何获得本软件及相关文档文件（以下简称“本软件”）副本的个人或非营利组织
+免费且不可独占的许可，允许在严格遵守以下全部条件的前提下，出于【非商业、非盈利】
+目的不受限制地使用、复制、修改、合并、二次开发、发布及分发本软件及其衍生作品：
+
+1. 允许的使用范围（非商业与二次开发不受限）
+   - 个人学习、研究、测试及个人日常非盈利使用；
+   - 学术研究、非营利开源项目或社区交流；
+   - 基于本软件进行任意修改、功能扩展、二次开发与非商业再分发。
+
+2. 严格禁止的商业与盈利行为
+   未经版权持有人书面商业授权，禁止将本软件或其任何修改版、衍生作品用于任何直接
+   或间接的商业用途或盈利行为，包括但不限于：
+   - 直接售卖、出租、转许可本软件或其衍生作品；
+   - 将本软件集成或打包至商业产品、付费软件或收费硬件中；
+   - 基于本软件对外提供收费托管、SaaS、咨询实施、代部署或增值服务；
+   - 在以营利为目的的商业机构生产或商业运营环境中使用以获取商业利益。
+
+   如需商业使用或定制授权，请联系版权持有人：haiyang.index@gmail.com。
+
+3. 署名与同协议延续
+   - 本软件的所有副本、重要组成部分及衍生作品中，均须完整保留上述版权声明与本
+     许可协议文本；
+   - 二次开发后对外分发的衍生作品，同样须遵守本协议的非商业与禁止盈利限制，不得
+     附加允许商业使用的再许可条款。
+
+4. 免责声明
+   本软件按“现状”（AS IS）提供，不附带任何明示或默示的担保，包括但不限于适销性、
+   特定用途适用性及不侵权担保。在任何情况下，作者或版权持有人均不对因本软件或使用
+   本软件而产生的任何索赔、损害或其他责任承担任何义务。
+
+================================================================================
+English Version
+================================================================================
+
+Permission is hereby granted, free of charge, to any person or non-profit entity
+obtaining a copy of this software and associated documentation files (the
+"Software"), to use, copy, modify, merge, create derivative works from, publish,
+and distribute copies of the Software solely for NON-COMMERCIAL and
+NON-PROFIT purposes, subject to the following conditions:
+
+1. Permitted Uses
+   You are free to use, study, modify, build upon, and redistribute the Software
+   and any derivative works for personal use, academic research, open-source
+   community collaboration, or any other non-commercial, non-profit purpose.
+
+2. Prohibited Commercial & Profit-Making Uses
+   Without prior written commercial authorization from the copyright holder, you
+   may NOT use the Software, or any modification or derivative work thereof, for
+   any direct or indirect commercial purpose or monetary gain, including but not
+   limited to:
+   - Selling, renting, leasing, or sublicensing the Software or derivative works;
+   - Incorporating or bundling the Software into any commercial product or paid
+     service;
+   - Offering paid hosting, SaaS, managed deployment, or fee-based services built
+     upon the Software;
+   - Deploying or operating the Software for commercial advantage in a for-profit
+     business operation.
+
+   For commercial licensing inquiries, please contact: haiyang.index@gmail.com.
+
+3. Attribution & Share-Alike Non-Commercial Restriction
+   - The above copyright notice and this license notice shall be included in all
+     copies, substantial portions, and derivative works of the Software.
+   - Any redistribution of the Software or its derivative works must remain
+     subject to these same non-commercial restrictions.
+
+4. Disclaimer of Warranty & Limitation of Liability
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
+   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING
+   FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+   IN THE SOFTWARE.

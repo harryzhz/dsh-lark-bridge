@@ -1,0 +1,1939 @@
+import { randomUUID } from 'node:crypto'
+import { networkInterfaces } from 'node:os'
+import type { Context } from '@deepseek-ai/cordis'
+import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import type { ContentBlock, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import {
+  appendPluginRecord,
+  pluginRecordOf,
+  type Session,
+  type SessionEvent,
+  type SessionId,
+} from '@deepseek-ai/dsh-session'
+import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
+import {
+  LarkBotTransport,
+  LarkPlatformManager,
+  MessageDeduplicator,
+  buildLarkPostPayload,
+  buildReplyCard,
+  buildRouteKey,
+  composeLarkContextReminder,
+  composeProactiveSessionReminder,
+  composeTurnPrompt,
+  decideLarkRouting,
+  expandWorkingDir,
+  extractPureUserIntent,
+  hasInjectedPromptMarkup,
+  resolveEffectiveAgentRuntime,
+  resolveEffectiveCardBot,
+  resolveEffectiveWorkingDir,
+  resolveEffectiveWorkspaceName,
+  type DiscoveredLarkChat,
+  type InboundLarkMessage,
+  type LarkBotConfig,
+  type LarkBotProfile,
+  type LarkBotStatus,
+  type LarkChatMember,
+  type LarkGroupConfig,
+  type LarkHistoryMessage,
+  type LarkMessageDetail,
+  type LarkQrJobView,
+  type LarkReminderItem,
+  type LarkReminderOrigin,
+  type LarkUserSearchHit,
+  type ReplyCardImage,
+  type SubstituteTarget,
+} from '@dsh-lark/lark-core'
+import {
+  ensureCliAuthEndpoint,
+  installLocalCliAndSkill,
+  type CliAuthEndpoint,
+} from './cli-support.js'
+import { LarkDirectoryEnricher } from './directory-enrichment.js'
+import { DreamingService } from './dreaming-service.js'
+import { assertExistingWorkingDirectory } from './fs-browser.js'
+import { ProactiveReminderService } from './reminder-service.js'
+import { RuntimeCatalog } from './runtime-catalog.js'
+import { ScheduleNotifier, type ScheduleCreateInputLike } from './schedule-notifier.js'
+import { LoopbackSessionHandoff, isLoopbackOrigin } from './session-handoff.js'
+import { handleSlashCommand } from './slash-commands.js'
+import type { LarkBridgeStore } from './store.js'
+import { runTurnAndCollectReply } from './turn-runner.js'
+import {
+  LARK_ORIGIN_RECORD_TYPE,
+  type LarkBridgeConfig,
+  type LarkScheduleDeliveryMode,
+  type LarkScheduleNotifyOn,
+  type LarkScheduleTarget,
+  type LarkSessionBinding,
+} from './types.js'
+import { WorkspaceGrouping } from './workspace-grouping.js'
+
+type AgentDecision = Extract<ReturnType<typeof decideLarkRouting>, { action: 'agent' }>
+
+interface ManagedTransport {
+  readonly config: LarkBotConfig
+  readonly transport: LarkBotTransport
+}
+
+interface AcquiredAgent {
+  readonly agent: Agent
+  readonly sessionId: string
+  readonly isNew: boolean
+  readonly disposeAfter: boolean
+}
+
+export interface AgentCliSendInput {
+  readonly sessionId?: string
+  readonly botId?: string
+  readonly chatId?: string
+  readonly userOpenId?: string
+  readonly replyToMessageId?: string
+  readonly replyInThread?: boolean
+  readonly title?: string
+  readonly text?: string
+  readonly textOnly?: boolean
+  readonly card?: Record<string, unknown>
+  readonly mentions?: readonly { openId: string; name?: string }[]
+  readonly images?: readonly { fileName?: string; dataBase64: string; alt?: string; mode?: ReplyCardImage['mode'] }[]
+  readonly files?: readonly { fileName: string; dataBase64: string }[]
+}
+
+const DEFAULT_HISTORICAL_ARCHIVE_MS = 60 * 60_000
+
+/**
+ * Owns Lark long connections, Open Platform & OAuth workflows, engineered
+ * `<system_reminder>` injection, CLI auth & agent endpoints, and session lifecycle.
+ */
+export class LarkBridgeManager {
+  readonly runtimes: RuntimeCatalog
+  readonly schedules: ScheduleNotifier
+  readonly dreaming: DreamingService
+  readonly reminders: ProactiveReminderService
+  readonly platform: LarkPlatformManager
+  readonly cliAuth: CliAuthEndpoint
+  readonly sessionHandoff = new LoopbackSessionHandoff()
+  private readonly directoryEnricher: LarkDirectoryEnricher
+  private readonly transports = new Map<string, ManagedTransport>()
+  private readonly handles = new Map<string, AgentHandle>()
+  private readonly dedup = new MessageDeduplicator()
+  private readonly workspaces: WorkspaceGrouping
+  private readonly disposers: Array<() => void> = []
+  private readonly preserveLocalDescriptionBots = new Set<string>()
+  private readonly hydratedProfileBots = new Set<string>()
+  private liveWebOrigin = ''
+  private liveConnection?: { authenticatedUrl?: (baseUrl: string) => string }
+  private idleTimer: ReturnType<typeof setInterval> | null = null
+  private disposed = false
+
+  constructor(
+    private readonly ctx: Context,
+    private readonly config: LarkBridgeConfig,
+    readonly store: LarkBridgeStore,
+  ) {
+    this.runtimes = new RuntimeCatalog(ctx)
+    this.workspaces = new WorkspaceGrouping(ctx, store)
+    this.platform = new LarkPlatformManager(config.dataDir)
+    this.directoryEnricher = new LarkDirectoryEnricher(this.platform, () => this.store.listBots())
+    this.cliAuth = ensureCliAuthEndpoint(config.dataDir, config.publicBaseUrl)
+    this.schedules = new ScheduleNotifier({
+      ctx,
+      store,
+      workspaces: this.workspaces,
+      getBotOpenId: (botId) => this.transports.get(botId)?.transport.state.botOpenId,
+      sendScheduleMessage: (input) => this.sendScheduleMessage(input),
+    })
+    this.dreaming = new DreamingService({
+      ctx,
+      dataDir: config.dataDir,
+      store,
+      runtimes: this.runtimes,
+      workspaces: this.workspaces,
+      runTurn: (agent, content) => runTurnAndCollectReply(this.ctx, agent, content),
+    })
+    this.reminders = new ProactiveReminderService({
+      ctx,
+      store,
+      runtimes: this.runtimes,
+      workspaces: this.workspaces,
+      runTurn: (agent, content) => runTurnAndCollectReply(this.ctx, agent, content),
+      sendOriginCard: (origin, card) => this.sendOriginCard(origin, card),
+      patchOriginCard: (botId, messageId, card) => this.patchOriginCard(botId, messageId, card),
+      deliverReminderOutput: (input) => this.deliverReminderOutput(input),
+    })
+  }
+
+  async start(): Promise<void> {
+    if (this.config.autoInstallCliAndSkill !== false) {
+      installLocalCliAndSkill(this.config.dataDir, this.cliAuth.endpointFile, this.ctx.logger)
+    }
+
+    this.schedules.start()
+    this.dreaming.start(this.config.idleSweepIntervalMs > 0 ? 60_000 : 0)
+    await this.reminders.recoverStaleRunningReminders().catch((err) => {
+      this.ctx.logger.warn(
+        `[lark-bridge] stale reminder recovery warning: ${err instanceof Error ? err.message : String(err)}`,
+      )
+    })
+    this.reminders.start(this.config.idleSweepIntervalMs > 0 ? 30_000 : 0)
+    this.installSessionTitleGuard()
+    await this.workspaces.reconcileBindings()
+
+    for (const bot of this.store.listBots()) {
+      if (!bot.enabled) continue
+      await this.startBot(bot).catch((err) => {
+        const message = err instanceof Error ? err.message : String(err)
+        this.ctx.logger.error(`[lark-bridge] failed to start bot "${bot.name}": ${message}`)
+        this.store.recordEvent({ botId: bot.id, kind: 'error', summary: `启动失败：${message}` })
+      })
+    }
+
+    void this.schedules.refreshScheduleContextCache()
+    void this.reconcileHistoricalSessions().catch((err) => {
+      this.ctx.logger.warn(
+        `[lark-bridge] historical session reconciliation warning: ${err instanceof Error ? err.message : String(err)}`,
+      )
+    })
+
+    if (this.config.idleSweepIntervalMs > 0) {
+      this.idleTimer = setInterval(() => void this.sweepIdleBindings(), this.config.idleSweepIntervalMs)
+      this.idleTimer.unref?.()
+    }
+  }
+
+  async stop(): Promise<void> {
+    this.disposed = true
+    this.sessionHandoff.dispose()
+    this.schedules.stop()
+    this.dreaming.stop()
+    await this.reminders.stop()
+    while (this.disposers.length > 0) {
+      this.disposers.pop()?.()
+    }
+    if (this.idleTimer) {
+      clearInterval(this.idleTimer)
+      this.idleTimer = null
+    }
+    await Promise.all([...this.transports.values()].map((m) => m.transport.stop().catch(() => {})))
+    this.transports.clear()
+    await Promise.all([...this.handles.values()].map((h) => h.dispose().catch(() => {})))
+    this.handles.clear()
+  }
+
+  listBotStatuses(): LarkBotStatus[] {
+    const bindings = this.store.listBindings()
+    return this.store.listBots().map((bot) => {
+      const state = this.transports.get(bot.id)?.transport.state
+      const avatarUrl = state?.avatarUrl || bot.avatarUrl || undefined
+      return {
+        botId: bot.id,
+        larkAppId: bot.larkAppId,
+        name: bot.name,
+        ...(avatarUrl ? { avatarUrl } : {}),
+        enabled: bot.enabled,
+        connected: state?.connected ?? false,
+        ...(state?.botOpenId ? { botOpenId: state.botOpenId } : {}),
+        ...(state?.startedAtMs ? { startedAtMs: state.startedAtMs } : {}),
+        ...(state?.lastEventAtMs ? { lastEventAtMs: state.lastEventAtMs } : {}),
+        ...(state?.lastError ? { lastError: state.lastError } : {}),
+        activeBindings: bindings.filter((b) => b.botId === bot.id).length,
+      }
+    })
+  }
+
+  async hydrateAllowedUserProfiles(bot: LarkBotConfig): Promise<SubstituteTarget[]> {
+    if (bot.allowedUsers.length === 0) return []
+    const byId = new Map<string, SubstituteTarget>()
+    for (const p of bot.allowedUserProfiles) byId.set(p.openId, p)
+    for (const t of bot.substituteMode.targets) {
+      const prev = byId.get(t.openId)
+      if (!prev || (!prev.avatarUrl && t.avatarUrl)) byId.set(t.openId, { ...prev, ...t })
+    }
+
+    const liveTransport = this.transports.get(bot.id)?.transport
+    let mutated = false
+    const result: SubstituteTarget[] = []
+    for (const openId of bot.allowedUsers) {
+      let profile = byId.get(openId)
+      if ((!profile || !profile.avatarUrl) && liveTransport) {
+        const resolved = await liveTransport
+          .resolveUserSummary(openId, profile?.name !== openId ? profile?.name : undefined)
+          .catch(() => undefined)
+        if (resolved && (resolved.name !== openId || resolved.avatarUrl)) {
+          const nextProfile: SubstituteTarget = {
+            ...(profile ?? {}),
+            ...resolved,
+          }
+          if (
+            !profile ||
+            profile.name !== nextProfile.name ||
+            profile.avatarUrl !== nextProfile.avatarUrl
+          ) {
+            profile = nextProfile
+            mutated = true
+          }
+        }
+      }
+      if (profile && !profile.avatarUrl && profile.name && !profile.name.startsWith('ou_')) {
+        const dirHits = await this.directoryEnricher.searchByQueries([profile.name], bot.id)
+        const matched =
+          dirHits.find((h) => h.openId === openId && h.avatarUrl) ??
+          (() => {
+            const byName = dirHits.filter((h) => h.name === profile!.name && h.avatarUrl)
+            return byName.length === 1 ? byName[0] : undefined
+          })()
+        if (matched?.avatarUrl) {
+          profile = {
+            ...profile,
+            ...(matched.email && !profile.email ? { email: matched.email } : {}),
+            avatarUrl: matched.avatarUrl,
+          }
+          mutated = true
+        }
+      }
+      result.push(profile ?? { openId, name: openId })
+    }
+
+    if (mutated) {
+      const latestBot = this.store.getBot(bot.id) ?? bot
+      this.store.upsertBot({
+        ...latestBot,
+        allowedUserProfiles: result.filter((p) => p.name !== p.openId),
+      })
+    }
+    return result
+  }
+
+  async startAutoCreateBot(rawBody: Record<string, unknown>): Promise<LarkQrJobView> {
+    const mode = rawBody.mode === 'device_flow' ? 'device_flow' : 'open_platform'
+    const name = typeof rawBody.name === 'string' ? rawBody.name.trim() : ''
+    const description = typeof rawBody.description === 'string' ? rawBody.description.trim() : ''
+    const requestedId = typeof rawBody.id === 'string' ? rawBody.id.trim() : ''
+    const workspaceName = typeof rawBody.workspaceName === 'string' ? rawBody.workspaceName.trim() : ''
+    const defaultWorkingDir =
+      (typeof rawBody.defaultWorkingDir === 'string' && rawBody.defaultWorkingDir.trim()) || '~'
+    assertExistingWorkingDirectory(defaultWorkingDir)
+    const requestedPreset =
+      typeof rawBody.agentPreset === 'string' ? rawBody.agentPreset.trim() : ''
+    let agentPreset = requestedPreset
+    if (!agentPreset) {
+      const availableRuntimes = await this.runtimes.list().catch(() => [])
+      agentPreset =
+        availableRuntimes.find((r) => r.isDefault)?.id ?? availableRuntimes[0]?.id ?? 'standard'
+    }
+    const model = typeof rawBody.model === 'string' && rawBody.model.trim() ? rawBody.model.trim() : undefined
+    const reasoningEffort =
+      typeof rawBody.reasoningEffort === 'string' && rawBody.reasoningEffort.trim()
+        ? rawBody.reasoningEffort.trim()
+        : undefined
+
+    return this.platform.startAutoCreateBot(
+      {
+        mode,
+        ...(requestedId ? { id: requestedId } : {}),
+        name,
+        description,
+      },
+      async (created) => {
+        let finalId = created.id
+        let suffix = 2
+        while (this.store.getBot(finalId) && this.store.getBot(finalId)?.larkAppId !== created.larkAppId) {
+          finalId = `${created.id}-${suffix}`
+          suffix += 1
+        }
+        const saved = this.store.upsertBot({
+          id: finalId,
+          name: created.name,
+          description: created.description,
+          larkAppId: created.larkAppId,
+          larkAppSecret: created.larkAppSecret,
+          enabled: true,
+          defaultWorkingDir,
+          workspaceName,
+          agentPreset,
+          ...(model ? { model } : {}),
+          ...(reasoningEffort ? { reasoningEffort } : {}),
+        })
+        await this.syncBot(saved.id)
+      },
+    )
+  }
+
+  async syncBot(
+    botId: string,
+    options: { readonly preserveLocalDescription?: boolean } = {},
+  ): Promise<void> {
+    const existing = this.transports.get(botId)
+    if (existing) {
+      await existing.transport.stop().catch(() => {})
+      this.transports.delete(botId)
+    }
+    const bot = this.store.getBot(botId)
+    if (!bot) return
+    await this.workspaces.syncBot(bot)
+    await this.workspaces.reconcileBindings()
+    if (bot.enabled && !this.disposed) {
+      if (options.preserveLocalDescription) {
+        this.preserveLocalDescriptionBots.add(botId)
+      }
+      try {
+        await this.startBot(bot)
+      } finally {
+        this.preserveLocalDescriptionBots.delete(botId)
+      }
+    }
+  }
+
+  async ensureBotProfileHydrated(botId: string): Promise<void> {
+    if (this.hydratedProfileBots.has(botId)) return
+    const bot = this.store.getBot(botId)
+    if (!bot) return
+    if (bot.avatarUrl.trim() && bot.description.trim()) {
+      this.hydratedProfileBots.add(botId)
+      return
+    }
+    this.hydratedProfileBots.add(botId)
+    await this.syncBotProfile(botId).catch(() => undefined)
+  }
+
+  async syncBotProfile(botId: string): Promise<LarkBotProfile | undefined> {
+    const bot = this.store.getBot(botId)
+    if (!bot) return undefined
+    const transport = this.transportFor(bot)
+    const remote = await transport.fetchBotProfile()
+    const fallback =
+      !remote.description || !remote.avatarUrl
+        ? await this.platform.fetchBotAppProfile(bot.larkAppId)
+        : undefined
+    const merged: LarkBotProfile = {
+      ...(remote.openId ? { openId: remote.openId } : {}),
+      ...(remote.name || fallback?.name ? { name: remote.name || fallback?.name } : {}),
+      ...(remote.avatarUrl || fallback?.avatarUrl
+        ? { avatarUrl: remote.avatarUrl || fallback?.avatarUrl }
+        : {}),
+      ...(remote.description || fallback?.description
+        ? { description: remote.description || fallback?.description }
+        : {}),
+    }
+    this.hydratedProfileBots.add(botId)
+    this.store.updateBotProfile(botId, merged)
+    return merged
+  }
+
+  async listGroupMembers(
+    botId: string,
+    chatId: string,
+    options: { readonly includeAvatars?: boolean } = {},
+  ): Promise<LarkChatMember[]> {
+    const bot = this.store.getBot(botId)
+    if (!bot) return []
+    const includeAvatars = options.includeAvatars !== false
+    const uat = includeAvatars
+      ? await this.platform.getValidUserAccessToken(bot.id, bot.larkAppId, bot.larkAppSecret)
+      : undefined
+    return this.transportFor(bot).listChatMembersAndBots(chatId, {
+      ...(uat ? { userAccessToken: uat } : {}),
+      ...(includeAvatars
+        ? {
+            userDirectoryLookup: (queries) => this.directoryEnricher.searchByQueries(queries, bot.id),
+            resolveBotAvatar: async (groupBot) => {
+              const allBots = this.store.listBots()
+              const peer = allBots.find((candidate) => {
+                if (groupBot.larkAppId && candidate.larkAppId === groupBot.larkAppId) return true
+                const st = this.transports.get(candidate.id)?.transport.state
+                if (st?.botOpenId && st.botOpenId === groupBot.openId) return true
+                if (st?.remoteBotName && st.remoteBotName === groupBot.name) return true
+                return candidate.name === groupBot.name
+              })
+              if (peer) {
+                if (!peer.avatarUrl) {
+                  await this.ensureBotProfileHydrated(peer.id)
+                }
+                const refreshedPeer = this.store.getBot(peer.id) ?? peer
+                const peerAvatar =
+                  this.transports.get(peer.id)?.transport.state.avatarUrl || refreshedPeer.avatarUrl
+                if (peerAvatar) return peerAvatar
+              }
+              return this.directoryEnricher.resolveAppAvatar(groupBot.larkAppId)
+            },
+          }
+        : {}),
+    })
+  }
+
+  async searchUsers(botId: string, query: string): Promise<LarkUserSearchHit[]> {
+    const bot = this.store.getBot(botId)
+    if (!bot) return []
+    const uat = await this.platform.getValidUserAccessToken(bot.id, bot.larkAppId, bot.larkAppSecret)
+    return this.transportFor(bot).searchUsers(query, uat, (queries) =>
+      this.directoryEnricher.searchByQueries(queries, bot.id),
+    )
+  }
+
+  async syncJoinedChats(targetBotId?: string): Promise<DiscoveredLarkChat[]> {
+    const entries = targetBotId
+      ? [this.transports.get(targetBotId)].filter((v): v is ManagedTransport => Boolean(v))
+      : [...this.transports.values()]
+    const results: DiscoveredLarkChat[] = []
+    for (const entry of entries) {
+      try {
+        const chats = await entry.transport.listJoinedChats()
+        this.store.mergeDiscoveredChats(entry.config.id, chats)
+        results.push(...chats)
+      } catch (err) {
+        this.ctx.logger.warn(
+          `[lark-bridge] syncJoinedChats(${entry.config.name}) failed: ${err instanceof Error ? err.message : String(err)}`,
+        )
+      }
+    }
+    return results
+  }
+
+  async syncGroupWorkspace(botId: string, chatId: string): Promise<void> {
+    await this.workspaces.syncGroup(botId, chatId)
+    await this.workspaces.reconcileBindings()
+  }
+
+  async unbindRoute(routeKey: string, options: { archive?: boolean } = {}): Promise<boolean> {
+    const handle = this.handles.get(routeKey)
+    if (handle) {
+      this.handles.delete(routeKey)
+      await handle.dispose().catch(() => {})
+    }
+    const removed = this.store.deleteBinding(routeKey)
+    if (removed && options.archive) {
+      await this.archiveManagedSession(removed.sessionId)
+    }
+    return Boolean(removed)
+  }
+
+  /**
+   * Record the live HTTP origin bound by `ctx.webServer` (essential for DSH Desktop
+   * where the listener uses an OS-assigned loopback port) and refresh `cli-endpoint.json`
+   * when no explicit `publicBaseUrl` was configured.
+   */
+  bindLiveWebOrigin(
+    origin: string,
+    connection?: { authenticatedUrl?: (baseUrl: string) => string },
+  ): void {
+    const clean = origin.trim().replace(/\/+$/, '')
+    if (!clean) return
+    this.liveWebOrigin = clean
+    if (connection) {
+      this.liveConnection = connection
+    }
+    if (!this.config.publicBaseUrl.trim()) {
+      this.cliAuth.updateBaseUrl(clean)
+    }
+  }
+
+  getLiveWebOrigin(): string {
+    return this.liveWebOrigin
+  }
+
+  sessionWebUrl(sessionId: string): string {
+    const base = this.resolveWebBaseUrl()
+    if (this.shouldUseLoopbackSessionHandoff(base)) {
+      return this.sessionHandoff.buildUrl(base, sessionId)
+    }
+    return `${base}/#session=${encodeURIComponent(sessionId)}`
+  }
+
+  private shouldUseLoopbackSessionHandoff(base: string): boolean {
+    if (!this.liveWebOrigin || !isLoopbackOrigin(base) || !isLoopbackOrigin(this.liveWebOrigin)) {
+      return false
+    }
+    try {
+      if (new URL(base).origin !== new URL(this.liveWebOrigin).origin) return false
+    } catch {
+      return false
+    }
+    const conn =
+      this.liveConnection ??
+      (this.ctx.get('connection' as never) as { authenticatedUrl?: (url: string) => string } | undefined)
+    return typeof conn?.authenticatedUrl === 'function'
+  }
+
+  private resolveWebBaseUrl(): string {
+    const explicit = this.config.publicBaseUrl.trim()
+    if (explicit) return explicit.replace(/\/+$/, '')
+    const webApp = this.ctx.get('webApp' as never) as { getAdvertisedUrl?: () => string } | undefined
+    const advertised = webApp?.getAdvertisedUrl?.()?.trim()
+    if (advertised) return advertised.replace(/\/+$/, '')
+    const webServer = this.ctx.get('webServer' as never) as { getOrigin?: () => string } | undefined
+    try {
+      const origin = webServer?.getOrigin?.()?.trim()
+      if (origin) return origin.replace(/\/+$/, '')
+    } catch {
+      // Listener may not be bound yet.
+    }
+    if (this.liveWebOrigin) return this.liveWebOrigin
+    for (const list of Object.values(networkInterfaces())) {
+      for (const addr of list ?? []) {
+        if (addr.family === 'IPv4' && !addr.internal) {
+          return `http://${addr.address}:3880`
+        }
+      }
+    }
+    return 'http://127.0.0.1:3880'
+  }
+
+  listArchivedSessionIds(): string[] {
+    return this.workspaces.listArchivedSessionIds()
+  }
+
+  // ── Agent CLI Context & Operations ──────────────────────────────────────────
+
+  resolveAgentContext(sessionId?: string): {
+    readonly sessionId?: string
+    readonly bound: boolean
+    readonly source?: 'session_binding' | 'schedule_session' | 'reminder_session' | 'default_bot'
+    readonly botId?: string
+    readonly botName?: string
+    readonly larkAppId?: string
+    readonly botOpenId?: string
+    readonly chatId?: string
+    readonly chatName?: string
+    readonly routeKey?: string
+    readonly replyToMessageId?: string
+    readonly scheduleContext?: ReturnType<ScheduleNotifier['getActiveSessionContext']>
+    readonly bots: readonly LarkBotStatus[]
+    readonly groups: ReturnType<LarkBridgeStore['listGroupViews']>
+  } {
+    const bots = this.listBotStatuses()
+    const groups = this.store.listGroupViews()
+    const sid = sessionId?.trim() || undefined
+
+    if (sid) {
+      const binding = this.store.listBindings().find((b) => b.sessionId === sid)
+      if (binding) {
+        const botStatus = bots.find((b) => b.botId === binding.botId)
+        const parts = binding.routeKey.split(':')
+        const scope = parts.slice(2).join(':')
+        const replyToMessageId = scope.startsWith('om_') ? scope : undefined
+        return {
+          sessionId: sid,
+          bound: true,
+          source: 'session_binding',
+          botId: binding.botId,
+          botName: binding.botName ?? binding.botId,
+          larkAppId: binding.larkAppId,
+          ...(botStatus?.botOpenId ? { botOpenId: botStatus.botOpenId } : {}),
+          chatId: binding.chatId,
+          ...(binding.chatName ? { chatName: binding.chatName } : {}),
+          routeKey: binding.routeKey,
+          ...(replyToMessageId ? { replyToMessageId } : {}),
+          bots,
+          groups,
+        }
+      }
+
+      const reminder = this.store.listReminders('all').find((r) => r.lastSessionId === sid)
+      if (reminder) {
+        const bot = this.store.getBot(reminder.origin.botId)
+        const botStatus = bots.find((b) => b.botId === reminder.origin.botId)
+        const chatId = reminder.origin.chatId
+        const chatName =
+          reminder.origin.chatName ||
+          (chatId ? this.store.resolveChatName(reminder.origin.botId, chatId) : undefined)
+        return {
+          sessionId: sid,
+          bound: true,
+          source: 'reminder_session',
+          botId: reminder.origin.botId,
+          botName: bot?.name ?? reminder.origin.botName ?? reminder.origin.botId,
+          larkAppId: bot?.larkAppId ?? reminder.origin.larkAppId,
+          ...(botStatus?.botOpenId ? { botOpenId: botStatus.botOpenId } : {}),
+          ...(chatId ? { chatId } : {}),
+          ...(chatName ? { chatName } : {}),
+          routeKey: `reminder:${reminder.id}`,
+          ...(reminder.origin.replyToMessageId
+            ? { replyToMessageId: reminder.origin.replyToMessageId }
+            : {}),
+          bots,
+          groups,
+        }
+      }
+
+      const schedCtx = this.schedules.getActiveSessionContext(sid)
+      if (schedCtx && schedCtx.targets.length > 0) {
+        const primary = schedCtx.targets[0]!
+        const bot = this.store.getBot(primary.botId)
+        const botStatus = bots.find((b) => b.botId === primary.botId)
+        const chatName = this.store.resolveChatName(primary.botId, primary.chatId)
+        return {
+          sessionId: sid,
+          bound: true,
+          source: 'schedule_session',
+          botId: primary.botId,
+          ...(bot ? { botName: bot.name, larkAppId: bot.larkAppId } : {}),
+          ...(botStatus?.botOpenId ? { botOpenId: botStatus.botOpenId } : {}),
+          chatId: primary.chatId,
+          ...(chatName ? { chatName } : {}),
+          scheduleContext: schedCtx,
+          bots,
+          groups,
+        }
+      }
+    }
+
+    const defaultBot = bots.find((b) => b.enabled && b.connected) ?? bots[0]
+    return {
+      ...(sid ? { sessionId: sid } : {}),
+      bound: false,
+      ...(defaultBot
+        ? {
+            source: 'default_bot',
+            botId: defaultBot.botId,
+            botName: defaultBot.name,
+            larkAppId: defaultBot.larkAppId,
+            ...(defaultBot.botOpenId ? { botOpenId: defaultBot.botOpenId } : {}),
+          }
+        : {}),
+      bots,
+      groups,
+    }
+  }
+
+  async agentSend(input: AgentCliSendInput): Promise<{
+    readonly messageIds: readonly string[]
+    readonly botId: string
+    readonly targetId: string
+  }> {
+    const ctxInfo = this.resolveAgentContext(input.sessionId)
+    const botId = input.botId?.trim() || ctxInfo.botId
+    if (!botId) throw new Error('No botId specified and no active bot available')
+    const bot = this.store.getBot(botId)
+    if (!bot) throw new Error(`Bot "${botId}" not found`)
+    const transport = this.transportFor(bot)
+
+    const userOpenId = input.userOpenId?.trim() || undefined
+    const chatId = userOpenId ? undefined : input.chatId?.trim() || ctxInfo.chatId
+    const explicitReplyTo = input.replyToMessageId?.trim() || undefined
+    const replyToMessageId =
+      explicitReplyTo ||
+      (!input.chatId && !userOpenId && ctxInfo.replyToMessageId ? ctxInfo.replyToMessageId : undefined)
+    const replyInThread = input.replyInThread ?? Boolean(ctxInfo.replyToMessageId && !explicitReplyTo)
+
+    if (!userOpenId && !chatId && !replyToMessageId) {
+      throw new Error('Target chatId (--chat), userOpenId (--user), or bound session is required')
+    }
+
+    const receiveIdType: 'open_id' | 'chat_id' = userOpenId ? 'open_id' : 'chat_id'
+    const receiveId = userOpenId ?? chatId
+    const messageIds: string[] = []
+
+    const uploadedImages: ReplyCardImage[] = []
+    for (const img of input.images ?? []) {
+      const buf = Buffer.from(img.dataBase64, 'base64')
+      const imgKey = await transport.uploadImageBuffer(buf)
+      uploadedImages.push({
+        imgKey,
+        ...(img.alt || img.fileName ? { alt: img.alt || img.fileName } : {}),
+        ...(img.mode ? { mode: img.mode } : {}),
+      })
+    }
+
+    let markdown = (input.text ?? '').trim()
+    if (input.mentions && input.mentions.length > 0) {
+      const mentionPrefix = input.mentions
+        .filter((m) => m.openId.trim())
+        .map((m) => `<at id="${m.openId.trim()}">${m.name?.trim() || ''}</at>`)
+        .join(' ')
+      if (mentionPrefix) {
+        markdown = markdown ? `${mentionPrefix} ${markdown}` : mentionPrefix
+      }
+    }
+
+    if (input.card) {
+      const sent = await transport.sendProactiveMessage({
+        receiveIdType,
+        ...(receiveId ? { receiveId } : {}),
+        ...(replyToMessageId ? { replyToMessageId, replyInThread } : {}),
+        msgType: 'interactive',
+        content: JSON.stringify(input.card),
+      })
+      if (sent.messageId) messageIds.push(sent.messageId)
+    } else if (markdown || input.title || uploadedImages.length > 0) {
+      if (!markdown && !input.title && uploadedImages.length === 1 && input.textOnly) {
+        const sent = await transport.sendProactiveMessage({
+          receiveIdType,
+          ...(receiveId ? { receiveId } : {}),
+          ...(replyToMessageId ? { replyToMessageId, replyInThread } : {}),
+          msgType: 'image',
+          content: JSON.stringify({ image_key: uploadedImages[0]!.imgKey }),
+        })
+        if (sent.messageId) messageIds.push(sent.messageId)
+      } else if (input.textOnly && uploadedImages.length === 0 && !input.title) {
+        const sent = await transport.sendProactiveMessage({
+          receiveIdType,
+          ...(receiveId ? { receiveId } : {}),
+          ...(replyToMessageId ? { replyToMessageId, replyInThread } : {}),
+          msgType: 'post',
+          content: JSON.stringify(buildLarkPostPayload(markdown)),
+        })
+        if (sent.messageId) messageIds.push(sent.messageId)
+      } else {
+        const group = chatId ? this.store.getGroup(bot.id, chatId) : undefined
+        const card = buildReplyCard({
+          ...(input.title ? { title: input.title } : {}),
+          markdown: markdown || ' ',
+          bot: resolveEffectiveCardBot(bot, group),
+          ...(input.sessionId ? { sessionUrl: this.sessionWebUrl(input.sessionId) } : {}),
+          ...(uploadedImages.length > 0 ? { images: uploadedImages } : {}),
+        })
+        const sent = await transport.sendProactiveMessage({
+          receiveIdType,
+          ...(receiveId ? { receiveId } : {}),
+          ...(replyToMessageId ? { replyToMessageId, replyInThread } : {}),
+          msgType: 'interactive',
+          content: JSON.stringify(card),
+        })
+        if (sent.messageId) messageIds.push(sent.messageId)
+      }
+    }
+
+    for (const f of input.files ?? []) {
+      const buf = Buffer.from(f.dataBase64, 'base64')
+      const uploaded = await transport.uploadFileBuffer(buf, f.fileName)
+      const sent = await transport.sendProactiveMessage({
+        receiveIdType,
+        ...(receiveId ? { receiveId } : {}),
+        ...(replyToMessageId ? { replyToMessageId, replyInThread } : {}),
+        msgType: 'file',
+        content: JSON.stringify({ file_key: uploaded.fileKey }),
+      })
+      if (sent.messageId) messageIds.push(sent.messageId)
+    }
+
+    return {
+      messageIds,
+      botId: bot.id,
+      targetId: receiveId ?? replyToMessageId ?? '',
+    }
+  }
+
+  async agentHistory(input: {
+    readonly sessionId?: string
+    readonly botId?: string
+    readonly chatId?: string
+    readonly threadId?: string
+    readonly limit?: number
+  }): Promise<{
+    readonly botId: string
+    readonly chatId: string
+    readonly threadId?: string
+    readonly messages: readonly LarkHistoryMessage[]
+  }> {
+    const ctxInfo = this.resolveAgentContext(input.sessionId)
+    const botId = input.botId?.trim() || ctxInfo.botId
+    if (!botId) throw new Error('No botId specified and no active bot available')
+    const bot = this.store.getBot(botId)
+    if (!bot) throw new Error(`Bot "${botId}" not found`)
+    const chatId = input.chatId?.trim() || ctxInfo.chatId
+    if (!chatId) throw new Error('chatId is required (--chat oc_xxx or run inside a bound Lark session)')
+    const threadId =
+      input.threadId === 'none'
+        ? undefined
+        : input.threadId?.trim() || (!input.chatId ? ctxInfo.replyToMessageId : undefined)
+    const messages = await this.transportFor(bot).listMessages({
+      chatId,
+      ...(threadId ? { threadId } : {}),
+      ...(input.limit ? { limit: input.limit } : {}),
+    })
+    return {
+      botId,
+      chatId,
+      ...(threadId ? { threadId } : {}),
+      messages,
+    }
+  }
+
+  async agentGetMessage(input: {
+    readonly sessionId?: string
+    readonly botId?: string
+    readonly messageId: string
+    readonly downloadResources?: boolean
+    readonly includeRaw?: boolean
+  }): Promise<LarkMessageDetail | undefined> {
+    const ctxInfo = this.resolveAgentContext(input.sessionId)
+    const botId = input.botId?.trim() || ctxInfo.botId
+    if (!botId) throw new Error('No botId specified and no active bot available')
+    const bot = this.store.getBot(botId)
+    if (!bot) throw new Error(`Bot "${botId}" not found`)
+    return this.transportFor(bot).getMessageDetail(input.messageId, {
+      downloadResources: input.downloadResources,
+      includeRaw: input.includeRaw,
+    })
+  }
+
+  async agentCreateSchedule(input: {
+    readonly sessionId?: string
+    readonly title: string
+    readonly prompt: string
+    readonly timing: ScheduleCreateInputLike['timing']
+    readonly cwd?: string
+    readonly agentPreset?: string
+    readonly botId?: string
+    readonly chatId?: string
+    readonly deliveryMode?: LarkScheduleDeliveryMode
+    readonly notifyOn?: LarkScheduleNotifyOn
+  }) {
+    const ctxInfo = this.resolveAgentContext(input.sessionId)
+    const explicitBotId = input.botId?.trim() || undefined
+    if (explicitBotId && !this.store.getBot(explicitBotId)) {
+      throw new Error(`未找到智能体 "${explicitBotId}"`)
+    }
+    const botId = explicitBotId || ctxInfo.botId
+    const chatId = input.chatId?.trim() || ctxInfo.chatId
+    const bot = botId ? this.store.getBot(botId) : undefined
+    const group = bot && chatId ? this.store.getGroup(bot.id, chatId) : undefined
+    const sessionBinding =
+      !explicitBotId && !input.chatId?.trim() && input.sessionId?.trim()
+        ? this.store.listBindings().find((b) => b.sessionId === input.sessionId!.trim())
+        : undefined
+    const rawCwd =
+      input.cwd?.trim() ||
+      (bot ? resolveEffectiveWorkingDir(bot, group) : sessionBinding?.workingDir)
+    const resolvedPreset =
+      input.agentPreset?.trim() ||
+      (bot ? resolveEffectiveAgentRuntime(bot, group).agentPreset : sessionBinding?.agentPreset)
+    const targets: LarkScheduleTarget[] = botId && chatId ? [{ botId, chatId }] : []
+    return this.schedules.createAndBind({
+      title: input.title,
+      prompt: input.prompt,
+      timing: input.timing,
+      ...(botId ? { botId } : {}),
+      ...(rawCwd ? { cwd: rawCwd } : {}),
+      ...(resolvedPreset ? { agentPreset: resolvedPreset } : {}),
+      ...(targets.length > 0 ? { targets } : {}),
+      ...(input.deliveryMode ? { deliveryMode: input.deliveryMode } : {}),
+      ...(input.notifyOn ? { notifyOn: input.notifyOn } : {}),
+    })
+  }
+
+  // ── Session Sweep & Lifecycle ───────────────────────────────────────────────
+
+  async sweepIdleBindings(): Promise<number> {
+    const now = Date.now()
+    let archivedCount = 0
+
+    for (const binding of this.store.listBindings()) {
+      if (!binding.idleCloseMs || now - binding.lastActivityMs < binding.idleCloseMs) continue
+      await this.unbindRoute(binding.routeKey, { archive: true })
+      archivedCount += 1
+      this.store.recordEvent({
+        botId: binding.botId,
+        chatId: binding.chatId,
+        routeKey: binding.routeKey,
+        sessionId: binding.sessionId,
+        kind: 'lifecycle',
+        summary: '会话空闲超时，已自动归档',
+      })
+    }
+
+    const activeBoundSessionIds = new Set(this.store.listBindings().map((b) => b.sessionId))
+    for (const ms of this.store.listExpiredManagedSessions(now)) {
+      if (activeBoundSessionIds.has(ms.sessionId)) continue
+      const didArchive = await this.archiveManagedSession(ms.sessionId)
+      if (didArchive) {
+        archivedCount += 1
+        this.store.recordEvent({
+          botId: ms.botId,
+          chatId: ms.chatId,
+          ...(ms.routeKey ? { routeKey: ms.routeKey } : {}),
+          sessionId: ms.sessionId,
+          kind: 'lifecycle',
+          summary: '过期会话已自动归档',
+        })
+      }
+    }
+
+    return archivedCount
+  }
+
+  private transportFor(bot: LarkBotConfig): LarkBotTransport {
+    return this.transports.get(bot.id)?.transport ?? new LarkBotTransport(bot, { onMessage: () => {} })
+  }
+
+  private async archiveManagedSession(sessionId: string): Promise<boolean> {
+    const archived = await this.workspaces.archiveSession(sessionId)
+    this.store.markSessionArchived(sessionId)
+    return archived
+  }
+
+  private async startBot(bot: LarkBotConfig): Promise<void> {
+    const transport: LarkBotTransport = new LarkBotTransport(bot, {
+      onMessage: (msg) => this.handleInbound(bot.id, transport, msg),
+      onCardAction: async (action) => {
+        const toast = await this.reminders.handleCardAction(action.actionValue)
+        return toast ? { toast } : undefined
+      },
+      onBotProfile: (profile) => {
+        this.hydratedProfileBots.add(bot.id)
+        this.store.updateBotProfile(bot.id, profile, {
+          preserveNonEmptyDescription: this.preserveLocalDescriptionBots.has(bot.id),
+        })
+      },
+      logger: (level, message) =>
+        this.ctx.logger[level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'info'](
+          `[lark-bridge] ${message}`,
+        ),
+    })
+    this.transports.set(bot.id, { config: bot, transport })
+    await transport.start()
+    this.store.recordEvent({
+      botId: bot.id,
+      kind: 'lifecycle',
+      summary: `长连接已就绪（${bot.larkAppId}）`,
+    })
+    await this.workspaces.syncBot(bot)
+    void this.syncJoinedChats(bot.id)
+  }
+
+  private async handleInbound(
+    botId: string,
+    transport: LarkBotTransport,
+    msg: InboundLarkMessage,
+  ): Promise<void> {
+    const bot = this.store.getBot(botId)
+    if (!bot || !this.dedup.claim(`${bot.larkAppId}:${msg.messageId}`)) return
+
+    const groupConfig = msg.chatType === 'group' ? this.store.getGroup(bot.id, msg.chatId) : undefined
+    const knownChatName =
+      msg.chatType === 'group' ? this.store.resolveChatName(bot.id, msg.chatId) : undefined
+    const rawDecision = decideLarkRouting(bot, msg, {
+      groupConfig,
+      ...(knownChatName ? { chatName: knownChatName } : {}),
+      hasActiveSessionForRoute: (routeKey) => Boolean(this.store.getBinding(routeKey)),
+      getRouteTrigger: (routeKey) => this.store.getBinding(routeKey)?.trigger,
+    })
+    const decision =
+      rawDecision.action !== 'ignore'
+        ? {
+            ...rawDecision,
+            workspaceName:
+              msg.chatType === 'group'
+                ? this.store.resolveGroupWorkspaceName(bot, groupConfig, knownChatName)
+                : this.store.resolveBotWorkspaceName(bot),
+          }
+        : rawDecision
+
+    if (decision.action === 'ignore') {
+      if (decision.reason !== 'no_matching_rule' && decision.reason !== 'self_message') {
+        this.store.recordMetric({ botId: bot.id, chatId: msg.chatId, kind: 'ignored' })
+        this.store.recordEvent({
+          botId: bot.id,
+          chatId: msg.chatId,
+          kind: 'ignored',
+          summary: `规则过滤（${decision.reason}）`,
+        })
+      }
+      return
+    }
+
+    const reply = (text: string) =>
+      transport.sendReply({
+        chatId: msg.chatId,
+        replyToMessageId: msg.messageId,
+        replyMode: decision.replyMode,
+        text,
+      })
+
+    if (decision.action === 'command') {
+      this.store.recordEvent({
+        botId: bot.id,
+        chatId: msg.chatId,
+        routeKey: decision.routeKey,
+        kind: 'command',
+        summary: `/${decision.command.name} ${decision.command.args}`.trim(),
+      })
+      await handleSlashCommand(
+        {
+          ctx: this.ctx,
+          store: this.store,
+          runtimes: this.runtimes,
+          unbindRoute: (key, opts) => this.unbindRoute(key, opts),
+          sessionWebUrl: (sid) => this.sessionWebUrl(sid),
+          runTurn: (agent, content) => runTurnAndCollectReply(this.ctx, agent, content),
+        },
+        {
+          bot,
+          ...(groupConfig ? { group: groupConfig } : {}),
+          command: decision.command,
+          routeKey: decision.routeKey,
+          workingDir: decision.workingDir,
+          workspaceName: decision.workspaceName,
+          reply: async (text) => {
+            await reply(text)
+          },
+        },
+      )
+      return
+    }
+
+    await this.runAgentTurn(bot, transport, msg, decision, groupConfig)
+  }
+
+  private async runAgentTurn(
+    bot: LarkBotConfig,
+    transport: LarkBotTransport,
+    msg: InboundLarkMessage,
+    decision: AgentDecision,
+    groupConfig?: LarkGroupConfig,
+  ): Promise<void> {
+    const startedMs = Date.now()
+    const resolvedChatName = decision.chatName || this.store.resolveChatName(bot.id, msg.chatId)
+    const chatName = resolvedChatName ? { chatName: resolvedChatName } : {}
+    this.store.recordMetric({ botId: bot.id, chatId: msg.chatId, ...chatName, kind: 'inbound', now: startedMs })
+    if (decision.trigger === 'listener') {
+      this.store.recordMetric({ botId: bot.id, chatId: msg.chatId, kind: 'listener', now: startedMs })
+    }
+
+    const reaction = decision.receivedReactionEmoji
+    const reactionId = reaction ? await transport.addReaction(msg.messageId, reaction) : undefined
+
+    try {
+      const acquired = await this.acquireAgent(bot, msg, decision)
+      this.ensureCleanSessionTitle(acquired.agent.session, msg, decision, acquired.isNew)
+
+      this.store.recordEvent({
+        botId: bot.id,
+        chatId: msg.chatId,
+        ...chatName,
+        routeKey: decision.routeKey,
+        sessionId: acquired.sessionId,
+        kind: 'inbound',
+        summary: `${decision.listenerName ? `监听「${decision.listenerName}」` : decision.trigger} → ${decision.agentPreset} · ${decision.workspaceName}`,
+      })
+
+      const content = await this.buildPrompt(
+        bot,
+        transport,
+        msg,
+        decision,
+        acquired.isNew,
+        resolvedChatName,
+      )
+      let intermediateSentCount = 0
+      const replyText = await runTurnAndCollectReply(
+        this.ctx,
+        acquired.agent,
+        content,
+        decision.sendIntermediateMessages
+          ? {
+              onIntermediate: async (stepText) => {
+                await this.deliverIntermediateReply(bot, transport, msg, decision, stepText)
+                intermediateSentCount += 1
+              },
+            }
+          : undefined,
+      )
+      const latencyMs = Date.now() - startedMs
+      this.store.touchBinding(decision.routeKey)
+      this.store.touchManagedSession(acquired.sessionId)
+      this.ensureCleanSessionTitle(acquired.agent.session, msg, decision, false)
+
+      const hasFinalText = replyText.trim().length > 0
+      const isSilentSkip =
+        decision.allowSilentEmptyReply && !hasFinalText && intermediateSentCount === 0
+      if (isSilentSkip) {
+        this.store.recordMetric({ botId: bot.id, chatId: msg.chatId, kind: 'silent_skip' })
+        this.store.recordEvent({
+          botId: bot.id,
+          chatId: msg.chatId,
+          routeKey: decision.routeKey,
+          sessionId: acquired.sessionId,
+          durationMs: latencyMs,
+          kind: 'silent_skip',
+          summary: '判断无需回复，已静默',
+        })
+      } else {
+        if (hasFinalText || intermediateSentCount === 0) {
+          await this.deliverReply(bot, transport, msg, decision, acquired.sessionId, replyText, groupConfig)
+        }
+        this.store.recordMetric({ botId: bot.id, chatId: msg.chatId, ...chatName, kind: 'replied', latencyMs })
+        this.store.recordEvent({
+          botId: bot.id,
+          chatId: msg.chatId,
+          routeKey: decision.routeKey,
+          sessionId: acquired.sessionId,
+          durationMs: latencyMs,
+          kind: 'reply',
+          summary:
+            intermediateSentCount > 0
+              ? `已发送 ${intermediateSentCount} 条过程消息${hasFinalText ? ` + 最终回复 ${replyText.trim().length} 字` : ''}`
+              : `已回复 ${replyText.trim().length} 字`,
+        })
+      }
+
+      if (acquired.disposeAfter || decision.autoCloseAfterCompletion) {
+        const handle = this.handles.get(decision.routeKey)
+        if (handle) {
+          this.handles.delete(decision.routeKey)
+          await handle.dispose().catch(() => {})
+        }
+        this.store.deleteBinding(decision.routeKey)
+        if (isSilentSkip && acquired.isNew) {
+          await this.archiveManagedSession(acquired.sessionId)
+        }
+      }
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err)
+      this.ctx.logger.error(`[lark-bridge] turn handling failed: ${errorMsg}`)
+      this.store.recordMetric({ botId: bot.id, chatId: msg.chatId, kind: 'error' })
+      this.store.recordEvent({
+        botId: bot.id,
+        chatId: msg.chatId,
+        routeKey: decision.routeKey,
+        kind: 'error',
+        summary: errorMsg,
+      })
+      await transport
+        .sendReply({
+          chatId: msg.chatId,
+          replyToMessageId: msg.messageId,
+          replyMode: decision.replyMode,
+          text: `执行异常：${errorMsg}`,
+        })
+        .catch(() => {})
+    } finally {
+      if (reactionId) await transport.removeReaction(msg.messageId, reactionId)
+    }
+  }
+
+  private async buildPrompt(
+    bot: LarkBotConfig,
+    transport: LarkBotTransport,
+    msg: InboundLarkMessage,
+    decision: AgentDecision,
+    isNewSession: boolean,
+    resolvedChatName?: string,
+  ): Promise<ContentBlock[]> {
+    const reminders: string[] = []
+    let senderName: string | undefined
+    if (msg.senderOpenId && typeof transport.resolveUserSummary === 'function') {
+      const summary = await transport.resolveUserSummary(msg.senderOpenId).catch(() => undefined)
+      if (summary?.name && summary.name !== msg.senderOpenId) {
+        senderName = summary.name
+      }
+    }
+
+    if (isNewSession && decision.roleReminder) {
+      reminders.push(decision.roleReminder)
+    }
+    if (isNewSession) {
+      const proactiveReminder = composeProactiveSessionReminder({
+        botId: bot.id,
+        workingDir: decision.workingDir,
+        config: bot.experimental.proactive,
+      })
+      if (proactiveReminder) reminders.push(proactiveReminder)
+    }
+
+    reminders.push(
+      composeLarkContextReminder({
+        bot,
+        botOpenId: transport.state?.botOpenId ?? msg.botOpenId,
+        msg,
+        ...(resolvedChatName ? { chatName: resolvedChatName } : {}),
+        ...(senderName ? { senderName } : {}),
+        replyMode: decision.replyMode,
+        useCard: decision.useCard,
+        includeFullGuide: isNewSession,
+      }),
+    )
+    reminders.push(...decision.turnReminders)
+
+    const text = composeTurnPrompt(reminders, decision.userText)
+    const blocks: ContentBlock[] = [{ type: 'text', text }]
+
+    for (const imageKey of msg.imageKeys) {
+      const data = await transport.downloadImageAsBase64(msg.messageId, imageKey)
+      if (data) {
+        blocks.push({ type: 'image', mediaType: 'image/png', data } as unknown as ContentBlock)
+      }
+    }
+    return blocks
+  }
+
+  private async formatReplyModelLabel(agentPreset: string, explicitModel?: string): Promise<string> {
+    const runtimeList = await this.runtimes.list().catch(() => [])
+    const runtimeOpt = runtimeList.find((r) => r.id === agentPreset)
+    const runtimeLabel = runtimeOpt?.name ?? agentPreset
+    const launch = await this.runtimes
+      .resolveAgentLaunch({
+        agentPreset,
+        ...(explicitModel ? { explicitModel } : {}),
+      })
+      .catch(() => undefined)
+    const modelId =
+      launch?.model ||
+      explicitModel ||
+      (await this.runtimes.resolveDefaultModel(agentPreset, runtimeOpt?.defaultModel).catch(() => runtimeOpt?.defaultModel))
+    if (!modelId) return runtimeLabel
+    const provider = launch?.provider ?? runtimeOpt?.providerId ?? this.runtimes.providerFor(agentPreset)
+    let modelLabel = modelId
+    if (provider && typeof this.ctx.llm?.resolveModelInfo === 'function') {
+      const resolved = await this.ctx.llm.resolveModelInfo(provider, modelId).catch(() => undefined)
+      if (resolved?.name) modelLabel = resolved.name
+    }
+    return [runtimeLabel, modelLabel].filter(Boolean).join(' · ')
+  }
+
+  private async deliverIntermediateReply(
+    bot: LarkBotConfig,
+    transport: LarkBotTransport,
+    msg: InboundLarkMessage,
+    decision: AgentDecision,
+    stepText: string,
+  ): Promise<void> {
+    const text = stepText.trim()
+    if (!text) return
+    const card = decision.useCard
+      ? buildReplyCard({
+          markdown: text,
+          bot: { ...bot, dshSessionLinkInCard: false, replyFooterEnabled: false },
+        })
+      : undefined
+    await transport.sendReply({
+      chatId: msg.chatId,
+      replyToMessageId: msg.messageId,
+      replyMode: decision.replyMode,
+      ...(card ? { card } : { text }),
+    })
+  }
+
+  private async deliverReply(
+    bot: LarkBotConfig,
+    transport: LarkBotTransport,
+    msg: InboundLarkMessage,
+    decision: AgentDecision,
+    sessionId: string,
+    replyText: string,
+    groupConfig?: LarkGroupConfig,
+  ): Promise<void> {
+    const text = replyText.trim() || '（已完成，无文本输出）'
+    const cardBot = resolveEffectiveCardBot(bot, msg.chatType === 'group' ? groupConfig : undefined)
+    const modelLabel =
+      decision.useCard && cardBot.replyFooterEnabled && cardBot.replyFooterModel
+        ? await this.formatReplyModelLabel(decision.agentPreset, decision.model)
+        : ''
+    const card = decision.useCard
+      ? buildReplyCard({
+          markdown: text,
+          bot: cardBot,
+          modelLabel,
+          sessionUrl: this.sessionWebUrl(sessionId),
+        })
+      : undefined
+    await transport.sendReply({
+      chatId: msg.chatId,
+      replyToMessageId: msg.messageId,
+      replyMode: decision.replyMode,
+      ...(card ? { card } : { text }),
+    })
+  }
+
+  private async acquireAgent(
+    bot: LarkBotConfig,
+    msg: InboundLarkMessage,
+    decision: AgentDecision,
+  ): Promise<AcquiredAgent> {
+    const reuseSession = decision.sessionMode !== 'per_message'
+    const existing = reuseSession ? this.store.getBinding(decision.routeKey) : undefined
+    if (existing) {
+      const targetCwd = expandWorkingDir(decision.workingDir) || decision.workingDir
+      const existingCwd = expandWorkingDir(existing.workingDir) || existing.workingDir
+      if (existing.agentPreset !== decision.agentPreset || existingCwd !== targetCwd) {
+        await this.unbindRoute(decision.routeKey, { archive: false })
+      } else {
+        const resumed = await this.resumeAgent(bot, existing, decision)
+        if (resumed) return resumed
+      }
+    }
+
+    const sessionId = brandString<SessionId>(`session-${randomUUID()}`)
+    const launch = await this.runtimes.resolveAgentLaunch({
+      agentPreset: decision.agentPreset,
+      ...(bot.provider ? { explicitProvider: bot.provider } : {}),
+      ...(decision.model ? { explicitModel: decision.model } : {}),
+      ...(decision.reasoningEffort ? { explicitReasoningEffort: decision.reasoningEffort } : {}),
+      requireNativeModel: true,
+    })
+    const resolvedCwd = expandWorkingDir(decision.workingDir) || decision.workingDir
+    const handle = await this.ctx.agents.create({
+      sessionId,
+      meta: { cwd: resolvedCwd, agentPreset: decision.agentPreset },
+      agentOptions: {
+        ...(launch.provider ? { provider: launch.provider } : {}),
+        ...(launch.model ? { model: launch.model } : {}),
+        ...(launch.reasoningEffort ? { reasoningEffort: launch.reasoningEffort } : {}),
+      },
+      setup: async (agentCtx, agent) => {
+        await launch.mountPreset(agentCtx)
+        const isP2p = msg.chatType === 'p2p'
+        const replyAnchor = msg.rootId ?? msg.threadId ?? msg.messageId
+        appendPluginRecord(agent.session, LARK_ORIGIN_RECORD_TYPE, {
+          botId: bot.id,
+          botName: bot.name,
+          larkAppId: bot.larkAppId,
+          chatType: isP2p ? 'p2p' : 'group',
+          chatId: msg.chatId,
+          ...(decision.chatName ? { chatName: decision.chatName } : {}),
+          ...(!isP2p && decision.replyMode !== 'chat' ? { replyToMessageId: replyAnchor } : {}),
+          ...(isP2p && msg.senderOpenId ? { userOpenId: msg.senderOpenId } : {}),
+          workspaceName: decision.workspaceName,
+          routeKey: decision.routeKey,
+          trigger: decision.trigger,
+          ...(decision.listenerName ? { listenerName: decision.listenerName } : {}),
+        })
+      },
+    })
+    this.schedules.instrumentAgent(handle.agent)
+    await this.workspaces.attachSession(resolvedCwd, decision.workspaceName, sessionId)
+    this.handles.set(decision.routeKey, handle)
+
+    const now = Date.now()
+    const idleCloseMs = decision.idleCloseMs
+    this.store.upsertManagedSession({
+      sessionId,
+      botId: bot.id,
+      chatId: msg.chatId,
+      routeKey: decision.routeKey,
+      trigger: decision.trigger,
+      createdAtMs: now,
+      lastActivityMs: now,
+      ...(idleCloseMs ? { idleCloseMs } : {}),
+    })
+    if (reuseSession) {
+      this.store.upsertBinding(this.createBinding(bot, msg, decision, sessionId, resolvedCwd))
+    }
+    return { agent: handle.agent, sessionId, isNew: true, disposeAfter: !reuseSession }
+  }
+
+  private async resumeAgent(
+    bot: LarkBotConfig,
+    binding: LarkSessionBinding,
+    decision: AgentDecision,
+  ): Promise<AcquiredAgent | undefined> {
+    const sessionId = brandString<SessionId>(binding.sessionId)
+    const launch = await this.runtimes.resolveAgentLaunch({
+      agentPreset: decision.agentPreset,
+      ...(bot.provider ? { explicitProvider: bot.provider } : {}),
+      ...(decision.model ? { explicitModel: decision.model } : {}),
+      ...(decision.reasoningEffort ? { explicitReasoningEffort: decision.reasoningEffort } : {}),
+      requireNativeModel: true,
+    })
+    let agent = this.ctx.agents.get(sessionId)
+    if (!agent) {
+      try {
+        const handle = await this.ctx.agents.resume(
+          launch.isExternal
+            ? { resumeSessionId: sessionId }
+            : {
+                resumeSessionId: sessionId,
+                agentOptions: {
+                  ...(launch.provider ? { provider: launch.provider } : {}),
+                  ...(launch.model ? { model: launch.model } : {}),
+                  ...(launch.reasoningEffort ? { reasoningEffort: launch.reasoningEffort } : {}),
+                },
+                setup: async (agentCtx) => {
+                  await launch.mountPreset(agentCtx)
+                },
+              },
+        )
+        this.handles.set(decision.routeKey, handle)
+        agent = handle.agent
+      } catch {
+        this.store.deleteBinding(decision.routeKey)
+        return undefined
+      }
+    }
+
+    const modelChanged = (binding.model ?? '') !== (decision.model ?? '')
+    const effortChanged = (binding.reasoningEffort ?? '') !== (decision.reasoningEffort ?? '')
+    if ((modelChanged || effortChanged) && agent.model?.select) {
+      const provider =
+        agent.model.current?.()?.provider ??
+        launch.provider ??
+        this.runtimes.providerFor(decision.agentPreset) ??
+        bot.provider
+      const targetModel = decision.model ?? launch.model ?? agent.model.current?.()?.model
+      if (provider && targetModel) {
+        try {
+          agent.model.select({
+            provider,
+            model: targetModel,
+            ...(decision.reasoningEffort
+              ? { reasoningEffort: brandString<ReasoningEffortId>(decision.reasoningEffort) }
+              : {}),
+          })
+        } catch {
+          // Ignore if native adapter does not support runtime hot-select.
+        }
+      }
+      this.store.upsertBinding({
+        ...binding,
+        ...(decision.model ? { model: decision.model } : { model: undefined }),
+        ...(decision.reasoningEffort
+          ? { reasoningEffort: decision.reasoningEffort }
+          : { reasoningEffort: undefined }),
+      })
+    }
+
+    this.schedules.instrumentAgent(agent)
+    await this.workspaces.attachSession(decision.workingDir, decision.workspaceName, binding.sessionId)
+    return { agent, sessionId: binding.sessionId, isNew: false, disposeAfter: false }
+  }
+
+  private createBinding(
+    bot: LarkBotConfig,
+    msg: InboundLarkMessage,
+    decision: AgentDecision,
+    sessionId: string,
+    workingDir: string,
+  ): LarkSessionBinding {
+    const now = Date.now()
+    const isP2p = msg.chatType === 'p2p'
+    return {
+      routeKey: decision.routeKey,
+      botId: bot.id,
+      botName: bot.name,
+      larkAppId: bot.larkAppId,
+      chatType: isP2p ? 'p2p' : 'group',
+      chatId: msg.chatId,
+      ...(decision.chatName ? { chatName: decision.chatName } : {}),
+      ...(isP2p && msg.senderOpenId ? { userOpenId: msg.senderOpenId } : {}),
+      workspaceName: decision.workspaceName,
+      sessionId,
+      agentPreset: decision.agentPreset,
+      ...(decision.model ? { model: decision.model } : {}),
+      ...(decision.reasoningEffort ? { reasoningEffort: decision.reasoningEffort } : {}),
+      workingDir,
+      trigger: decision.trigger,
+      ...(decision.listenerName ? { listenerName: decision.listenerName } : {}),
+      createdAtMs: now,
+      lastActivityMs: now,
+      ...(decision.idleCloseMs ? { idleCloseMs: decision.idleCloseMs } : {}),
+    }
+  }
+
+  private ensureCleanSessionTitle(
+    session: Session,
+    msg: InboundLarkMessage,
+    decision: AgentDecision,
+    isNew: boolean,
+  ): void {
+    const titleService = this.titleService()
+    if (!titleService?.rename) return
+
+    const pure = extractPureUserIntent(decision.userText || msg.text)
+    const candidate = (pure || (msg.imageKeys.length > 0 ? '图片消息' : '')).slice(0, 60)
+    if (!candidate) return
+
+    const current = titleService.get?.(session)?.title?.trim() ?? ''
+    const isTrivialGreeting = /^(hi|hello|hey|你好|您好|在吗|测试|test)$/i.test(current)
+    const shouldWrite =
+      isNew ||
+      !current ||
+      hasInjectedPromptMarkup(current) ||
+      (isTrivialGreeting && candidate.length > 6 && !/^(hi|hello|hey|你好|您好|在吗|测试|test)$/i.test(candidate))
+
+    if (shouldWrite && candidate !== current) {
+      try {
+        titleService.rename(session, candidate)
+      } catch {
+        // Ignore if session closed.
+      }
+    }
+  }
+
+  private installSessionTitleGuard(): void {
+    const wrapTitleProvider = (rawSvc: unknown) => {
+      const svc = rawSvc as
+        | {
+            registration?: {
+              provider?: {
+                __larkSanitized?: boolean
+                generate: (req: {
+                  messages: ReadonlyArray<{ seq: unknown; text: string }>
+                  [k: string]: unknown
+                }) => Promise<unknown>
+              }
+            }
+          }
+        | undefined
+      const provider = svc?.registration?.provider
+      if (provider && !provider.__larkSanitized && typeof provider.generate === 'function') {
+        const origGenerate = provider.generate.bind(provider)
+        provider.__larkSanitized = true
+        provider.generate = (req) => {
+          const cleanedMessages = req.messages.map((m) => {
+            if (!hasInjectedPromptMarkup(m.text) && !m.text.includes('<user_message>')) return m
+            const pure = extractPureUserIntent(m.text)
+            return pure ? { ...m, text: pure } : m
+          })
+          return origGenerate({ ...req, messages: cleanedMessages })
+        }
+      }
+    }
+    wrapTitleProvider(this.titleService())
+    if (typeof this.ctx.inject === 'function') {
+      this.ctx.inject(['sessionTitle' as never], (tCtx) => {
+        wrapTitleProvider((tCtx as Context).get('sessionTitle' as never))
+      })
+    }
+
+    const off = this.ctx.on(
+      'session/event',
+      (session: Session, event: SessionEvent) => {
+        const rawEvent = event as unknown as { type: string; data?: { title?: string } }
+        if (rawEvent.type !== 'session/title') return
+        const rawTitle = rawEvent.data?.title ?? ''
+        if (!hasInjectedPromptMarkup(rawTitle)) return
+        const repaired = this.deriveCleanTitleFromEvents(session.snapshotEvents())
+        if (!repaired || repaired === rawTitle) return
+        try {
+          this.titleService()?.rename?.(session, repaired)
+        } catch {
+          // Ignore if session is closing.
+        }
+      },
+      { global: true },
+    )
+    this.disposers.push(off)
+  }
+
+  private deriveCleanTitleFromEvents(events: readonly SessionEvent[]): string | undefined {
+    for (const ev of events) {
+      if (ev.type !== 'user/message') continue
+      const content = (ev.data as { content?: ReadonlyArray<{ type?: string; text?: string }> }).content ?? []
+      const rawText = content
+        .filter((b) => b.type === 'text' && typeof b.text === 'string')
+        .map((b) => b.text!)
+        .join('\n')
+      const pure = extractPureUserIntent(rawText)
+      if (pure) return pure.slice(0, 60)
+    }
+    return undefined
+  }
+
+  private async reconcileHistoricalSessions(): Promise<void> {
+    const persistence = this.ctx.get('sessionPersistence') as SessionPersistence | undefined
+    if (!persistence) return
+
+    const activeBoundSessionIds = new Set(this.store.listBindings().map((b) => b.sessionId))
+    const sessionIds = this.workspaces.listWorkspaceSessionIds()
+    const now = Date.now()
+    const bots = this.store.listBots()
+    const defaultIdleMs =
+      bots.length > 0 && bots[0]!.idleCloseMinutes > 0
+        ? bots[0]!.idleCloseMinutes * 60_000
+        : DEFAULT_HISTORICAL_ARCHIVE_MS
+
+    for (const sid of sessionIds) {
+      let events: readonly SessionEvent[] = []
+      let headerCreatedAt = 0
+      try {
+        const handle = await persistence.open(brandString<SessionId>(sid), 'read')
+        headerCreatedAt = handle.header?.createdAt ?? 0
+        try {
+          const readRes = await handle.read(0, 200)
+          events = readRes.events
+        } finally {
+          await handle.close().catch(() => {})
+        }
+      } catch {
+        continue
+      }
+      if (events.length === 0) continue
+
+      let latestTitle = ''
+      let lastTimestampMs = 0
+      let isBridgeSession = false
+      for (const ev of events) {
+        const rawEv = ev as unknown as {
+          type: string
+          time?: number
+          timestamp?: number
+          data?: { title?: string; content?: ReadonlyArray<{ text?: string }> }
+        }
+        const evTime =
+          typeof rawEv.time === 'number'
+            ? rawEv.time
+            : typeof rawEv.timestamp === 'number'
+              ? rawEv.timestamp
+              : 0
+        if (rawEv.type !== 'session/title' && evTime > lastTimestampMs) {
+          lastTimestampMs = evTime
+        }
+        const rec = pluginRecordOf(ev as never) as { type?: string } | undefined
+        if (rec?.type?.endsWith('/origin')) {
+          isBridgeSession = true
+        }
+        if (rawEv.type === 'user/message') {
+          const txt = (rawEv.data?.content ?? []).map((c) => c.text ?? '').join('\n')
+          if (hasInjectedPromptMarkup(txt) || txt.includes('<user_message>')) {
+            isBridgeSession = true
+          }
+        }
+        if (rawEv.type === 'session/title') {
+          latestTitle = rawEv.data?.title ?? ''
+        }
+      }
+      if (lastTimestampMs === 0) {
+        lastTimestampMs = headerCreatedAt
+      }
+
+      if (latestTitle && hasInjectedPromptMarkup(latestTitle)) {
+        const clean = this.deriveCleanTitleFromEvents(events)
+        if (clean) {
+          try {
+            const live = this.ctx.agents.get(brandString<SessionId>(sid))
+            if (live) {
+              this.titleService()?.rename?.(live.session, clean)
+            } else {
+              const resumed = await this.ctx.agents.resume({ resumeSessionId: brandString<SessionId>(sid) })
+              try {
+                this.titleService()?.rename?.(resumed.agent.session, clean)
+              } finally {
+                await resumed.dispose().catch(() => {})
+              }
+            }
+            this.ctx.logger.info(`[lark-bridge] repaired polluted session title for ${sid} -> "${clean}"`)
+          } catch {
+            // Best-effort historical title repair.
+          }
+        }
+      }
+
+      if (isBridgeSession && !activeBoundSessionIds.has(sid) && lastTimestampMs > 0) {
+        const managed = this.store.getManagedSession?.(sid)
+        const archiveThresholdMs = managed
+          ? managed.idleCloseMs && managed.idleCloseMs > 0
+            ? managed.idleCloseMs
+            : Number.POSITIVE_INFINITY
+          : Math.min(defaultIdleMs, DEFAULT_HISTORICAL_ARCHIVE_MS)
+        if (now - lastTimestampMs >= archiveThresholdMs) {
+          await this.archiveManagedSession(sid)
+        }
+      }
+    }
+  }
+
+  private titleService():
+    | {
+        get?: (s: Session) => { title?: string; source?: { kind?: string } } | undefined
+        rename?: (s: Session, nextTitle: string) => unknown
+      }
+    | undefined {
+    return this.ctx.get('sessionTitle' as never) as
+      | {
+          get?: (s: Session) => { title?: string; source?: { kind?: string } } | undefined
+          rename?: (s: Session, nextTitle: string) => unknown
+        }
+      | undefined
+  }
+
+  private async sendScheduleMessage(input: {
+    readonly botId: string
+    readonly chatId: string
+    readonly deliveryMode: LarkScheduleDeliveryMode
+    readonly replyToMessageId?: string
+    readonly scheduleTitle: string
+    readonly markdown: string
+    readonly isError: boolean
+    readonly isIntermediate?: boolean
+    readonly sessionId: string
+  }): Promise<void> {
+    const bot = this.store.getBot(input.botId)
+    if (!bot) throw new Error(`bot "${input.botId}" not found`)
+    const group = this.store.getGroup(bot.id, input.chatId)
+    const transport = this.transportFor(bot)
+    const cardTitle = input.isError
+      ? `自动化任务异常 · ${input.scheduleTitle}`
+      : input.isIntermediate
+        ? `自动化任务进展 · ${input.scheduleTitle}`
+        : `自动化任务 · ${input.scheduleTitle}`
+    const cardBot = resolveEffectiveCardBot(bot, group)
+    const card = buildReplyCard({
+      title: cardTitle,
+      template: input.isError ? 'orange' : 'blue',
+      markdown: input.markdown,
+      bot: input.isIntermediate
+        ? { ...cardBot, dshSessionLinkInCard: false, replyFooterEnabled: false }
+        : cardBot,
+      ...(input.isIntermediate ? {} : { sessionUrl: this.sessionWebUrl(input.sessionId) }),
+    })
+    const inThread = Boolean(input.replyToMessageId && input.deliveryMode === 'thread')
+    const sent = await transport.sendReply({
+      chatId: input.chatId,
+      ...(inThread
+        ? { replyToMessageId: input.replyToMessageId!, replyMode: 'new-topic' as const }
+        : { replyMode: 'chat' as const }),
+      card,
+    })
+    if (input.isIntermediate) return
+    const scopeId = inThread ? input.replyToMessageId! : sent.messageId
+    if (scopeId) {
+      const liveSession = (
+        this.ctx.sessions as unknown as { get?: (id: SessionId) => Agent['session'] | undefined }
+      ).get?.(brandString<SessionId>(input.sessionId))
+      const now = Date.now()
+      const idleMinutes = group?.idleCloseMinutes ?? bot.idleCloseMinutes
+      const rawDir = liveSession?.header.cwd || group?.workingDir.trim() || bot.defaultWorkingDir
+      const chatName = this.store.resolveChatName(bot.id, input.chatId)
+      this.store.upsertBinding({
+        routeKey: buildRouteKey(bot.larkAppId, input.chatId, scopeId),
+        botId: bot.id,
+        botName: bot.name,
+        larkAppId: bot.larkAppId,
+        chatId: input.chatId,
+        ...(chatName ? { chatName } : {}),
+        workspaceName: this.store.resolveGroupWorkspaceName(bot, group, chatName),
+        sessionId: input.sessionId,
+        agentPreset: liveSession?.header.agentPreset ?? bot.agentPreset,
+        workingDir: expandWorkingDir(rawDir) || rawDir,
+        trigger: 'schedule',
+        createdAtMs: now,
+        lastActivityMs: now,
+        ...(idleMinutes > 0 ? { idleCloseMs: idleMinutes * 60_000 } : {}),
+      })
+    }
+  }
+
+  private async sendOriginCard(
+    origin: LarkReminderOrigin,
+    card: Record<string, unknown>,
+  ): Promise<{ readonly messageId?: string }> {
+    const bot = this.store.getBot(origin.botId)
+    if (!bot) return {}
+    const transport = this.transportFor(bot)
+    if (origin.chatType === 'p2p' && origin.userOpenId) {
+      const sent = await transport.sendProactiveMessage({
+        receiveIdType: 'open_id',
+        receiveId: origin.userOpenId,
+        msgType: 'interactive',
+        content: JSON.stringify(card),
+      })
+      return { ...(sent.messageId ? { messageId: sent.messageId } : {}) }
+    }
+    if (!origin.chatId) return {}
+    const inThread = Boolean(origin.deliveryMode === 'thread' && origin.replyToMessageId)
+    const sent = await transport.sendReply({
+      chatId: origin.chatId,
+      ...(inThread
+        ? { replyToMessageId: origin.replyToMessageId!, replyMode: 'new-topic' as const }
+        : { replyMode: 'chat' as const }),
+      card,
+    })
+    return { ...(sent.messageId ? { messageId: sent.messageId } : {}) }
+  }
+
+  private async patchOriginCard(
+    botId: string,
+    messageId: string,
+    card: Record<string, unknown>,
+  ): Promise<void> {
+    const bot = this.store.getBot(botId)
+    if (!bot) return
+    await this.transportFor(bot).patchMessageCard(messageId, card)
+  }
+
+  private async deliverReminderOutput(input: {
+    readonly item: LarkReminderItem
+    readonly sessionId: string
+    readonly markdown: string
+    readonly isError: boolean
+  }): Promise<{ readonly messageId?: string }> {
+    const { item, sessionId, isError } = input
+    const bot = this.store.getBot(item.origin.botId)
+    if (!bot) return {}
+    const transport = this.transportFor(bot)
+
+    let markdown = input.markdown.trim()
+    if (item.origin.chatType === 'group' && item.mentions.length > 0) {
+      const missingMentions = item.mentions.filter(
+        (m) => m.openId.trim() && !markdown.includes(`id="${m.openId.trim()}"`),
+      )
+      if (missingMentions.length > 0) {
+        const prefix = missingMentions
+          .map((m) => `<at id="${m.openId.trim()}">${m.name.trim() || ''}</at>`)
+          .join(' ')
+        markdown = `${prefix}\n\n${markdown}`
+      }
+    }
+
+    const cardTitle = isError
+      ? `提醒事项异常 · ${item.title}`
+      : item.worktree
+        ? `主动跟进与代码待审 · ${item.title}`
+        : `主动跟进提醒 · ${item.title}`
+
+    if (item.origin.chatType === 'p2p' && item.origin.userOpenId) {
+      const card = buildReplyCard({
+        title: cardTitle,
+        template: isError ? 'orange' : 'blue',
+        markdown,
+        bot: resolveEffectiveCardBot(bot),
+        sessionUrl: this.sessionWebUrl(sessionId),
+      })
+      const sent = await transport.sendProactiveMessage({
+        receiveIdType: 'open_id',
+        receiveId: item.origin.userOpenId,
+        msgType: 'interactive',
+        content: JSON.stringify(card),
+      })
+      return { ...(sent.messageId ? { messageId: sent.messageId } : {}) }
+    }
+
+    if (!item.origin.chatId) return {}
+    const chatId = item.origin.chatId
+    const group = this.store.getGroup(bot.id, chatId)
+    const card = buildReplyCard({
+      title: cardTitle,
+      template: isError ? 'orange' : 'blue',
+      markdown,
+      bot: resolveEffectiveCardBot(bot, group),
+      sessionUrl: this.sessionWebUrl(sessionId),
+    })
+    const inThread = Boolean(item.origin.deliveryMode === 'thread' && item.origin.replyToMessageId)
+    const sent = await transport.sendReply({
+      chatId,
+      ...(inThread
+        ? { replyToMessageId: item.origin.replyToMessageId!, replyMode: 'new-topic' as const }
+        : { replyMode: 'chat' as const }),
+      card,
+    })
+
+    const scopeId = inThread ? item.origin.replyToMessageId! : sent.messageId
+    if (scopeId) {
+      const now = Date.now()
+      const idleMinutes = group?.idleCloseMinutes ?? bot.idleCloseMinutes
+      const runtime = resolveEffectiveAgentRuntime(bot, group)
+      const rawDir = item.workingDir || group?.workingDir.trim() || bot.defaultWorkingDir
+      const chatName = this.store.resolveChatName(bot.id, chatId)
+      this.store.upsertBinding({
+        routeKey: buildRouteKey(bot.larkAppId, chatId, scopeId),
+        botId: bot.id,
+        botName: bot.name,
+        larkAppId: bot.larkAppId,
+        chatType: 'group',
+        chatId,
+        ...(chatName ? { chatName } : {}),
+        workspaceName: this.store.resolveGroupWorkspaceName(bot, group, chatName),
+        sessionId,
+        agentPreset: runtime.agentPreset,
+        workingDir: expandWorkingDir(rawDir) || rawDir,
+        trigger: 'reminder',
+        createdAtMs: now,
+        lastActivityMs: now,
+        ...(idleMinutes > 0 ? { idleCloseMs: idleMinutes * 60_000 } : {}),
+      })
+    }
+    return { ...(sent.messageId ? { messageId: sent.messageId } : {}) }
+  }
+}

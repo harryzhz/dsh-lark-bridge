@@ -1,0 +1,799 @@
+import { useEffect, useState } from 'react'
+import {
+  Button,
+  IconAgentPresetOutlineRegular,
+  IconCloseOutlineRegular,
+  IconNewChatOutlineRegular,
+  IconPersonalizationOutlineRegular,
+  IconRefreshOutlineRegular,
+  IconSettingsOutlineRegular,
+  IconSparkleRegular,
+  IconUsersOutlineRegular,
+  Modal,
+  SegmentedControl,
+  Switch,
+} from '@deepseek-ai/dsh-client-ui-primitives'
+import { bridgeApi } from '../api.js'
+import {
+  ACCESS_MODES,
+  DEFAULT_DREAMING_SCOPES,
+  DISCLOSURE_MODES,
+  P2P_SESSION_MODES,
+  REPLY_MODES,
+  ROLE_PRESETS,
+  SESSION_MODES,
+  TRIGGER_MODES,
+} from '../presets.js'
+import type {
+  AuthStatusPayload,
+  BotConfig,
+  BotDreamingConfig,
+  BotProactiveConfig,
+  BotRecord,
+  DreamRunState,
+  ModelGroup,
+  QrJobView,
+  RuntimeOption,
+  SubstituteTarget,
+} from '../types.js'
+import { AgentRuntimeFields } from './AgentRuntimeFields.js'
+import { ConfigDialog, type ConfigSection } from './ConfigDialog.js'
+import { DirectoryField } from './DirectoryPickerModal.js'
+import { ExperimentalSection } from './ExperimentalSection.js'
+import {
+  Avatar,
+  GroupTitle,
+  NestedSettings,
+  NumberField,
+  SelectMenu,
+  SettingRow,
+  TextArea,
+  TextField,
+} from './fields.js'
+import {
+  effectiveDefaultModel,
+  leafDirectoryLabel,
+  normalizeModelAndEffort,
+  reactionOptions,
+} from './options.js'
+import { UserSearchPicker } from './UserSearchPicker.js'
+
+type Section = 'basic' | 'runtime' | 'conversation' | 'role' | 'access' | 'experimental'
+
+const SECTIONS: readonly ConfigSection<Section>[] = [
+  { key: 'basic', label: '基本信息', icon: <IconSettingsOutlineRegular size={16} /> },
+  { key: 'runtime', label: 'Agent 运行时', icon: <IconAgentPresetOutlineRegular size={16} /> },
+  { key: 'conversation', label: '会话与消息', icon: <IconNewChatOutlineRegular size={16} /> },
+  { key: 'role', label: '角色设定', icon: <IconPersonalizationOutlineRegular size={16} /> },
+  { key: 'access', label: '私聊与代答', icon: <IconUsersOutlineRegular size={16} /> },
+  { key: 'experimental', label: '实验性', icon: <IconSparkleRegular size={16} /> },
+]
+
+export const DEFAULT_DREAMING_CONFIG: BotDreamingConfig = {
+  enabled: false,
+  scheduleTime: '02:00',
+  minNewSessions: 2,
+  scopes: [...DEFAULT_DREAMING_SCOPES],
+  cleanupAndCorrect: true,
+}
+
+export const DEFAULT_PROACTIVE_CONFIG: BotProactiveConfig = {
+  remindersEnabled: false,
+  reminderCreationMode: 'silent',
+  autoCodeEnabled: false,
+  branchPrefix: 'agent/',
+}
+
+export function newBotConfig(
+  defaultRuntime: RuntimeOption | undefined,
+  models: readonly ModelGroup[] = [],
+): BotConfig {
+  return {
+    id: '',
+    name: '',
+    enabled: true,
+    larkAppId: '',
+    larkAppSecret: '',
+    avatarUrl: '',
+    description: '',
+    agentPreset: defaultRuntime?.id ?? 'standard',
+    model: effectiveDefaultModel(defaultRuntime, models),
+    reasoningEffort: '',
+    defaultWorkingDir: '~',
+    workspaceName: '',
+    groupReplyMode: 'new-topic',
+    groupSessionMode: 'thread',
+    mentionTriggerMode: 'mention_and_active_thread',
+    groupAccessMode: 'all_joined',
+    p2pEnabled: true,
+    p2pSessionMode: 'chat',
+    allowedUsers: [],
+    allowedUserProfiles: [],
+    sendIntermediateMessages: false,
+    useInteractiveCard: true,
+    dshSessionLinkInCard: true,
+    replyFooterEnabled: true,
+    replyFooterModel: true,
+    replyFooterSignature: true,
+    signature: '',
+    receivedReactionEmoji: 'OnIt',
+    idleCloseMinutes: 720,
+    role: { enabled: false, name: '', systemPrompt: '' },
+    substituteMode: { enabled: false, targets: [], disclosure: 'none', activeThreadFollowup: true },
+    experimental: {
+      dreaming: { ...DEFAULT_DREAMING_CONFIG, scopes: [...DEFAULT_DREAMING_CONFIG.scopes] },
+      proactive: { ...DEFAULT_PROACTIVE_CONFIG },
+    },
+  }
+}
+
+/** Strip read-only view fields so the PUT body only carries configuration. */
+function toBotConfig(record: BotRecord): BotConfig {
+  const {
+    hasSecret: _h,
+    effectiveWorkspaceName: _e,
+    configuredGroupCount: _c,
+    status: _s,
+    dreamState: _d,
+    ...config
+  } = record
+  const cloned = structuredClone(config)
+  return {
+    ...cloned,
+    larkAppSecret: '',
+    experimental: {
+      dreaming: {
+        ...DEFAULT_DREAMING_CONFIG,
+        ...(cloned.experimental?.dreaming ?? {}),
+        scopes: cloned.experimental?.dreaming?.scopes?.length
+          ? [...cloned.experimental.dreaming.scopes]
+          : [...DEFAULT_DREAMING_CONFIG.scopes],
+      },
+      proactive: {
+        ...DEFAULT_PROACTIVE_CONFIG,
+        ...(cloned.experimental?.proactive ?? {}),
+      },
+    },
+  }
+}
+
+export function BotConfigDialog({
+  target,
+  runtimes,
+  models,
+  auth,
+  onClose,
+  onSave,
+  onAutoCreated,
+  onOpenAuth,
+  onOpenSession,
+}: {
+  target: BotRecord | 'new' | null
+  runtimes: readonly RuntimeOption[]
+  models: readonly ModelGroup[]
+  auth: AuthStatusPayload | null
+  onClose: () => void
+  onSave: (config: BotConfig, existingId: string | null) => Promise<void>
+  onAutoCreated: () => Promise<void>
+  onOpenAuth: () => void
+  onOpenSession?: (sessionId: string) => void
+}) {
+  const [section, setSection] = useState<Section>('basic')
+  const [createMode, setCreateMode] = useState<'auto' | 'manual'>('auto')
+  const [autoProtocol, setAutoProtocol] = useState<'open_platform' | 'device_flow'>('open_platform')
+  const [autoJob, setAutoJob] = useState<QrJobView | null>(null)
+  const [draft, setDraft] = useState<BotConfig | null>(null)
+  const [localDreamState, setLocalDreamState] = useState<DreamRunState | undefined>(undefined)
+  const [saving, setSaving] = useState(false)
+  const [syncingProfile, setSyncingProfile] = useState(false)
+  const [error, setError] = useState('')
+  const existingId = target && target !== 'new' ? target.id : null
+
+  useEffect(() => {
+    if (!target) return
+    setDraft(
+      target === 'new'
+        ? newBotConfig(runtimes.find((r) => r.isDefault) ?? runtimes[0], models)
+        : toBotConfig(target),
+    )
+    setLocalDreamState(target !== 'new' ? target.dreamState : undefined)
+    setSection('basic')
+    setCreateMode('auto')
+    setAutoJob(null)
+    setError('')
+
+    if (target !== 'new' && (!target.avatarUrl?.trim() || !target.description?.trim())) {
+      let cancelled = false
+      void bridgeApi
+        .syncBotProfile(target.id)
+        .then((res) => {
+          if (cancelled) return
+          const nextAvatar = res.profile.avatarUrl?.trim()
+          const nextDesc = res.profile.description?.trim()
+          if (!nextAvatar && !nextDesc) return
+          setDraft((prev) => {
+            if (!prev || prev.id !== target.id) return prev
+            return {
+              ...prev,
+              ...(nextAvatar && !prev.avatarUrl.trim() ? { avatarUrl: nextAvatar } : {}),
+              ...(nextDesc && !prev.description.trim() ? { description: nextDesc } : {}),
+            }
+          })
+        })
+        .catch(() => {})
+      return () => {
+        cancelled = true
+      }
+    }
+    return undefined
+  }, [target, runtimes, models])
+
+  useEffect(() => {
+    if (target && target !== 'new' && target.dreamState) {
+      setLocalDreamState(target.dreamState)
+    }
+  }, [target])
+
+  useEffect(() => {
+    if (!autoJob || !['waiting_scan', 'scanned', 'working'].includes(autoJob.status)) return
+    const timer = window.setInterval(async () => {
+      try {
+        const next = await bridgeApi.pollAuthJob(autoJob.jobId)
+        setAutoJob(next)
+        if (next.status === 'succeeded') {
+          await onAutoCreated()
+          onClose()
+        } else if (next.status === 'failed' || next.status === 'expired') {
+          setError(next.error || next.stepMessage)
+        }
+      } catch {
+        // Ignore transient polling error.
+      }
+    }, 1500)
+    return () => window.clearInterval(timer)
+  }, [autoJob, onAutoCreated, onClose])
+
+  if (!target || !draft) return null
+  const patch = (p: Partial<BotConfig>) => setDraft({ ...draft, ...p })
+  const runtime = runtimes.find((r) => r.id === draft.agentPreset)
+
+  // Dedicated streamlined dialog when creating a brand-new agent in "auto" mode
+  if (!existingId && createMode === 'auto') {
+    const opAuth = auth?.openPlatform
+    const startAuto = async () => {
+      if (!draft.name.trim() || !draft.defaultWorkingDir.trim()) {
+        setError('请填写智能体显示名称与默认工作目录')
+        return
+      }
+      setSaving(true)
+      setError('')
+      try {
+        const norm = normalizeModelAndEffort(runtime, models, draft.model, draft.reasoningEffort)
+        const job = await bridgeApi.autoCreateBot({
+          mode: autoProtocol,
+          ...(draft.id.trim() ? { id: draft.id.trim() } : {}),
+          name: draft.name.trim(),
+          description: draft.description.trim(),
+          workspaceName: draft.workspaceName.trim(),
+          defaultWorkingDir: draft.defaultWorkingDir.trim(),
+          agentPreset: draft.agentPreset,
+          ...(norm.model ? { model: norm.model } : {}),
+          ...(norm.reasoningEffort ? { reasoningEffort: norm.reasoningEffort } : {}),
+        })
+        setAutoJob(job)
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err))
+      } finally {
+        setSaving(false)
+      }
+    }
+
+    const isJobRunning = autoJob && ['waiting_scan', 'scanned', 'working'].includes(autoJob.status)
+
+    return (
+      <Modal open onClose={onClose} title="新增智能体" headless className="fb-schedule-dialog">
+        <div className="fb-schedule-dialog-head">
+          <div style={{ minWidth: 0 }}>
+            <div className="fb-schedule-dialog-title">新增飞书智能体</div>
+            <div className="fb-schedule-dialog-sub">支持一键自动创建飞书应用并开启长连接，或手动填入已有应用凭证</div>
+          </div>
+          <button type="button" className="fb-icon-btn" aria-label="关闭" onClick={onClose}>
+            <IconCloseOutlineRegular size={14} />
+          </button>
+        </div>
+
+        <div className="fb-schedule-dialog-body">
+          <div style={{ marginBottom: 10 }}>
+            <SegmentedControl
+              id="fb-bot-create-mode"
+              label="创建方式"
+              value={createMode}
+              options={[
+                { value: 'auto', label: '自动创建飞书智能体' },
+                { value: 'manual', label: '接入已有应用' },
+              ]}
+              onChange={(m) => {
+                setCreateMode(m)
+                setError('')
+              }}
+            />
+          </div>
+
+          <SettingRow
+            title="创建通道"
+            desc={
+              autoProtocol === 'open_platform'
+                ? opAuth?.authenticated && opAuth.identity
+                  ? `已登录开放平台：${opAuth.identity.userName}（${opAuth.identity.tenantName}）`
+                  : '扫码自动创建自建应用并开通权限与长连接'
+                : '通过官方 SDK 设备流注册个人智能体凭证'
+            }
+          >
+            <SelectMenu
+              value={autoProtocol}
+              options={[
+                { value: 'open_platform', label: '开放平台全自动创建（推荐）', desc: '创建企业自建应用并自动开通权限与长连接' },
+                { value: 'device_flow', label: '扫码快速注册（SDK）', desc: '通过官方设备流注册个人应用凭证' },
+              ]}
+              onChange={setAutoProtocol}
+            />
+          </SettingRow>
+
+          <SettingRow title="智能体名称">
+            <TextField value={draft.name} onChange={(name) => patch({ name })} placeholder="例如 研发协作助手" />
+          </SettingRow>
+          <SettingRow title="智能体签名">
+            <TextField value={draft.description} onChange={(description) => patch({ description })} placeholder="飞书名片简介（选填）" />
+          </SettingRow>
+          <SettingRow title="工作目录">
+            <DirectoryField
+              value={draft.defaultWorkingDir}
+              onChange={(defaultWorkingDir) => patch({ defaultWorkingDir })}
+              placeholder="~ 或 /path/to/workspace"
+            />
+          </SettingRow>
+          <SettingRow title="工作区" desc="留空默认使用工作目录末级名称">
+            <TextField
+              value={draft.workspaceName}
+              onChange={(workspaceName) => patch({ workspaceName })}
+              placeholder={leafDirectoryLabel(draft.defaultWorkingDir) || '默认使用工作目录名称'}
+            />
+          </SettingRow>
+          <AgentRuntimeFields
+            runtimeTitle="默认运行时"
+            value={{
+              agentPreset: draft.agentPreset,
+              model: draft.model ?? '',
+              reasoningEffort: draft.reasoningEffort ?? '',
+            }}
+            runtimes={runtimes}
+            models={models}
+            onChange={({ agentPreset, model, reasoningEffort }) =>
+              patch({
+                agentPreset,
+                model: model || undefined,
+                reasoningEffort: reasoningEffort || undefined,
+              })
+            }
+          />
+
+          {autoJob && (
+            <div className="fb-qr-panel" style={{ marginTop: 12 }}>
+              {autoJob.qrSvgDataUrl && <img className="fb-qr-img" src={autoJob.qrSvgDataUrl} alt="扫码创建智能体" />}
+              <div className="fb-qr-info">
+                <div style={{ fontWeight: 500 }}>自动创建进度</div>
+                <div className="fb-row-desc">{autoJob.stepMessage}</div>
+                {autoJob.verificationUrl && (
+                  <a href={autoJob.verificationUrl} target="_blank" rel="noreferrer" className="fb-row-desc" style={{ textDecoration: 'underline' }}>
+                    在浏览器中打开验证链接
+                  </a>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="fb-schedule-dialog-foot">
+          {error ? <span className="fb-dialog-error">{error}</span> : null}
+          <Button variant="outline" onClick={onClose}>
+            取消
+          </Button>
+          <Button variant="primary" disabled={saving || Boolean(isJobRunning)} onClick={() => void startAuto()}>
+            {isJobRunning ? '等待完成…' : opAuth?.authenticated && autoProtocol === 'open_platform' ? '一键创建并接入' : '扫码创建并接入'}
+          </Button>
+        </div>
+      </Modal>
+    )
+  }
+
+  const save = async () => {
+    const missing = !draft.id.trim() || !draft.name.trim() || !draft.larkAppId.trim() || !draft.defaultWorkingDir.trim()
+    if (missing || (!existingId && !draft.larkAppSecret?.trim())) {
+      setSection('basic')
+      setError('请补全基本信息中的必填项')
+      return
+    }
+    setSaving(true)
+    setError('')
+    try {
+      const norm = normalizeModelAndEffort(runtime, models, draft.model, draft.reasoningEffort)
+      const hasSignature = Boolean(draft.signature.trim())
+      const showModel = Boolean(draft.replyFooterEnabled && draft.replyFooterModel)
+      await onSave(
+        {
+          ...draft,
+          model: norm.model || undefined,
+          reasoningEffort: norm.reasoningEffort || undefined,
+          replyFooterSignature: hasSignature,
+          replyFooterEnabled: showModel || hasSignature,
+        },
+        existingId,
+      )
+      onClose()
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      if (msg.includes('工作目录')) setSection('basic')
+      setError(msg)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const syncAvatarAndProfile = async () => {
+    if (!existingId) return
+    setSyncingProfile(true)
+    try {
+      const res = await bridgeApi.syncBotProfile(existingId)
+      patch({
+        ...(res.profile.avatarUrl ? { avatarUrl: res.profile.avatarUrl } : {}),
+        ...(res.profile.description ? { description: res.profile.description } : {}),
+      })
+      await onAutoCreated()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setSyncingProfile(false)
+    }
+  }
+
+  return (
+    <ConfigDialog
+      open
+      title={existingId ? draft.name || existingId : '接入已有飞书应用'}
+      sections={SECTIONS}
+      active={section}
+      onSectionChange={setSection}
+      onClose={onClose}
+      onSave={() => void save()}
+      saving={saving}
+      error={error}
+    >
+      {section === 'basic' && (
+        <>
+          {!existingId && (
+            <div style={{ paddingTop: 10, paddingBottom: 4 }}>
+              <SegmentedControl
+                id="fb-bot-create-mode-manual"
+                label="创建方式"
+                value={createMode}
+                options={[
+                  { value: 'auto', label: '自动创建飞书智能体' },
+                  { value: 'manual', label: '接入已有应用' },
+                ]}
+                onChange={setCreateMode}
+              />
+            </div>
+          )}
+          {existingId && (
+            <SettingRow title="智能体头像">
+              <Avatar src={draft.avatarUrl} name={draft.name || existingId} kind="bot" />
+              <Button
+                size="sm"
+                variant="outline"
+                icon={<IconRefreshOutlineRegular size={14} />}
+                disabled={syncingProfile}
+                onClick={() => void syncAvatarAndProfile()}
+              >
+                {syncingProfile ? '同步中…' : '同步飞书信息'}
+              </Button>
+            </SettingRow>
+          )}
+          <SettingRow title="显示名称">
+            <TextField value={draft.name} onChange={(name) => patch({ name })} placeholder="例如 DSH-Agent" />
+          </SettingRow>
+          <SettingRow
+            title="智能体签名"
+            desc={auth?.openPlatform.authenticated ? '修改保存后同步更新至飞书名片' : '留空保存可从飞书自动同步'}
+          >
+            <TextField value={draft.description} onChange={(description) => patch({ description })} placeholder="飞书名片简介" />
+          </SettingRow>
+          <SettingRow title="标识" desc="内部唯一 ID，创建后不可修改">
+            <TextField value={draft.id} onChange={(id) => patch({ id })} placeholder="dsh-agent" mono disabled={Boolean(existingId)} />
+          </SettingRow>
+          <SettingRow title="App ID">
+            <TextField value={draft.larkAppId} onChange={(larkAppId) => patch({ larkAppId })} placeholder="cli_xxx" mono />
+          </SettingRow>
+          <SettingRow title="App Secret" desc={existingId ? '留空保持原密钥不变' : '仅加密保存在本机'}>
+            <TextField value={draft.larkAppSecret ?? ''} onChange={(larkAppSecret) => patch({ larkAppSecret })} placeholder={existingId ? '••••••••' : ''} secret mono />
+          </SettingRow>
+          <SettingRow title="工作目录">
+            <DirectoryField
+              value={draft.defaultWorkingDir}
+              onChange={(defaultWorkingDir) => patch({ defaultWorkingDir })}
+              placeholder="~ 或 /path/to/workspace"
+            />
+          </SettingRow>
+          <SettingRow title="工作区" desc="留空默认使用工作目录末级名称">
+            <TextField
+              value={draft.workspaceName}
+              onChange={(workspaceName) => patch({ workspaceName })}
+              placeholder={
+                leafDirectoryLabel(draft.defaultWorkingDir) ||
+                (target !== 'new' && !target.workspaceName && draft.defaultWorkingDir === target.defaultWorkingDir
+                  ? target.effectiveWorkspaceName
+                  : '') ||
+                '默认使用工作目录名称'
+              }
+            />
+          </SettingRow>
+        </>
+      )}
+
+      {section === 'runtime' && (
+        <AgentRuntimeFields
+          value={{
+            agentPreset: draft.agentPreset,
+            model: draft.model ?? '',
+            reasoningEffort: draft.reasoningEffort ?? '',
+          }}
+          runtimes={runtimes}
+          models={models}
+          onChange={({ agentPreset, model, reasoningEffort }) =>
+            patch({
+              agentPreset,
+              model: model || undefined,
+              reasoningEffort: reasoningEffort || undefined,
+            })
+          }
+        />
+      )}
+
+      {section === 'conversation' && <BotConversationAndMessageSection draft={draft} patch={patch} />}
+
+      {section === 'role' && (
+        <>
+          <SettingRow title="启用角色设定" desc="新会话开始时注入角色设定，群聊可单独追加或覆盖">
+            <Switch label="启用角色设定" checked={draft.role.enabled} onChange={(enabled) => patch({ role: { ...draft.role, enabled } })} />
+          </SettingRow>
+          {draft.role.enabled && (
+            <NestedSettings>
+              <SettingRow title="模板">
+                <SelectMenu
+                  value={draft.role.presetKey ?? ''}
+                  options={[{ value: '', label: '自定义' }, ...ROLE_PRESETS.map((p) => ({ value: p.key, label: p.label }))]}
+                  onChange={(key) => {
+                    const preset = ROLE_PRESETS.find((p) => p.key === key)
+                    patch({ role: preset ? { enabled: true, presetKey: preset.key, name: preset.roleName, systemPrompt: preset.systemPrompt } : { ...draft.role, presetKey: undefined } })
+                  }}
+                />
+              </SettingRow>
+              <SettingRow title="角色名称">
+                <TextField value={draft.role.name} onChange={(name) => patch({ role: { ...draft.role, name } })} placeholder="例如 研发协作搭档" />
+              </SettingRow>
+              <SettingRow title="角色提示词" stack>
+                <TextArea value={draft.role.systemPrompt} onChange={(systemPrompt) => patch({ role: { ...draft.role, systemPrompt } })} rows={8} placeholder="定义职责、回答风格与协作边界" />
+              </SettingRow>
+            </NestedSettings>
+          )}
+        </>
+      )}
+
+      {section === 'access' && (
+        <AccessSection
+          botId={existingId}
+          draft={draft}
+          patch={patch}
+          auth={auth}
+          onOpenAuth={onOpenAuth}
+        />
+      )}
+
+      {section === 'experimental' && (
+        <ExperimentalSection
+          botId={existingId}
+          experimental={draft.experimental}
+          dreamState={localDreamState}
+          onChange={(experimental) => patch({ experimental })}
+          onOpenSession={(sid) => {
+            onClose()
+            onOpenSession?.(sid)
+          }}
+          onStateUpdated={(next) => {
+            setLocalDreamState(next)
+            void onAutoCreated()
+          }}
+        />
+      )}
+    </ConfigDialog>
+  )
+}
+
+function BotConversationAndMessageSection({
+  draft,
+  patch,
+}: {
+  draft: BotConfig
+  patch: (p: Partial<BotConfig>) => void
+}) {
+  return (
+    <>
+      <GroupTitle>群聊触发与会话</GroupTitle>
+      <SettingRow title="可用范围">
+        <SelectMenu value={draft.groupAccessMode} options={ACCESS_MODES} onChange={(groupAccessMode) => patch({ groupAccessMode })} />
+      </SettingRow>
+      <SettingRow title="触发方式" desc="开启活跃话题后，进行中的话题内追问无需再次 @">
+        <SelectMenu value={draft.mentionTriggerMode} options={TRIGGER_MODES} onChange={(mentionTriggerMode) => patch({ mentionTriggerMode })} />
+      </SettingRow>
+      <SettingRow title="会话策略">
+        <SelectMenu value={draft.groupSessionMode} options={SESSION_MODES} onChange={(groupSessionMode) => patch({ groupSessionMode })} />
+      </SettingRow>
+      <SettingRow title="空闲自动归档" desc="0 表示不自动归档">
+        <NumberField value={draft.idleCloseMinutes} onChange={(idleCloseMinutes) => patch({ idleCloseMinutes })} suffix="分钟" />
+      </SettingRow>
+
+      <GroupTitle>回复与反馈</GroupTitle>
+      <SettingRow title="回复方式">
+        <SelectMenu value={draft.groupReplyMode} options={REPLY_MODES} onChange={(groupReplyMode) => patch({ groupReplyMode })} />
+      </SettingRow>
+      <SettingRow title="收到消息时的表情" desc="处理期间贴在原消息上，回复完成后自动移除">
+        <SelectMenu value={draft.receivedReactionEmoji} options={reactionOptions()} onChange={(receivedReactionEmoji) => patch({ receivedReactionEmoji })} />
+      </SettingRow>
+      <SettingRow title="发送中间过程消息" desc="执行过程中的阶段说明实时发出，不与最终回复合并">
+        <Switch
+          label="发送中间过程消息"
+          checked={Boolean(draft.sendIntermediateMessages)}
+          onChange={(sendIntermediateMessages) => patch({ sendIntermediateMessages })}
+        />
+      </SettingRow>
+
+      <GroupTitle>消息卡片</GroupTitle>
+      <SettingRow title="使用消息卡片" desc="关闭后以纯文本发送回复">
+        <Switch label="使用消息卡片" checked={draft.useInteractiveCard} onChange={(useInteractiveCard) => patch({ useInteractiveCard })} />
+      </SettingRow>
+      {draft.useInteractiveCard && (
+        <NestedSettings>
+          <SettingRow title="附带会话链接" desc="卡片底部提供跳转 DSH 接管会话的入口">
+            <Switch label="附带会话链接" checked={draft.dshSessionLinkInCard} onChange={(dshSessionLinkInCard) => patch({ dshSessionLinkInCard })} />
+          </SettingRow>
+          <SettingRow title="显示模型信息">
+            <Switch
+              label="显示模型信息"
+              checked={draft.replyFooterEnabled && draft.replyFooterModel}
+              onChange={(on) => patch({ replyFooterEnabled: on || Boolean(draft.signature.trim()), replyFooterModel: on })}
+            />
+          </SettingRow>
+          <SettingRow title="卡片底部签名">
+            <TextField
+              value={draft.signature}
+              onChange={(signature) => patch({ signature, replyFooterEnabled: true, replyFooterSignature: true })}
+              placeholder="留空不展示，例如 AI 回复仅供参考"
+            />
+          </SettingRow>
+        </NestedSettings>
+      )}
+    </>
+  )
+}
+
+function resolveAllowedUsersAsTargets(draft: BotConfig): SubstituteTarget[] {
+  const byId = new Map<string, SubstituteTarget>()
+  for (const p of draft.allowedUserProfiles ?? []) byId.set(p.openId, p)
+  for (const t of draft.substituteMode.targets) {
+    if (!byId.has(t.openId)) byId.set(t.openId, t)
+  }
+  return draft.allowedUsers.map((openId) => byId.get(openId) ?? { openId, name: openId })
+}
+
+function AccessSection({
+  botId,
+  draft,
+  patch,
+  auth,
+  onOpenAuth,
+}: {
+  botId: string | null
+  draft: BotConfig
+  patch: (p: Partial<BotConfig>) => void
+  auth: AuthStatusPayload | null
+  onOpenAuth: () => void
+}) {
+  const sub = draft.substituteMode
+  const setSub = (p: Partial<BotConfig['substituteMode']>) => patch({ substituteMode: { ...sub, ...p } })
+  const userAuth = botId ? auth?.userAuth.find((u) => u.botId === botId) : undefined
+  const allowedTargets = resolveAllowedUsersAsTargets(draft)
+
+  const renderSearchHint = (prefix: string) =>
+    botId ? (
+      <span>
+        {prefix}
+        {!userAuth?.authorized && (
+          <>
+            {prefix ? ' ' : ''}当前可搜群成员，全企业搜索需先{' '}
+            <button
+              type="button"
+              className="fb-link-btn"
+              style={{ textDecoration: 'underline', padding: 0 }}
+              onClick={onOpenAuth}
+            >
+              飞书授权
+            </button>
+          </>
+        )}
+      </span>
+    ) : (
+      `${prefix}${prefix ? ' ' : ''}请先保存智能体后再搜索成员`
+    )
+
+  return (
+    <>
+      <GroupTitle>私聊</GroupTitle>
+      <SettingRow title="允许私聊">
+        <Switch label="允许私聊" checked={draft.p2pEnabled} onChange={(p2pEnabled) => patch({ p2pEnabled })} />
+      </SettingRow>
+      {draft.p2pEnabled && (
+        <NestedSettings>
+          <SettingRow title="私聊会话">
+            <SelectMenu value={draft.p2pSessionMode} options={P2P_SESSION_MODES} onChange={(p2pSessionMode) => patch({ p2pSessionMode })} />
+          </SettingRow>
+          <SettingRow
+            title="私聊白名单"
+            desc={renderSearchHint('留空允许所有成员私聊。')}
+            stack
+          >
+            <UserSearchPicker
+              botId={botId}
+              values={allowedTargets}
+              onChange={(next) =>
+                patch({
+                  allowedUsers: next.map((u) => u.openId),
+                  allowedUserProfiles: next,
+                })
+              }
+              placeholder="输入姓名、邮箱或 ou_xxx 搜索添加…"
+            />
+          </SettingRow>
+        </NestedSettings>
+      )}
+
+      <GroupTitle>代答</GroupTitle>
+      <SettingRow title="代答指定成员" desc="群里 @ 这些成员时，由智能体先行检索并协助回复">
+        <Switch label="代答指定成员" checked={sub.enabled} onChange={(enabled) => setSub({ enabled })} />
+      </SettingRow>
+      {sub.enabled && (
+        <NestedSettings>
+          <SettingRow
+            title="身份说明"
+            desc={DISCLOSURE_MODES.find((m) => m.value === sub.disclosure)?.desc}
+          >
+            <SelectMenu value={sub.disclosure} options={DISCLOSURE_MODES} onChange={(disclosure) => setSub({ disclosure })} />
+          </SettingRow>
+          <SettingRow title="话题内持续跟进" desc="代答开启的话题内后续追问无需再次 @">
+            <Switch label="话题内持续跟进" checked={sub.activeThreadFollowup} onChange={(activeThreadFollowup) => setSub({ activeThreadFollowup })} />
+          </SettingRow>
+          <SettingRow
+            title="代答成员"
+            desc={!botId || !userAuth?.authorized ? renderSearchHint('') : undefined}
+            stack
+          >
+            <UserSearchPicker
+              botId={botId}
+              values={sub.targets}
+              onChange={(targets) => setSub({ targets })}
+              placeholder="输入姓名、邮箱或 ou_xxx 搜索代答成员…"
+            />
+          </SettingRow>
+        </NestedSettings>
+      )}
+    </>
+  )
+}

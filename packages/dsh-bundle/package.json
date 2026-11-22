@@ -1,0 +1,26 @@
+{
+  "name": "@dsh-lark/dsh-bundle",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "dsh-lark-ctl": "./bin/dsh-lark-ctl.mjs",
+    "lark-bridge": "./bin/lark-bridge.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "cordis.patch.yml"
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh": "0.2.2-rc.5",
+    "@dsh-lark/dsh-lark-bridge": "file:../dsh-lark-bridge",
+    "@dsh-lark/dsh-lark-ui": "file:../dsh-lark-ui",
+    "@dsh-lark/lark-core": "file:../lark-core"
+  },
+  "scripts": {
+    "build": "echo 'dsh-bundle ready'",
+    "typecheck": "echo 'dsh-bundle typecheck ok'",
+    "clean": "echo 'nothing to clean'"
+  }
+}

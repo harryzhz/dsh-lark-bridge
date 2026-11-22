@@ -1,0 +1,707 @@
+import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import type { Context } from '@deepseek-ai/cordis'
+import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+
+vi.mock('@deepseek-ai/dsh-session', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@deepseek-ai/dsh-session')>()
+  return {
+    ...actual,
+    appendPluginRecord: vi.fn(),
+  }
+})
+
+import { LarkBridgeManager } from '../src/bridge-manager.js'
+import { LarkBridgeStore } from '../src/store.js'
+
+const tempDirs: string[] = []
+afterEach(() => {
+  while (tempDirs.length > 0) {
+    rmSync(tempDirs.pop()!, { recursive: true, force: true })
+  }
+})
+
+function makeTempDir(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'lark-lifecycle-test-'))
+  tempDirs.push(dir)
+  return dir
+}
+
+describe('LarkBridgeManager prompt injection, title hygiene & auto-archiving', () => {
+  it('injects role + proactive protocol + context + listener inside <system_reminder>, leaves workDir clean of .local, protects clean user-intent titles, and auto-archives silent/expired sessions', async () => {
+    const dir = makeTempDir()
+    const workDir = makeTempDir()
+
+    const store = new LarkBridgeStore(dir)
+    const bot = store.upsertBot({
+      id: 'dsh-bot',
+      name: 'DSH-Bot',
+      enabled: false,
+      larkAppId: 'cli_test',
+      larkAppSecret: 'sec_test',
+      defaultWorkingDir: workDir,
+      idleCloseMinutes: 1,
+      role: {
+        enabled: true,
+        name: '资深工程师',
+        systemPrompt: '先给结论，再附代码定位。',
+      },
+      experimental: {
+        dreaming: {
+          enabled: true,
+        },
+        proactive: {
+          remindersEnabled: true,
+          reminderCreationMode: 'silent',
+          autoCodeEnabled: true,
+          branchPrefix: 'agent/',
+        },
+      },
+    })
+    store.upsertGroup({
+      botId: 'dsh-bot',
+      chatId: 'oc_team',
+      chatName: '研发协作群',
+      enabled: true,
+      listener: {
+        enabled: true,
+        templateKey: 'project',
+        name: '项目讨论',
+        prompt: '你只监听技术相关的消息，其他消息保持静默',
+        replyMode: 'new-topic',
+        sessionMode: 'per_message',
+        allowSilentEmptyReply: true,
+      },
+    })
+
+    const listeners = new Map<string, Array<(...args: unknown[]) => void>>()
+    const emit = (event: string, ...args: unknown[]) => {
+      for (const fn of listeners.get(event) ?? []) fn(...args)
+    }
+
+    const archivedSessionIds: string[] = []
+    const sessionTitles = new Map<string, string>()
+    const submittedPrompts: string[] = []
+    let nextReply = ''
+
+    const liveSessions = new Map<string, { id: string; events: SessionEvent[] }>()
+
+    const fakeCtx = {
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      on(event: string, fn: (...args: unknown[]) => void) {
+        const list = listeners.get(event) ?? []
+        list.push(fn)
+        listeners.set(event, list)
+        return () => {
+          listeners.set(
+            event,
+            (listeners.get(event) ?? []).filter((f) => f !== fn),
+          )
+        }
+      },
+      sessions: {
+        get: (id: string) => {
+          const found = liveSessions.get(id)
+          return found ? ({ id: found.id, snapshotEvents: () => found.events } as unknown as Session) : undefined
+        },
+      },
+      agents: {
+        get: () => undefined,
+        create: vi.fn(async ({ sessionId, setup }: { sessionId: string; setup?: (c: unknown, a: unknown) => void }) => {
+          const events: SessionEvent[] = []
+          const sessionObj = {
+            id: sessionId,
+            header: { cwd: workDir, agentPreset: 'codex' },
+            append: vi.fn(),
+            snapshotEvents: () => events,
+          } as unknown as Session
+          liveSessions.set(sessionId, { id: sessionId, events })
+          const agent = {
+            session: sessionObj,
+            followup: (userMsg: { content: Array<{ type: string; text?: string }> }) => {
+              const text = userMsg.content.map((b) => b.text ?? '').join('\n')
+              submittedPrompts.push(text)
+              events.push({
+                type: 'user/message',
+                data: { content: userMsg.content, source: { kind: 'user' } },
+              } as unknown as SessionEvent)
+              emit('session/event', sessionObj, { type: 'turn/start', data: { turn: 1 } })
+              if (nextReply) {
+                emit('session/event', sessionObj, {
+                  type: 'assistant/message',
+                  data: { turn: 1, message: { content: [{ type: 'text', text: nextReply }] } },
+                })
+              }
+              emit('session/event', sessionObj, {
+                type: 'turn/end',
+                data: { turn: 1, reason: { kind: 'complete' } },
+              })
+            },
+          }
+          setup?.({}, agent)
+          return { agent, dispose: vi.fn().mockResolvedValue(undefined) }
+        }),
+      },
+      get(service: string) {
+        if (service === 'workspaceRegistry') {
+          return {
+            archivedSessionIds,
+            list: () => [],
+            create: async (_dir: string, title?: string) => ({
+              title: title ?? 'DSH-Bot',
+              setTitle: vi.fn(),
+              attachSession: vi.fn(),
+            }),
+            archiveSession: vi.fn(async (sid: string) => {
+              if (!archivedSessionIds.includes(sid)) archivedSessionIds.push(sid)
+            }),
+          }
+        }
+        if (service === 'sessionTitle') {
+          return {
+            get: (s: Session) => (sessionTitles.has(s.id) ? { title: sessionTitles.get(s.id), source: { kind: 'user' } } : undefined),
+            rename: (s: Session, next: string) => {
+              sessionTitles.set(s.id, next)
+            },
+          }
+        }
+        return undefined
+      },
+    } as unknown as Context
+
+    const manager = new LarkBridgeManager(
+      fakeCtx,
+      {
+        dataDir: dir,
+        publicBaseUrl: 'http://192.168.1.10:3880',
+        idleSweepIntervalMs: 0,
+        maxAuditEvents: 100,
+        autoInstallCliAndSkill: false,
+      },
+      store,
+    )
+    await manager.start()
+
+    store.upsertBot({ ...bot, enabled: true })
+    const fakeTransport = {
+      state: { botOpenId: 'ou_bot' },
+      resolveUserSummary: vi.fn().mockResolvedValue({ openId: 'ou_user_1', name: 'Alex Chen' }),
+      addReaction: vi.fn().mockResolvedValue('r1'),
+      removeReaction: vi.fn().mockResolvedValue(undefined),
+      sendReply: vi.fn().mockResolvedValue({ messageId: 'om_reply_1' }),
+      downloadImageAsBase64: vi.fn().mockResolvedValue(undefined),
+    }
+
+    // 1. Silent-skipped listener message -> injects role + memory + context + listener + <user_message>, clean title, and auto-archives!
+    nextReply = ''
+    await (manager as unknown as { handleInbound: (b: string, t: unknown, m: unknown) => Promise<void> }).handleInbound(
+      'dsh-bot',
+      fakeTransport,
+      {
+        botId: 'dsh-bot',
+        larkAppId: 'cli_test',
+        botOpenId: 'ou_bot',
+        messageId: 'om_msg_1',
+        chatId: 'oc_team',
+        chatType: 'group',
+        msgType: 'text',
+        senderOpenId: 'ou_user_1',
+        senderType: 'user',
+        text: '收到，谢谢大家',
+        rawContent: '{"text":"收到，谢谢大家"}',
+        mentions: [],
+        imageKeys: [],
+        createTimeMs: Date.now(),
+      },
+    )
+
+    expect(submittedPrompts[0]?.match(/<system_reminder>/g)).toHaveLength(1)
+    expect(submittedPrompts[0]).toContain('<role name="资深工程师">')
+    expect(submittedPrompts[0]).toContain('<proactive reminders="silent" auto_code="on">')
+    expect(submittedPrompts[0]).toContain('.worktrees/')
+    expect(submittedPrompts[0]).toContain('<lark_context bot_id="dsh-bot"')
+    expect(submittedPrompts[0]).toContain('sender_name="Alex Chen"')
+    expect(submittedPrompts[0]).toContain('<listener name="项目讨论"')
+    expect(submittedPrompts[0]).toContain('<user_message>\n收到，谢谢大家\n</user_message>')
+    expect(existsSync(join(workDir, '.local'))).toBe(false)
+    expect(fakeTransport.sendReply).not.toHaveBeenCalled()
+    expect(archivedSessionIds).toHaveLength(1)
+    const firstSid = archivedSessionIds[0]!
+    expect(sessionTitles.get(firstSid)).toBe('收到，谢谢大家')
+
+    // 2. Simulate fallback overwriting title with XML -> installSessionTitleGuard immediately repairs it!
+    const sessionObj = {
+      id: firstSid,
+      snapshotEvents: () => liveSessions.get(firstSid)!.events,
+    } as unknown as Session
+    emit('session/event', sessionObj, {
+      type: 'session/title',
+      data: { title: '<system_reminder>\n<listener name="项目讨论">', source: { kind: 'fallback' } },
+    })
+    expect(sessionTitles.get(firstSid)).toBe('收到，谢谢大家')
+
+    // 3. Mentioned thread session -> expires after idleCloseMs -> sweepIdleBindings archives it!
+    nextReply = '排查结论：一切正常'
+    await (manager as unknown as { handleInbound: (b: string, t: unknown, m: unknown) => Promise<void> }).handleInbound(
+      'dsh-bot',
+      fakeTransport,
+      {
+        botId: 'dsh-bot',
+        larkAppId: 'cli_test',
+        botOpenId: 'ou_bot',
+        messageId: 'om_msg_2',
+        chatId: 'oc_team',
+        chatType: 'group',
+        msgType: 'text',
+        senderOpenId: 'ou_user_1',
+        senderType: 'user',
+        text: '@_user_1 帮我检查核心网关服务健康状态',
+        rawContent: '{}',
+        mentions: [{ key: '@_user_1', openId: 'ou_bot', name: 'DSH-Bot' }],
+        imageKeys: [],
+        createTimeMs: Date.now(),
+      },
+    )
+    expect(fakeTransport.sendReply).toHaveBeenCalledTimes(1)
+    const activeBinding = store.listBindings()[0]!
+    expect(sessionTitles.get(activeBinding.sessionId)).toBe('帮我检查核心网关服务健康状态')
+
+    store.upsertBinding({
+      ...activeBinding,
+      lastActivityMs: Date.now() - 120_000,
+    })
+    const swept = await manager.sweepIdleBindings()
+    expect(swept).toBeGreaterThanOrEqual(1)
+    expect(archivedSessionIds).toContain(activeBinding.sessionId)
+
+    // 4. Group-level independent Agent runtime override takes priority over bot runtime and rotates mismatched bindings
+    store.upsertGroup({
+      ...store.getGroup('dsh-bot', 'oc_team')!,
+      runtimeMode: 'override',
+      agentPreset: 'agy',
+      model: 'gemini-4-neon-high',
+      reasoningEffort: '',
+      sessionMode: 'chat',
+    })
+    await (manager as unknown as { handleInbound: (b: string, t: unknown, m: unknown) => Promise<void> }).handleInbound(
+      'dsh-bot',
+      fakeTransport,
+      {
+        botId: 'dsh-bot',
+        larkAppId: 'cli_test',
+        botOpenId: 'ou_bot',
+        messageId: 'om_msg_3',
+        chatId: 'oc_team',
+        chatType: 'group',
+        msgType: 'text',
+        senderOpenId: 'ou_user_1',
+        senderType: 'user',
+        text: '@_user_1 测试本群独立运行时',
+        rawContent: '{}',
+        mentions: [{ key: '@_user_1', openId: 'ou_bot', name: 'DSH-Bot' }],
+        imageKeys: [],
+        createTimeMs: Date.now(),
+      },
+    )
+    const createCalls = (fakeCtx.agents.create as ReturnType<typeof vi.fn>).mock.calls
+    const lastCreateArg = createCalls[createCalls.length - 1]?.[0] as {
+      meta: { agentPreset: string }
+      agentOptions: { model?: string; reasoningEffort?: string }
+    }
+    expect(lastCreateArg.meta.agentPreset).toBe('agy')
+    expect(lastCreateArg.agentOptions.model).toBe('gemini-4-neon-high')
+    expect(lastCreateArg.agentOptions.reasoningEffort).toBeUndefined()
+
+    const groupView = store.listGroupViews('dsh-bot').find((g) => g.chatId === 'oc_team')
+    expect(groupView).toMatchObject({
+      runtimeSource: 'group',
+      effectiveAgentPreset: 'agy',
+      effectiveModel: 'gemini-4-neon-high',
+    })
+
+    // 5. Group-level message overrides (reaction, card footer, and idleCloseMinutes=0/null)
+    const savedWithIdle = store.upsertGroup({
+      ...store.getGroup('dsh-bot', 'oc_team')!,
+      idleCloseMinutes: 0,
+      receivedReactionEmoji: 'THUMBSUP',
+      replyFormat: 'card',
+      dshSessionLinkInCard: 'off',
+      replyFooterModel: 'off',
+      signatureMode: 'custom',
+      signature: '本群专属卡片签名',
+    })
+    expect(savedWithIdle.idleCloseMinutes).toBe(0)
+    await manager.unbindRoute(store.listBindings()[0]!.routeKey, { archive: false })
+    fakeTransport.addReaction.mockClear()
+    fakeTransport.sendReply.mockClear()
+    nextReply = '已使用本群专属配置回复'
+
+    await (manager as unknown as { handleInbound: (b: string, t: unknown, m: unknown) => Promise<void> }).handleInbound(
+      'dsh-bot',
+      fakeTransport,
+      {
+        botId: 'dsh-bot',
+        larkAppId: 'cli_test',
+        botOpenId: 'ou_bot',
+        messageId: 'om_msg_4',
+        chatId: 'oc_team',
+        chatType: 'group',
+        msgType: 'text',
+        senderOpenId: 'ou_user_1',
+        senderType: 'user',
+        text: '@_user_1 验证群级消息配置',
+        rawContent: '{}',
+        mentions: [{ key: '@_user_1', openId: 'ou_bot', name: 'DSH-Bot' }],
+        imageKeys: [],
+        createTimeMs: Date.now(),
+      },
+    )
+    expect(fakeTransport.addReaction).toHaveBeenCalledWith('om_msg_4', 'THUMBSUP')
+
+    const sentReplyArg = fakeTransport.sendReply.mock.calls[0]?.[0] as { card?: Record<string, unknown> }
+    const sentCardStr = JSON.stringify(sentReplyArg?.card ?? {})
+    expect(sentCardStr).toContain('本群专属卡片签名')
+    expect(sentCardStr).not.toContain('在 DSH 接管会话')
+
+    // Verify idleCloseMinutes: 0 keeps session from expiring even when bot.idleCloseMinutes = 1
+    const zeroIdleBinding = store.listBindings()[0]!
+    expect(zeroIdleBinding.idleCloseMs).toBeUndefined()
+    store.upsertBinding({
+      ...zeroIdleBinding,
+      lastActivityMs: Date.now() - 600_000,
+    })
+    expect(await manager.sweepIdleBindings()).toBe(0)
+
+    // Verify resetting idleCloseMinutes to null removes the group override
+    const resetIdleGroup = store.upsertGroup({
+      ...store.getGroup('dsh-bot', 'oc_team')!,
+      idleCloseMinutes: null,
+    })
+    expect(resetIdleGroup.idleCloseMinutes).toBeUndefined()
+
+    // 6. Multi-group same-directory conflict resolution (prevents Group B overwriting Group A's workspace title)
+    const exclusiveRepoDir = join(workDir, 'order-service')
+    const sharedRepoDir = join(workDir, 'core-service')
+    store.upsertGroup({
+      botId: 'dsh-bot',
+      chatId: 'oc_order_only',
+      chatName: '订单研发群',
+      enabled: true,
+      workingDir: exclusiveRepoDir,
+      workspaceName: '',
+    })
+    store.upsertGroup({
+      botId: 'dsh-bot',
+      chatId: 'oc_svc_alert',
+      chatName: '【核心服务】告警群',
+      enabled: true,
+      workingDir: sharedRepoDir,
+      workspaceName: '',
+    })
+    store.upsertGroup({
+      botId: 'dsh-bot',
+      chatId: 'oc_svc_release',
+      chatName: '核心服务发布群',
+      enabled: true,
+      workingDir: sharedRepoDir,
+      workspaceName: '',
+    })
+
+    const expectedSharedRoot = workDir.split('/').filter(Boolean).pop()!
+    const viewsByChat = new Map(store.listGroupViews('dsh-bot').map((v) => [v.chatId, v]))
+    // Bot and groups without explicit workspaceName default to leaf directory name
+    expect(store.resolveBotWorkspaceName(store.getBot('dsh-bot')!)).toBe(expectedSharedRoot)
+    expect(viewsByChat.get('oc_team')?.effectiveWorkspaceName).toBe(expectedSharedRoot)
+    expect(viewsByChat.get('oc_order_only')?.effectiveWorkspaceName).toBe('order-service')
+    expect(viewsByChat.get('oc_svc_alert')?.effectiveWorkspaceName).toBe('core-service')
+    expect(viewsByChat.get('oc_svc_release')?.effectiveWorkspaceName).toBe('core-service')
+
+    // 7. Multi-bot same-defaultWorkingDir stays consistent on leaf directory name, and explicit peer workspaceName wins
+    const peerBot = store.upsertBot({
+      id: 'peer-bot',
+      name: 'PeerBot',
+      enabled: true,
+      larkAppId: 'cli_peer',
+      larkAppSecret: 'sec_peer',
+      defaultWorkingDir: workDir,
+    })
+    expect(store.resolveBotWorkspaceName(store.getBot('dsh-bot')!)).toBe(expectedSharedRoot)
+    expect(store.resolveBotWorkspaceName(peerBot)).toBe(expectedSharedRoot)
+    expect(
+      store.listGroupViews('dsh-bot').find((v) => v.chatId === 'oc_team')?.effectiveWorkspaceName,
+    ).toBe(expectedSharedRoot)
+
+    store.upsertBot({
+      ...peerBot,
+      workspaceName: '共享主工作区',
+    })
+    expect(store.resolveBotWorkspaceName(store.getBot('dsh-bot')!)).toBe('共享主工作区')
+    expect(
+      store.listGroupViews('dsh-bot').find((v) => v.chatId === 'oc_team')?.effectiveWorkspaceName,
+    ).toBe('共享主工作区')
+
+    await manager.stop()
+  })
+
+  it('resolves native provider/model and mounts preset plugins on create and cold resume for built-in standard preset, while keeping external cold resume untouched', async () => {
+    const dir = makeTempDir()
+    const workDir = makeTempDir()
+    const store = new LarkBridgeStore(dir)
+    const bot = store.upsertBot({
+      id: 'std-bot',
+      name: 'StandardBot',
+      enabled: false,
+      larkAppId: 'cli_std',
+      larkAppSecret: 'sec_std',
+      defaultWorkingDir: workDir,
+      agentPreset: 'standard',
+      model: 'deepseek-reasoner',
+      reasoningEffort: 'high',
+      p2pReplyMode: 'reply',
+      useCardReply: false,
+    })
+    const codexBot = store.upsertBot({
+      id: 'codex-bot',
+      name: 'CodexBot',
+      enabled: false,
+      larkAppId: 'cli_codex',
+      larkAppSecret: 'sec_codex',
+      defaultWorkingDir: workDir,
+      agentPreset: 'codex',
+      model: 'gpt-6.1-sol',
+      p2pReplyMode: 'reply',
+      useCardReply: false,
+    })
+
+    const listeners = new Map<string, Array<(...args: unknown[]) => void>>()
+    const emit = (event: string, ...args: unknown[]) => {
+      for (const fn of listeners.get(event) ?? []) fn(...args)
+    }
+
+    const mountedPresets: string[] = []
+    const createCalls: Array<{ sessionId: string; meta?: unknown; agentOptions?: unknown }> = []
+    const resumeCalls: Array<{ resumeSessionId: string; agentOptions?: unknown; hasSetup: boolean }> = []
+    const liveAgents = new Map<string, unknown>()
+
+    const makeAgent = (sessionId: string, presetId: string) => {
+      const events: SessionEvent[] = []
+      const sessionObj = {
+        id: sessionId,
+        header: { cwd: workDir, agentPreset: presetId },
+        append: vi.fn(),
+        snapshotEvents: () => events,
+      } as unknown as Session
+      return {
+        session: sessionObj,
+        model: {
+          current: () => ({ provider: presetId === 'codex' ? 'codex-cli' : 'deepseek', model: 'deepseek-reasoner' }),
+          select: vi.fn(),
+        },
+        followup: () => {
+          emit('session/event', sessionObj, { type: 'turn/start', data: { turn: 1 } })
+          emit('session/event', sessionObj, {
+            type: 'assistant/message',
+            data: { turn: 1, message: { content: [{ type: 'text', text: '收到' }] } },
+          })
+          emit('session/event', sessionObj, {
+            type: 'turn/end',
+            data: { turn: 1, reason: { kind: 'complete' } },
+          })
+        },
+      }
+    }
+
+    const fakeCtx = {
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      on(event: string, fn: (...args: unknown[]) => void) {
+        const list = listeners.get(event) ?? []
+        list.push(fn)
+        listeners.set(event, list)
+        return () => {
+          listeners.set(event, (listeners.get(event) ?? []).filter((f) => f !== fn))
+        }
+      },
+      sessions: { get: () => undefined },
+      llm: {
+        listProviders: () => [
+          { id: 'codex-cli', name: 'Codex' },
+          { id: 'deepseek', name: 'DeepSeek' },
+        ],
+        listModels: async (providerId: string) =>
+          providerId === 'deepseek'
+            ? [
+                { provider: 'deepseek', id: 'deepseek-chat', name: 'DeepSeek Chat' },
+                { provider: 'deepseek', id: 'deepseek-reasoner', name: 'DeepSeek Reasoner' },
+              ]
+            : [{ provider: 'codex-cli', id: 'gpt-6.1-sol', name: 'GPT-6.1 Sol' }],
+      },
+      agents: {
+        get: (id: string) => liveAgents.get(id),
+        create: vi.fn(
+          async (opts: {
+            sessionId: string
+            meta?: { agentPreset?: string }
+            agentOptions?: unknown
+            setup?: (c: unknown, a: unknown) => Promise<void> | void
+          }) => {
+            createCalls.push({
+              sessionId: opts.sessionId,
+              meta: opts.meta,
+              agentOptions: opts.agentOptions,
+            })
+            const agent = makeAgent(opts.sessionId, opts.meta?.agentPreset ?? 'standard')
+            await opts.setup?.({ on: vi.fn() }, agent)
+            liveAgents.set(opts.sessionId, agent)
+            return { agent, dispose: vi.fn().mockResolvedValue(undefined) }
+          },
+        ),
+        resume: vi.fn(
+          async (opts: {
+            resumeSessionId: string
+            agentOptions?: unknown
+            setup?: (c: unknown, a: unknown) => Promise<void> | void
+          }) => {
+            resumeCalls.push({
+              resumeSessionId: opts.resumeSessionId,
+              agentOptions: opts.agentOptions,
+              hasSetup: typeof opts.setup === 'function',
+            })
+            const preset = opts.agentOptions ? 'standard' : 'codex'
+            const agent = makeAgent(opts.resumeSessionId, preset)
+            await opts.setup?.({ on: vi.fn() }, agent)
+            liveAgents.set(opts.resumeSessionId, agent)
+            return { agent, dispose: vi.fn().mockResolvedValue(undefined) }
+          },
+        ),
+      },
+      get(service: string) {
+        if (service === 'externalRuntimes') {
+          const codex = {
+            id: 'codex',
+            displayName: 'Codex',
+            description: 'Codex',
+            providerId: 'codex-cli',
+            defaultModel: 'gpt-6.1-sol',
+          }
+          return {
+            list: () => [codex],
+            get: (id: string) => (id === 'codex' ? codex : undefined),
+          }
+        }
+        if (service === 'agentPresets') {
+          return {
+            remoteExportList: async () => ({ presets: [{ id: 'standard', isDefault: true }] }),
+            mount: async (_ctx: unknown, presetId?: string) => {
+              if (presetId) mountedPresets.push(presetId)
+            },
+          }
+        }
+        if (service === 'workspaceRegistry') {
+          return {
+            list: () => [],
+            create: async (_d: string, title?: string) => ({
+              title: title ?? 'ws',
+              setTitle: vi.fn(),
+              attachSession: vi.fn(),
+            }),
+          }
+        }
+        return undefined
+      },
+    } as unknown as Context
+
+    const manager = new LarkBridgeManager(
+      fakeCtx,
+      {
+        dataDir: dir,
+        publicBaseUrl: 'http://192.168.1.10:3880',
+        idleSweepIntervalMs: 0,
+        maxAuditEvents: 100,
+        autoInstallCliAndSkill: false,
+      },
+      store,
+    )
+    await manager.start()
+    store.upsertBot({ ...bot, enabled: true })
+    store.upsertBot({ ...codexBot, enabled: true })
+
+    const fakeTransport = {
+      state: { botOpenId: 'ou_bot' },
+      resolveUserSummary: vi.fn().mockResolvedValue({ openId: 'ou_u1', name: 'Tester' }),
+      addReaction: vi.fn().mockResolvedValue('r1'),
+      removeReaction: vi.fn().mockResolvedValue(undefined),
+      sendReply: vi.fn().mockResolvedValue({ messageId: 'om_r1' }),
+      downloadImageAsBase64: vi.fn().mockResolvedValue(undefined),
+    }
+
+    const handleInbound = (
+      manager as unknown as { handleInbound: (b: string, t: unknown, m: unknown) => Promise<void> }
+    ).handleInbound.bind(manager)
+
+    // 1. Initial turn for built-in `standard` preset passes provider + model + effort and mounts preset
+    await handleInbound('std-bot', fakeTransport, {
+      messageId: 'om_std_1',
+      chatId: 'oc_p2p_std',
+      chatType: 'p2p',
+      senderOpenId: 'ou_u1',
+      text: '你好',
+      mentions: [],
+      imageKeys: [],
+    })
+    expect(createCalls).toHaveLength(1)
+    expect(createCalls[0]?.agentOptions).toEqual({
+      provider: 'deepseek',
+      model: 'deepseek-reasoner',
+      reasoningEffort: 'high',
+    })
+    expect(mountedPresets).toEqual(['standard'])
+
+    // 2. Cold resume for built-in `standard` preset re-supplies native agentOptions and re-mounts preset
+    liveAgents.clear()
+    await handleInbound('std-bot', fakeTransport, {
+      messageId: 'om_std_2',
+      chatId: 'oc_p2p_std',
+      chatType: 'p2p',
+      senderOpenId: 'ou_u1',
+      text: '继续',
+      mentions: [],
+      imageKeys: [],
+    })
+    expect(resumeCalls).toHaveLength(1)
+    expect(resumeCalls[0]?.agentOptions).toEqual({
+      provider: 'deepseek',
+      model: 'deepseek-reasoner',
+      reasoningEffort: 'high',
+    })
+    expect(resumeCalls[0]?.hasSetup).toBe(true)
+    expect(mountedPresets).toEqual(['standard', 'standard'])
+
+    // 3. External `codex` cold resume passes only `{ resumeSessionId }` without agentOptions override
+    await handleInbound('codex-bot', fakeTransport, {
+      messageId: 'om_cx_1',
+      chatId: 'oc_p2p_cx',
+      chatType: 'p2p',
+      senderOpenId: 'ou_u1',
+      text: 'hi',
+      mentions: [],
+      imageKeys: [],
+    })
+    liveAgents.clear()
+    await handleInbound('codex-bot', fakeTransport, {
+      messageId: 'om_cx_2',
+      chatId: 'oc_p2p_cx',
+      chatType: 'p2p',
+      senderOpenId: 'ou_u1',
+      text: 'next',
+      mentions: [],
+      imageKeys: [],
+    })
+    expect(resumeCalls).toHaveLength(2)
+    expect(resumeCalls[1]?.agentOptions).toBeUndefined()
+    expect(resumeCalls[1]?.hasSetup).toBe(false)
+
+    await manager.stop()
+  })
+})

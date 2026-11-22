@@ -1,0 +1,8 @@
+# DeepSeekHarness Bundle Patch for Lark (Feishu) Multi-Agent Bridge (Desktop & Web)
+# Zero-intrusion hot-installable bundle: leaves native agent-loop and user defaults untouched.
+# Install `dsh-external-agents` separately if you also want Codex / Antigravity / ClaudeCode / TRAE presets.
+- insert:
+    - id: dsh-lark-bridge
+      name: 'dsh-lark-bridge'
+      config:
+        publicBaseUrl: ''
