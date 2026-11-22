@@ -22,38 +22,38 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          registry-url: 'https://registry.npmjs.org'
           cache: pnpm
 
-      - name: Install, build, typecheck, and test
+      - name: Install, verify privacy, build, typecheck, and test
         run: |
           pnpm install
+          pnpm run check:privacy
           pnpm build
           pnpm typecheck
           pnpm test
 
-      - name: Pack plugin tarball and checksums
+      - name: Pack plugin tarballs (versioned + latest alias) and checksums
         run: |
           node scripts/pack-bundle.mjs --out-dir .local/releases
           cd .local/releases
           sha256sum *.tgz > SHA256SUMS.txt
           ls -la
 
-      - name: Publish to npm (when NPM_TOKEN secret is configured)
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          if [ -z "$NODE_AUTH_TOKEN" ]; then
-            echo "NPM_TOKEN not configured; skipping npm publish."
-            exit 0
-          fi
-          npm publish --access public
-
-      - name: Publish GitHub Release with .tgz asset
+      - name: Publish GitHub Release with .tgz assets
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          body: |
+            ### 通过 GitHub Release `.tgz` 安装（无需构建脚本，始终指向最新版本）
+
+            - **DSH 界面安装（Desktop / Web）**：在侧边栏 **插件 → 添加插件** 中直接填入：
+              `https://github.com/harryzhz/dsh-lark-bridge/releases/latest/download/dsh-lark-bridge.tgz`
+            - **CLI 安装（独立 Web 服务）**：
+              ```bash
+              dsh plugin --profile web add https://github.com/harryzhz/dsh-lark-bridge/releases/latest/download/dsh-lark-bridge.tgz
+              ```
+            - 如需同时接入外部 CLI 运行时（Codex / Antigravity / Claude Code / TRAE），可一并安装配套插件：`https://github.com/harryzhz/dsh-external-agents/releases/latest/download/dsh-external-agents.tgz`。
           files: |
             .local/releases/*.tgz
             .local/releases/SHA256SUMS.txt

@@ -27,9 +27,11 @@ https://github.com/user-attachments/assets/3f02edff-d477-49dc-a515-fc3820231f71
 
 1. 打开侧边栏 **插件 → 添加插件**。
 2. 填入任一安装源并点击 **安装**：
-   - **GitHub 仓库（推荐）**：`github:harryzhz/dsh-lark-bridge`（或 `https://github.com/harryzhz/dsh-lark-bridge`；pnpm ≥ 10 首次会拦截 `prepare` 脚本，按界面提示点击 **允许这些脚本并重试**）
-     - 如需额外接入外部 CLI Agent（Codex / Antigravity / Claude Code / TRAE），按同样方式再安装 `github:harryzhz/dsh-external-agents`（或 `https://github.com/harryzhz/dsh-external-agents`）并重启一次 DSH。
-   - **GitHub Release `.tgz`**：Release 页面 `.tgz` 下载链接或本地绝对路径
+   - **GitHub Release `.tgz`（推荐，免构建脚本）**：
+     - 飞书桥接：`https://github.com/harryzhz/dsh-lark-bridge/releases/latest/download/dsh-lark-bridge.tgz`
+     - 外部 CLI 运行时（可选，支持 Codex / Antigravity / Claude Code / TRAE）：`https://github.com/harryzhz/dsh-external-agents/releases/latest/download/dsh-external-agents.tgz`（启用后重启一次 DSH）
+   - **GitHub 仓库**：`github:harryzhz/dsh-lark-bridge`（或 `https://github.com/harryzhz/dsh-lark-bridge`；pnpm ≥ 10 首次会拦截 `prepare` 脚本，按界面提示点击 **允许这些脚本并重试**）
+     - 外部 CLI 运行时（可选）：`github:harryzhz/dsh-external-agents`（或 `https://github.com/harryzhz/dsh-external-agents`）
    - **本地源码目录**：先在仓库运行 `pnpm install && pnpm build`，再填入绝对路径
 3. 点击 **立即启用**：支持热加载生效，无需重启，左侧导航栏随即出现 **飞书桥接**。
 
@@ -38,14 +40,16 @@ https://github.com/user-attachments/assets/3f02edff-d477-49dc-a515-fc3820231f71
 > `--profile <name>` 须写在 `add` / `remove` 之前。`desktop` profile 由桌面端托管，请使用上方界面安装。
 
 ```bash
-# 从 GitHub 仓库安装（推荐，也可使用 https://github.com/harryzhz/dsh-lark-bridge）
-dsh plugin --profile web add github:harryzhz/dsh-lark-bridge
+# 从 GitHub Release latest .tgz 安装（推荐，免构建脚本）
+dsh plugin --profile web add https://github.com/harryzhz/dsh-lark-bridge/releases/latest/download/dsh-lark-bridge.tgz
 
 # 可选：一并安装外部 CLI Agent 插件（Codex / Antigravity / Claude Code / TRAE）
-dsh plugin --profile web add github:harryzhz/dsh-external-agents github:harryzhz/dsh-lark-bridge
+dsh plugin --profile web add \
+  https://github.com/harryzhz/dsh-external-agents/releases/latest/download/dsh-external-agents.tgz \
+  https://github.com/harryzhz/dsh-lark-bridge/releases/latest/download/dsh-lark-bridge.tgz
 
-# 从 Release .tgz 安装（支持 URL 或本地路径）
-dsh plugin --profile web add ./harryzhz-dsh-lark-bridge-0.3.0.tgz
+# 从 GitHub 仓库安装（也可使用 https://github.com/harryzhz/dsh-lark-bridge）
+dsh plugin --profile web add github:harryzhz/dsh-lark-bridge
 
 # 从本地已构建仓库安装
 dsh plugin --profile web add file:/absolute/path/to/dsh-lark-bridge
