@@ -1,15 +1,16 @@
 #!/usr/bin/env node
 /**
- * Self-contained bundle builder for root `dsh-lark-bridge` (Host + Web/Desktop Client + CLI).
+ * Self-contained bundle builder for root `@harryzhz/dsh-lark-bridge` (Host + Web/Desktop Client + CLI).
  * Can run with ONLY root `devDependencies` (`esbuild`) during Git installs (`prepare`)
  * or full workspace builds (`build:bundles`).
  */
-import { chmodSync, copyFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { build } from 'esbuild'
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+const rootPackageName = JSON.parse(readFileSync(resolve(repoRoot, 'package.json'), 'utf8')).name
 const distDir = resolve(repoRoot, 'dist')
 const bridgeEntry = resolve(repoRoot, 'packages/dsh-lark-bridge/src/index.ts')
 const uiClientEntry = resolve(repoRoot, 'packages/dsh-lark-ui/src/client.tsx')
@@ -58,7 +59,7 @@ export async function buildLarkBridgeRootBundle() {
     ],
   })
 
-  // 2. Bundle Client UI for DSH `window.__ModuleLoader__` (matching package name `dsh-lark-bridge`)
+  // 2. Bundle Client UI for DSH `window.__ModuleLoader__` (id must match root package.json `name`)
   const clientResult = await build({
     entryPoints: [uiClientEntry],
     bundle: true,
@@ -80,7 +81,7 @@ export async function buildLarkBridgeRootBundle() {
 
   const bundledCode = clientResult.outputFiles[0]?.text ?? ''
   const wrapped = `window.__ModuleLoader__.load({
-  id: 'dsh-lark-bridge',
+  id: ${JSON.stringify(rootPackageName)},
   factory: (require) => {
     var module = { exports: {} };
     var exports = module.exports;
@@ -100,7 +101,7 @@ ${bundledCode}
     }
   }
 
-  console.log('Built standalone bundle dsh-lark-bridge:', distDir)
+  console.log(`Built standalone bundle ${rootPackageName}:`, distDir)
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

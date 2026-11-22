@@ -240,7 +240,7 @@ try {
 Commands:
   install-profile      Install plugins, CLI, skill & cordis.patch.yml into DSH web profile
                        [--dsh-home ~/.dsh] [--dsh-bin /path/to/dsh] [--host <ipv4>] [--port 3880]
-                       [--external-agents <dsh-external-agents-pkg-or-path>]
+                       [--external-agents <@harryzhz/dsh-external-agents-or-path>]
   install-launchagent  Generate macOS LaunchAgent plist for always-on DSH web daemon
                        [--dsh-home ~/.dsh] [--dsh-bin /path/to/dsh] [--host <ipv4>] [--port 3880] [--label io.dsh.lark-bridge] [--load]
   install-cli          Install or refresh the lark-bridge CLI wrapper & Agent skill only
