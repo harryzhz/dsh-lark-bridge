@@ -70,6 +70,7 @@ export interface LarkSessionBinding {
   readonly workingDir: string
   readonly trigger: string
   readonly listenerName?: string
+  readonly hasReplied?: boolean
   readonly createdAtMs: number
   readonly lastActivityMs: number
   readonly idleCloseMs?: number

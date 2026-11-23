@@ -704,4 +704,308 @@ describe('LarkBridgeManager prompt injection, title hygiene & auto-archiving', (
 
     await manager.stop()
   })
+
+  it('prevents un-replied listener threads from leaking empty-output fallback replies, cleans up silent bindings, and preserves silent followup after reply', async () => {
+    const dir = makeTempDir()
+    const workDir = makeTempDir()
+    const store = new LarkBridgeStore(dir)
+    const bot = store.upsertBot({
+      id: 'daily-bot',
+      name: 'DailyBot',
+      enabled: false,
+      larkAppId: 'cli_daily',
+      larkAppSecret: 'sec_daily',
+      defaultWorkingDir: workDir,
+      mentionTriggerMode: 'mention_and_active_thread',
+      useInteractiveCard: false,
+    })
+    store.upsertGroup({
+      botId: 'daily-bot',
+      chatId: 'oc_daily',
+      chatName: '研发日常群',
+      enabled: true,
+      listener: {
+        enabled: true,
+        name: '工作日常',
+        prompt: '无需回复或 @他人 时直接输出空文本保持静默。',
+        scope: 'all',
+        replyMode: 'reply',
+        sessionMode: 'thread',
+        allowSilentEmptyReply: true,
+        autoCloseAfterCompletion: false,
+        excludeKeywords: ['@'],
+      },
+    })
+
+    const listeners = new Map<string, Array<(...args: unknown[]) => void>>()
+    const emit = (event: string, ...args: unknown[]) => {
+      for (const fn of listeners.get(event) ?? []) fn(...args)
+    }
+    const archivedSessionIds: string[] = []
+    const disposedSessionIds: string[] = []
+    const liveAgents = new Map<string, unknown>()
+    const pendingTurns: Array<{ session: Session; turn: number; finish: (replyText: string) => void }> = []
+    const turnCounters = new Map<string, number>()
+
+    const fakeCtx = {
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      on(event: string, fn: (...args: unknown[]) => void) {
+        const list = listeners.get(event) ?? []
+        list.push(fn)
+        listeners.set(event, list)
+        return () => {
+          listeners.set(event, (listeners.get(event) ?? []).filter((f) => f !== fn))
+        }
+      },
+      sessions: { get: () => undefined },
+      agents: {
+        get: (id: string) => liveAgents.get(id),
+        create: vi.fn(async ({ sessionId }: { sessionId: string }) => {
+          const sessionObj = {
+            id: sessionId,
+            header: { cwd: workDir, agentPreset: 'codex' },
+            append: vi.fn(),
+            snapshotEvents: () => [],
+          } as unknown as Session
+          const agent = {
+            session: sessionObj,
+            followup: () => {
+              const turn = (turnCounters.get(sessionId) ?? 0) + 1
+              turnCounters.set(sessionId, turn)
+              emit('session/event', sessionObj, { type: 'turn/start', data: { turn } })
+              pendingTurns.push({
+                session: sessionObj,
+                turn,
+                finish: (replyText: string) => {
+                  if (replyText) {
+                    emit('session/event', sessionObj, {
+                      type: 'assistant/message',
+                      data: { turn, message: { content: [{ type: 'text', text: replyText }] } },
+                    })
+                  }
+                  emit('session/event', sessionObj, {
+                    type: 'turn/end',
+                    data: { turn, reason: { kind: 'completed' } },
+                  })
+                },
+              })
+            },
+          }
+          liveAgents.set(sessionId, agent)
+          return {
+            agent,
+            dispose: vi.fn(async () => {
+              disposedSessionIds.push(sessionId)
+              liveAgents.delete(sessionId)
+            }),
+          }
+        }),
+      },
+      get(service: string) {
+        if (service === 'workspaceRegistry') {
+          return {
+            list: () => [],
+            create: async (_d: string, title?: string) => ({
+              title: title ?? 'ws',
+              setTitle: vi.fn(),
+              attachSession: vi.fn(),
+            }),
+            archiveSession: vi.fn(async (sid: string) => {
+              if (!archivedSessionIds.includes(sid)) archivedSessionIds.push(sid)
+            }),
+          }
+        }
+        return undefined
+      },
+    } as unknown as Context
+
+    const manager = new LarkBridgeManager(
+      fakeCtx,
+      {
+        dataDir: dir,
+        publicBaseUrl: 'http://192.0.2.10:3880',
+        idleSweepIntervalMs: 0,
+        maxAuditEvents: 100,
+        autoInstallCliAndSkill: false,
+      },
+      store,
+    )
+    await manager.start()
+    store.upsertBot({ ...bot, enabled: true })
+
+    const fakeTransport = {
+      state: { botOpenId: 'ou_bot' },
+      resolveUserSummary: vi.fn().mockResolvedValue({ openId: 'ou_user_1', name: 'Alex Chen' }),
+      addReaction: vi.fn().mockResolvedValue('r1'),
+      removeReaction: vi.fn().mockResolvedValue(undefined),
+      sendReply: vi.fn().mockResolvedValue({ messageId: 'om_reply_sent' }),
+      downloadImageAsBase64: vi.fn().mockResolvedValue(undefined),
+    }
+    const handleInbound = (
+      manager as unknown as { handleInbound: (b: string, t: unknown, m: unknown) => Promise<void> }
+    ).handleInbound.bind(manager)
+
+    // Case 1: Turn 1 starts on a listener thread (hasReplied=false). While Turn 1 is still running,
+    // a quoted reply mentioning another member (`@Sam 空降`) arrives -> filtered by excludeKeywords=['@']
+    // instead of being hijacked into active-thread!
+    const turn1Promise = handleInbound('daily-bot', fakeTransport, {
+      botId: 'daily-bot',
+      larkAppId: 'cli_daily',
+      botOpenId: 'ou_bot',
+      messageId: 'om_root_1',
+      chatId: 'oc_daily',
+      chatType: 'group',
+      msgType: 'text',
+      senderOpenId: 'ou_user_1',
+      senderType: 'user',
+      text: '感觉周围人变多了',
+      rawContent: '{}',
+      mentions: [],
+      imageKeys: [],
+      createTimeMs: Date.now(),
+    })
+    await vi.waitFor(() => expect(pendingTurns).toHaveLength(1))
+    expect(store.listBindings()).toHaveLength(1)
+    expect(store.listBindings()[0]?.hasReplied).toBe(false)
+
+    await handleInbound('daily-bot', fakeTransport, {
+      botId: 'daily-bot',
+      larkAppId: 'cli_daily',
+      botOpenId: 'ou_bot',
+      messageId: 'om_quote_excluded',
+      chatId: 'oc_daily',
+      chatType: 'group',
+      rootId: 'om_root_1',
+      parentId: 'om_root_1',
+      msgType: 'text',
+      senderOpenId: 'ou_user_2',
+      senderType: 'user',
+      text: '@_user_2 空降',
+      rawContent: '{}',
+      mentions: [{ key: '@_user_2', openId: 'ou_peer', name: 'Sam' }],
+      imageKeys: [],
+      createTimeMs: Date.now(),
+    })
+    // Still only 1 agent turn created; excluded message never triggered the agent or sent fallback text
+    expect(pendingTurns).toHaveLength(1)
+    expect(fakeTransport.sendReply).not.toHaveBeenCalled()
+
+    // Turn 1 finishes silently -> binding is removed and session is archived (no zombie thread binding!)
+    const sid1 = pendingTurns[0]!.session.id
+    pendingTurns.shift()!.finish('')
+    await turn1Promise
+    expect(fakeTransport.sendReply).not.toHaveBeenCalled()
+    expect(store.listBindings()).toHaveLength(0)
+    expect(disposedSessionIds).toContain(sid1)
+    expect(archivedSessionIds).toContain(sid1)
+
+    // Case 2: Listener thread DOES reply -> binding stays active with hasReplied=true;
+    // subsequent active-thread message returning empty text silently skips instead of sending fallback
+    const turn2Promise = handleInbound('daily-bot', fakeTransport, {
+      botId: 'daily-bot',
+      larkAppId: 'cli_daily',
+      botOpenId: 'ou_bot',
+      messageId: 'om_root_2',
+      chatId: 'oc_daily',
+      chatType: 'group',
+      msgType: 'text',
+      senderOpenId: 'ou_user_1',
+      senderType: 'user',
+      text: '这个报错有谁遇到过吗',
+      rawContent: '{}',
+      mentions: [],
+      imageKeys: [],
+      createTimeMs: Date.now(),
+    })
+    await vi.waitFor(() => expect(pendingTurns).toHaveLength(1))
+    pendingTurns.shift()!.finish('刚查了代码，是连接池超时配置过小。')
+    await turn2Promise
+
+    expect(fakeTransport.sendReply).toHaveBeenCalledTimes(1)
+    expect(store.listBindings()).toHaveLength(1)
+    expect(store.listBindings()[0]?.hasReplied).toBe(true)
+
+    const turn2FollowupPromise = handleInbound('daily-bot', fakeTransport, {
+      botId: 'daily-bot',
+      larkAppId: 'cli_daily',
+      botOpenId: 'ou_bot',
+      messageId: 'om_root_2_reply',
+      chatId: 'oc_daily',
+      chatType: 'group',
+      rootId: 'om_root_2',
+      parentId: 'om_root_2',
+      msgType: 'text',
+      senderOpenId: 'ou_user_2',
+      senderType: 'user',
+      text: '收到，我马上去改',
+      rawContent: '{}',
+      mentions: [],
+      imageKeys: [],
+      createTimeMs: Date.now(),
+    })
+    await vi.waitFor(() => expect(pendingTurns).toHaveLength(1))
+    pendingTurns.shift()!.finish('')
+    await turn2FollowupPromise
+
+    // Silent skip honored (no "（已完成，无文本输出）" sent) and active thread binding stays alive
+    expect(fakeTransport.sendReply).toHaveBeenCalledTimes(1)
+    expect(store.listBindings()).toHaveLength(1)
+
+    // Case 3: Two overlapping listener turns on an un-replied thread -> first silent turn does NOT
+    // prematurely dispose the agent while second turn is still in flight; cleanup runs once both finish silently
+    const turn3aPromise = handleInbound('daily-bot', fakeTransport, {
+      botId: 'daily-bot',
+      larkAppId: 'cli_daily',
+      botOpenId: 'ou_bot',
+      messageId: 'om_root_3',
+      chatId: 'oc_daily',
+      chatType: 'group',
+      msgType: 'text',
+      senderOpenId: 'ou_user_1',
+      senderType: 'user',
+      text: '上午好',
+      rawContent: '{}',
+      mentions: [],
+      imageKeys: [],
+      createTimeMs: Date.now(),
+    })
+    await vi.waitFor(() => expect(pendingTurns).toHaveLength(1))
+
+    const turn3bPromise = handleInbound('daily-bot', fakeTransport, {
+      botId: 'daily-bot',
+      larkAppId: 'cli_daily',
+      botOpenId: 'ou_bot',
+      messageId: 'om_root_3_reply',
+      chatId: 'oc_daily',
+      chatType: 'group',
+      rootId: 'om_root_3',
+      parentId: 'om_root_3',
+      msgType: 'text',
+      senderOpenId: 'ou_user_2',
+      senderType: 'user',
+      text: '早呀',
+      rawContent: '{}',
+      mentions: [],
+      imageKeys: [],
+      createTimeMs: Date.now(),
+    })
+    await vi.waitFor(() => expect(pendingTurns).toHaveLength(2))
+    const sid3 = pendingTurns[0]!.session.id
+    expect(pendingTurns[1]!.session.id).toBe(sid3)
+
+    // First turn finishes silently while second turn is still running -> must keep handle & binding
+    pendingTurns.shift()!.finish('')
+    await turn3aPromise
+    expect(disposedSessionIds).not.toContain(sid3)
+    expect(store.listBindings().some((b) => b.sessionId === sid3)).toBe(true)
+
+    // Second turn finishes silently -> now safely disposes, unbinds, and archives
+    pendingTurns.shift()!.finish('')
+    await turn3bPromise
+    expect(disposedSessionIds).toContain(sid3)
+    expect(archivedSessionIds).toContain(sid3)
+    expect(store.listBindings().some((b) => b.sessionId === sid3)).toBe(false)
+
+    await manager.stop()
+  })
 })

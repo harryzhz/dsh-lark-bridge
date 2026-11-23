@@ -503,10 +503,13 @@ export function decideLarkRouting(
 
   // 3. Group chat: active thread continuation (without re-mentioning agent)
   const existingThreadTrigger = runtime.getRouteTrigger?.(threadRouteKey)
+  const hasThreadReplied = runtime.hasRouteReplied?.(threadRouteKey) ?? true
   const allowThreadFollowup =
     existingThreadTrigger === 'substitute'
       ? bot.substituteMode.activeThreadFollowup
-      : mentionTriggerMode === 'mention_and_active_thread'
+      : existingThreadTrigger === 'listener'
+        ? hasThreadReplied && mentionTriggerMode === 'mention_and_active_thread'
+        : mentionTriggerMode === 'mention_and_active_thread'
   if (
     allowThreadFollowup &&
     (msg.rootId || msg.threadId) &&
@@ -514,6 +517,10 @@ export function decideLarkRouting(
   ) {
     const clean = replaceMentionKeysWithNames(msg.text, msg.mentions)
     const cmd = parseSlashCommand(clean)
+    const activeThreadReplyMode: GroupReplyMode =
+      existingThreadTrigger === 'listener' && !msg.threadId && group?.listener
+        ? group.listener.replyMode
+        : 'new-topic'
     if (cmd) {
       return {
         action: 'command',
@@ -521,10 +528,14 @@ export function decideLarkRouting(
         routeKey: threadRouteKey,
         workingDir,
         workspaceName,
-        replyMode: 'new-topic',
+        replyMode: activeThreadReplyMode,
       }
     }
     const userText = clean || (msg.imageKeys.length > 0 ? '[图片消息]' : '')
+    const allowSilentEmptyReply =
+      existingThreadTrigger === 'listener'
+        ? (group?.listener?.allowSilentEmptyReply ?? true)
+        : false
     return {
       action: 'agent',
       trigger: 'active-thread',
@@ -536,11 +547,11 @@ export function decideLarkRouting(
       ...(model ? { model } : {}),
       ...(reasoningEffort ? { reasoningEffort } : {}),
       sessionMode: 'thread',
-      replyMode: 'new-topic',
+      replyMode: activeThreadReplyMode,
       useCard,
       sendIntermediateMessages,
       ...(receivedReactionEmoji ? { receivedReactionEmoji } : {}),
-      allowSilentEmptyReply: false,
+      allowSilentEmptyReply,
       autoCloseAfterCompletion: false,
       ...(idleCloseMs ? { idleCloseMs } : {}),
       ...(roleReminder ? { roleReminder } : {}),

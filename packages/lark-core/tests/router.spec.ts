@@ -939,4 +939,176 @@ describe('decideLarkRouting, <user_message> format, memberOverrides & title inte
     expect(cardMd).toBe('请 <at id="ou_owner">Alex</at> 核实：**目前未确认恢复。**')
     expect(formatMarkdownForLarkPost('**A** 和 **B**')).toBe('**A** 和 **B**')
   })
+
+  it('guards listener threads from premature active-thread hijacking and preserves silent reply semantics after replying', () => {
+    const bot = createBot({ mentionTriggerMode: 'mention_and_active_thread' })
+    const dailyGroup = LarkGroupConfigSchema.parse({
+      key: 'dsh-bot:oc_daily',
+      botId: 'dsh-bot',
+      chatId: 'oc_daily',
+      enabled: true,
+      listener: {
+        enabled: true,
+        name: '工作日常',
+        prompt: '明确 @其他成员 时必须输出空文本保持静默。',
+        scope: 'all',
+        replyMode: 'reply',
+        sessionMode: 'thread',
+        allowSilentEmptyReply: true,
+        autoCloseAfterCompletion: false,
+        excludeKeywords: ['@'],
+      },
+    })
+    const topLevelGroup = LarkGroupConfigSchema.parse({
+      key: 'dsh-bot:oc_alert',
+      botId: 'dsh-bot',
+      chatId: 'oc_alert',
+      enabled: true,
+      listener: {
+        enabled: true,
+        name: '告警排查',
+        prompt: '仅在告警时排查，其他静默。',
+        scope: 'top_level',
+        replyMode: 'new-topic',
+        sessionMode: 'thread',
+        allowSilentEmptyReply: true,
+        autoCloseAfterCompletion: false,
+      },
+    })
+
+    const quotedPeerMention = createMessage({
+      chatId: 'oc_daily',
+      messageId: 'om_reply_2',
+      rootId: 'om_root_1',
+      parentId: 'om_root_1',
+      text: '@_user_2 空降',
+      mentions: [{ key: '@_user_2', openId: 'ou_peer', name: 'Sam' }],
+    })
+
+    // 1. Before bot has replied in a listener thread, follow-up must NOT bypass listener filters via active-thread
+    expect(
+      decideLarkRouting(bot, quotedPeerMention, {
+        groupConfig: dailyGroup,
+        hasActiveSessionForRoute: () => true,
+        getRouteTrigger: () => 'listener',
+        hasRouteReplied: () => false,
+      }),
+    ).toEqual({ action: 'ignore', reason: 'listener_keyword_excluded' })
+
+    // 2. Non-excluded follow-up before first reply still falls through to listener (preserving allowSilentEmptyReply & replyMode)
+    const quotedPlain = createMessage({
+      chatId: 'oc_daily',
+      messageId: 'om_reply_3',
+      rootId: 'om_root_1',
+      parentId: 'om_root_1',
+      text: '我也注意到人变多了',
+      mentions: [],
+    })
+    expect(
+      decideLarkRouting(bot, quotedPlain, {
+        groupConfig: dailyGroup,
+        hasActiveSessionForRoute: () => true,
+        getRouteTrigger: () => 'listener',
+        hasRouteReplied: () => false,
+      }),
+    ).toMatchObject({
+      action: 'agent',
+      trigger: 'listener',
+      replyMode: 'reply',
+      allowSilentEmptyReply: true,
+    })
+
+    // 3. For top_level listener before first reply, thread follow-up is ignored as listener_not_top_level
+    expect(
+      decideLarkRouting(
+        bot,
+        createMessage({
+          chatId: 'oc_alert',
+          messageId: 'om_alert_reply',
+          rootId: 'om_alert_root',
+          parentId: 'om_alert_root',
+          text: '这条回复在机器人还没发言前出现',
+        }),
+        {
+          groupConfig: topLevelGroup,
+          hasActiveSessionForRoute: () => true,
+          getRouteTrigger: () => 'listener',
+          hasRouteReplied: () => false,
+        },
+      ),
+    ).toEqual({ action: 'ignore', reason: 'listener_not_top_level' })
+
+    // 4. Once bot HAS replied in a listener thread, active-thread followup activates while inheriting allowSilentEmptyReply & replyMode
+    expect(
+      decideLarkRouting(bot, quotedPlain, {
+        groupConfig: dailyGroup,
+        hasActiveSessionForRoute: () => true,
+        getRouteTrigger: () => 'listener',
+        hasRouteReplied: () => true,
+      }),
+    ).toMatchObject({
+      action: 'agent',
+      trigger: 'active-thread',
+      replyMode: 'reply',
+      allowSilentEmptyReply: true,
+    })
+
+    // Inside an explicit Lark topic (threadId set), active-thread stays in-topic ('new-topic') and keeps silent capability
+    expect(
+      decideLarkRouting(
+        bot,
+        createMessage({
+          chatId: 'oc_alert',
+          messageId: 'om_alert_followup',
+          rootId: 'om_alert_root',
+          threadId: 'omt_alert_1',
+          text: '再查一下近 1 小时慢日志',
+        }),
+        {
+          groupConfig: topLevelGroup,
+          hasActiveSessionForRoute: () => true,
+          getRouteTrigger: () => 'listener',
+          hasRouteReplied: () => true,
+        },
+      ),
+    ).toMatchObject({
+      action: 'agent',
+      trigger: 'active-thread',
+      replyMode: 'new-topic',
+      allowSilentEmptyReply: true,
+    })
+
+    // 5. Explicit allowSilentEmptyReply=false on listener is respected in active-thread
+    const nonSilentGroup = LarkGroupConfigSchema.parse({
+      ...dailyGroup,
+      listener: { ...dailyGroup.listener, allowSilentEmptyReply: false },
+    })
+    expect(
+      decideLarkRouting(bot, quotedPlain, {
+        groupConfig: nonSilentGroup,
+        hasActiveSessionForRoute: () => true,
+        getRouteTrigger: () => 'listener',
+        hasRouteReplied: () => true,
+      }),
+    ).toMatchObject({
+      action: 'agent',
+      trigger: 'active-thread',
+      allowSilentEmptyReply: false,
+    })
+
+    // 6. Regular mention-originated active thread remains non-silent with new-topic replyMode
+    expect(
+      decideLarkRouting(bot, quotedPlain, {
+        groupConfig: dailyGroup,
+        hasActiveSessionForRoute: () => true,
+        getRouteTrigger: () => 'mention',
+        hasRouteReplied: () => true,
+      }),
+    ).toMatchObject({
+      action: 'agent',
+      trigger: 'active-thread',
+      replyMode: 'new-topic',
+      allowSilentEmptyReply: false,
+    })
+  })
 })

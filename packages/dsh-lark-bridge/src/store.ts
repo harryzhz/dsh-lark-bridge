@@ -525,6 +525,17 @@ export class LarkBridgeStore {
     this.persist()
   }
 
+  markBindingReplied(routeKey: string, now = Date.now()): void {
+    const existing = this.bindings.get(routeKey)
+    if (!existing) return
+    this.bindings.set(routeKey, { ...existing, hasReplied: true, lastActivityMs: now })
+    const ms = this.managedSessions.get(existing.sessionId)
+    if (ms && !ms.archivedAtMs) {
+      this.managedSessions.set(existing.sessionId, { ...ms, lastActivityMs: now })
+    }
+    this.persist()
+  }
+
   deleteBinding(routeKey: string): LarkSessionBinding | undefined {
     const existing = this.bindings.get(routeKey)
     if (!existing) return undefined

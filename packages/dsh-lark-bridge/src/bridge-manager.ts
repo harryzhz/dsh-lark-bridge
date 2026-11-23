@@ -119,6 +119,7 @@ export class LarkBridgeManager {
   private readonly directoryEnricher: LarkDirectoryEnricher
   private readonly transports = new Map<string, ManagedTransport>()
   private readonly handles = new Map<string, AgentHandle>()
+  private readonly inFlightTurns = new Map<string, number>()
   private readonly dedup = new MessageDeduplicator()
   private readonly workspaces: WorkspaceGrouping
   private readonly disposers: Array<() => void> = []
@@ -1075,6 +1076,7 @@ export class LarkBridgeManager {
       ...(knownChatName ? { chatName: knownChatName } : {}),
       hasActiveSessionForRoute: (routeKey) => Boolean(this.store.getBinding(routeKey)),
       getRouteTrigger: (routeKey) => this.store.getBinding(routeKey)?.trigger,
+      hasRouteReplied: (routeKey) => this.store.getBinding(routeKey)?.hasReplied !== false,
     })
     const decision =
       rawDecision.action !== 'ignore'
@@ -1160,9 +1162,12 @@ export class LarkBridgeManager {
 
     const reaction = decision.receivedReactionEmoji
     const reactionId = reaction ? await transport.addReaction(msg.messageId, reaction) : undefined
+    let trackedSessionId: string | undefined
 
     try {
       const acquired = await this.acquireAgent(bot, msg, decision)
+      trackedSessionId = acquired.sessionId
+      this.inFlightTurns.set(trackedSessionId, (this.inFlightTurns.get(trackedSessionId) ?? 0) + 1)
       this.ensureCleanSessionTitle(acquired.agent.session, msg, decision, acquired.isNew)
 
       this.store.recordEvent({
@@ -1193,6 +1198,7 @@ export class LarkBridgeManager {
               onIntermediate: async (stepText) => {
                 await this.deliverIntermediateReply(bot, transport, msg, decision, stepText)
                 intermediateSentCount += 1
+                this.store.markBindingReplied(decision.routeKey)
               },
             }
           : undefined,
@@ -1220,6 +1226,7 @@ export class LarkBridgeManager {
         if (hasFinalText || intermediateSentCount === 0) {
           await this.deliverReply(bot, transport, msg, decision, acquired.sessionId, replyText, groupConfig)
         }
+        this.store.markBindingReplied(decision.routeKey)
         this.store.recordMetric({ botId: bot.id, chatId: msg.chatId, ...chatName, kind: 'replied', latencyMs })
         this.store.recordEvent({
           botId: bot.id,
@@ -1235,14 +1242,23 @@ export class LarkBridgeManager {
         })
       }
 
-      if (acquired.disposeAfter || decision.autoCloseAfterCompletion) {
+      const otherTurnsInFlight = (this.inFlightTurns.get(acquired.sessionId) ?? 1) > 1
+      const currentBinding = this.store.getBinding(decision.routeKey)
+      const isNeverRepliedListener =
+        isSilentSkip &&
+        decision.trigger === 'listener' &&
+        (acquired.isNew || currentBinding?.hasReplied === false)
+      if (
+        !otherTurnsInFlight &&
+        (acquired.disposeAfter || decision.autoCloseAfterCompletion || isNeverRepliedListener)
+      ) {
         const handle = this.handles.get(decision.routeKey)
+        this.handles.delete(decision.routeKey)
+        this.store.deleteBinding(decision.routeKey)
         if (handle) {
-          this.handles.delete(decision.routeKey)
           await handle.dispose().catch(() => {})
         }
-        this.store.deleteBinding(decision.routeKey)
-        if (isSilentSkip && acquired.isNew) {
+        if (isSilentSkip && (acquired.isNew || isNeverRepliedListener)) {
           await this.archiveManagedSession(acquired.sessionId)
         }
       }
@@ -1266,6 +1282,14 @@ export class LarkBridgeManager {
         })
         .catch(() => {})
     } finally {
+      if (trackedSessionId) {
+        const nextCount = (this.inFlightTurns.get(trackedSessionId) ?? 1) - 1
+        if (nextCount <= 0) {
+          this.inFlightTurns.delete(trackedSessionId)
+        } else {
+          this.inFlightTurns.set(trackedSessionId, nextCount)
+        }
+      }
       if (reactionId) await transport.removeReaction(msg.messageId, reactionId)
     }
   }
@@ -1581,6 +1605,7 @@ export class LarkBridgeManager {
       workingDir,
       trigger: decision.trigger,
       ...(decision.listenerName ? { listenerName: decision.listenerName } : {}),
+      hasReplied: decision.trigger !== 'listener',
       createdAtMs: now,
       lastActivityMs: now,
       ...(decision.idleCloseMs ? { idleCloseMs: decision.idleCloseMs } : {}),

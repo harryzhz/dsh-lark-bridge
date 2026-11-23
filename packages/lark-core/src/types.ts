@@ -606,6 +606,7 @@ export interface RoutingRuntimeContext {
   readonly chatName?: string
   readonly hasActiveSessionForRoute: (routeKey: string) => boolean
   readonly getRouteTrigger?: (routeKey: string) => string | undefined
+  readonly hasRouteReplied?: (routeKey: string) => boolean
 }
 
 export interface LarkBotStatus {
