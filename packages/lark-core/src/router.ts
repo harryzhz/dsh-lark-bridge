@@ -427,7 +427,7 @@ export function decideLarkRouting(
       ? resolveEffectiveWorkspaceName(bot, group)
       : resolveEffectiveWorkspaceName(bot)
   const effectiveRuntime = resolveEffectiveAgentRuntime(bot, group)
-  const { agentPreset, model, reasoningEffort } = effectiveRuntime
+  const { agentPreset, runtimeProfileId, model, reasoningEffort } = effectiveRuntime
   const useCard = resolveUseCard(bot, group)
   const sendIntermediateMessages = resolveSendIntermediateMessages(bot, group)
   const receivedReactionEmoji = resolveEffectiveReactionEmoji(bot, group)
@@ -462,6 +462,7 @@ export function decideLarkRouting(
       workingDir,
       workspaceName,
       agentPreset,
+      ...(runtimeProfileId ? { runtimeProfileId } : {}),
       ...(model ? { model } : {}),
       ...(reasoningEffort ? { reasoningEffort } : {}),
       sessionMode: bot.p2pSessionMode,
@@ -517,6 +518,7 @@ export function decideLarkRouting(
       workspaceName,
       ...(resolvedChatName ? { chatName: resolvedChatName } : {}),
       agentPreset,
+      ...(runtimeProfileId ? { runtimeProfileId } : {}),
       ...(model ? { model } : {}),
       ...(reasoningEffort ? { reasoningEffort } : {}),
       sessionMode: groupSessionMode,
@@ -577,6 +579,7 @@ export function decideLarkRouting(
       workspaceName,
       ...(resolvedChatName ? { chatName: resolvedChatName } : {}),
       agentPreset,
+      ...(runtimeProfileId ? { runtimeProfileId } : {}),
       ...(model ? { model } : {}),
       ...(reasoningEffort ? { reasoningEffort } : {}),
       sessionMode: 'thread',
@@ -614,6 +617,7 @@ export function decideLarkRouting(
         workspaceName,
         ...(resolvedChatName ? { chatName: resolvedChatName } : {}),
         agentPreset,
+        ...(runtimeProfileId ? { runtimeProfileId } : {}),
         ...(model ? { model } : {}),
         ...(reasoningEffort ? { reasoningEffort } : {}),
         sessionMode: effectiveSubSessionMode,
@@ -651,6 +655,7 @@ export function decideLarkRouting(
       workspaceName,
       ...(resolvedChatName ? { chatName: resolvedChatName } : {}),
       agentPreset,
+      ...(runtimeProfileId ? { runtimeProfileId } : {}),
       ...(model ? { model } : {}),
       ...(reasoningEffort ? { reasoningEffort } : {}),
       sessionMode: listener.sessionMode,

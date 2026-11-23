@@ -87,7 +87,7 @@ export function normalizeModelAndEffort(
   let reasoningEffort = rawEffort?.trim() ?? ''
 
   if (model && catalog.length > 0 && !catalog.some((m) => m.id === model)) {
-    const match = /^(.*)-(low|medium|high|xhigh|max|ultra)$/i.exec(model)
+    const match = /^(.*)-(none|minimal|low|medium|high|xhigh|max|ultra)$/i.exec(model)
     if (match && catalog.some((m) => m.id === match[1])) {
       model = match[1]!
       if (!reasoningEffort) reasoningEffort = match[2]!.toLowerCase()
@@ -107,11 +107,25 @@ export function normalizeModelAndEffort(
   return { model, reasoningEffort }
 }
 
+export function resolveRuntimeProfileDisplayName(
+  agentPreset: string,
+  runtimeProfileId: string | undefined,
+  runtimes: readonly RuntimeOption[],
+): string {
+  const cleanId = runtimeProfileId?.trim() ?? ''
+  if (!cleanId) return ''
+  const runtime = runtimes.find((r) => r.id === agentPreset)
+  return runtime?.profiles?.find((p) => p.id === cleanId)?.name ?? cleanId
+}
+
 export function resolveRuntimeDisplayName(
   agentPreset: string,
   runtimes: readonly RuntimeOption[],
+  runtimeProfileId?: string,
 ): string {
-  return runtimes.find((r) => r.id === agentPreset)?.name ?? agentPreset
+  const baseName = runtimes.find((r) => r.id === agentPreset)?.name ?? agentPreset
+  const profileLabel = resolveRuntimeProfileDisplayName(agentPreset, runtimeProfileId, runtimes)
+  return profileLabel ? `${baseName} (${profileLabel})` : baseName
 }
 
 /**
@@ -147,10 +161,14 @@ export function formatRuntimeSummary(
   reasoningEffort: string | undefined,
   runtimes: readonly RuntimeOption[],
   models: readonly ModelGroup[],
+  runtimeProfileId?: string,
 ): string {
   const runtime = runtimes.find((r) => r.id === agentPreset)
-  const normalized = normalizeModelAndEffort(runtime, models, model, reasoningEffort)
-  const runtimeLabel = resolveRuntimeDisplayName(agentPreset, runtimes)
+  const hasProfile = Boolean(runtimeProfileId?.trim())
+  const normalized = hasProfile
+    ? { model: model?.trim() ?? '', reasoningEffort: reasoningEffort?.trim() ?? '' }
+    : normalizeModelAndEffort(runtime, models, model, reasoningEffort)
+  const runtimeLabel = resolveRuntimeDisplayName(agentPreset, runtimes, runtimeProfileId)
   const modelLabel = resolveModelDisplayName(agentPreset, normalized.model, runtimes, models)
   const effortLabel = effortDisplayLabel(normalized.reasoningEffort)
   return [runtimeLabel, modelLabel, effortLabel].filter(Boolean).join(' · ')

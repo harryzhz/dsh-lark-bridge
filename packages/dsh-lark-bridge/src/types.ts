@@ -1,4 +1,5 @@
 import type {
+  GroupReplyMode,
   LarkBotStatus,
   LarkGroupConfig,
   ListenerTemplate,
@@ -66,6 +67,7 @@ export interface LarkSessionBinding {
   readonly workspaceName: string
   readonly sessionId: string
   readonly agentPreset: string
+  readonly runtimeProfileId?: string
   readonly model?: string
   readonly reasoningEffort?: string
   readonly workingDir: string
@@ -89,6 +91,21 @@ export interface LarkManagedSession {
   readonly archivedAtMs?: number
 }
 
+export interface LarkPendingTurn {
+  readonly id: string
+  readonly botId: string
+  readonly chatId: string
+  readonly chatName?: string
+  readonly messageId: string
+  readonly routeKey: string
+  readonly replyMode: GroupReplyMode
+  readonly trigger: string
+  readonly allowSilentEmptyReply: boolean
+  readonly reactionId?: string
+  readonly sessionId?: string
+  readonly startedAtMs: number
+}
+
 export interface LarkDreamRunState {
   readonly botId: string
   readonly status: 'idle' | 'running' | 'succeeded' | 'skipped' | 'failed'
@@ -107,6 +124,7 @@ export interface LarkDreamSession {
   readonly workspaceName: string
   readonly workingDir: string
   readonly agentPreset: string
+  readonly runtimeProfileId?: string
   readonly model?: string
   readonly status: 'running' | 'succeeded' | 'failed'
   readonly dateKey: string
@@ -186,6 +204,7 @@ export interface LarkGroupView {
   readonly effectiveWorkingDir: string
   readonly runtimeSource: 'bot' | 'group'
   readonly effectiveAgentPreset: string
+  readonly effectiveRuntimeProfileId?: string
   readonly effectiveModel?: string
   readonly effectiveReasoningEffort?: string
   readonly activeSessionCount: number
@@ -265,6 +284,7 @@ export interface LarkCockpitPayload {
   readonly botRows: readonly (LarkBotStatus & {
     readonly workspaceName: string
     readonly agentPreset: string
+    readonly runtimeProfileId?: string
     readonly model?: string
     readonly inboundTotal: number
     readonly repliedTotal: number

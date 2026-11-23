@@ -129,7 +129,7 @@ export function SessionsView({
           {visibleSessions.map((row) => {
             if (row.kind === 'chat') {
               const b = row.binding
-              const runtimeLabel = resolveRuntimeDisplayName(b.agentPreset, runtimes)
+              const runtimeLabel = resolveRuntimeDisplayName(b.agentPreset, runtimes, b.runtimeProfileId)
               return (
                 <div key={`chat:${b.routeKey}`} className="fb-item">
                   <div className="fb-item-main">
@@ -168,7 +168,7 @@ export function SessionsView({
             }
 
             const s = row.dream
-            const runtimeLabel = resolveRuntimeDisplayName(s.agentPreset, runtimes)
+            const runtimeLabel = resolveRuntimeDisplayName(s.agentPreset, runtimes, s.runtimeProfileId)
             const modelLabel = resolveModelDisplayName(s.agentPreset, s.model, runtimes, models)
             const dotState =
               s.status === 'running' ? 'ongoing' : s.status === 'failed' ? 'error' : 'done'

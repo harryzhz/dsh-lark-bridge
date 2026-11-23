@@ -54,6 +54,7 @@ const POLL_MS = 6000
 export function useBridgeData(): BridgeData & {
   refresh: () => Promise<void>
   refreshAuth: () => Promise<void>
+  refreshRuntimes: () => Promise<void>
   error: string
 } {
   const [data, setData] = useState<BridgeData>(EMPTY)
@@ -63,6 +64,23 @@ export function useBridgeData(): BridgeData & {
     try {
       const auth = await bridgeApi.authStatus()
       setData((prev) => ({ ...prev, auth }))
+    } catch {
+      // Non-fatal.
+    }
+  }, [])
+
+  const refreshRuntimes = useCallback(async () => {
+    try {
+      const [catalog, models] = await Promise.all([
+        bridgeApi.runtimeCatalog(),
+        bridgeApi.models(),
+      ])
+      updateSessionFilterRuntimes(catalog.runtimes, catalog.exposedPresets)
+      setData((prev) => ({
+        ...prev,
+        runtimes: catalog.runtimes,
+        models,
+      }))
     } catch {
       // Non-fatal.
     }
@@ -103,22 +121,20 @@ export function useBridgeData(): BridgeData & {
   useEffect(() => {
     void refresh()
     void refreshAuth()
-    void Promise.all([bridgeApi.runtimes(), bridgeApi.models(), bridgeApi.listenerTemplates()])
-      .then(([runtimes, models, listenerTemplates]) => {
-        updateSessionFilterRuntimes(runtimes)
-        setData((prev) => ({
-          ...prev,
-          runtimes,
-          models,
-          ...(listenerTemplates.length ? { listenerTemplates } : {}),
-        }))
+    void refreshRuntimes()
+    void bridgeApi
+      .listenerTemplates()
+      .then((listenerTemplates) => {
+        if (listenerTemplates.length) {
+          setData((prev) => ({ ...prev, listenerTemplates }))
+        }
       })
       .catch(() => {})
     const timer = window.setInterval(() => void refresh(), POLL_MS)
     return () => window.clearInterval(timer)
-  }, [refresh, refreshAuth])
+  }, [refresh, refreshAuth, refreshRuntimes])
 
-  return { ...data, refresh, refreshAuth, error }
+  return { ...data, refresh, refreshAuth, refreshRuntimes, error }
 }
 
 export function formatDuration(ms: number): string {

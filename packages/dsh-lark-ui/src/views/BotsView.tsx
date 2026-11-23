@@ -30,7 +30,7 @@ export function BotsView({
     <div className="fb-card fb-list">
       {bots.map((bot) => {
         const connected = Boolean(bot.status?.connected)
-        const runtime = resolveRuntimeDisplayName(bot.agentPreset, runtimes)
+        const runtime = resolveRuntimeDisplayName(bot.agentPreset, runtimes, bot.runtimeProfileId)
         const modelLabel = resolveModelDisplayName(bot.agentPreset, bot.model, runtimes, models)
         const avatarUrl = bot.avatarUrl || bot.status?.avatarUrl
         const dreamEnabled = Boolean(bot.experimental?.dreaming?.enabled)

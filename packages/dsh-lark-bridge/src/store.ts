@@ -29,6 +29,7 @@ import type {
   LarkGroupView,
   LarkHourlyBucket,
   LarkManagedSession,
+  LarkPendingTurn,
   LarkScheduleBinding,
   LarkScheduleDeliveryMode,
   LarkScheduleNotifyOn,
@@ -81,6 +82,7 @@ interface PersistedStateV3 {
   readonly dreamStates?: LarkDreamRunState[]
   readonly dreamSessions?: LarkDreamSession[]
   readonly reminders?: LarkReminderItem[]
+  readonly pendingTurns?: LarkPendingTurn[]
   readonly listenerTemplates: ListenerTemplate[]
   readonly scheduleBindings: LarkScheduleBinding[]
   readonly hourlyBuckets: LarkHourlyBucket[]
@@ -145,6 +147,7 @@ export class LarkBridgeStore {
   private readonly dreamStates = new Map<string, LarkDreamRunState>()
   private readonly dreamSessions = new Map<string, LarkDreamSession>()
   private readonly reminders = new Map<string, LarkReminderItem>()
+  private readonly pendingTurns = new Map<string, LarkPendingTurn>()
   private readonly listenerTemplates = new Map<string, ListenerTemplate>()
   private readonly scheduleBindings = new Map<string, LarkScheduleBinding>()
   private readonly hourlyBuckets = new Map<string, LarkHourlyBucket>()
@@ -255,6 +258,9 @@ export class LarkBridgeStore {
     }
     for (const [remId, rem] of this.reminders) {
       if (rem.origin.botId === id) this.reminders.delete(remId)
+    }
+    for (const [turnId, turn] of this.pendingTurns) {
+      if (turn.botId === id) this.pendingTurns.delete(turnId)
     }
     this.persist()
     return true
@@ -411,6 +417,9 @@ export class LarkBridgeStore {
         effectiveWorkingDir: resolveEffectiveWorkingDir(bot, fullConfig),
         runtimeSource: effectiveRuntime.source,
         effectiveAgentPreset: effectiveRuntime.agentPreset,
+        ...(effectiveRuntime.runtimeProfileId
+          ? { effectiveRuntimeProfileId: effectiveRuntime.runtimeProfileId }
+          : {}),
         ...(effectiveRuntime.model ? { effectiveModel: effectiveRuntime.model } : {}),
         ...(effectiveRuntime.reasoningEffort
           ? { effectiveReasoningEffort: effectiveRuntime.reasoningEffort }
@@ -844,6 +853,22 @@ export class LarkBridgeStore {
     return existed
   }
 
+  listPendingTurns(): LarkPendingTurn[] {
+    return [...this.pendingTurns.values()]
+  }
+
+  upsertPendingTurn(turn: LarkPendingTurn): LarkPendingTurn {
+    this.pendingTurns.set(turn.id, turn)
+    this.persist()
+    return turn
+  }
+
+  deletePendingTurn(id: string): boolean {
+    const existed = this.pendingTurns.delete(id)
+    if (existed) this.persist()
+    return existed
+  }
+
   resolveChatName(botId: string, chatId: string): string | undefined {
     const key = buildGroupKey(botId, chatId)
     return this.groups.get(key)?.chatName || this.discoveredChats.get(key)?.name
@@ -1042,6 +1067,7 @@ export class LarkBridgeStore {
         ...(avatarUrl ? { avatarUrl } : {}),
         workspaceName: bot ? this.resolveBotWorkspaceName(bot) : st.name,
         agentPreset: bot?.agentPreset ?? 'codex',
+        ...(bot?.runtimeProfileId ? { runtimeProfileId: bot.runtimeProfileId } : {}),
         ...(bot?.model ? { model: bot.model } : {}),
         inboundTotal: bm?.inboundTotal ?? 0,
         repliedTotal: bm?.repliedTotal ?? 0,
@@ -1283,6 +1309,38 @@ export class LarkBridgeStore {
         }
       }
 
+      if (Array.isArray(raw.pendingTurns)) {
+        for (const item of raw.pendingTurns as Partial<LarkPendingTurn>[]) {
+          if (
+            !item?.id ||
+            !item.botId ||
+            !item.chatId ||
+            !item.messageId ||
+            !item.routeKey
+          ) {
+            continue
+          }
+          const replyMode =
+            item.replyMode === 'chat' || item.replyMode === 'reply' || item.replyMode === 'new-topic'
+              ? item.replyMode
+              : 'new-topic'
+          this.pendingTurns.set(item.id, {
+            id: item.id,
+            botId: item.botId,
+            chatId: item.chatId,
+            ...(item.chatName ? { chatName: item.chatName } : {}),
+            messageId: item.messageId,
+            routeKey: item.routeKey,
+            replyMode,
+            trigger: item.trigger ?? 'mention',
+            allowSilentEmptyReply: Boolean(item.allowSilentEmptyReply),
+            ...(item.reactionId ? { reactionId: item.reactionId } : {}),
+            ...(item.sessionId ? { sessionId: item.sessionId } : {}),
+            startedAtMs: typeof item.startedAtMs === 'number' ? item.startedAtMs : Date.now(),
+          })
+        }
+      }
+
       if (Array.isArray(raw.bindings)) {
         for (const b of raw.bindings as Array<Partial<LarkSessionBinding> & { workspaceGroupName?: string }>) {
           if (!b?.routeKey || !b?.sessionId || !b?.botId || !b?.chatId) continue
@@ -1460,6 +1518,7 @@ export class LarkBridgeStore {
       dreamStates: [...this.dreamStates.values()],
       dreamSessions: [...this.dreamSessions.values()],
       reminders: [...this.reminders.values()],
+      pendingTurns: [...this.pendingTurns.values()],
       listenerTemplates: this.listListenerTemplates(),
       scheduleBindings: [...this.scheduleBindings.values()],
       hourlyBuckets: [...this.hourlyBuckets.values()],

@@ -58,6 +58,7 @@ import {
   normalizeModelAndEffort,
   reactionOptions,
 } from './options.js'
+import { RuntimeProfilePanel } from './RuntimeProfileDialog.js'
 import { UserSearchPicker } from './UserSearchPicker.js'
 
 type Section = 'basic' | 'runtime' | 'conversation' | 'role' | 'access' | 'experimental'
@@ -99,6 +100,7 @@ export function newBotConfig(
     avatarUrl: '',
     description: '',
     agentPreset: defaultRuntime?.id ?? 'standard',
+    runtimeProfileId: '',
     model: effectiveDefaultModel(defaultRuntime, models),
     reasoningEffort: '',
     defaultWorkingDir: '~',
@@ -190,6 +192,7 @@ export function BotConfigDialog({
   onAutoCreated,
   onExistingImported,
   onRefresh,
+  onProfilesChanged,
   onAuthUpdated,
   onOpenAuth,
   onOpenSession,
@@ -204,6 +207,7 @@ export function BotConfigDialog({
   onAutoCreated: () => Promise<void>
   onExistingImported: (botName: string) => Promise<void>
   onRefresh: () => Promise<void>
+  onProfilesChanged?: () => Promise<void>
   onAuthUpdated: () => Promise<void>
   onOpenAuth: () => void
   onOpenSession?: (sessionId: string) => void
@@ -220,6 +224,7 @@ export function BotConfigDialog({
         onSave={onSave}
         onAutoCreated={onAutoCreated}
         onExistingImported={onExistingImported}
+        onProfilesChanged={onProfilesChanged}
         onAuthUpdated={onAuthUpdated}
       />
     )
@@ -233,6 +238,7 @@ export function BotConfigDialog({
       onClose={onClose}
       onSave={onSave}
       onSynced={onRefresh}
+      onProfilesChanged={onProfilesChanged}
       onOpenAuth={onOpenAuth}
       onOpenSession={onOpenSession}
     />
@@ -336,6 +342,7 @@ function CreateBotDialog({
   onSave,
   onAutoCreated,
   onExistingImported,
+  onProfilesChanged,
   onAuthUpdated,
 }: {
   bots: readonly BotRecord[]
@@ -346,6 +353,7 @@ function CreateBotDialog({
   onSave: (config: BotConfig, existingId: string | null) => Promise<void>
   onAutoCreated: () => Promise<void>
   onExistingImported: (botName: string) => Promise<void>
+  onProfilesChanged?: () => Promise<void>
   onAuthUpdated: () => Promise<void>
 }) {
   const [createMode, setCreateMode] = useState<'auto' | 'existing'>('auto')
@@ -358,12 +366,15 @@ function CreateBotDialog({
   const [autoJob, setAutoJob] = useState<QrJobView | null>(null)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
+  const [profileView, setProfileView] = useState<{ runtimeId: string; initialProfileId?: string } | null>(null)
+  const [profileRevision, setProfileRevision] = useState(0)
 
   const opAuth = auth?.openPlatform
   const isOpAuthenticated = Boolean(opAuth?.authenticated)
   const opState = useOpenPlatformAppsState(isOpAuthenticated, onAuthUpdated)
   const patch = (p: Partial<BotConfig>) => setDraft((prev) => ({ ...prev, ...p }))
   const runtime = runtimes.find((r) => r.id === draft.agentPreset)
+  const profileViewRuntime = profileView ? runtimes.find((r) => r.id === profileView.runtimeId) : undefined
 
   useEffect(() => {
     if (runtimeTouchedRef.current || runtimes.length === 0) return
@@ -424,7 +435,10 @@ function CreateBotDialog({
 
   const handlePrimarySubmit = async () => {
     setError('')
-    const norm = normalizeModelAndEffort(runtime, models, draft.model, draft.reasoningEffort)
+    const hasProfile = Boolean(draft.runtimeProfileId?.trim())
+    const norm = hasProfile
+      ? { model: draft.model?.trim() ?? '', reasoningEffort: draft.reasoningEffort?.trim() ?? '' }
+      : normalizeModelAndEffort(runtime, models, draft.model, draft.reasoningEffort)
     if (createMode === 'auto') {
       if (!draft.name.trim() || !draft.defaultWorkingDir.trim()) {
         setError('请填写智能体名称与工作目录')
@@ -440,6 +454,7 @@ function CreateBotDialog({
           workspaceName: draft.workspaceName.trim(),
           defaultWorkingDir: draft.defaultWorkingDir.trim(),
           agentPreset: draft.agentPreset,
+          ...(draft.runtimeProfileId?.trim() ? { runtimeProfileId: draft.runtimeProfileId.trim() } : {}),
           ...(norm.model ? { model: norm.model } : {}),
           ...(norm.reasoningEffort ? { reasoningEffort: norm.reasoningEffort } : {}),
         })
@@ -468,6 +483,7 @@ function CreateBotDialog({
           workspaceName: draft.workspaceName.trim(),
           defaultWorkingDir: draft.defaultWorkingDir.trim(),
           agentPreset: draft.agentPreset,
+          ...(draft.runtimeProfileId?.trim() ? { runtimeProfileId: draft.runtimeProfileId.trim() } : {}),
           ...(norm.model ? { model: norm.model } : {}),
           ...(norm.reasoningEffort ? { reasoningEffort: norm.reasoningEffort } : {}),
         })
@@ -497,6 +513,7 @@ function CreateBotDialog({
         {
           ...draft,
           id: resolvedId,
+          runtimeProfileId: draft.runtimeProfileId?.trim() || undefined,
           model: norm.model || undefined,
           reasoningEffort: norm.reasoningEffort || undefined,
         },
@@ -532,11 +549,43 @@ function CreateBotDialog({
     <Modal
       open
       onClose={onClose}
-      title="新增智能体"
+      title={profileViewRuntime ? `${profileViewRuntime.name} 启动配置` : '新增智能体'}
       headless
-      className="fb-schedule-dialog fb-create-bot-dialog"
+      className={profileViewRuntime ? 'fb-dialog' : 'fb-schedule-dialog fb-create-bot-dialog'}
+      onKeyDownCapture={
+        profileViewRuntime
+          ? (event) => {
+              if (event.key === 'Escape' && !event.shiftKey && !event.defaultPrevented) {
+                event.preventDefault()
+                event.stopPropagation()
+                setProfileView(null)
+              }
+            }
+          : undefined
+      }
     >
-      <div className="fb-schedule-dialog-head">
+      {profileViewRuntime ? (
+        <RuntimeProfilePanel
+          runtime={profileViewRuntime}
+          initialProfileId={profileView?.initialProfileId}
+          backLabel="新增智能体"
+          onBack={() => setProfileView(null)}
+          onClose={onClose}
+          onChanged={async (nextProfileId) => {
+            setProfileRevision((v) => v + 1)
+            await onProfilesChanged?.()
+            if (nextProfileId !== undefined) {
+              const changed = nextProfileId !== (draft.runtimeProfileId ?? '')
+              patch({
+                runtimeProfileId: nextProfileId || undefined,
+                ...(changed ? { model: undefined, reasoningEffort: undefined } : {}),
+              })
+            }
+          }}
+        />
+      ) : (
+        <>
+          <div className="fb-schedule-dialog-head">
         <div style={{ minWidth: 0 }}>
           <div className="fb-schedule-dialog-title">新增飞书智能体</div>
           <div className="fb-schedule-dialog-sub">
@@ -677,15 +726,22 @@ function CreateBotDialog({
           runtimeTitle="默认运行时"
           value={{
             agentPreset: draft.agentPreset,
+            runtimeProfileId: draft.runtimeProfileId ?? '',
             model: draft.model ?? '',
             reasoningEffort: draft.reasoningEffort ?? '',
           }}
           runtimes={runtimes}
           models={models}
-          onChange={({ agentPreset, model, reasoningEffort }) => {
+          profileRevision={profileRevision}
+          onProfilesChanged={onProfilesChanged}
+          onManageProfiles={(rt, pid) =>
+            setProfileView({ runtimeId: rt.id, ...(pid ? { initialProfileId: pid } : {}) })
+          }
+          onChange={({ agentPreset, runtimeProfileId, model, reasoningEffort }) => {
             runtimeTouchedRef.current = true
             patch({
               agentPreset,
+              runtimeProfileId: runtimeProfileId?.trim() || undefined,
               model: model || undefined,
               reasoningEffort: reasoningEffort || undefined,
             })
@@ -717,6 +773,8 @@ function CreateBotDialog({
           {primaryLabel}
         </Button>
       </div>
+        </>
+      )}
     </Modal>
   )
 }
@@ -729,6 +787,7 @@ function EditBotDialog({
   onClose,
   onSave,
   onSynced,
+  onProfilesChanged,
   onOpenAuth,
   onOpenSession,
 }: {
@@ -739,6 +798,7 @@ function EditBotDialog({
   onClose: () => void
   onSave: (config: BotConfig, existingId: string | null) => Promise<void>
   onSynced: () => Promise<void>
+  onProfilesChanged?: () => Promise<void>
   onOpenAuth: () => void
   onOpenSession?: (sessionId: string) => void
 }) {
@@ -748,12 +808,15 @@ function EditBotDialog({
   const [saving, setSaving] = useState(false)
   const [syncingProfile, setSyncingProfile] = useState(false)
   const [error, setError] = useState('')
+  const [profileView, setProfileView] = useState<{ runtimeId: string; initialProfileId?: string } | null>(null)
+  const [profileRevision, setProfileRevision] = useState(0)
   const existingId = target.id
 
   useEffect(() => {
     setDraft(toBotConfig(target))
     setLocalDreamState(target.dreamState)
     setSection('basic')
+    setProfileView(null)
     setError('')
 
     if (!target.avatarUrl?.trim() || !target.description?.trim()) {
@@ -790,6 +853,7 @@ function EditBotDialog({
 
   const patch = (p: Partial<BotConfig>) => setDraft({ ...draft, ...p })
   const runtime = runtimes.find((r) => r.id === draft.agentPreset)
+  const profileViewRuntime = profileView ? runtimes.find((r) => r.id === profileView.runtimeId) : undefined
 
   const save = async () => {
     const missing = !draft.id.trim() || !draft.name.trim() || !draft.larkAppId.trim() || !draft.defaultWorkingDir.trim()
@@ -801,12 +865,16 @@ function EditBotDialog({
     setSaving(true)
     setError('')
     try {
-      const norm = normalizeModelAndEffort(runtime, models, draft.model, draft.reasoningEffort)
+      const hasProfile = Boolean(draft.runtimeProfileId?.trim())
+      const norm = hasProfile
+        ? { model: draft.model?.trim() ?? '', reasoningEffort: draft.reasoningEffort?.trim() ?? '' }
+        : normalizeModelAndEffort(runtime, models, draft.model, draft.reasoningEffort)
       const hasSignature = Boolean(draft.signature.trim())
       const showModel = Boolean(draft.replyFooterEnabled && draft.replyFooterModel)
       await onSave(
         {
           ...draft,
+          runtimeProfileId: draft.runtimeProfileId?.trim() || undefined,
           model: norm.model || undefined,
           reasoningEffort: norm.reasoningEffort || undefined,
           replyFooterSignature: hasSignature,
@@ -851,6 +919,34 @@ function EditBotDialog({
       onSave={() => void save()}
       saving={saving}
       error={error}
+      subview={
+        profileViewRuntime
+          ? {
+              title: `${profileViewRuntime.name} 启动配置`,
+              onBack: () => setProfileView(null),
+              content: (
+                <RuntimeProfilePanel
+                  runtime={profileViewRuntime}
+                  initialProfileId={profileView?.initialProfileId}
+                  backLabel="Agent 运行时"
+                  onBack={() => setProfileView(null)}
+                  onClose={onClose}
+                  onChanged={async (nextProfileId) => {
+                    setProfileRevision((v) => v + 1)
+                    await onProfilesChanged?.()
+                    if (nextProfileId !== undefined) {
+                      const changed = nextProfileId !== (draft.runtimeProfileId ?? '')
+                      patch({
+                        runtimeProfileId: nextProfileId || undefined,
+                        ...(changed ? { model: undefined, reasoningEffort: undefined } : {}),
+                      })
+                    }
+                  }}
+                />
+              ),
+            }
+          : null
+      }
     >
       {section === 'basic' && (
         <>
@@ -911,14 +1007,21 @@ function EditBotDialog({
         <AgentRuntimeFields
           value={{
             agentPreset: draft.agentPreset,
+            runtimeProfileId: draft.runtimeProfileId ?? '',
             model: draft.model ?? '',
             reasoningEffort: draft.reasoningEffort ?? '',
           }}
           runtimes={runtimes}
           models={models}
-          onChange={({ agentPreset, model, reasoningEffort }) =>
+          profileRevision={profileRevision}
+          onProfilesChanged={onProfilesChanged}
+          onManageProfiles={(rt, pid) =>
+            setProfileView({ runtimeId: rt.id, ...(pid ? { initialProfileId: pid } : {}) })
+          }
+          onChange={({ agentPreset, runtimeProfileId, model, reasoningEffort }) =>
             patch({
               agentPreset,
+              runtimeProfileId: runtimeProfileId?.trim() || undefined,
               model: model || undefined,
               reasoningEffort: reasoningEffort || undefined,
             })

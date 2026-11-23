@@ -202,6 +202,7 @@ export class DreamingService {
 
       const launch = await this.host.runtimes.resolveAgentLaunch({
         agentPreset: bot.agentPreset,
+        ...(bot.runtimeProfileId ? { runtimeProfileId: bot.runtimeProfileId } : {}),
         ...(bot.provider ? { explicitProvider: bot.provider } : {}),
         ...(bot.model ? { explicitModel: bot.model } : {}),
         ...(bot.reasoningEffort ? { explicitReasoningEffort: bot.reasoningEffort } : {}),
@@ -216,7 +217,7 @@ export class DreamingService {
           ...(launch.reasoningEffort ? { reasoningEffort: launch.reasoningEffort } : {}),
         },
         setup: async (agentCtx, agent) => {
-          await launch.mountPreset(agentCtx)
+          await launch.mountPreset(agentCtx, agent)
           appendPluginRecord(agent.session, LARK_ORIGIN_RECORD_TYPE, {
             botId: bot.id,
             botName: bot.name,
@@ -256,6 +257,7 @@ export class DreamingService {
         workspaceName,
         workingDir,
         agentPreset: bot.agentPreset,
+        ...(bot.runtimeProfileId ? { runtimeProfileId: bot.runtimeProfileId } : {}),
         ...(launch.model ?? bot.model ? { model: launch.model ?? bot.model } : {}),
         status: 'running',
         dateKey,
@@ -304,6 +306,7 @@ export class DreamingService {
         workspaceName,
         workingDir,
         agentPreset: bot.agentPreset,
+        ...(bot.runtimeProfileId ? { runtimeProfileId: bot.runtimeProfileId } : {}),
         ...(launch.model ?? bot.model ? { model: launch.model ?? bot.model } : {}),
         status: 'succeeded',
         dateKey,
@@ -347,6 +350,7 @@ export class DreamingService {
           workspaceName,
           workingDir,
           agentPreset: bot.agentPreset,
+          ...(bot.runtimeProfileId ? { runtimeProfileId: bot.runtimeProfileId } : {}),
           ...(bot.model ? { model: bot.model } : {}),
           status: 'failed',
           dateKey,

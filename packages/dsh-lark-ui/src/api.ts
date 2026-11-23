@@ -4,11 +4,13 @@ import type {
   AutoCreateBotInput,
   BotConfig,
   BotRecord,
+  CatalogModelItem,
   ChatMemberItem,
   CockpitPayload,
   DirectoryBrowseResult,
   DreamRunState,
   DreamSession,
+  ExposedRuntimePreset,
   GroupConfig,
   GroupView,
   ImportExistingBotInput,
@@ -17,7 +19,10 @@ import type {
   OpenPlatformAppsPayload,
   QrJobView,
   ReminderItem,
+  RuntimeCatalogPayload,
   RuntimeOption,
+  RuntimeProfileInput,
+  RuntimeProfileSummary,
   ScheduleBinding,
   ScheduleView,
   SessionBinding,
@@ -114,7 +119,43 @@ export const bridgeApi = {
   deleteDreamSession: (sessionId: string) => del(`/dream-sessions/${seg(sessionId)}`),
   events: async (limit = 120) => (await request<{ events: AuditEvent[] }>(`/events?limit=${limit}`)).events,
   runtimes: async () => (await request<{ runtimes: RuntimeOption[] }>('/runtimes')).runtimes,
+  runtimeCatalog: async (): Promise<RuntimeCatalogPayload> => {
+    const res = await request<{ runtimes?: RuntimeOption[]; exposedPresets?: ExposedRuntimePreset[] }>('/runtimes')
+    return {
+      runtimes: res.runtimes ?? [],
+      exposedPresets: res.exposedPresets ?? [],
+    }
+  },
   models: async () => (await request<{ groups: ModelGroup[] }>('/models')).groups,
+  profileModels: async (runtimeId: string, profileId?: string, refresh = false) => {
+    const params = new URLSearchParams({ runtimeId })
+    if (profileId) params.set('profileId', profileId)
+    if (refresh) params.set('refresh', '1')
+    return (await request<{ models?: CatalogModelItem[] }>(`/models?${params.toString()}`)).models ?? []
+  },
+  runtimeProfiles: async (runtimeId?: string) =>
+    (
+      await request<{ profiles?: RuntimeProfileSummary[] }>(
+        `/runtime-profiles${runtimeId ? `?runtimeId=${seg(runtimeId)}` : ''}`,
+      )
+    ).profiles ?? [],
+  createRuntimeProfile: async (input: RuntimeProfileInput) =>
+    (await post<{ profile: RuntimeProfileSummary }>('/runtime-profiles', input)).profile,
+  updateRuntimeProfile: async (runtimeId: string, profileId: string, input: RuntimeProfileInput) =>
+    (
+      await put<{ profile: RuntimeProfileSummary }>(
+        `/runtime-profiles/${seg(runtimeId)}/${seg(profileId)}`,
+        input,
+      )
+    ).profile,
+  deleteRuntimeProfile: (runtimeId: string, profileId: string) =>
+    del(`/runtime-profiles/${seg(runtimeId)}/${seg(profileId)}`),
+  probeRuntimeProfile: async (runtimeId: string, profileId?: string) =>
+    (
+      await post<{ models?: CatalogModelItem[] }>(
+        `/runtime-profiles/${seg(runtimeId)}/${seg(profileId || '_default')}/probe`,
+      )
+    ).models ?? [],
   listenerTemplates: async () => (await request<{ templates: ListenerTemplate[] }>('/listener-templates')).templates,
   resetListenerTemplates: async () => (await post<{ templates: ListenerTemplate[] }>('/listener-templates')).templates,
 

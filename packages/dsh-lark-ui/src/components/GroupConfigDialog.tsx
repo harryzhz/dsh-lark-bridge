@@ -55,6 +55,7 @@ import {
   normalizeModelAndEffort,
   reactionOptionsWithInherit,
 } from './options.js'
+import { RuntimeProfilePanel } from './RuntimeProfileDialog.js'
 
 type Section = 'basic' | 'runtime' | 'conversation' | 'role' | 'listener'
 
@@ -85,6 +86,7 @@ export function GroupConfigDialog({
   listenerTemplates,
   onClose,
   onSave,
+  onProfilesChanged,
 }: {
   target: GroupView | null
   bots: readonly BotRecord[]
@@ -93,6 +95,7 @@ export function GroupConfigDialog({
   listenerTemplates: readonly ListenerTemplate[]
   onClose: () => void
   onSave: (config: GroupConfig) => Promise<void>
+  onProfilesChanged?: () => Promise<void>
 }) {
   const [section, setSection] = useState<Section>('basic')
   const [draft, setDraft] = useState<GroupConfig | null>(null)
@@ -100,11 +103,14 @@ export function GroupConfigDialog({
   const [loadingMembers, setLoadingMembers] = useState(false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
+  const [profileView, setProfileView] = useState<{ runtimeId: string; initialProfileId?: string } | null>(null)
+  const [profileRevision, setProfileRevision] = useState(0)
 
   useEffect(() => {
     if (!target) return
     setDraft(structuredClone(target.config))
     setSection('basic')
+    setProfileView(null)
     setMembers([])
     setError('')
   }, [target])
@@ -134,20 +140,40 @@ export function GroupConfigDialog({
   const patch = (p: Partial<GroupConfig>) => setDraft({ ...draft, ...p })
   const runtimeMode: 'inherit' | 'override' =
     draft.runtimeMode ??
-    (draft.agentPreset || draft.model || draft.reasoningEffort ? 'override' : 'inherit')
+    (draft.agentPreset || draft.runtimeProfileId || draft.model || draft.reasoningEffort
+      ? 'override'
+      : 'inherit')
   const overridePreset = draft.agentPreset || bot?.agentPreset || runtimes[0]?.id || 'standard'
   const overrideRuntime = runtimes.find((r) => r.id === overridePreset)
+  const profileViewRuntime = profileView ? runtimes.find((r) => r.id === profileView.runtimeId) : undefined
   const inheritedSummary = bot
-    ? formatRuntimeSummary(bot.agentPreset, bot.model, bot.reasoningEffort, runtimes, models)
+    ? formatRuntimeSummary(
+        bot.agentPreset,
+        bot.model,
+        bot.reasoningEffort,
+        runtimes,
+        models,
+        bot.runtimeProfileId,
+      )
     : '跟随智能体默认运行时'
 
   const switchRuntimeMode = (nextMode: 'inherit' | 'override') => {
     if (nextMode === 'inherit') {
-      patch({ runtimeMode: 'inherit', agentPreset: '', model: '', reasoningEffort: '' })
+      patch({
+        runtimeMode: 'inherit',
+        agentPreset: '',
+        runtimeProfileId: '',
+        model: '',
+        reasoningEffort: '',
+      })
       return
     }
     const basePreset = draft.agentPreset || bot?.agentPreset || runtimes.find((r) => r.isDefault)?.id || runtimes[0]?.id || 'standard'
     const baseRuntime = runtimes.find((r) => r.id === basePreset)
+    const baseProfileId =
+      draft.runtimeProfileId ||
+      (basePreset === bot?.agentPreset ? bot?.runtimeProfileId : undefined) ||
+      ''
     const baseModel =
       draft.model ||
       (basePreset === bot?.agentPreset ? bot?.model : undefined) ||
@@ -159,6 +185,7 @@ export function GroupConfigDialog({
     patch({
       runtimeMode: 'override',
       agentPreset: basePreset,
+      runtimeProfileId: baseProfileId,
       model: baseModel,
       reasoningEffort: baseEffort,
     })
@@ -176,21 +203,32 @@ export function GroupConfigDialog({
       const savedDraft =
         runtimeMode === 'override'
           ? (() => {
-              const norm = normalizeModelAndEffort(
-                overrideRuntime,
-                models,
-                draft.model,
-                draft.reasoningEffort,
-              )
+              const hasProfile = Boolean(draft.runtimeProfileId?.trim())
+              const norm = hasProfile
+                ? { model: draft.model.trim(), reasoningEffort: draft.reasoningEffort.trim() }
+                : normalizeModelAndEffort(
+                    overrideRuntime,
+                    models,
+                    draft.model,
+                    draft.reasoningEffort,
+                  )
               return {
                 ...draft,
                 runtimeMode: 'override' as const,
                 agentPreset: overridePreset,
+                runtimeProfileId: draft.runtimeProfileId?.trim() ?? '',
                 model: norm.model,
                 reasoningEffort: norm.reasoningEffort,
               }
             })()
-          : { ...draft, runtimeMode: 'inherit' as const, agentPreset: '', model: '', reasoningEffort: '' }
+          : {
+              ...draft,
+              runtimeMode: 'inherit' as const,
+              agentPreset: '',
+              runtimeProfileId: '',
+              model: '',
+              reasoningEffort: '',
+            }
       await onSave(savedDraft)
       onClose()
     } catch (err) {
@@ -213,6 +251,36 @@ export function GroupConfigDialog({
       onSave={() => void save()}
       saving={saving}
       error={error}
+      subview={
+        profileViewRuntime
+          ? {
+              title: `${profileViewRuntime.name} 启动配置`,
+              onBack: () => setProfileView(null),
+              content: (
+                <RuntimeProfilePanel
+                  runtime={profileViewRuntime}
+                  initialProfileId={profileView?.initialProfileId}
+                  backLabel="Agent 运行时"
+                  onBack={() => setProfileView(null)}
+                  onClose={onClose}
+                  onChanged={async (nextProfileId) => {
+                    setProfileRevision((v) => v + 1)
+                    await onProfilesChanged?.()
+                    if (nextProfileId !== undefined) {
+                      const changed = nextProfileId !== (draft.runtimeProfileId ?? '')
+                      patch({
+                        runtimeMode: 'override',
+                        agentPreset: overridePreset,
+                        runtimeProfileId: nextProfileId,
+                        ...(changed ? { model: '', reasoningEffort: '' } : {}),
+                      })
+                    }
+                  }}
+                />
+              ),
+            }
+          : null
+      }
     >
       {section === 'basic' && (
         <>
@@ -264,15 +332,22 @@ export function GroupConfigDialog({
               <AgentRuntimeFields
                 value={{
                   agentPreset: overridePreset,
+                  runtimeProfileId: draft.runtimeProfileId ?? '',
                   model: draft.model,
                   reasoningEffort: draft.reasoningEffort,
                 }}
                 runtimes={runtimes}
                 models={models}
-                onChange={({ agentPreset, model, reasoningEffort }) =>
+                profileRevision={profileRevision}
+                onProfilesChanged={onProfilesChanged}
+                onManageProfiles={(rt, pid) =>
+                  setProfileView({ runtimeId: rt.id, ...(pid ? { initialProfileId: pid } : {}) })
+                }
+                onChange={({ agentPreset, runtimeProfileId, model, reasoningEffort }) =>
                   patch({
                     runtimeMode: 'override',
                     agentPreset,
+                    runtimeProfileId: runtimeProfileId?.trim() ?? '',
                     model,
                     reasoningEffort,
                   })
@@ -555,15 +630,19 @@ function GroupConversationAndMessageSection({
             else patch({ idleCloseMinutes: bot.idleCloseMinutes > 0 ? bot.idleCloseMinutes : 720 })
           }}
         />
-        {idleMode === 'custom' && (
-          <NumberField
-            value={draft.idleCloseMinutes ?? 720}
-            min={1}
-            onChange={(mins) => patch({ idleCloseMinutes: Math.max(1, mins) })}
-            suffix="分钟"
-          />
-        )}
       </SettingRow>
+      {idleMode === 'custom' && (
+        <NestedSettings>
+          <SettingRow title="归档时长">
+            <NumberField
+              value={draft.idleCloseMinutes ?? 720}
+              min={1}
+              onChange={(mins) => patch({ idleCloseMinutes: Math.max(1, mins) })}
+              suffix="分钟"
+            />
+          </SettingRow>
+        </NestedSettings>
+      )}
 
       <GroupTitle>回复与反馈</GroupTitle>
       <SettingRow title="回复方式">

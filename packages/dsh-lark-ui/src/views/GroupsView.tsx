@@ -63,9 +63,14 @@ export function GroupsView({
           const cfg = g.config
           const bot = bots.find((b) => b.id === g.botId)
           const effectivePreset = g.effectiveAgentPreset || cfg.agentPreset || bot?.agentPreset || ''
+          const effectiveProfileId =
+            g.effectiveRuntimeProfileId ??
+            (g.runtimeSource === 'group' ? cfg.runtimeProfileId || undefined : bot?.runtimeProfileId)
           const effectiveModel =
             g.effectiveModel ?? (g.runtimeSource === 'group' ? cfg.model || undefined : bot?.model)
-          const runtimeLabel = effectivePreset ? resolveRuntimeDisplayName(effectivePreset, runtimes) : ''
+          const runtimeLabel = effectivePreset
+            ? resolveRuntimeDisplayName(effectivePreset, runtimes, effectiveProfileId)
+            : ''
           const modelLabel = effectivePreset
             ? resolveModelDisplayName(effectivePreset, effectiveModel, runtimes, models)
             : ''

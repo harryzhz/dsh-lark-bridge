@@ -515,6 +515,7 @@ export class ProactiveReminderService {
 
       const launch = await this.host.runtimes.resolveAgentLaunch({
         agentPreset: runtime.agentPreset,
+        ...(runtime.runtimeProfileId ? { runtimeProfileId: runtime.runtimeProfileId } : {}),
         ...(runtime.provider ? { explicitProvider: runtime.provider } : {}),
         ...(runtime.model ? { explicitModel: runtime.model } : {}),
         ...(runtime.reasoningEffort ? { explicitReasoningEffort: runtime.reasoningEffort } : {}),
@@ -529,7 +530,7 @@ export class ProactiveReminderService {
           ...(launch.reasoningEffort ? { reasoningEffort: launch.reasoningEffort } : {}),
         },
         setup: async (agentCtx, agent) => {
-          await launch.mountPreset(agentCtx)
+          await launch.mountPreset(agentCtx, agent)
           appendPluginRecord(agent.session, LARK_ORIGIN_RECORD_TYPE, {
             botId: bot.id,
             botName: bot.name,

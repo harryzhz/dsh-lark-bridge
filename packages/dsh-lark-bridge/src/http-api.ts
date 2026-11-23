@@ -9,6 +9,7 @@ import {
   createHostSubdirectory,
 } from './fs-browser.js'
 import type { CreateReminderInput, UpdateReminderInput } from './reminder-service.js'
+import type { RuntimeProfileInput } from './runtime-catalog.js'
 import type { ScheduleCreateInputLike } from './schedule-notifier.js'
 import {
   LARK_SESSION_OPEN_PATH,
@@ -708,12 +709,112 @@ export async function dispatchLarkApiRequest(
       }
     }
 
+    // ── Runtime Profiles (Owner Web/Desktop session strictly required) ────
+    if (segments[0] === 'runtime-profiles') {
+      if (principalKind !== 'owner' || isCliAuthenticated) {
+        return ok({ ok: false, error: 'owner_web_session_required' }, 403)
+      }
+      if (method === 'GET' && segments.length === 1) {
+        const runtimeId = url.searchParams.get('runtimeId')?.trim() || undefined
+        return ok({
+          ok: true,
+          supported: manager.runtimes.supportsProfiles(),
+          profiles: manager.runtimes.listProfiles(runtimeId),
+        })
+      }
+      if (method === 'POST' && segments.length === 1) {
+        const body = bodyRecord(request.body) as unknown as Partial<RuntimeProfileInput>
+        if (typeof body.runtimeId !== 'string' || !body.runtimeId.trim()) {
+          return ok({ ok: false, error: 'runtimeId is required' }, 400)
+        }
+        if (typeof body.name !== 'string' || !body.name.trim()) {
+          return ok({ ok: false, error: 'name is required' }, 400)
+        }
+        const profile = await manager.runtimes.upsertProfile({
+          ...body,
+          runtimeId: body.runtimeId.trim(),
+          name: body.name.trim(),
+        })
+        return ok({ ok: true, profile }, 201)
+      }
+      if (segments[1] && segments[2]) {
+        const runtimeId = segments[1]
+        const profileId = segments[2]
+        if (method === 'PUT' && segments.length === 3) {
+          const body = bodyRecord(request.body) as unknown as Partial<RuntimeProfileInput>
+          const existing = manager.runtimes.getProfile(runtimeId, profileId)
+          const resolvedName =
+            typeof body.name === 'string' && body.name.trim()
+              ? body.name.trim()
+              : existing?.name || profileId
+          const profile = await manager.runtimes.upsertProfile({
+            ...body,
+            id: profileId,
+            runtimeId,
+            name: resolvedName,
+          })
+          return ok({ ok: true, profile })
+        }
+        if (method === 'DELETE' && segments.length === 3) {
+          const deleted = await manager.runtimes.deleteProfile(runtimeId, profileId)
+          return ok({ ok: deleted }, deleted ? 200 : 404)
+        }
+        if (method === 'POST' && segments[3] === 'probe' && segments.length === 4) {
+          const targetProfileId = profileId === '_default' ? undefined : profileId
+          const models = await manager.runtimes.probeProfileModels(runtimeId, targetProfileId)
+          const providerId = manager.runtimes.providerFor(runtimeId) ?? ''
+          return ok({
+            ok: true,
+            runtimeId,
+            ...(targetProfileId ? { profileId: targetProfileId } : {}),
+            provider: providerId,
+            models: models.map((m) => ({
+              provider: providerId,
+              id: m.id,
+              name: m.name,
+              ...(m.isDefault ? { isDefault: true } : {}),
+              ...(m.reasoningEfforts !== undefined
+                ? { reasoningEfforts: [...m.reasoningEfforts] }
+                : {}),
+              ...(m.defaultEffort ? { defaultEffort: m.defaultEffort } : {}),
+            })),
+          })
+        }
+      }
+    }
+
     // ── Runtimes & Models ─────────────────────────────────────────────────
     if (method === 'GET' && pathname === 'runtimes') {
-      return ok({ ok: true, runtimes: await manager.runtimes.list() })
+      const runtimes = await manager.runtimes.list()
+      const exposedPresets = manager.runtimes.listExposedPresets()
+      return ok({ ok: true, runtimes, exposedPresets })
     }
 
     if (method === 'GET' && pathname === 'models') {
+      const runtimeId = url.searchParams.get('runtimeId')?.trim() || ''
+      if (runtimeId) {
+        const profileId = url.searchParams.get('profileId')?.trim() || undefined
+        const refresh = url.searchParams.get('refresh') === '1'
+        const meta =
+          (await manager.runtimes.modelsForRuntime(runtimeId, profileId, { force: refresh })) ?? []
+        const providerId = manager.runtimes.providerFor(runtimeId) ?? ''
+        return ok({
+          ok: true,
+          runtimeId,
+          ...(profileId ? { profileId } : {}),
+          provider: providerId,
+          models: meta.map((m) => ({
+            provider: providerId,
+            id: m.id,
+            name: m.name,
+            ...(m.isDefault ? { isDefault: true } : {}),
+            ...(m.reasoningEfforts !== undefined
+              ? { reasoningEfforts: [...m.reasoningEfforts] }
+              : {}),
+            ...(m.defaultEffort ? { defaultEffort: m.defaultEffort } : {}),
+          })),
+        })
+      }
       const providers = ctx.llm.listProviders()
       const groups = await Promise.all(
         providers.map(async (info) => {

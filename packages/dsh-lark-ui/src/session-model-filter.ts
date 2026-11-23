@@ -1,5 +1,5 @@
 import { bridgeApi } from './api.js'
-import type { RuntimeOption } from './types.js'
+import type { ExposedRuntimePreset, RuntimeOption } from './types.js'
 
 export interface DshModelReasoning {
   readonly efforts: ReadonlyArray<{ readonly id: string; readonly name: string }>
@@ -69,13 +69,35 @@ export function getRuntimeTargetsSnapshot(): {
   return { map: runtimeTargets, revision: runtimeTargetsRevision }
 }
 
-export function updateSessionFilterRuntimes(runtimes: readonly RuntimeOption[]): void {
+export function updateSessionFilterRuntimes(
+  runtimes: readonly RuntimeOption[],
+  exposedPresets: readonly ExposedRuntimePreset[] = [],
+): void {
   const next = new Map<string, PresetRuntimeTarget>(Object.entries(BUILTIN_PRESET_TARGETS))
   for (const rt of runtimes) {
     next.set(rt.id, {
       kind: rt.kind,
       ...(rt.providerId ? { providerId: rt.providerId } : {}),
       ...(rt.defaultModel ? { defaultModel: rt.defaultModel } : {}),
+    })
+    for (const profile of rt.profiles ?? []) {
+      if (profile.exposeAsPreset && profile.presetId && profile.providerId) {
+        next.set(profile.presetId, {
+          kind: 'external',
+          providerId: profile.providerId,
+          ...(profile.defaultModel || rt.defaultModel
+            ? { defaultModel: profile.defaultModel || rt.defaultModel }
+            : {}),
+        })
+      }
+    }
+  }
+  for (const exposed of exposedPresets) {
+    if (!exposed.presetId || !exposed.providerId) continue
+    next.set(exposed.presetId, {
+      kind: 'external',
+      providerId: exposed.providerId,
+      ...(exposed.defaultModel ? { defaultModel: exposed.defaultModel } : {}),
     })
   }
   runtimeTargets = next
@@ -336,8 +358,8 @@ export function installSessionModelFilter(scope: {
   effect?: (fn: () => () => void, label?: string) => void
 }): void {
   void bridgeApi
-    .runtimes()
-    .then((list) => updateSessionFilterRuntimes(list))
+    .runtimeCatalog()
+    .then(({ runtimes, exposedPresets }) => updateSessionFilterRuntimes(runtimes, exposedPresets))
     .catch(() => {})
 
   const restorers = new Set<() => void>()

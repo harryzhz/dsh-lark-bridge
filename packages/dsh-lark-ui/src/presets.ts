@@ -93,6 +93,8 @@ export const REMINDER_CREATION_MODES: readonly Choice<ReminderCreationMode>[] = 
 ]
 
 export const REASONING_EFFORTS: readonly Choice<string>[] = [
+  { value: 'none', label: 'None' },
+  { value: 'minimal', label: 'Minimal' },
   { value: 'low', label: 'Low' },
   { value: 'medium', label: 'Medium' },
   { value: 'high', label: 'High' },

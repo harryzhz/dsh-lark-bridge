@@ -40,7 +40,7 @@ const P2P_HELP_TEXT = [
   '/new - 归档当前会话并开启新会话',
   '/close - 关闭并归档当前会话',
   '/cancel - 中断执行中的任务',
-  '/agent <运行时 ID> - 切换智能体默认运行时',
+  '/agent <运行时 ID> [启动配置 ID] - 切换智能体默认运行时或启动配置',
   '/model <模型 ID> - 切换当前会话模型',
 ].join('\n')
 
@@ -55,6 +55,10 @@ const GROUP_HELP_TEXT = [
 
 const GROUP_CONFIG_COMMAND_DENIED_TEXT =
   '安全限制：群聊中禁止通过 /agent 或 /model 修改运行时与模型配置，请在 DSH 控制台或私聊中调整。'
+
+function formatRuntimeWithProfile(presetId: string, profileId?: string): string {
+  return profileId ? `${presetId} (${profileId})` : presetId
+}
 
 export async function handleSlashCommand(host: SlashCommandHost, input: SlashCommandInput): Promise<void> {
   const { bot, command, routeKey, reply } = input
@@ -79,7 +83,7 @@ export async function handleSlashCommand(host: SlashCommandHost, input: SlashCom
           [
             '当前没有活跃会话',
             `工作区：${input.workspaceName}`,
-            `生效运行时：${effective.agentPreset}（${effective.model ?? 'default'}${effective.source === 'group' ? ' · 群独立配置' : ''}）`,
+            `生效运行时：${formatRuntimeWithProfile(effective.agentPreset, effective.runtimeProfileId)}（${effective.model ?? 'default'}${effective.source === 'group' ? ' · 群独立配置' : ''}）`,
             `工作目录：${input.workingDir}`,
           ].join('\n'),
         )
@@ -90,7 +94,7 @@ export async function handleSlashCommand(host: SlashCommandHost, input: SlashCom
         [
           `会话：${binding.sessionId}`,
           `工作区：${binding.workspaceName}`,
-          `运行时：${binding.agentPreset}（${liveAgent?.status ?? '休眠，可恢复'}${effective.source === 'group' ? ' · 群独立配置' : ''}）`,
+          `运行时：${formatRuntimeWithProfile(binding.agentPreset, binding.runtimeProfileId)}（${liveAgent?.status ?? '休眠，可恢复'}${effective.source === 'group' ? ' · 群独立配置' : ''}）`,
           `模型：${selection ? `${selection.provider}/${selection.model}` : binding.model ?? effective.model ?? 'default'}`,
           `工作目录：${binding.workingDir}`,
           `接管链接：${host.sessionWebUrl(binding.sessionId)}`,
@@ -123,37 +127,88 @@ export async function handleSlashCommand(host: SlashCommandHost, input: SlashCom
   }
 }
 
+function parseAgentCommandArgs(rawArgs: string): {
+  readonly runtimeTarget: string
+  readonly profileTarget: string
+} {
+  const parts = rawArgs.trim().split(/\s+/).filter(Boolean)
+  if (parts.length === 0) return { runtimeTarget: '', profileTarget: '' }
+  if (parts.length === 1) {
+    const token = parts[0]!
+    const colonIdx = token.indexOf(':')
+    if (colonIdx > 0 && colonIdx < token.length - 1) {
+      return {
+        runtimeTarget: token.slice(0, colonIdx).trim(),
+        profileTarget: token.slice(colonIdx + 1).trim(),
+      }
+    }
+    return { runtimeTarget: token, profileTarget: '' }
+  }
+  return {
+    runtimeTarget: parts[0]!,
+    profileTarget: parts.slice(1).join(' ').trim(),
+  }
+}
+
 async function switchRuntime(host: SlashCommandHost, input: SlashCommandInput): Promise<void> {
-  const target = input.command.args.trim()
+  const { runtimeTarget, profileTarget } = parseAgentCommandArgs(input.command.args)
   const options = await host.runtimes.list()
-  const known = options.find((o) => o.id === target)
+  const known = options.find((o) => o.id === runtimeTarget)
   if (!known) {
-    await input.reply(`用法：/agent <${options.map((o) => o.id).join(' | ')}>`)
+    await input.reply(`用法：/agent <${options.map((o) => o.id).join(' | ')}> [启动配置 ID]`)
     return
   }
+
+  let nextProfileId = ''
+  let nextProfileName = ''
+  if (profileTarget && profileTarget !== 'default' && profileTarget !== '默认') {
+    const profiles = known.profiles ?? []
+    const matched = profiles.find(
+      (p) =>
+        p.id === profileTarget ||
+        p.id.toLowerCase() === profileTarget.toLowerCase() ||
+        p.name === profileTarget,
+    )
+    if (!matched) {
+      const available = profiles.map((p) => p.id).join(' | ')
+      await input.reply(
+        available
+          ? `运行时 ${known.name} 未找到启动配置 "${profileTarget}"，可用配置：${available}（留空或 default 使用默认配置）`
+          : `运行时 ${known.name} 暂无已配置的启动配置，请省略配置参数或先在 DSH 控制台创建。`,
+      )
+      return
+    }
+    nextProfileId = matched.id
+    nextProfileName = matched.name
+  }
+
   const nextModel = await host.runtimes
-    .resolveDefaultModel(known.id, known.defaultModel)
+    .resolveDefaultModel(known.id, known.defaultModel, nextProfileId || undefined)
     .catch(() => known.defaultModel ?? '')
+  const displayTarget = nextProfileName ? `${known.name}（${nextProfileName}）` : known.name
+
   if (input.group?.runtimeMode === 'override') {
     host.store.upsertGroup({
       ...input.group,
       runtimeMode: 'override',
       agentPreset: known.id,
+      runtimeProfileId: nextProfileId,
       model: nextModel,
       reasoningEffort: '',
     })
     await host.unbindRoute(input.routeKey, { archive: true })
-    await input.reply(`本群独立运行时已切换为 ${known.name}，下一条消息生效。`)
+    await input.reply(`本群独立运行时已切换为 ${displayTarget}，下一条消息生效。`)
     return
   }
   host.store.upsertBot({
     ...input.bot,
     agentPreset: known.id,
+    runtimeProfileId: nextProfileId || undefined,
     model: nextModel || undefined,
     reasoningEffort: undefined,
   })
   await host.unbindRoute(input.routeKey, { archive: true })
-  await input.reply(`默认运行时已切换为 ${known.name}，下一条消息生效。`)
+  await input.reply(`默认运行时已切换为 ${displayTarget}，下一条消息生效。`)
 }
 
 async function switchModel(host: SlashCommandHost, input: SlashCommandInput, liveAgent: Agent | undefined): Promise<void> {
@@ -163,14 +218,14 @@ async function switchModel(host: SlashCommandHost, input: SlashCommandInput, liv
     return
   }
   const binding = host.store.getBinding(input.routeKey)
-  const effectivePreset =
-    binding?.agentPreset ??
-    (input.group?.runtimeMode === 'override' ? input.group.agentPreset : undefined) ??
-    input.bot.agentPreset
+  const effective = resolveEffectiveAgentRuntime(input.bot, input.group)
+  const effectivePreset = binding?.agentPreset ?? effective.agentPreset
+  const effectiveProfileId = binding?.runtimeProfileId ?? effective.runtimeProfileId
   const launch = effectivePreset
     ? await host.runtimes
         .resolveAgentLaunch({
           agentPreset: effectivePreset,
+          ...(effectiveProfileId ? { runtimeProfileId: effectiveProfileId } : {}),
           explicitModel: model,
         })
         .catch(() => undefined)

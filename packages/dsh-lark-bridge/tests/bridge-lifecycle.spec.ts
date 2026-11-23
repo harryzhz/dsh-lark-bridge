@@ -1378,4 +1378,341 @@ describe('LarkBridgeManager prompt injection, title hygiene & auto-archiving', (
 
     await manager.stop()
   })
+
+  it('cleans up in-flight reactions and notifies users on HMR/plugin stop, manual abort, and crash recovery without spamming silent listeners', async () => {
+    const dir = makeTempDir()
+    const workDir = makeTempDir()
+
+    const store = new LarkBridgeStore(dir)
+    store.upsertBot({
+      id: 'ops-bot',
+      name: 'OpsBot',
+      enabled: true,
+      larkAppId: 'cli_ops',
+      larkAppSecret: 'sec_ops',
+      defaultWorkingDir: workDir,
+      receivedReactionEmoji: 'OnIt',
+    })
+    store.upsertGroup({
+      botId: 'ops-bot',
+      chatId: 'oc_ops',
+      chatName: '运维群',
+      enabled: true,
+      replyMode: 'new-topic',
+      sessionMode: 'thread',
+      listener: {
+        enabled: true,
+        templateKey: 'project',
+        name: '静默巡检',
+        prompt: '无需回复时输出空文本',
+        replyMode: 'new-topic',
+        sessionMode: 'per_message',
+        allowSilentEmptyReply: true,
+      },
+    })
+
+    const listeners = new Map<string, Array<(...args: unknown[]) => void>>()
+    const fiberDisposables: Array<() => void> = []
+    const emit = (event: string, ...args: unknown[]) => {
+      for (const fn of [...(listeners.get(event) ?? [])]) fn(...args)
+    }
+
+    let turnBehavior: 'complete' | 'hang' | 'user-abort' = 'hang'
+    let createdCount = 0
+    const liveSessions = new Map<string, Session>()
+    const fakeCtx = {
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      on(event: string, fn: (...args: unknown[]) => void) {
+        const list = listeners.get(event) ?? []
+        list.push(fn)
+        listeners.set(event, list)
+        const off = () => {
+          listeners.set(
+            event,
+            (listeners.get(event) ?? []).filter((f) => f !== fn),
+          )
+        }
+        fiberDisposables.push(off)
+        return off
+      },
+      effect(execute: () => () => void) {
+        const cleanup = execute()
+        let active = true
+        const off = () => {
+          if (!active) return
+          active = false
+          cleanup()
+        }
+        fiberDisposables.push(off)
+        return off
+      },
+      sessions: {
+        get: (id: string) => liveSessions.get(id),
+      },
+      agents: {
+        get: () => undefined,
+        create: vi.fn(async ({ sessionId }: { sessionId: string }) => {
+          createdCount += 1
+          const sessionObj = {
+            id: sessionId,
+            header: { cwd: workDir, agentPreset: 'codex' },
+            append: vi.fn(),
+            snapshotEvents: () => [],
+          } as unknown as Session
+          liveSessions.set(sessionId, sessionObj)
+          const agent = {
+            session: sessionObj,
+            followup: () => {
+              emit('session/event', sessionObj, { type: 'turn/start', data: { turn: 1 } })
+              if (turnBehavior === 'complete') {
+                emit('session/event', sessionObj, {
+                  type: 'assistant/message',
+                  data: {
+                    turn: 1,
+                    step: 1,
+                    message: { content: [{ type: 'text', text: '配置一切正常。' }] },
+                  },
+                })
+                emit('session/event', sessionObj, {
+                  type: 'turn/end',
+                  data: { turn: 1, reason: { kind: 'completed' } },
+                })
+              } else if (turnBehavior === 'user-abort') {
+                emit('session/event', sessionObj, {
+                  type: 'turn/end',
+                  data: { turn: 1, reason: { kind: 'aborted', reason: { kind: 'user' } } },
+                })
+              }
+            },
+          }
+          return {
+            agent,
+            dispose: vi.fn(async () => {
+              emit('session/event', sessionObj, {
+                type: 'turn/end',
+                data: { turn: 1, reason: { kind: 'aborted', reason: { kind: 'disposed' } } },
+              })
+            }),
+          }
+        }),
+      },
+      get() {
+        return undefined
+      },
+    } as unknown as Context
+
+    const manager = new LarkBridgeManager(
+      fakeCtx,
+      {
+        dataDir: dir,
+        publicBaseUrl: 'http://127.0.0.1:3880',
+        idleSweepIntervalMs: 0,
+        maxAuditEvents: 100,
+        autoInstallCliAndSkill: false,
+      },
+      store,
+    )
+
+    const removedReactions: Array<{ messageId: string; reactionId: string }> = []
+    const sentReplies: Array<{
+      chatId: string
+      replyToMessageId?: string
+      text?: string
+      card?: Record<string, unknown>
+    }> = []
+    let reactionSeq = 0
+    const fakeTransport = {
+      state: { botOpenId: 'ou_bot', connected: true },
+      addReaction: vi.fn(async () => `react_${++reactionSeq}`),
+      removeReaction: vi.fn(async (messageId: string, reactionId: string) => {
+        removedReactions.push({ messageId, reactionId })
+      }),
+      sendReply: vi.fn(
+        async (opts: {
+          chatId: string
+          replyToMessageId?: string
+          text?: string
+          card?: Record<string, unknown>
+        }) => {
+          sentReplies.push(opts)
+          return { messageId: `om_reply_${sentReplies.length}` }
+        },
+      ),
+      stop: vi.fn(async () => {}),
+    }
+
+    const handleInbound = (
+      manager as unknown as {
+        handleInbound: (botId: string, transport: unknown, msg: unknown) => Promise<void>
+      }
+    ).handleInbound.bind(manager)
+
+    // 0. Normal completed turn with Cordis ctx.effect present -> delivers actual reply (never falsely aborts)
+    turnBehavior = 'complete'
+    await handleInbound('ops-bot', fakeTransport, {
+      botId: 'ops-bot',
+      larkAppId: 'cli_ops',
+      botOpenId: 'ou_bot',
+      messageId: 'om_normal_ok_1',
+      chatId: 'oc_ops',
+      chatType: 'group',
+      msgType: 'text',
+      senderOpenId: 'ou_u1',
+      senderType: 'user',
+      text: '@_bot_1 看下状态',
+      rawContent: '{}',
+      mentions: [{ key: '@_bot_1', openId: 'ou_bot', name: 'OpsBot' }],
+      imageKeys: [],
+      createTimeMs: Date.now(),
+    })
+
+    expect(removedReactions).toEqual([{ messageId: 'om_normal_ok_1', reactionId: 'react_1' }])
+    expect(sentReplies).toHaveLength(1)
+    expect(JSON.stringify(sentReplies[0]!.card ?? sentReplies[0]!.text)).toContain('配置一切正常。')
+    expect(sentReplies[0]!.text ?? '').not.toContain('服务重载或停机已中断')
+    expect(store.listPendingTurns()).toHaveLength(0)
+
+    // 1. User manually stops an active turn -> reaction removed once, user notified, audit event carries sessionId
+    turnBehavior = 'user-abort'
+    removedReactions.length = 0
+    sentReplies.length = 0
+    await handleInbound('ops-bot', fakeTransport, {
+      botId: 'ops-bot',
+      larkAppId: 'cli_ops',
+      botOpenId: 'ou_bot',
+      messageId: 'om_user_stop_1',
+      chatId: 'oc_ops',
+      chatType: 'group',
+      msgType: 'text',
+      senderOpenId: 'ou_u1',
+      senderType: 'user',
+      text: '@_bot_1 查下配置',
+      rawContent: '{}',
+      mentions: [{ key: '@_bot_1', openId: 'ou_bot', name: 'OpsBot' }],
+      imageKeys: [],
+      createTimeMs: Date.now(),
+    })
+
+    expect(removedReactions).toEqual([{ messageId: 'om_user_stop_1', reactionId: 'react_2' }])
+    expect(sentReplies).toHaveLength(1)
+    expect(sentReplies[0]!.text).toContain('已被手动停止')
+    expect(store.listPendingTurns()).toHaveLength(0)
+    const stopAudit = store.listEvents().find((e) => e.kind === 'error' && e.summary.includes('手动停止'))
+    expect(stopAudit?.sessionId).toBeTruthy()
+
+    // 2. Reproduce HMR LIFO unload while a turn is in-flight -> fiber effects dispose first, then manager.stop()
+    turnBehavior = 'hang'
+    removedReactions.length = 0
+    sentReplies.length = 0
+    const inFlightPromise = handleInbound('ops-bot', fakeTransport, {
+      botId: 'ops-bot',
+      larkAppId: 'cli_ops',
+      botOpenId: 'ou_bot',
+      messageId: 'om_hmr_1',
+      chatId: 'oc_ops',
+      chatType: 'group',
+      msgType: 'text',
+      senderOpenId: 'ou_u1',
+      senderType: 'user',
+      text: '@_bot_1 帮我核实',
+      rawContent: '{}',
+      mentions: [{ key: '@_bot_1', openId: 'ou_bot', name: 'OpsBot' }],
+      imageKeys: [],
+      createTimeMs: Date.now(),
+    })
+
+    await vi.waitFor(() => {
+      expect(store.listPendingTurns()).toHaveLength(1)
+      expect(store.listPendingTurns()[0]?.sessionId).toBeTruthy()
+    })
+    const hmrSessionId = store.listPendingTurns()[0]!.sessionId!
+
+    // Cordis LIFO disposal: detaches `ctx.on` and runs `turn-runner` effect before `manager.stop()` runs.
+    for (const dispose of fiberDisposables.splice(0).reverse()) {
+      dispose()
+    }
+    await manager.stop()
+    await inFlightPromise
+
+    expect(removedReactions).toEqual([{ messageId: 'om_hmr_1', reactionId: 'react_3' }])
+    expect(sentReplies).toHaveLength(1)
+    expect(sentReplies[0]!.text).toContain('服务重载或停机已中断')
+    expect(store.listPendingTurns()).toHaveLength(0)
+    const hmrAudit = store
+      .listEvents()
+      .find((e) => e.kind === 'error' && e.sessionId === hmrSessionId)
+    expect(hmrAudit?.summary).toContain('服务重载或停机已中断')
+    expect(createdCount).toBe(3)
+
+    // 3. Crash/SIGKILL recovery: persisted pendingTurns survive restart; recoverStalePendingTurns cleans both reactions
+    //    but only notifies the interactive turn (not the silent listener).
+    store.upsertPendingTurn({
+      id: 'pt-interactive',
+      botId: 'ops-bot',
+      chatId: 'oc_ops',
+      chatName: '运维群',
+      messageId: 'om_crash_interactive',
+      routeKey: 'cli_ops:oc_ops:om_crash_interactive',
+      replyMode: 'new-topic',
+      trigger: 'mention',
+      allowSilentEmptyReply: false,
+      reactionId: 'react_crash_1',
+      sessionId: 'session-crash-1',
+      startedAtMs: Date.now() - 10_000,
+    })
+    store.upsertPendingTurn({
+      id: 'pt-silent-listener',
+      botId: 'ops-bot',
+      chatId: 'oc_ops',
+      chatName: '运维群',
+      messageId: 'om_crash_listener',
+      routeKey: 'cli_ops:oc_ops:om_crash_listener',
+      replyMode: 'new-topic',
+      trigger: 'listener',
+      allowSilentEmptyReply: true,
+      reactionId: 'react_crash_2',
+      sessionId: 'session-crash-2',
+      startedAtMs: Date.now() - 10_000,
+    })
+
+    const reloadedStore = new LarkBridgeStore(dir)
+    expect(reloadedStore.listPendingTurns()).toHaveLength(2)
+
+    const recoveredManager = new LarkBridgeManager(
+      fakeCtx,
+      {
+        dataDir: dir,
+        publicBaseUrl: 'http://127.0.0.1:3880',
+        idleSweepIntervalMs: 0,
+        maxAuditEvents: 100,
+        autoInstallCliAndSkill: false,
+      },
+      reloadedStore,
+    )
+    removedReactions.length = 0
+    sentReplies.length = 0
+    ;(
+      recoveredManager as unknown as {
+        transports: Map<string, { config: unknown; transport: unknown }>
+      }
+    ).transports.set('ops-bot', { config: reloadedStore.getBot('ops-bot'), transport: fakeTransport })
+
+    const recoveredCount = await recoveredManager.recoverStalePendingTurns()
+    expect(recoveredCount).toBe(2)
+    expect(reloadedStore.listPendingTurns()).toHaveLength(0)
+    expect(removedReactions).toEqual([
+      { messageId: 'om_crash_interactive', reactionId: 'react_crash_1' },
+      { messageId: 'om_crash_listener', reactionId: 'react_crash_2' },
+    ])
+    expect(sentReplies).toHaveLength(1)
+    expect(sentReplies[0]!.replyToMessageId).toBe('om_crash_interactive')
+    expect(sentReplies[0]!.text).toContain('服务重启中断')
+    expect(
+      reloadedStore.listEvents().some((e) => e.sessionId === 'session-crash-1' && e.kind === 'error'),
+    ).toBe(true)
+    expect(
+      reloadedStore.listEvents().some((e) => e.sessionId === 'session-crash-2' && e.kind === 'error'),
+    ).toBe(true)
+    await recoveredManager.stop()
+  })
 })

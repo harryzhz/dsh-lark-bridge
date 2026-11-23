@@ -67,6 +67,7 @@ export interface DreamSession {
   workspaceName: string
   workingDir: string
   agentPreset: string
+  runtimeProfileId?: string
   model?: string
   status: 'running' | 'succeeded' | 'failed'
   dateKey: string
@@ -160,6 +161,7 @@ export interface BotConfig {
   avatarUrl: string
   description: string
   agentPreset: string
+  runtimeProfileId?: string
   model?: string
   reasoningEffort?: string
   defaultWorkingDir: string
@@ -250,6 +252,7 @@ export interface GroupConfig {
   workspaceName: string
   runtimeMode: 'inherit' | 'override'
   agentPreset: string
+  runtimeProfileId?: string
   model: string
   reasoningEffort: string
   replyMode: Inheritable<GroupReplyMode>
@@ -282,6 +285,7 @@ export interface GroupView {
   effectiveWorkingDir: string
   runtimeSource: 'bot' | 'group'
   effectiveAgentPreset: string
+  effectiveRuntimeProfileId?: string
   effectiveModel?: string
   effectiveReasoningEffort?: string
   activeSessionCount: number
@@ -347,6 +351,7 @@ export interface ImportExistingBotInput {
   workspaceName?: string
   defaultWorkingDir: string
   agentPreset: string
+  runtimeProfileId?: string
   model?: string
   reasoningEffort?: string
 }
@@ -383,6 +388,7 @@ export interface AutoCreateBotInput {
   workspaceName?: string
   defaultWorkingDir: string
   agentPreset: string
+  runtimeProfileId?: string
   model?: string
   reasoningEffort?: string
 }
@@ -396,6 +402,7 @@ export interface SessionBinding {
   workspaceName: string
   sessionId: string
   agentPreset: string
+  runtimeProfileId?: string
   workingDir: string
   trigger: string
   listenerName?: string
@@ -448,6 +455,7 @@ export interface CockpitPayload {
       name: string
       workspaceName: string
       agentPreset: string
+      runtimeProfileId?: string
       model?: string
       inboundTotal: number
       repliedTotal: number
@@ -469,6 +477,77 @@ export interface CockpitPayload {
   listenerTemplates?: ListenerTemplate[]
 }
 
+export interface RuntimeProfileAuthMethod {
+  id: string
+  name?: string
+  description?: string
+}
+
+export interface RuntimeProfileCapabilities {
+  supportsCliProfile: boolean
+  supportsConfigFile: boolean
+  configFileHint?: string
+  supportsEnv: boolean
+  envHints?: string[]
+  supportsArgs: boolean
+  supportsAuthMethod: boolean
+  authMethods?: RuntimeProfileAuthMethod[]
+  supportsExposeAsPreset: boolean
+}
+
+export interface RuntimeProfileSummary {
+  id: string
+  runtimeId: string
+  name: string
+  description?: string
+  source: 'discovered' | 'config' | 'user'
+  cliProfile?: string
+  configFile?: string
+  env?: Record<string, string>
+  secretEnvKeys?: string[]
+  args?: string[]
+  argsMode?: 'append' | 'prepend' | 'replace'
+  authMethodId?: string
+  defaultModel?: string
+  defaultReasoningEffort?: string
+  exposeAsPreset?: boolean
+  presetId?: string
+  providerId?: string
+}
+
+export interface RuntimeProfileInput {
+  id?: string
+  runtimeId: string
+  name: string
+  description?: string
+  cliProfile?: string
+  configFile?: string
+  env?: Record<string, string>
+  removeEnvKeys?: string[]
+  args?: string[]
+  argsMode?: 'append' | 'prepend' | 'replace'
+  authMethodId?: string
+  defaultModel?: string
+  defaultReasoningEffort?: string
+  exposeAsPreset?: boolean
+}
+
+export interface ExposedRuntimePreset {
+  presetId: string
+  runtimeId: string
+  profileId: string
+  displayName: string
+  description: string
+  providerId: string
+  defaultModel: string
+  defaultReasoningEffort?: string
+}
+
+export interface RuntimeCatalogPayload {
+  runtimes: RuntimeOption[]
+  exposedPresets: ExposedRuntimePreset[]
+}
+
 /** One agent runtime (DSH preset) the bridge can route a conversation to. */
 export interface RuntimeOption {
   id: string
@@ -479,6 +558,9 @@ export interface RuntimeOption {
   providerId?: string
   defaultModel?: string
   supportsReasoningEffort: boolean
+  supportsProfiles?: boolean
+  profileCapabilities?: RuntimeProfileCapabilities
+  profiles?: RuntimeProfileSummary[]
   isDefault: boolean
   broken?: string
 }

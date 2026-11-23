@@ -1,8 +1,12 @@
-import type { Context } from '@deepseek-ai/cordis'
+import { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import { describe, expect, it } from 'vitest'
-import { TurnFinalReplyTracker, runTurnAndCollectReply } from '../src/turn-runner.js'
+import {
+  TurnAbortedError,
+  TurnFinalReplyTracker,
+  runTurnAndCollectReply,
+} from '../src/turn-runner.js'
 
 describe('TurnFinalReplyTracker & runTurnAndCollectReply', () => {
   it('ignores intermediate progress commentary before/with tool calls and returns only the final response', () => {
@@ -262,5 +266,257 @@ describe('TurnFinalReplyTracker & runTurnAndCollectReply', () => {
       'intermediate:第 2 步：核对 CI 结果。',
       'final:最终结论：共 2 个待审 MR。',
     ])
+  })
+
+  it('rejects immediately with TurnAbortedError when Cordis fiber disposes in LIFO order before turn/end arrives', async () => {
+    const disposables: Array<() => void> = []
+    const handlers: Array<(s: Session, ev: SessionEvent) => void> = []
+    const session = { id: 'session-hmr-dispose' } as unknown as Session
+
+    const ctx = {
+      on(_event: string, fn: (s: Session, ev: SessionEvent) => void) {
+        handlers.push(fn)
+        const off = () => {
+          const idx = handlers.indexOf(fn)
+          if (idx >= 0) handlers.splice(idx, 1)
+        }
+        disposables.push(off)
+        return off
+      },
+      effect(execute: () => () => void) {
+        const cleanup = execute()
+        let active = true
+        const off = () => {
+          if (!active) return
+          active = false
+          cleanup()
+        }
+        disposables.push(off)
+        return off
+      },
+    } as unknown as Context
+
+    const agent = {
+      session,
+      followup() {
+        for (const h of handlers) h(session, { type: 'turn/start', data: { turn: 4 } } as unknown as SessionEvent)
+      },
+    } as unknown as Agent
+
+    const promise = runTurnAndCollectReply(ctx, agent, [{ type: 'text', text: '继续排查' }])
+
+    // Simulate Cordis LIFO disposal during HMR: later-registered effects dispose before manager.stop() emits turn/end.
+    for (const dispose of disposables.splice(0).reverse()) {
+      dispose()
+    }
+
+    await expect(promise).rejects.toSatisfy(
+      (err: unknown) => err instanceof TurnAbortedError && err.kind === 'disposed',
+    )
+    expect(handlers).toHaveLength(0)
+  })
+
+  it('rejects with TurnAbortedError when AbortSignal triggers and when turn/end reports aborted or interrupted', async () => {
+    const handlers: Array<(s: Session, ev: SessionEvent) => void> = []
+    const session = { id: 'session-abort-cases' } as unknown as Session
+    const ctx = {
+      on(_event: string, fn: (s: Session, ev: SessionEvent) => void) {
+        handlers.push(fn)
+        return () => {
+          const idx = handlers.indexOf(fn)
+          if (idx >= 0) handlers.splice(idx, 1)
+        }
+      },
+    } as unknown as Context
+
+    const emit = (ev: Record<string, unknown>) => {
+      for (const h of [...handlers]) h(session, ev as unknown as SessionEvent)
+    }
+
+    // 1. Signal abort while in-flight
+    const ac = new AbortController()
+    const hangingAgent = {
+      session,
+      followup() {
+        emit({ type: 'turn/start', data: { turn: 1 } })
+      },
+    } as unknown as Agent
+    const signalPromise = runTurnAndCollectReply(ctx, hangingAgent, [{ type: 'text', text: 'A' }], {
+      signal: ac.signal,
+    })
+    ac.abort()
+    await expect(signalPromise).rejects.toSatisfy(
+      (err: unknown) => err instanceof TurnAbortedError && err.kind === 'disposed',
+    )
+    expect(handlers).toHaveLength(0)
+
+    // 2. turn/end aborted by user
+    const userStopAgent = {
+      session,
+      followup() {
+        emit({ type: 'turn/start', data: { turn: 2 } })
+        emit({ type: 'turn/end', data: { turn: 2, reason: { kind: 'aborted', reason: { kind: 'user' } } } })
+      },
+    } as unknown as Agent
+    await expect(
+      runTurnAndCollectReply(ctx, userStopAgent, [{ type: 'text', text: 'B' }]),
+    ).rejects.toSatisfy((err: unknown) => err instanceof TurnAbortedError && err.kind === 'user')
+
+    // 3. turn/end interrupted
+    const interruptedAgent = {
+      session,
+      followup() {
+        emit({ type: 'turn/start', data: { turn: 3 } })
+        emit({ type: 'turn/end', data: { turn: 3, reason: { kind: 'interrupted' } } })
+      },
+    } as unknown as Agent
+    await expect(
+      runTurnAndCollectReply(ctx, interruptedAgent, [{ type: 'text', text: 'C' }]),
+    ).rejects.toSatisfy((err: unknown) => err instanceof TurnAbortedError && err.kind === 'interrupted')
+
+    // 4. turn/end aborted by hook preserves custom hook reason
+    const hookAgent = {
+      session,
+      followup() {
+        emit({ type: 'turn/start', data: { turn: 4 } })
+        emit({
+          type: 'turn/end',
+          data: { turn: 4, reason: { kind: 'aborted', reason: { kind: 'hook', reason: '策略拦截' } } },
+        })
+      },
+    } as unknown as Agent
+    await expect(
+      runTurnAndCollectReply(ctx, hookAgent, [{ type: 'text', text: 'D' }]),
+    ).rejects.toSatisfy(
+      (err: unknown) =>
+        err instanceof TurnAbortedError && err.kind === 'hook' && err.message === '策略拦截',
+    )
+  })
+
+  it('resolves completed turns on a real Cordis Context without self-aborting on ctx.effect cleanup, and survives dispose during intermediate flush', async () => {
+    const root = new Context()
+    let pluginCtx!: Context
+    let ready1!: () => void
+    const fiber1Ready = new Promise<void>((resolve) => {
+      ready1 = resolve
+    })
+    const fiber = root.plugin((ctx) => {
+      pluginCtx = ctx
+      ready1()
+    })
+    await fiber1Ready
+
+    const session = { id: 'session-real-cordis' } as unknown as Session
+    const emit = (ev: Record<string, unknown>) => {
+      ;(root as unknown as { emit: (name: string, ...args: unknown[]) => void }).emit(
+        'session/event',
+        session,
+        ev as unknown as SessionEvent,
+      )
+    }
+
+    // 1. Synchronous turn/end completion on real Cordis Context (verifies offDispose does not self-reject)
+    const syncAgent = {
+      session,
+      followup() {
+        emit({ type: 'turn/start', data: { turn: 1 } })
+        emit({
+          type: 'assistant/message',
+          data: {
+            turn: 1,
+            step: 1,
+            message: { content: [{ type: 'text', text: '同步完成回复' }] },
+          },
+        })
+        emit({ type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+      },
+    } as unknown as Agent
+    const syncReply = await runTurnAndCollectReply(pluginCtx, syncAgent, [{ type: 'text', text: 'Q1' }])
+    expect(syncReply).toBe('同步完成回复')
+    expect(pluginCtx.fiber.getEffects()).toEqual([])
+
+    // 2. Asynchronous turn/end completion with slow onIntermediate; dispose + AbortSignal during flush
+    let releaseIntermediate!: () => void
+    const intermediateGate = new Promise<void>((resolve) => {
+      releaseIntermediate = resolve
+    })
+    const ac = new AbortController()
+    let finishAsyncTurn!: () => void
+    const asyncAgent = {
+      session,
+      followup() {
+        emit({ type: 'turn/start', data: { turn: 2 } })
+        emit({
+          type: 'assistant/message',
+          data: {
+            turn: 2,
+            step: 1,
+            message: {
+              content: [
+                { type: 'text', text: '阶段进度' },
+                { type: 'tool-call', id: 'tc1', name: 'bash', arguments: '{}' },
+              ],
+            },
+          },
+        })
+        emit({ type: 'tool/call', data: { turn: 2, step: 1, callId: 'tc1', name: 'bash', arguments: '{}' } })
+        finishAsyncTurn = () => {
+          emit({
+            type: 'assistant/message',
+            data: {
+              turn: 2,
+              step: 2,
+              message: { content: [{ type: 'text', text: '异步最终回复' }] },
+            },
+          })
+          emit({ type: 'turn/end', data: { turn: 2, reason: { kind: 'completed' } } })
+        }
+      },
+    } as unknown as Agent
+
+    const deliveredIntermediate: string[] = []
+    const asyncPromise = runTurnAndCollectReply(pluginCtx, asyncAgent, [{ type: 'text', text: 'Q2' }], {
+      signal: ac.signal,
+      onIntermediate: async (stepText) => {
+        await intermediateGate
+        deliveredIntermediate.push(stepText)
+      },
+    })
+    expect(pluginCtx.fiber.getEffects().map((e) => e.label)).toContain('dsh-lark-bridge.turn-runner')
+
+    finishAsyncTurn()
+    // Effect and event listener should already be detached on turn/end before flush finishes
+    expect(pluginCtx.fiber.getEffects()).toEqual([])
+
+    // Trigger both abort signal and real Cordis fiber disposal while intermediate flush is still pending
+    ac.abort()
+    await fiber.dispose()
+    releaseIntermediate()
+
+    expect(await asyncPromise).toBe('异步最终回复')
+    expect(deliveredIntermediate).toEqual(['阶段进度'])
+
+    // 3. Real Cordis fiber disposal while a turn is still running rejects with TurnAbortedError('disposed')
+    let pluginCtx2!: Context
+    let ready2!: () => void
+    const fiber2Ready = new Promise<void>((resolve) => {
+      ready2 = resolve
+    })
+    const fiber2 = root.plugin((ctx) => {
+      pluginCtx2 = ctx
+      ready2()
+    })
+    await fiber2Ready
+    const hangingAgent = {
+      session,
+      followup() {
+        emit({ type: 'turn/start', data: { turn: 3 } })
+      },
+    } as unknown as Agent
+    const inFlight = runTurnAndCollectReply(pluginCtx2, hangingAgent, [{ type: 'text', text: 'Q3' }])
+    await fiber2.dispose()
+    await expect(inFlight).rejects.toSatisfy(
+      (err: unknown) => err instanceof TurnAbortedError && err.kind === 'disposed',
+    )
   })
 })

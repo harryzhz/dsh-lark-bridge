@@ -261,6 +261,7 @@ function LarkBridgePage() {
           await data.refresh()
         }}
         onRefresh={data.refresh}
+        onProfilesChanged={data.refreshRuntimes}
         onAuthUpdated={data.refreshAuth}
         onOpenAuth={() => setAuthOpen(true)}
         onOpenSession={(sid) => openDshSession?.(sid)}
@@ -272,6 +273,7 @@ function LarkBridgePage() {
         models={data.models}
         listenerTemplates={data.listenerTemplates}
         onClose={() => setEditingGroup(null)}
+        onProfilesChanged={data.refreshRuntimes}
         onSave={async (config) => {
           await bridgeApi.saveGroup(config)
           setToast({ text: '已保存', ok: true })

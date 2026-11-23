@@ -107,7 +107,7 @@ export function LarkAuthDialog({
   }
 
   return (
-    <Modal open onClose={onClose} title="飞书登录与授权" headless className="fb-schedule-dialog">
+    <Modal open onClose={onClose} title="飞书登录与授权" headless className="fb-schedule-dialog fb-nested-modal">
       <div className="fb-schedule-dialog-head">
         <div style={{ minWidth: 0 }}>
           <div className="fb-schedule-dialog-title">飞书登录与授权</div>

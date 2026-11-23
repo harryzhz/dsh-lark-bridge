@@ -127,7 +127,7 @@ export function DirectoryPickerModal({
   }
 
   return (
-    <Modal open onClose={onClose} title="选择本地工作目录" headless className="fb-schedule-dialog">
+    <Modal open onClose={onClose} title="选择本地工作目录" headless className="fb-schedule-dialog fb-nested-modal">
       <div className="fb-schedule-dialog-head">
         <div style={{ minWidth: 0 }}>
           <div className="fb-schedule-dialog-title">选择本地工作目录</div>

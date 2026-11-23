@@ -197,6 +197,7 @@ export const LarkBotConfigSchema = z.preprocess(
 
     // Engine & workspace defaults
     agentPreset: z.string().min(1).default('codex'),
+    runtimeProfileId: z.string().default(''),
     provider: z.string().min(1).optional(),
     model: z.string().min(1).optional(),
     reasoningEffort: z.string().min(1).optional(),
@@ -277,6 +278,7 @@ function migrateLegacyGroupFields(input: unknown): unknown {
   if (rec.runtimeMode === undefined) {
     const hasOverride =
       (typeof rec.agentPreset === 'string' && rec.agentPreset.trim().length > 0) ||
+      (typeof rec.runtimeProfileId === 'string' && rec.runtimeProfileId.trim().length > 0) ||
       (typeof rec.model === 'string' && rec.model.trim().length > 0) ||
       (typeof rec.reasoningEffort === 'string' && rec.reasoningEffort.trim().length > 0)
     rec.runtimeMode = hasOverride ? 'override' : 'inherit'
@@ -305,6 +307,7 @@ export const LarkGroupConfigSchema = z.preprocess(
     workspaceName: z.string().default(''),
     runtimeMode: z.enum(['inherit', 'override']).default('inherit'),
     agentPreset: z.string().default(''),
+    runtimeProfileId: z.string().default(''),
     model: z.string().default(''),
     reasoningEffort: z.string().default(''),
 
@@ -593,6 +596,7 @@ export type RoutingDecision =
       readonly workspaceName: string
       readonly chatName?: string
       readonly agentPreset: string
+      readonly runtimeProfileId?: string
       readonly model?: string
       readonly reasoningEffort?: string
       readonly sessionMode: 'thread' | 'per_message' | 'chat'
@@ -639,19 +643,22 @@ export function buildGroupKey(botId: string, chatId: string): string {
 export interface EffectiveAgentRuntime {
   readonly source: 'bot' | 'group'
   readonly agentPreset: string
+  readonly runtimeProfileId?: string
   readonly provider?: string
   readonly model?: string
   readonly reasoningEffort?: string
 }
 
 export function resolveEffectiveAgentRuntime(
-  bot: Pick<LarkBotConfig, 'agentPreset' | 'provider' | 'model' | 'reasoningEffort'>,
-  group?: Pick<LarkGroupConfig, 'runtimeMode' | 'agentPreset' | 'model' | 'reasoningEffort'>,
+  bot: Pick<LarkBotConfig, 'agentPreset' | 'runtimeProfileId' | 'provider' | 'model' | 'reasoningEffort'>,
+  group?: Pick<LarkGroupConfig, 'runtimeMode' | 'agentPreset' | 'runtimeProfileId' | 'model' | 'reasoningEffort'>,
 ): EffectiveAgentRuntime {
+  const botProfileId = bot.runtimeProfileId?.trim() || undefined
   if (!group || group.runtimeMode === 'inherit') {
     return {
       source: 'bot',
       agentPreset: bot.agentPreset,
+      ...(botProfileId ? { runtimeProfileId: botProfileId } : {}),
       ...(bot.provider ? { provider: bot.provider } : {}),
       ...(bot.model ? { model: bot.model } : {}),
       ...(bot.reasoningEffort ? { reasoningEffort: bot.reasoningEffort } : {}),
@@ -659,6 +666,7 @@ export function resolveEffectiveAgentRuntime(
   }
 
   const groupPreset = group.agentPreset.trim()
+  const groupProfileId = group.runtimeProfileId?.trim() || undefined
   const groupModel = group.model.trim()
   const groupEffort = group.reasoningEffort.trim()
 
@@ -667,18 +675,22 @@ export function resolveEffectiveAgentRuntime(
     return {
       source: 'group',
       agentPreset: groupPreset,
+      ...(groupProfileId ? { runtimeProfileId: groupProfileId } : {}),
       ...(provider ? { provider } : {}),
       ...(groupModel ? { model: groupModel } : {}),
       ...(groupEffort ? { reasoningEffort: groupEffort } : {}),
     }
   }
 
-  // Partial override (e.g. API caller supplied model/reasoningEffort without agentPreset)
-  const effectiveModel = groupModel || bot.model
-  const effectiveEffort = groupEffort || bot.reasoningEffort
+  // Partial override (e.g. API caller supplied profile/model/reasoningEffort without agentPreset)
+  const effectiveProfileId = groupProfileId ?? botProfileId
+  const profileChanged = Boolean(groupProfileId && groupProfileId !== botProfileId)
+  const effectiveModel = groupModel || (profileChanged ? undefined : bot.model)
+  const effectiveEffort = groupEffort || (profileChanged ? undefined : bot.reasoningEffort)
   return {
-    source: groupModel || groupEffort ? 'group' : 'bot',
+    source: groupProfileId || groupModel || groupEffort ? 'group' : 'bot',
     agentPreset: bot.agentPreset,
+    ...(effectiveProfileId ? { runtimeProfileId: effectiveProfileId } : {}),
     ...(bot.provider ? { provider: bot.provider } : {}),
     ...(effectiveModel ? { model: effectiveModel } : {}),
     ...(effectiveEffort ? { reasoningEffort: effectiveEffort } : {}),

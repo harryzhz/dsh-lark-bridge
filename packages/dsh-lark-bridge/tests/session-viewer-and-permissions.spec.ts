@@ -148,11 +148,19 @@ function createViewerHarness(options: {
   const authenticatedUrl = vi.fn((base: string) => `${base}/?token=SHOULD_NEVER_LEAK`)
 
   const connection = {
+    _sentinel: 'host-connection-instance',
     admit: vi.fn((_req: IncomingMessage) =>
       isOwnerAuthed ? { peer: { principal: { kind: 'owner' } } } : { rejection: 401 as const },
     ),
     authenticatedUrl,
-    createPeer: vi.fn(({ principal }: { principal: LarkViewerPrincipal }) => {
+    createPeer: vi.fn(function (
+      this: { _sentinel?: string } | undefined,
+      { principal }: { principal: LarkViewerPrincipal },
+    ) {
+      // Mirrors HostConnectionService.createPeer accessing `this.ctx` — fails loudly if called detached!
+      if (this?._sentinel !== 'host-connection-instance') {
+        throw new TypeError("Cannot read properties of undefined (reading 'ctx')")
+      }
       const controller = new AbortController()
       const dispose = vi.fn(() => {
         controller.abort()
@@ -165,19 +173,24 @@ function createViewerHarness(options: {
       createdPeers.push({ principal, controller, dispose })
       return peer
     }),
-    createSharedFetchHandler: vi.fn(() => ({
-      fetch:
-        options.sharedFetch ??
-        (async (request: Request, peer: { principal: LarkViewerPrincipal }) =>
-          Response.json({
-            type: 'server-response',
-            rpcId: 'rpc-1',
-            result: {
-              ok: true,
-              value: { path: new URL(request.url).pathname, viewerSession: peer.principal.sessionId },
-            },
-          })),
-    })),
+    createSharedFetchHandler: vi.fn(function (this: { _sentinel?: string } | undefined) {
+      if (this?._sentinel !== 'host-connection-instance') {
+        throw new TypeError("Cannot read properties of undefined (reading 'ctx')")
+      }
+      return {
+        fetch:
+          options.sharedFetch ??
+          (async (request: Request, peer: { principal: LarkViewerPrincipal }) =>
+            Response.json({
+              type: 'server-response',
+              rpcId: 'rpc-1',
+              result: {
+                ok: true,
+                value: { path: new URL(request.url).pathname, viewerSession: peer.principal.sessionId },
+              },
+            })),
+      }
+    }),
   }
 
   const webServer = {
@@ -609,10 +622,222 @@ describe('Read-only guest session viewer & RBAC policy', () => {
       body: JSON.stringify({ endpoint: 'session/send', payload: {} }),
     })
     expect(errStream.status).toBe(200)
+    expect(errStream.headers['cache-control']).toBe('no-store, no-transform')
     expect(JSON.parse(errStream.text.trim())).toMatchObject({
       type: 'error',
       error: { code: 'remote-access/denied', message: 'lark-viewer/read-only' },
     })
+  })
+
+  it('multiplexes concurrent viewer streams over one NDJSON downlink and isolates cancel / peer revocation', async () => {
+    const abortedEndpoints: string[] = []
+    const h = createViewerHarness({
+      liveOrigin: 'http://198.51.100.10:3880',
+      streamOpen: async (endpoint, _payload, _uplink, peer, signal) => {
+        if (endpoint === 'account/watch') {
+          throw new Error('lark-viewer/read-only')
+        }
+        if (endpoint === 'session/control') {
+          return {
+            async *[Symbol.asyncIterator]() {
+              yield { kind: 'control-ready', sessionId: peer.principal.sessionId }
+              await new Promise<void>((resolve) => {
+                signal.addEventListener(
+                  'abort',
+                  () => {
+                    abortedEndpoints.push(endpoint)
+                    resolve()
+                  },
+                  { once: true },
+                )
+              })
+            },
+          }
+        }
+        return {
+          async *[Symbol.asyncIterator]() {
+            yield { endpoint, step: 1 }
+            yield { endpoint, step: 2 }
+          },
+        }
+      },
+    })
+    h.store.upsertBot({
+      id: 'bot-1',
+      name: 'Team Bot',
+      larkAppId: 'cli_test',
+      larkAppSecret: 'sec_test',
+      defaultWorkingDir: h.dir,
+    })
+    h.store.upsertManagedSession({
+      sessionId: 'sess-group-1',
+      botId: 'bot-1',
+      chatId: 'oc_team',
+      routeKey: 'cli_test:oc_team:om_1',
+      trigger: 'mention',
+      createdAtMs: Date.now(),
+      lastActivityMs: Date.now(),
+    })
+    const ticket = h.manager.sessionViewer.signTicket('sess-group-1')
+    const baseHeaders = {
+      host: '198.51.100.10:3880',
+      origin: 'http://198.51.100.10:3880',
+      'x-lark-view-session': 'sess-group-1',
+      'x-lark-view-ticket': ticket,
+    }
+
+    // Open a live attach downlink that stays open until we close it
+    const attachReq = Readable.from([
+      Buffer.from(JSON.stringify({ op: 'attach', muxId: 'mux-test-1' }), 'utf8'),
+    ]) as IncomingMessage
+    attachReq.method = 'POST'
+    attachReq.url = LARK_VIEW_STREAM_PATH
+    attachReq.headers = { ...baseHeaders }
+    ;(attachReq as { socket: { remoteAddress: string } }).socket = { remoteAddress: '198.51.100.42' }
+
+    const writtenFrames: Array<Record<string, unknown>> = []
+    let attachHeaders: Record<string, string | string[]> = {}
+    const resEmitter = new EventEmitter()
+    let waitForFrames: (() => void) | undefined
+    const attachRes = Object.assign(resEmitter, {
+      writableEnded: false,
+      destroyed: false,
+      writeHead(_code: number, headers?: Record<string, string | string[]>) {
+        attachHeaders = Object.fromEntries(Object.entries(headers ?? {}).map(([k, v]) => [k.toLowerCase(), v]))
+        return attachRes
+      },
+      flushHeaders() {},
+      write(chunk?: string | Buffer) {
+        const text = Buffer.isBuffer(chunk) ? chunk.toString('utf8') : (chunk ?? '')
+        for (const line of text.split('\n')) {
+          if (line.trim()) writtenFrames.push(JSON.parse(line) as Record<string, unknown>)
+        }
+        waitForFrames?.()
+        return true
+      },
+      end() {
+        attachRes.writableEnded = true
+        resEmitter.emit('close')
+        return attachRes
+      },
+    }) as unknown as ServerResponse
+
+    const attachDone = h.httpHandler(attachReq, attachRes)
+    const waitUntil = (pred: () => boolean) =>
+      new Promise<void>((resolve, reject) => {
+        if (pred()) {
+          resolve()
+          return
+        }
+        const timer = setTimeout(() => reject(new Error('timed out waiting for mux frames')), 2000)
+        const check = () => {
+          if (pred()) {
+            clearTimeout(timer)
+            waitForFrames = undefined
+            resolve()
+          }
+        }
+        waitForFrames = check
+      })
+
+    await waitUntil(() => writtenFrames.some((f) => f.type === 'ready'))
+    expect(attachHeaders['cache-control']).toBe('no-store, no-transform')
+
+    // Unknown mux returns 410 so the client cleanly reconnects
+    const missingMux = await invokeHttp(h.httpHandler, {
+      method: 'POST',
+      url: LARK_VIEW_STREAM_PATH,
+      headers: baseHeaders,
+      body: JSON.stringify({ op: 'open', muxId: 'mux-missing', streamId: 's0', endpoint: 'session/follow' }),
+    })
+    expect(missingMux.status).toBe(410)
+
+    // Open 3 concurrent streams over the SAME single downlink
+    const [open1, open2, open3] = await Promise.all([
+      invokeHttp(h.httpHandler, {
+        method: 'POST',
+        url: LARK_VIEW_STREAM_PATH,
+        headers: baseHeaders,
+        body: JSON.stringify({ op: 'open', muxId: 'mux-test-1', streamId: 's1', endpoint: 'session/follow' }),
+      }),
+      invokeHttp(h.httpHandler, {
+        method: 'POST',
+        url: LARK_VIEW_STREAM_PATH,
+        headers: baseHeaders,
+        body: JSON.stringify({ op: 'open', muxId: 'mux-test-1', streamId: 's2', endpoint: 'account/watch' }),
+      }),
+      invokeHttp(h.httpHandler, {
+        method: 'POST',
+        url: LARK_VIEW_STREAM_PATH,
+        headers: baseHeaders,
+        body: JSON.stringify({ op: 'open', muxId: 'mux-test-1', streamId: 's3', endpoint: 'session/control' }),
+      }),
+    ])
+    expect(open1.status).toBe(200)
+    expect(open2.status).toBe(200)
+    expect(open3.status).toBe(200)
+
+    await waitUntil(
+      () =>
+        writtenFrames.some((f) => f.streamId === 's1' && f.type === 'end') &&
+        writtenFrames.some((f) => f.streamId === 's2' && f.type === 'error') &&
+        writtenFrames.some((f) => f.streamId === 's3' && f.type === 'value'),
+    )
+    expect(writtenFrames.filter((f) => f.streamId === 's1')).toEqual([
+      { type: 'value', streamId: 's1', value: { endpoint: 'session/follow', step: 1 } },
+      { type: 'value', streamId: 's1', value: { endpoint: 'session/follow', step: 2 } },
+      { type: 'end', streamId: 's1' },
+    ])
+    expect(writtenFrames.find((f) => f.streamId === 's2')).toMatchObject({
+      type: 'error',
+      streamId: 's2',
+      error: { code: 'remote-access/denied', message: 'lark-viewer/read-only' },
+    })
+
+    // Cancelling s3 aborts the upstream stream without closing the downlink
+    const cancelRes = await invokeHttp(h.httpHandler, {
+      method: 'POST',
+      url: LARK_VIEW_STREAM_PATH,
+      headers: baseHeaders,
+      body: JSON.stringify({ op: 'cancel', muxId: 'mux-test-1', streamId: 's3' }),
+    })
+    expect(cancelRes.status).toBe(200)
+    await new Promise((r) => setTimeout(r, 10))
+    expect(abortedEndpoints).toContain('session/control')
+    expect(attachRes.writableEnded).toBe(false)
+
+    // Invalidating access / rotating secret closes the downlink cleanly
+    h.manager.sessionViewer.invalidateAccess(true)
+    await attachDone
+    expect(attachRes.writableEnded).toBe(true)
+  })
+
+  it('returns 503 HTML instead of throwing when readResource fails unexpectedly', async () => {
+    const h = createViewerHarness({ liveOrigin: 'http://198.51.100.10:3880' })
+    h.store.upsertBot({
+      id: 'bot-1',
+      name: 'Team Bot',
+      larkAppId: 'cli_test',
+      larkAppSecret: 'sec_test',
+      defaultWorkingDir: h.dir,
+    })
+    h.store.upsertManagedSession({
+      sessionId: 'sess-group-1',
+      botId: 'bot-1',
+      chatId: 'oc_team',
+      routeKey: 'cli_test:oc_team:om_1',
+      trigger: 'mention',
+      createdAtMs: Date.now(),
+      lastActivityMs: Date.now(),
+    })
+    h.webServer.readResource.mockRejectedValueOnce(new Error('boom'))
+    const url = new URL(h.manager.sessionWebUrl('sess-group-1'))
+    const res = await invokeHttp(h.httpHandler, {
+      url: `${url.pathname}${url.search}`,
+      headers: { host: '198.51.100.10:3880', accept: 'text/html' },
+    })
+    expect(res.status).toBe(503)
+    expect(res.text).toContain('只读会话视图服务暂不可用')
   })
 })
 

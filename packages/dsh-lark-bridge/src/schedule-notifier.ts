@@ -2,7 +2,13 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { brandString } from '@deepseek-ai/dsh-brand'
 import type { ContentBlock, UserMessage } from '@deepseek-ai/dsh-llm'
-import { pluginRecordOf, type Session, type SessionEvent, type SessionId } from '@deepseek-ai/dsh-session'
+import {
+  appendPluginRecord,
+  pluginRecordOf,
+  type Session,
+  type SessionEvent,
+  type SessionId,
+} from '@deepseek-ai/dsh-session'
 import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
 import {
   composeScheduleContextReminder,
@@ -13,6 +19,7 @@ import {
   type ScheduleTargetContextItem,
 } from '@dsh-lark/lark-core'
 import { assertExistingWorkingDirectory } from './fs-browser.js'
+import { EXTERNAL_LAUNCH_RECORD_TYPE } from './runtime-catalog.js'
 import type { LarkBridgeStore } from './store.js'
 import { TurnFinalReplyTracker } from './turn-runner.js'
 import {
@@ -271,12 +278,16 @@ export class ScheduleNotifier {
 
     const origFollowup = agent.followup.bind(agent)
     agent.followup = ((message: UserMessage) => {
-      const enriched = this.enrichScheduleUserMessage(agent.session.id, message)
+      const enriched = this.enrichScheduleUserMessage(agent.session.id, message, agent.session)
       return origFollowup(enriched)
     }) as Agent['followup']
   }
 
-  enrichScheduleUserMessage(sessionId: string, message: UserMessage): UserMessage {
+  enrichScheduleUserMessage(
+    sessionId: string,
+    message: UserMessage,
+    session?: Session,
+  ): UserMessage {
     const sourceKind = (message as { source?: { kind?: string } }).source?.kind
     if (sourceKind !== 'schedule') return message
 
@@ -294,6 +305,9 @@ export class ScheduleNotifier {
     }
 
     const scheduleIds = extractScheduleIdsFromFraming(rawText)
+    if (session && scheduleIds.length > 0) {
+      this.maybeAttachLaunchProfileRecord(session, scheduleIds)
+    }
     const reminderBlocks: string[] = []
     for (const scheduleId of scheduleIds) {
       const built = this.buildScheduleReminderSync(sessionId, scheduleId)
@@ -312,6 +326,36 @@ export class ScheduleNotifier {
       return block
     })
     return { ...message, content: nextContent }
+  }
+
+  private maybeAttachLaunchProfileRecord(session: Session, scheduleIds: readonly string[]): void {
+    const sessionPreset = session.header?.agentPreset?.trim()
+    if (!sessionPreset || typeof session.snapshotEvents !== 'function') return
+    const events = session.snapshotEvents()
+    for (const ev of events) {
+      if (ev.type === 'user/message') return
+      const rec = pluginRecordOf(ev as never) as { type?: string } | undefined
+      if (rec?.type === EXTERNAL_LAUNCH_RECORD_TYPE) return
+    }
+    for (const scheduleId of scheduleIds) {
+      const explicit = this.host.store.getScheduleBinding(scheduleId)
+      const inferred = this.inferredOriginById.get(scheduleId)
+      const primary =
+        explicit?.targets[0] ??
+        (inferred ? { botId: inferred.botId, chatId: inferred.chatId } : undefined)
+      if (!primary) continue
+      const bot = this.host.store.getBot(primary.botId)
+      if (!bot) continue
+      const group = this.host.store.getGroup(bot.id, primary.chatId)
+      const effective = resolveEffectiveAgentRuntime(bot, group)
+      if (effective.runtimeProfileId && effective.agentPreset === sessionPreset) {
+        appendPluginRecord(session, EXTERNAL_LAUNCH_RECORD_TYPE, {
+          runtimeId: sessionPreset,
+          profileId: effective.runtimeProfileId,
+        })
+        return
+      }
+    }
   }
 
   async refreshScheduleContextCache(): Promise<void> {

@@ -163,7 +163,7 @@ export function OverviewView({
                     <StateDot state={b.connected ? 'done' : b.enabled ? 'error' : 'idle'} />
                   </div>
                   <div className="fb-item-meta">
-                    {resolveRuntimeDisplayName(b.agentPreset, runtimes)}
+                    {resolveRuntimeDisplayName(b.agentPreset, runtimes, b.runtimeProfileId)}
                     {(() => {
                       const label = resolveModelDisplayName(b.agentPreset, b.model, runtimes, models)
                       return label ? ` · ${label}` : ''

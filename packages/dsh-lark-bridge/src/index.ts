@@ -133,11 +133,18 @@ export {
   type UpdateReminderInput,
 } from './reminder-service.js'
 export {
+  EXTERNAL_LAUNCH_RECORD_TYPE,
   RuntimeCatalog,
   type AgentLaunchInput,
+  type ExposedExternalPresetSummary,
+  type ExternalLaunchRecord,
+  type ExternalRuntimeAuthMethod,
   type ExternalRuntimeSummary,
   type ResolvedAgentLaunch,
   type RuntimeOption,
+  type RuntimeProfileCapabilities,
+  type RuntimeProfileInput,
+  type RuntimeProfileSummary,
 } from './runtime-catalog.js'
 export { ScheduleNotifier, formatScheduleRuleSummary } from './schedule-notifier.js'
 export {
@@ -171,6 +178,14 @@ export {
 } from './session-viewer.js'
 export { LarkBridgeStore } from './store.js'
 export {
+  TurnAbortedError,
+  TurnFinalReplyTracker,
+  runTurnAndCollectReply,
+  type RunTurnOptions,
+  type TurnAbortKind,
+  type TurnReplyTrackerOptions,
+} from './turn-runner.js'
+export {
   LARK_ORIGIN_RECORD_TYPE,
   type LarkAuditEvent,
   type LarkBridgeConfig,
@@ -181,6 +196,7 @@ export {
   type LarkGroupView,
   type LarkManagedSession,
   type LarkOriginRecord,
+  type LarkPendingTurn,
   type LarkScheduleBinding,
   type LarkScheduleView,
   type LarkSessionBinding,

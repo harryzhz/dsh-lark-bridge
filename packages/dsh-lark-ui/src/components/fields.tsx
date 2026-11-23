@@ -431,11 +431,20 @@ function buildSelectMenuEntries<T extends string>(options: readonly SelectOption
   return entries
 }
 
+export interface SelectFooterAction {
+  readonly id: string
+  readonly label: ReactNode
+  readonly icon?: ReactNode
+  readonly disabled?: boolean
+  readonly onSelect: () => void
+}
+
 /** Dropdown built on DSH's Menu primitive with the settings-pill trigger. */
 export function SelectMenu<T extends string>({
   value,
   options,
   onChange,
+  footer,
   placeholder = '请选择',
   size = 'md',
   disabled,
@@ -443,19 +452,37 @@ export function SelectMenu<T extends string>({
   value: T
   options: readonly SelectOption<T>[]
   onChange: (next: T) => void
+  /** Pinned bottom actions separated by a hairline (e.g. "管理启动配置…"). */
+  footer?: readonly SelectFooterAction[]
   placeholder?: string
   size?: 'md' | 'sm'
   disabled?: boolean
 }) {
   const [open, setOpen] = useState(false)
   const selected = options.find((o) => o.value === value)
+  const footerEntries: MenuEntry[] | undefined =
+    footer && footer.length > 0
+      ? footer.map((item) => ({
+          id: item.id,
+          label: item.label,
+          ...(item.icon ? { icon: item.icon } : {}),
+          ...(item.disabled ? { disabled: true } : {}),
+        }))
+      : undefined
   return (
     <Menu
       open={open}
       onClose={() => setOpen(false)}
       items={buildSelectMenuEntries(options)}
+      footer={footerEntries}
       selectedId={value}
       onSelect={(id) => {
+        const footerItem = footer?.find((item) => item.id === id)
+        if (footerItem) {
+          setOpen(false)
+          footerItem.onSelect()
+          return
+        }
         setOpen(false)
         if (id !== value) onChange(id as T)
       }}
@@ -505,6 +532,7 @@ export function TextField({
       autoComplete={secret ? 'new-password' : 'off'}
       spellCheck={false}
       value={value}
+      title={!secret && value ? value : undefined}
       placeholder={placeholder}
       disabled={disabled}
       onChange={(e) => onChange(e.target.value)}
