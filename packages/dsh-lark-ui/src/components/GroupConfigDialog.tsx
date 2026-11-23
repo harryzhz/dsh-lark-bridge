@@ -21,6 +21,7 @@ import {
   SENDER_TYPES,
   SESSION_MODES,
   TRIGGER_MODES,
+  groupRouterModeOptions,
   withInherit,
 } from '../presets.js'
 import type {
@@ -614,6 +615,16 @@ function GroupConversationAndMessageSection({
           value={draft.sessionMode}
           options={withInherit(SESSION_MODES, bot.groupSessionMode)}
           onChange={(sessionMode) => patch({ sessionMode })}
+        />
+      </SettingRow>
+      <SettingRow title="Router 分流">
+        <SelectMenu
+          value={draft.routerMode ?? 'inherit'}
+          options={groupRouterModeOptions(
+            Boolean(bot.experimental?.router?.enabled),
+            bot.experimental?.router?.scope ?? 'passive_only',
+          )}
+          onChange={(routerMode) => patch({ routerMode })}
         />
       </SettingRow>
       <SettingRow title="空闲自动归档">

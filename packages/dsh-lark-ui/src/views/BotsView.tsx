@@ -38,6 +38,7 @@ export function BotsView({
           bot.experimental?.proactive?.remindersEnabled ||
             bot.experimental?.proactive?.autoCodeEnabled,
         )
+        const routerEnabled = Boolean(bot.experimental?.router?.enabled)
         return (
           <div key={bot.id} className="fb-item">
             <Avatar src={avatarUrl} name={bot.name} kind="bot" />
@@ -45,6 +46,7 @@ export function BotsView({
               <div className="fb-item-title">
                 <span>{bot.name}</span>
                 <StateDot state={connected ? 'done' : bot.enabled ? 'error' : 'idle'} />
+                {routerEnabled && <Tag tone="neutral">Router</Tag>}
                 {dreamEnabled && <Tag tone="info">Dreaming</Tag>}
                 {proactiveEnabled && <Tag tone="neutral">主动工作</Tag>}
               </div>

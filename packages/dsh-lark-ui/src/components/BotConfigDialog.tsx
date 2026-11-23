@@ -30,6 +30,7 @@ import type {
   BotDreamingConfig,
   BotProactiveConfig,
   BotRecord,
+  BotRouterConfig,
   DreamRunState,
   ModelGroup,
   OpenPlatformAppItem,
@@ -87,6 +88,16 @@ export const DEFAULT_PROACTIVE_CONFIG: BotProactiveConfig = {
   branchPrefix: 'agent/',
 }
 
+export const DEFAULT_ROUTER_CONFIG: BotRouterConfig = {
+  enabled: false,
+  provider: '',
+  model: '',
+  scope: 'passive_only',
+  timeoutMs: 4000,
+  customPrompt: '',
+  coalesceQueuedMessages: true,
+}
+
 export function newBotConfig(
   defaultRuntime: RuntimeOption | undefined,
   models: readonly ModelGroup[] = [],
@@ -130,6 +141,7 @@ export function newBotConfig(
     experimental: {
       dreaming: { ...DEFAULT_DREAMING_CONFIG, scopes: [...DEFAULT_DREAMING_CONFIG.scopes] },
       proactive: { ...DEFAULT_PROACTIVE_CONFIG },
+      router: { ...DEFAULT_ROUTER_CONFIG },
     },
   }
 }
@@ -162,6 +174,10 @@ function toBotConfig(record: BotRecord): BotConfig {
       proactive: {
         ...DEFAULT_PROACTIVE_CONFIG,
         ...(cloned.experimental?.proactive ?? {}),
+      },
+      router: {
+        ...DEFAULT_ROUTER_CONFIG,
+        ...(cloned.experimental?.router ?? {}),
       },
     },
   }
@@ -1074,6 +1090,8 @@ function EditBotDialog({
           botId={existingId}
           experimental={draft.experimental}
           dreamState={localDreamState}
+          runtimes={runtimes}
+          models={models}
           onChange={(experimental) => patch({ experimental })}
           onOpenSession={(sid) => {
             onClose()

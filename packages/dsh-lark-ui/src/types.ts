@@ -28,6 +28,8 @@ export interface SubstituteMode {
 }
 
 export type ReminderCreationMode = 'silent' | 'notify' | 'confirm'
+export type RouterScopeMode = 'passive_only' | 'all_group'
+export type GroupRouterMode = 'inherit' | 'passive_only' | 'all_group' | 'off'
 
 export interface BotDreamingConfig {
   enabled: boolean
@@ -44,9 +46,20 @@ export interface BotProactiveConfig {
   branchPrefix: string
 }
 
+export interface BotRouterConfig {
+  enabled: boolean
+  provider: string
+  model: string
+  scope: RouterScopeMode
+  timeoutMs: number
+  customPrompt: string
+  coalesceQueuedMessages: boolean
+}
+
 export interface BotExperimentalConfig {
   dreaming: BotDreamingConfig
   proactive: BotProactiveConfig
+  router: BotRouterConfig
 }
 
 export interface DreamRunState {
@@ -258,6 +271,7 @@ export interface GroupConfig {
   replyMode: Inheritable<GroupReplyMode>
   sessionMode: Inheritable<GroupSessionMode>
   mentionTriggerMode: Inheritable<MentionTriggerMode>
+  routerMode?: GroupRouterMode
   idleCloseMinutes?: number | null
   receivedReactionEmoji: string
   intermediateMessages: Inheritable<'on' | 'off'>
@@ -588,6 +602,7 @@ export interface CatalogModelItem {
 export interface ModelGroup {
   provider: string
   name?: string
+  isExternal?: boolean
   models: CatalogModelItem[]
 }
 

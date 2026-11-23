@@ -32,6 +32,7 @@ import { SessionTitleGuard } from './session-title-guard.js'
 import { LarkSessionViewerService } from './session-viewer.js'
 import type { SplitBrainDetector } from './split-brain-detector.js'
 import type { LarkBridgeStore } from './store.js'
+import { LlmTriageService } from './triage-service.js'
 import { runTurnAndCollectReply } from './turn-runner.js'
 import type {
   LarkBridgeConfig,
@@ -61,6 +62,7 @@ export class LarkBridgeManager {
   readonly sessionViewer: LarkSessionViewerService
   readonly connections: BotConnectionPool
   readonly sessions: SessionCoordinator
+  readonly triage: LlmTriageService
   readonly inbound: InboundPipeline
   readonly facade: AgentToolFacade
   readonly titleGuard: SessionTitleGuard
@@ -129,12 +131,15 @@ export class LarkBridgeManager {
       this.sessions.archiveManagedSession(sid),
     )
 
+    this.triage = new LlmTriageService(ctx, this.runtimes)
+
     this.inbound = new InboundPipeline({
       ctx,
       store,
       runtimes: this.runtimes,
       connections: this.connections,
       sessions: this.sessions,
+      triage: this.triage,
       titleGuard: this.titleGuard,
       shutdownSignal: this.shutdownController.signal,
       isDisposed: () => this.disposed,
@@ -356,6 +361,7 @@ export class LarkBridgeManager {
   // ── Session Lifecycle Facade ─────────────────────────────────────────────
 
   unbindRoute(routeKey: string, options: { archive?: boolean } = {}): Promise<boolean> {
+    this.triage.context.clearRoute(routeKey)
     return this.sessions.unbindRoute(routeKey, options)
   }
 

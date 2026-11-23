@@ -121,6 +121,29 @@ export const DEFAULT_BOT_PROACTIVE_CONFIG: z.output<typeof BotProactiveConfigSch
   branchPrefix: 'agent/',
 }
 
+export const RouterScopeModeSchema = z.enum(['passive_only', 'all_group'])
+export const GroupRouterModeSchema = z.enum(['inherit', 'passive_only', 'all_group', 'off'])
+
+export const BotRouterConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+  provider: z.string().default(''),
+  model: z.string().default(''),
+  scope: RouterScopeModeSchema.default('passive_only'),
+  timeoutMs: z.number().int().min(1000).max(15000).default(4000),
+  customPrompt: z.string().default(''),
+  coalesceQueuedMessages: z.boolean().default(true),
+})
+
+export const DEFAULT_BOT_ROUTER_CONFIG: z.output<typeof BotRouterConfigSchema> = {
+  enabled: false,
+  provider: '',
+  model: '',
+  scope: 'passive_only',
+  timeoutMs: 4000,
+  customPrompt: '',
+  coalesceQueuedMessages: true,
+}
+
 function migrateLegacyExperimentalInput(input: unknown): unknown {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return input
   const rec = { ...(input as Record<string, unknown>) }
@@ -150,6 +173,7 @@ export const BotExperimentalConfigSchema = z.preprocess(
   z.object({
     dreaming: BotDreamingConfigSchema.default(DEFAULT_BOT_DREAMING_CONFIG),
     proactive: BotProactiveConfigSchema.default(DEFAULT_BOT_PROACTIVE_CONFIG),
+    router: BotRouterConfigSchema.default(DEFAULT_BOT_ROUTER_CONFIG),
   }),
 )
 
@@ -241,6 +265,7 @@ export const LarkBotConfigSchema = z.preprocess(
     experimental: BotExperimentalConfigSchema.default({
       dreaming: DEFAULT_BOT_DREAMING_CONFIG,
       proactive: DEFAULT_BOT_PROACTIVE_CONFIG,
+      router: DEFAULT_BOT_ROUTER_CONFIG,
     }),
   }),
 )
@@ -317,6 +342,7 @@ export const LarkGroupConfigSchema = z.preprocess(
     mentionTriggerMode: z
       .enum(['inherit', 'mention_and_active_thread', 'mention_only'])
       .default('inherit'),
+    routerMode: GroupRouterModeSchema.default('inherit'),
     idleCloseMinutes: z.number().min(0).optional(),
 
     // Message & card overrides
@@ -460,6 +486,9 @@ export type SubstituteMode = z.infer<typeof SubstituteModeSchema>
 export type ReminderCreationMode = z.infer<typeof ReminderCreationModeSchema>
 export type BotDreamingConfig = z.output<typeof BotDreamingConfigSchema>
 export type BotProactiveConfig = z.output<typeof BotProactiveConfigSchema>
+export type RouterScopeMode = z.infer<typeof RouterScopeModeSchema>
+export type GroupRouterMode = z.infer<typeof GroupRouterModeSchema>
+export type BotRouterConfig = z.output<typeof BotRouterConfigSchema>
 export type BotExperimentalConfig = z.output<typeof BotExperimentalConfigSchema>
 export type GroupReplyMode = z.infer<typeof GroupReplyModeSchema>
 export type GroupSessionMode = z.infer<typeof GroupSessionModeSchema>
@@ -618,6 +647,7 @@ export interface RoutingRuntimeContext {
   readonly groupConfig?: LarkGroupConfig
   readonly chatName?: string
   readonly hasActiveSessionForRoute: (routeKey: string) => boolean
+  readonly hasEphemeralRouterThread?: (routeKey: string) => boolean
   readonly getRouteTrigger?: (routeKey: string) => string | undefined
   readonly hasRouteReplied?: (routeKey: string) => boolean
 }
@@ -797,6 +827,41 @@ export function resolveEffectiveGuestReadOnly(
   if (group?.sessionLinkGuestReadOnly === 'on') return true
   if (group?.sessionLinkGuestReadOnly === 'off') return false
   return bot.sessionLinkGuestReadOnly
+}
+
+export interface EffectiveRouterConfig {
+  readonly enabled: boolean
+  readonly provider: string
+  readonly model: string
+  readonly scope: RouterScopeMode
+  readonly timeoutMs: number
+  readonly customPrompt: string
+  readonly coalesceQueuedMessages: boolean
+}
+
+export function resolveEffectiveRouterConfig(
+  bot: Pick<LarkBotConfig, 'experimental'>,
+  group?: Pick<LarkGroupConfig, 'routerMode'>,
+): EffectiveRouterConfig {
+  const base = bot.experimental?.router ?? DEFAULT_BOT_ROUTER_CONFIG
+  const groupMode = group?.routerMode ?? 'inherit'
+  const enabled =
+    groupMode === 'off'
+      ? false
+      : groupMode === 'passive_only' || groupMode === 'all_group'
+        ? true
+        : base.enabled
+  const scope: RouterScopeMode =
+    groupMode === 'passive_only' || groupMode === 'all_group' ? groupMode : base.scope
+  return {
+    enabled,
+    provider: base.provider.trim(),
+    model: base.model.trim(),
+    scope,
+    timeoutMs: base.timeoutMs,
+    customPrompt: base.customPrompt.trim(),
+    coalesceQueuedMessages: enabled && base.coalesceQueuedMessages,
+  }
 }
 
 export function toPublicBotView(bot: LarkBotConfig): LarkBotPublicView {

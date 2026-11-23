@@ -850,6 +850,7 @@ export async function dispatchLarkApiRequest(
       const providers = ctx.llm.listProviders()
       const groups = await Promise.all(
         providers.map(async (info) => {
+          const isExternal = manager.runtimes?.isExternalProvider?.(info.id) ?? false
           try {
             const externalMeta = await manager.runtimes?.modelsForProvider?.(info.id)
             if (externalMeta) {
@@ -863,7 +864,7 @@ export async function dispatchLarkApiRequest(
                   : {}),
                 ...(m.defaultEffort ? { defaultEffort: m.defaultEffort } : {}),
               }))
-              return { provider: info.id, name: info.name, models }
+              return { provider: info.id, name: info.name, isExternal: true, models }
             }
             const rawModels = await ctx.llm.listModels(info.id)
             const models = await Promise.all(
@@ -882,11 +883,12 @@ export async function dispatchLarkApiRequest(
                 }
               }),
             )
-            return { provider: info.id, name: info.name, models }
+            return { provider: info.id, name: info.name, isExternal, models }
           } catch (err) {
             return {
               provider: info.id,
               name: info.name,
+              isExternal,
               models: [],
               error: err instanceof Error ? err.message : String(err),
             }
