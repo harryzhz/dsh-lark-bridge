@@ -56,7 +56,7 @@ flowchart LR
 - **会话接管与只读查看（`/api/lark-bridge/open`）**：
   - **绝不向飞书消息泄露主 `launchToken`**，统一使用进程级随机密钥签发的 HMAC 票据。
   - **Loopback 监听**：优先经由桌面端 `dsh-app://app` 渲染进程长轮询通道（`/desktop/open-wait` + `/desktop/open-ack`）直接切至桌面 APP 会话页并通过官方 `dsh://open` 置顶窗口；无桌面窗口或显式 `mode=web` 时平滑回退到同源 HTML 跳转 `ctx.connection.authenticatedUrl` 完成浏览器首跳鉴权。
-  - **非 Loopback（局域网 / 服务器 / 反代）**：绝不签发 `launchToken`；已认证 Owner 直达完整会话，未登录群成员仅在开启「允许群成员只读查看」并持有效票据时经 DSH 原生 `RemoteAccessService`（`lark-viewer` 策略）进入单会话只读视图（详见 [SECURITY.md](../SECURITY.md)）。
+  - **非 Loopback（局域网 / 服务器 / 反代）**：绝不签发 `launchToken`；已认证 Owner 直达完整会话，未登录群成员仅在开启「允许群成员只读查看」并持有效票据时经 DSH 原生 `RemoteAccessService`（`lark-viewer` 策略）进入单会话只读视图（详见 [SECURITY.md](../../SECURITY.md)）。
 
 ## 5. 静态资源生成
 

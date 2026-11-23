@@ -8,7 +8,7 @@
 
 - **零遥测与无第三方中转**：本插件不收集任何使用遥测数据，不向除用户主动连接的飞书开放平台官方接口（`open.feishu.cn`、`accounts.feishu.cn`、`ask.feishu.cn`）及本地 DSH 宿主之外的任何第三方服务器发送配置、消息或代码内容。
 - **本地存储与严格文件权限**：
-  - 全局状态与敏感凭据统一存储在 `$DSH_HOME/lark-bridge/`（默认 `~/.dsh/lark-bridge/`），包括 `state.json`、`open-platform-session.json`、`user-oauth-tokens.json`、`cli-endpoint.json`。
+  - 全局状态与敏感凭据统一存储在 `$DSH_HOME/lark-bridge/`（默认 `~/.dsh/lark-bridge/`），包括 `lark-bridge.db`（SQLite WAL 主库）、`config.snapshot.json`、`bridge.lock`、`open-platform-session.json`、`user-oauth-tokens.json`、`cli-endpoint.json`（及迁移前的旧版 `lark-bridge-state.json` 备份）。
   - 数据目录以 `0o700` 创建，凭据与状态文件均以 `0o600` 权限原子写入（POSIX 平台）。
   - 工作区级附件下载与临时文件隔离写入 `<workingDir>/.dsh-lark-bridge/`，主动代码修改隔离在 `<workingDir>/.worktrees/`，均自动加入目标仓库 `.gitignore`。
 - **密钥隔离边界**：
@@ -23,7 +23,7 @@
 
 ### 部署建议
 
-- 如需在局域网或反向代理后暴露 DSH Web 服务，请配合 HTTPS 与可信反向代理鉴权，并避免将 `state.json`、`cli-endpoint.json`、`open-platform-session.json`、`user-oauth-tokens.json` 同步到云盘或纳入版本控制。
+- 如需在局域网或反向代理后暴露 DSH Web 服务，请配合 HTTPS 与可信反向代理鉴权，并避免将 `lark-bridge.db*`、`config.snapshot.json`、`bridge.lock`、`lark-bridge-state*.json`、`cli-endpoint.json`、`open-platform-session.json`、`user-oauth-tokens.json` 同步到云盘或纳入版本控制。
 - 为飞书自建应用按最小必要范围配置可见成员与群权限；不再使用时可随时在「飞书认证」中撤销用户 OAuth 授权或登出开放平台会话。
 
 ## 2. 开源仓库防泄露规范（面向贡献者）

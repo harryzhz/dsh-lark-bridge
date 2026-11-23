@@ -55,14 +55,15 @@
 | `pnpm clean` | 清理各子包与根包构建产物 |
 
 - **本仓库研发临时产物**：开发本仓库自身产生的临时脚本、验证日志与本地测试数据统一放在本仓库 `.local/`（已被 gitignore）。
-- **产品运行产物边界**：切勿混淆本仓库 `.local/` 与用户工作区目录，产品运行产物路径约束见 [ARCHITECTURE.md](./ARCHITECTURE.md#3-产物目录边界)。
+- **产品运行产物边界**：切勿混淆本仓库 `.local/` 与用户工作区目录，产品运行产物路径约束见 [architecture/overview.md](../architecture/overview.md#3-产物目录边界)。
+- **文档归档与放置规范**：新增长期规范或阶段性审查/复盘文档时，请按 [docs/README.md](../README.md) 约定的目录与命名归类。
 
 ## 3. 开源隐私与提交自检清单
 
-本仓库面向 GitHub 公开发布，完整运行期与开源安全规范见 [SECURITY.md](../SECURITY.md)。提交代码、测试、文档、配置或媒体资源前逐项确认：
+本仓库面向 GitHub 公开发布，完整运行期与开源安全规范见 [SECURITY.md](../../SECURITY.md)。提交代码、测试、文档、配置或媒体资源前逐项确认：
 
 1. **禁止非公开信息与运行期状态文件**：
-   - 严禁提交真实密钥、App Secret、OAuth Token、Cookie、Bearer Token、私钥及运行期状态文件（`state.json`、`cli-endpoint.json`、`open-platform-session.json`、`user-oauth-tokens.json`）。
+   - 严禁提交真实密钥、App Secret、OAuth Token、Cookie、Bearer Token、私钥及运行期状态文件（`lark-bridge.db*`、`config.snapshot.json`、`bridge.lock`、`lark-bridge-state*.json`、`state.json`、`cli-endpoint.json`、`open-platform-session.json`、`user-oauth-tokens.json`）。
    - 严禁提交真实飞书租户、群聊、成员或应用的真实 ID（`cli_*`、`ou_*`、`oc_*`、`on_*`、`om_*`）、真实姓名、个人邮箱、手机号及宿主机真实绝对路径（如 `/Users/<真实用户名>`）。
    - 严禁提交公司/组织内部系统名称、内部域名、私有 npm registry 镜像源、未公开产品/内部版本代号，以及直接复制自真实生产环境的告警文本、日志、错误码或业务源码文件名/行号；严禁在注释、测试或文档中提及或暗示任何非公开/内部版本的存在。
 2. **测试夹具与示例脱敏约定**：
