@@ -172,6 +172,17 @@ export class ProactiveReminderService {
   }
 
   /**
+   * Releases and disposes a retained reminder session handle (e.g. when its
+   * managed session is archived by idle sweep).
+   */
+  async disposeSessionHandle(sessionId: string): Promise<void> {
+    const handle = this.sessionHandles.get(sessionId)
+    if (!handle) return
+    this.sessionHandles.delete(sessionId)
+    await handle.dispose().catch(() => {})
+  }
+
+  /**
    * Transitions any reminder left in `running` from a prior process restart/crash
    * into `archived` (`error`) while preserving or backfilling its `lastSessionId`.
    */
@@ -600,6 +611,9 @@ export class ProactiveReminderService {
       return { runningItem, completion }
     } catch (err) {
       this.runningIds.delete(item.id)
+      if (createdSession) {
+        await this.disposeSessionHandle(sessionId)
+      }
       const msg = err instanceof Error ? err.message : String(err)
       const finishedMs = Date.now()
       const failed = this.host.store.upsertReminder({

@@ -3,6 +3,7 @@ import { Readable } from 'node:stream'
 import * as lark from '@larksuiteoapi/node-sdk'
 import { buildLarkPostPayload } from './markdown.js'
 import { parseLarkMessageContent } from './message-parser.js'
+import { hasVisibleText } from './reply-text.js'
 import type {
   DiscoveredLarkChat,
   InboundLarkMessage,
@@ -49,6 +50,7 @@ export interface LarkTransportCallbacks {
   readonly onCardAction?: (
     action: CardActionEvent,
   ) => Promise<{ toast?: string } | void> | { toast?: string } | void
+  readonly onChatMembershipChange?: () => Promise<void> | void
   readonly onStatusChange?: () => void
   readonly onBotProfile?: (profile: LarkBotProfile) => void
   readonly logger?: (level: 'info' | 'warn' | 'error', message: string) => void
@@ -218,6 +220,8 @@ function pickDirectoryMatch(
 export class LarkBotTransport {
   private readonly client: lark.Client
   private wsClient?: lark.WSClient
+  private startPromise?: Promise<void>
+  private lifecycleEpoch = 0
   private botOpenId?: string
   private botAvatarUrl?: string
   private botDescription?: string
@@ -266,6 +270,21 @@ export class LarkBotTransport {
 
   async start(): Promise<void> {
     if (this.wsClient) return
+    if (this.startPromise) return this.startPromise
+
+    const epoch = ++this.lifecycleEpoch
+    const startTask = this.startInternal(epoch)
+    this.startPromise = startTask
+    try {
+      await startTask
+    } finally {
+      if (this.startPromise === startTask) {
+        this.startPromise = undefined
+      }
+    }
+  }
+
+  private async startInternal(epoch: number): Promise<void> {
     this.startedAtMs = Date.now()
     this.lastError = undefined
 
@@ -275,30 +294,40 @@ export class LarkBotTransport {
       this.log('warn', `fetch bot info failed for ${this.bot.name}: ${err instanceof Error ? err.message : String(err)}`)
     }
 
+    if (epoch !== this.lifecycleEpoch) return
+
     const dispatcher = new lark.EventDispatcher({}).register({
-      'im.message.receive_v1': async (data: unknown) => {
+      'im.message.receive_v1': (data: unknown) => {
+        if (epoch !== this.lifecycleEpoch) return
         this.lastEventAtMs = Date.now()
         try {
           const parsed = this.normalizeReceiveEvent(data)
-          if (parsed) {
-            if (parsed.senderType === 'bot' && parsed.senderOpenId && parsed.senderOpenId !== this.botOpenId) {
-              let botsInChat = this.observedChatBots.get(parsed.chatId)
-              if (!botsInChat) {
-                botsInChat = new Map()
-                this.observedChatBots.set(parsed.chatId, botsInChat)
-              }
-              if (!botsInChat.has(parsed.senderOpenId)) {
-                botsInChat.set(parsed.senderOpenId, parsed.senderOpenId)
-              }
+          if (!parsed) return
+          if (parsed.senderType === 'bot' && parsed.senderOpenId && parsed.senderOpenId !== this.botOpenId) {
+            let botsInChat = this.observedChatBots.get(parsed.chatId)
+            if (!botsInChat) {
+              botsInChat = new Map()
+              this.observedChatBots.set(parsed.chatId, botsInChat)
             }
-            await this.callbacks.onMessage(parsed)
+            if (!botsInChat.has(parsed.senderOpenId)) {
+              botsInChat.set(parsed.senderOpenId, parsed.senderOpenId)
+            }
           }
+          // Return immediately so WSClient ACKs Feishu well within the 3-second deadline
+          // instead of triggering duplicate server retries during long-running agent turns.
+          void Promise.resolve()
+            .then(() => this.callbacks.onMessage(parsed))
+            .catch((err) => {
+              this.lastError = err instanceof Error ? err.message : String(err)
+              this.log('error', `im.message.receive_v1 handler failed: ${this.lastError}`)
+            })
         } catch (err) {
           this.lastError = err instanceof Error ? err.message : String(err)
-          this.log('error', `im.message.receive_v1 handler failed: ${this.lastError}`)
+          this.log('error', `im.message.receive_v1 normalize failed: ${this.lastError}`)
         }
       },
       'card.action.trigger': async (data: unknown) => {
+        if (epoch !== this.lifecycleEpoch) return {}
         this.lastEventAtMs = Date.now()
         try {
           const event = this.normalizeCardAction(data)
@@ -314,21 +343,68 @@ export class LarkBotTransport {
           return { toast: { type: 'error', content: '操作处理失败' } }
         }
       },
+      'im.message.reaction.created_v1': () => {},
+      'im.message.reaction.deleted_v1': () => {},
+      'im.message.updated_v1': () => {},
+      'im.chat.member.bot.added_v1': () => {
+        if (epoch !== this.lifecycleEpoch) return
+        this.lastEventAtMs = Date.now()
+        void Promise.resolve(this.callbacks.onChatMembershipChange?.()).catch(() => {})
+      },
+      'im.chat.member.bot.deleted_v1': () => {
+        if (epoch !== this.lifecycleEpoch) return
+        this.lastEventAtMs = Date.now()
+        void Promise.resolve(this.callbacks.onChatMembershipChange?.()).catch(() => {})
+      },
     })
 
-    this.wsClient = new lark.WSClient({
+    const ws = new lark.WSClient({
       appId: this.bot.larkAppId,
       appSecret: this.bot.larkAppSecret,
       loggerLevel: lark.LoggerLevel.warn,
     })
+    if (epoch !== this.lifecycleEpoch) {
+      try {
+        ws.close({ force: true })
+      } catch {
+        // Best-effort cleanup.
+      }
+      return
+    }
+    this.wsClient = ws
 
-    await this.wsClient.start({ eventDispatcher: dispatcher })
+    try {
+      await ws.start({ eventDispatcher: dispatcher })
+    } catch (err) {
+      if (this.wsClient === ws) {
+        this.wsClient = undefined
+        this.connected = false
+      }
+      try {
+        ws.close({ force: true })
+      } catch {
+        // Best-effort cleanup.
+      }
+      throw err
+    }
+
+    if (epoch !== this.lifecycleEpoch || this.wsClient !== ws) {
+      try {
+        ws.close({ force: true })
+      } catch {
+        // Best-effort cleanup.
+      }
+      return
+    }
+
     this.connected = true
     this.callbacks.onStatusChange?.()
     this.log('info', `Lark WSClient connected for bot "${this.bot.name}" (${this.bot.larkAppId})`)
   }
 
   async stop(): Promise<void> {
+    this.lifecycleEpoch += 1
+    this.startPromise = undefined
     const ws = this.wsClient
     this.wsClient = undefined
     this.connected = false
@@ -537,6 +613,14 @@ export class LarkBotTransport {
   }
 
   async sendReply(options: SendLarkReplyOptions): Promise<SendLarkReplyResult> {
+    if (!options.card && !hasVisibleText(options.text ?? '')) {
+      this.log(
+        'warn',
+        `Refused to send blank reply to chat ${options.chatId} (replyTo=${options.replyToMessageId ?? '-'})`,
+      )
+      return {}
+    }
+
     const msgType = options.card ? 'interactive' : 'post'
     const content = options.card
       ? JSON.stringify(options.card)

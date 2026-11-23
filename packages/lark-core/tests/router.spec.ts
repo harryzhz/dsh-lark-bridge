@@ -9,6 +9,7 @@ import {
   LarkReminderItemSchema,
   MessageDeduplicator,
   REMINDER_SILENT_SENTINEL,
+  SILENT_REPLY_SENTINEL,
   buildGroupKey,
   buildLarkPostPayload,
   buildReminderConfirmCard,
@@ -30,13 +31,16 @@ import {
   formatMarkdownForLarkPost,
   generateDefaultBotIconPng,
   hasInjectedPromptMarkup,
+  hasVisibleText,
   leafDirectoryName,
+  normalizeReplyText,
   parseLarkMessageContent,
   renderQrSvgDataUrl,
   resolveEffectiveCardBot,
   resolveEffectiveGuestReadOnly,
   resolveEffectiveReactionEmoji,
   resolveEffectiveWorkspaceName,
+  trimInvisibleText,
   type InboundLarkMessage,
 } from '../src/index.js'
 
@@ -236,6 +240,7 @@ describe('decideLarkRouting, <user_message> format, memberOverrides & title inte
           '<system_reminder>',
           '<listener name="智能技术旁听" chat_id="oc_team_dev" sender_type="user" msg_type="text">',
           '你只监听技术相关的消息，其他消息保持静默',
+          '静默约定：判断无需回复时，仅输出 `<no_reply/>` 或完全不输出正文（禁止输出空格、零宽字符或解释性拒答）。',
           '</listener>',
           '</system_reminder>',
           '',
@@ -1281,5 +1286,86 @@ describe('decideLarkRouting, <user_message> format, memberOverrides & title inte
       sessionLinkGuestReadOnly: 'on',
     })
     expect(resolveEffectiveGuestReadOnly(botGuestOff, groupOn)).toBe(true)
+  })
+
+  it('strips invisible zero-width characters, honors silent sentinels, respects groupReplyMode on non-topic active-thread, and supports persistent deduplication', () => {
+    // 1. Invisible characters & silent sentinels
+    expect(hasVisibleText('')).toBe(false)
+    expect(hasVisibleText('   \n\t  ')).toBe(false)
+    expect(hasVisibleText('\u200b')).toBe(false)
+    expect(hasVisibleText('\u200b\u200c\u200d\uFEFF\u2060\u3164\u2800')).toBe(false)
+    expect(trimInvisibleText('\u200b  你好\u200b\uFEFF ')).toBe('你好')
+    // Preserves interior ZWJ inside compound emoji
+    expect(trimInvisibleText('\u200b👨‍👩‍👧‍👦\u200b')).toBe('👨‍👩‍👧‍👦')
+
+    expect(normalizeReplyText('\u200b', { allowSilentSentinel: true })).toBe('')
+    expect(normalizeReplyText(SILENT_REPLY_SENTINEL, { allowSilentSentinel: true })).toBe('')
+    expect(normalizeReplyText(` \u200b\`${SILENT_REPLY_SENTINEL}\`\u200b `, { allowSilentSentinel: true })).toBe('')
+    expect(normalizeReplyText(REMINDER_SILENT_SENTINEL, { allowSilentSentinel: true })).toBe('')
+    expect(normalizeReplyText('请使用 `<no_reply/>` 表示静默', { allowSilentSentinel: true })).toBe(
+      '请使用 `<no_reply/>` 表示静默',
+    )
+    expect(normalizeReplyText(SILENT_REPLY_SENTINEL, { allowSilentSentinel: false })).toBe(SILENT_REPLY_SENTINEL)
+    expect(extractReminderTriggerOutput('\u200b')).toBeUndefined()
+    expect(extractReminderTriggerOutput('<no_reply/>')).toBeUndefined()
+    expect(formatMarkdownForLarkPost('\u200b\n\u200c')).toBe('')
+    expect(formatMarkdownForLarkCard('\u200b')).toBe('')
+
+    const emptyCard = buildReplyCard({ markdown: '\u200b', bot: createBot() }) as {
+      body: { elements: Array<{ content?: string }> }
+    }
+    expect(emptyCard.body.elements[0]?.content).toBe('(空回复)')
+
+    // 2. Non-topic active-thread (quoted reply without threadId) honors groupReplyMode instead of forcing new-topic
+    const replyBot = createBot({
+      groupReplyMode: 'reply',
+      groupSessionMode: 'thread',
+      mentionTriggerMode: 'mention_and_active_thread',
+    })
+    const quotedGroup = LarkGroupConfigSchema.parse({
+      key: 'dsh-bot:oc_quoted',
+      botId: 'dsh-bot',
+      chatId: 'oc_quoted',
+      enabled: true,
+      replyMode: 'reply',
+      sessionMode: 'thread',
+    })
+    const quotedFollowup = decideLarkRouting(
+      replyBot,
+      createMessage({
+        chatId: 'oc_quoted',
+        messageId: 'om_q2',
+        rootId: 'om_q1',
+        parentId: 'om_q1',
+        text: '能展开说下吗',
+      }),
+      {
+        groupConfig: quotedGroup,
+        hasActiveSessionForRoute: () => true,
+        getRouteTrigger: () => 'mention',
+        hasRouteReplied: () => true,
+      },
+    )
+    expect(quotedFollowup).toMatchObject({
+      action: 'agent',
+      trigger: 'active-thread',
+      replyMode: 'reply',
+    })
+
+    // 3. MessageDeduplicator hydrate / exportEntries persists seen IDs across restarts and prunes expired items
+    const dedup1 = new MessageDeduplicator(60_000, 3)
+    expect(dedup1.claim('cli:m1', 10_000)).toBe(true)
+    expect(dedup1.claim('cli:m2', 20_000)).toBe(true)
+    expect(dedup1.claim('cli:m3', 30_000)).toBe(true)
+    expect(dedup1.claim('cli:m4', 40_000)).toBe(true) // evicts m1
+
+    const exported = dedup1.exportEntries(50_000)
+    expect(exported.map((e) => e.key)).toEqual(['cli:m2', 'cli:m3', 'cli:m4'])
+
+    const dedup2 = new MessageDeduplicator(60_000, 3)
+    dedup2.hydrate(exported, 85_000) // m2 (age 65s) expired, m3/m4 survive
+    expect(dedup2.claim('cli:m2', 85_000)).toBe(true)
+    expect(dedup2.claim('cli:m3', 85_000)).toBe(false)
+    expect(dedup2.claim('cli:m4', 85_000)).toBe(false)
   })
 })

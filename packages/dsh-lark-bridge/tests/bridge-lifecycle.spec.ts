@@ -989,17 +989,24 @@ describe('LarkBridgeManager prompt injection, title hygiene & auto-archiving', (
       imageKeys: [],
       createTimeMs: Date.now(),
     })
-    await vi.waitFor(() => expect(pendingTurns).toHaveLength(2))
+    // Wait until turn3b has acquired the same session and registered in-flight behind turn3a (FIFO serialized)
     const sid3 = pendingTurns[0]!.session.id
-    expect(pendingTurns[1]!.session.id).toBe(sid3)
+    await vi.waitFor(() =>
+      expect(
+        (manager as unknown as { inFlightTurns: Map<string, number> }).inFlightTurns.get(sid3),
+      ).toBe(2),
+    )
+    expect(pendingTurns).toHaveLength(1)
 
-    // First turn finishes silently while second turn is still running -> must keep handle & binding
+    // First turn finishes silently while second turn is queued -> must keep handle & binding alive
     pendingTurns.shift()!.finish('')
     await turn3aPromise
     expect(disposedSessionIds).not.toContain(sid3)
     expect(store.listBindings().some((b) => b.sessionId === sid3)).toBe(true)
 
-    // Second turn finishes silently -> now safely disposes, unbinds, and archives
+    // Second turn immediately runs on the same session and finishes silently -> now safely disposes, unbinds, and archives
+    await vi.waitFor(() => expect(pendingTurns).toHaveLength(1))
+    expect(pendingTurns[0]!.session.id).toBe(sid3)
     pendingTurns.shift()!.finish('')
     await turn3bPromise
     expect(disposedSessionIds).toContain(sid3)
@@ -1714,5 +1721,359 @@ describe('LarkBridgeManager prompt injection, title hygiene & auto-archiving', (
       reloadedStore.listEvents().some((e) => e.sessionId === 'session-crash-2' && e.kind === 'error'),
     ).toBe(true)
     await recoveredManager.stop()
+  })
+
+  it('suppresses zero-width & sentinel silent replies, serializes concurrent turns without double replies, persists dedup & runtimeProfileId across restart, and silences listener errors', async () => {
+    const dir = makeTempDir()
+    const workDir = makeTempDir()
+    const store = new LarkBridgeStore(dir)
+    store.upsertBot({
+      id: 'audit-bot',
+      name: 'AuditBot',
+      enabled: true,
+      larkAppId: 'cli_audit',
+      larkAppSecret: 'sec_audit',
+      defaultWorkingDir: workDir,
+      agentPreset: 'agy',
+      runtimeProfileId: 'demo-proxy',
+      model: 'gemini-4-carbon',
+      groupReplyMode: 'reply',
+      groupSessionMode: 'thread',
+      mentionTriggerMode: 'mention_and_active_thread',
+      useInteractiveCard: false,
+    })
+    store.upsertGroup({
+      botId: 'audit-bot',
+      chatId: 'oc_audit',
+      chatName: '联合验收群',
+      enabled: true,
+      replyMode: 'reply',
+      sessionMode: 'thread',
+      listener: {
+        enabled: true,
+        name: '工作日常',
+        prompt: '无需回复时输出 <no_reply/>',
+        scope: 'all',
+        replyMode: 'reply',
+        sessionMode: 'thread',
+        allowSilentEmptyReply: true,
+        autoCloseAfterCompletion: false,
+      },
+    })
+
+    const listeners = new Map<string, Array<(...args: unknown[]) => void>>()
+    const emit = (event: string, ...args: unknown[]) => {
+      for (const fn of [...(listeners.get(event) ?? [])]) fn(...args)
+    }
+    const archivedSessionIds: string[] = []
+    const liveAgents = new Map<string, unknown>()
+    const queuedBehavior: Array<{ reply?: string; error?: string; delayMs?: number }> = []
+    const turnCounters = new Map<string, number>()
+
+    const fakeCtx = {
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      on(event: string, fn: (...args: unknown[]) => void) {
+        const list = listeners.get(event) ?? []
+        list.push(fn)
+        listeners.set(event, list)
+        return () => {
+          listeners.set(event, (listeners.get(event) ?? []).filter((f) => f !== fn))
+        }
+      },
+      sessions: { get: () => undefined },
+      agents: {
+        get: (id: string) => liveAgents.get(id),
+        create: vi.fn(async ({ sessionId }: { sessionId: string }) => {
+          const sessionObj = {
+            id: sessionId,
+            header: { cwd: workDir, agentPreset: 'agy' },
+            append: vi.fn(),
+            snapshotEvents: () => [],
+          } as unknown as Session
+          const agent = {
+            session: sessionObj,
+            followup: (userMsg: { id?: string }) => {
+              const turn = (turnCounters.get(sessionId) ?? 0) + 1
+              turnCounters.set(sessionId, turn)
+              const spec = queuedBehavior.shift() ?? { reply: `第 ${turn} 轮回复` }
+              setTimeout(() => {
+                emit('session/event', sessionObj, { type: 'turn/start', data: { turn } })
+                emit('session/event', sessionObj, {
+                  type: 'user/message',
+                  data: { id: userMsg.id, source: { kind: 'user' } },
+                })
+                if (spec.error) {
+                  emit('session/event', sessionObj, {
+                    type: 'turn/end',
+                    data: { turn, reason: { kind: 'error', error: { message: spec.error } } },
+                  })
+                  return
+                }
+                if (spec.reply !== undefined) {
+                  emit('session/event', sessionObj, {
+                    type: 'assistant/message',
+                    data: { turn, message: { content: [{ type: 'text', text: spec.reply }] } },
+                  })
+                }
+                emit('session/event', sessionObj, {
+                  type: 'turn/end',
+                  data: { turn, reason: { kind: 'completed' } },
+                })
+              }, spec.delayMs ?? 15)
+            },
+          }
+          liveAgents.set(sessionId, agent)
+          return {
+            agent,
+            dispose: vi.fn(async () => {
+              liveAgents.delete(sessionId)
+            }),
+          }
+        }),
+      },
+      get(service: string) {
+        if (service === 'workspaceRegistry') {
+          return {
+            list: () => [],
+            create: async (_d: string, title?: string) => ({
+              title: title ?? 'ws',
+              setTitle: vi.fn(),
+              attachSession: vi.fn(),
+            }),
+            archiveSession: vi.fn(async (sid: string) => {
+              archivedSessionIds.push(sid)
+            }),
+          }
+        }
+        return undefined
+      },
+    } as unknown as Context
+
+    const manager = new LarkBridgeManager(
+      fakeCtx,
+      {
+        dataDir: dir,
+        publicBaseUrl: 'http://127.0.0.1:3880',
+        idleSweepIntervalMs: 0,
+        maxAuditEvents: 100,
+        autoInstallCliAndSkill: false,
+      },
+      store,
+    )
+    const sentReplies: Array<{ replyToMessageId?: string; text?: string; replyMode?: string }> = []
+    const fakeTransport = {
+      state: { botOpenId: 'ou_bot', connected: true },
+      resolveUserSummary: vi.fn().mockResolvedValue({ openId: 'ou_u1', name: 'Tester' }),
+      addReaction: vi.fn().mockResolvedValue('r1'),
+      removeReaction: vi.fn().mockResolvedValue(undefined),
+      sendReply: vi.fn(async (opts: { replyToMessageId?: string; text?: string; replyMode?: string }) => {
+        sentReplies.push(opts)
+        return { messageId: `om_out_${sentReplies.length}`, rootId: opts.replyToMessageId }
+      }),
+      downloadImageAsBase64: vi.fn().mockResolvedValue(undefined),
+      stop: vi.fn().mockResolvedValue(undefined),
+    }
+    const handleInbound = (
+      manager as unknown as { handleInbound: (b: string, t: unknown, m: unknown) => Promise<void> }
+    ).handleInbound.bind(manager)
+
+    // 1. Listener returning only `\u200b` or `<no_reply/>` must NOT send blank messages and must clean up temp sessions
+    queuedBehavior.push({ reply: '\u200b' }, { reply: '<no_reply/>' })
+    await handleInbound('audit-bot', fakeTransport, {
+      botId: 'audit-bot',
+      larkAppId: 'cli_audit',
+      botOpenId: 'ou_bot',
+      messageId: 'om_zwsp_1',
+      chatId: 'oc_audit',
+      chatType: 'group',
+      msgType: 'text',
+      senderOpenId: 'ou_u1',
+      senderType: 'user',
+      text: '好的收到',
+      rawContent: '{}',
+      mentions: [],
+      imageKeys: [],
+      createTimeMs: Date.now(),
+    })
+    await handleInbound('audit-bot', fakeTransport, {
+      botId: 'audit-bot',
+      larkAppId: 'cli_audit',
+      botOpenId: 'ou_bot',
+      messageId: 'om_sentinel_1',
+      chatId: 'oc_audit',
+      chatType: 'group',
+      msgType: 'text',
+      senderOpenId: 'ou_u1',
+      senderType: 'user',
+      text: '+1',
+      rawContent: '{}',
+      mentions: [],
+      imageKeys: [],
+      createTimeMs: Date.now(),
+    })
+    expect(sentReplies).toHaveLength(0)
+    expect(store.listBindings()).toHaveLength(0)
+    expect(archivedSessionIds).toHaveLength(2)
+
+    // 2. Listener encountering a runtime error must stay silent in chat and clean up un-replied temp session
+    queuedBehavior.push({ error: 'upstream timeout' })
+    await handleInbound('audit-bot', fakeTransport, {
+      botId: 'audit-bot',
+      larkAppId: 'cli_audit',
+      botOpenId: 'ou_bot',
+      messageId: 'om_listener_err_1',
+      chatId: 'oc_audit',
+      chatType: 'group',
+      msgType: 'text',
+      senderOpenId: 'ou_u1',
+      senderType: 'user',
+      text: '今天天气不错',
+      rawContent: '{}',
+      mentions: [],
+      imageKeys: [],
+      createTimeMs: Date.now(),
+    })
+    expect(sentReplies).toHaveLength(0)
+    expect(store.listBindings()).toHaveLength(0)
+    expect(archivedSessionIds).toHaveLength(3)
+
+    // 3. Direct @bot returning `\u200b` falls back to explicit non-blank text (never sends a blank bubble)
+    //    Also verifies bot-originated messages skip human contact lookup (`resolveUserSummary`).
+    fakeTransport.resolveUserSummary.mockClear()
+    queuedBehavior.push({ reply: '\u200b' })
+    await handleInbound('audit-bot', fakeTransport, {
+      botId: 'audit-bot',
+      larkAppId: 'cli_audit',
+      botOpenId: 'ou_bot',
+      messageId: 'om_mention_zwsp',
+      chatId: 'oc_audit',
+      chatType: 'group',
+      msgType: 'text',
+      senderOpenId: 'ou_peer_bot',
+      senderType: 'bot',
+      text: '@_b hi',
+      rawContent: '{}',
+      mentions: [{ key: '@_b', openId: 'ou_bot', name: 'AuditBot' }],
+      imageKeys: [],
+      createTimeMs: Date.now(),
+    })
+    expect(fakeTransport.resolveUserSummary).not.toHaveBeenCalled()
+    expect(sentReplies).toHaveLength(1)
+    expect(sentReplies[0]?.text).toBe('（已完成，无文本输出）')
+
+    // 4. Two concurrent async turns on the same thread serialize FIFO and each gets its own distinct reply
+    sentReplies.length = 0
+    queuedBehavior.push({ reply: '回复A', delayMs: 40 }, { reply: '回复B', delayMs: 10 })
+    const pA = handleInbound('audit-bot', fakeTransport, {
+      botId: 'audit-bot',
+      larkAppId: 'cli_audit',
+      botOpenId: 'ou_bot',
+      messageId: 'om_conc_1',
+      chatId: 'oc_audit',
+      chatType: 'group',
+      rootId: 'om_mention_zwsp',
+      parentId: 'om_mention_zwsp',
+      msgType: 'text',
+      senderOpenId: 'ou_u1',
+      senderType: 'user',
+      text: '问题 A',
+      rawContent: '{}',
+      mentions: [],
+      imageKeys: [],
+      createTimeMs: Date.now(),
+    })
+    const pB = handleInbound('audit-bot', fakeTransport, {
+      botId: 'audit-bot',
+      larkAppId: 'cli_audit',
+      botOpenId: 'ou_bot',
+      messageId: 'om_conc_2',
+      chatId: 'oc_audit',
+      chatType: 'group',
+      rootId: 'om_mention_zwsp',
+      parentId: 'om_mention_zwsp',
+      msgType: 'text',
+      senderOpenId: 'ou_u1',
+      senderType: 'user',
+      text: '问题 B',
+      rawContent: '{}',
+      mentions: [],
+      imageKeys: [],
+      createTimeMs: Date.now(),
+    })
+    await Promise.all([pA, pB])
+    expect(sentReplies).toEqual([
+      expect.objectContaining({ replyToMessageId: 'om_conc_1', text: '回复A', replyMode: 'reply' }),
+      expect.objectContaining({ replyToMessageId: 'om_conc_2', text: '回复B', replyMode: 'reply' }),
+    ])
+
+    // 5. Stale replaced transport events are dropped
+    ;(manager as unknown as { transports: Map<string, { config: unknown; transport: unknown }> }).transports.set(
+      'audit-bot',
+      {
+        config: store.getBot('audit-bot'),
+        transport: { state: { botOpenId: 'ou_bot' }, stop: vi.fn().mockResolvedValue(undefined) },
+      },
+    )
+    sentReplies.length = 0
+    await handleInbound('audit-bot', fakeTransport, {
+      botId: 'audit-bot',
+      larkAppId: 'cli_audit',
+      botOpenId: 'ou_bot',
+      messageId: 'om_stale_transport_msg',
+      chatId: 'oc_audit',
+      chatType: 'group',
+      msgType: 'text',
+      senderOpenId: 'ou_u1',
+      senderType: 'user',
+      text: '@_b stale',
+      rawContent: '{}',
+      mentions: [{ key: '@_b', openId: 'ou_bot', name: 'AuditBot' }],
+      imageKeys: [],
+      createTimeMs: Date.now(),
+    })
+    expect(sentReplies).toHaveLength(0)
+
+    await manager.stop()
+
+    // 6. Reloading store preserves both runtimeProfileId on bindings and seenMessages for cross-restart dedup
+    const reloadedStore = new LarkBridgeStore(dir)
+    const reloadedBinding = reloadedStore.getBinding('cli_audit:oc_audit:om_mention_zwsp')
+    expect(reloadedBinding?.runtimeProfileId).toBe('demo-proxy')
+    expect(reloadedStore.listSeenMessages().some((e) => e.key === 'cli_audit:om_conc_1')).toBe(true)
+
+    const restartedManager = new LarkBridgeManager(
+      fakeCtx,
+      {
+        dataDir: dir,
+        publicBaseUrl: 'http://127.0.0.1:3880',
+        idleSweepIntervalMs: 0,
+        maxAuditEvents: 100,
+        autoInstallCliAndSkill: false,
+      },
+      reloadedStore,
+    )
+    sentReplies.length = 0
+    await (
+      restartedManager as unknown as { handleInbound: (b: string, t: unknown, m: unknown) => Promise<void> }
+    ).handleInbound('audit-bot', fakeTransport, {
+      botId: 'audit-bot',
+      larkAppId: 'cli_audit',
+      botOpenId: 'ou_bot',
+      messageId: 'om_conc_1',
+      chatId: 'oc_audit',
+      chatType: 'group',
+      rootId: 'om_mention_zwsp',
+      parentId: 'om_mention_zwsp',
+      msgType: 'text',
+      senderOpenId: 'ou_u1',
+      senderType: 'user',
+      text: '问题 A（重启后迟到的飞书重试）',
+      rawContent: '{}',
+      mentions: [],
+      imageKeys: [],
+      createTimeMs: Date.now(),
+    })
+    expect(sentReplies).toHaveLength(0)
+    await restartedManager.stop()
   })
 })

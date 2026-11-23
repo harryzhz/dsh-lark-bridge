@@ -137,7 +137,7 @@ export function GroupConfigDialog({
 
   if (!target || !draft) return null
   const bot = bots.find((b) => b.id === draft.botId)
-  const patch = (p: Partial<GroupConfig>) => setDraft({ ...draft, ...p })
+  const patch = (p: Partial<GroupConfig>) => setDraft((prev) => (prev ? { ...prev, ...p } : prev))
   const runtimeMode: 'inherit' | 'override' =
     draft.runtimeMode ??
     (draft.agentPreset || draft.runtimeProfileId || draft.model || draft.reasoningEffort

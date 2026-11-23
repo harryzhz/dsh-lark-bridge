@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
   DEFAULT_LISTENER_TEMPLATES,
@@ -18,6 +18,7 @@ import {
   type LarkGroupConfig,
   type LarkReminderItem,
   type ListenerTemplate,
+  type SeenMessageEntry,
 } from '@dsh-lark/lark-core'
 import type {
   LarkAuditEvent,
@@ -83,6 +84,7 @@ interface PersistedStateV3 {
   readonly dreamSessions?: LarkDreamSession[]
   readonly reminders?: LarkReminderItem[]
   readonly pendingTurns?: LarkPendingTurn[]
+  readonly seenMessages?: SeenMessageEntry[]
   readonly listenerTemplates: ListenerTemplate[]
   readonly scheduleBindings: LarkScheduleBinding[]
   readonly hourlyBuckets: LarkHourlyBucket[]
@@ -96,6 +98,8 @@ const MAX_HOURLY_BUCKETS = 48
 const MAX_MANAGED_SESSIONS = 600
 const MAX_DREAM_SESSIONS = 100
 const MAX_ARCHIVED_REMINDERS = 300
+const MAX_SEEN_MESSAGES = 2000
+const SEEN_MESSAGE_TTL_MS = 24 * 60 * 60_000
 
 function stripDreamSummaryPrefix(raw?: string): string | undefined {
   if (!raw) return undefined
@@ -148,6 +152,7 @@ export class LarkBridgeStore {
   private readonly dreamSessions = new Map<string, LarkDreamSession>()
   private readonly reminders = new Map<string, LarkReminderItem>()
   private readonly pendingTurns = new Map<string, LarkPendingTurn>()
+  private readonly seenMessages = new Map<string, number>()
   private readonly listenerTemplates = new Map<string, ListenerTemplate>()
   private readonly scheduleBindings = new Map<string, LarkScheduleBinding>()
   private readonly hourlyBuckets = new Map<string, LarkHourlyBucket>()
@@ -164,6 +169,51 @@ export class LarkBridgeStore {
     }
     this.statePath = join(dataDir, 'lark-bridge-state.json')
     this.load()
+  }
+
+  listSeenMessages(now = Date.now()): SeenMessageEntry[] {
+    this.pruneSeenMessages(now)
+    const out: SeenMessageEntry[] = []
+    for (const [key, seenAtMs] of this.seenMessages) {
+      out.push({ key, seenAtMs })
+    }
+    return out
+  }
+
+  rememberSeenMessage(
+    key: string,
+    seenAtMs = Date.now(),
+    options: { readonly persist?: boolean } = {},
+  ): void {
+    if (!key) return
+    this.seenMessages.delete(key)
+    this.seenMessages.set(key, seenAtMs)
+    this.pruneSeenMessages(seenAtMs)
+    if (options.persist) {
+      this.persist()
+    }
+  }
+
+  flushSeenMessages(): void {
+    this.pruneSeenMessages(Date.now())
+    if (this.seenMessages.size > 0) {
+      this.persist()
+    }
+  }
+
+  private pruneSeenMessages(now: number): void {
+    for (const [k, ts] of this.seenMessages) {
+      if (now - ts >= SEEN_MESSAGE_TTL_MS) {
+        this.seenMessages.delete(k)
+      } else {
+        break
+      }
+    }
+    while (this.seenMessages.size > MAX_SEEN_MESSAGES) {
+      const oldest = this.seenMessages.keys().next().value
+      if (oldest === undefined) break
+      this.seenMessages.delete(oldest)
+    }
   }
 
   getViewerTicketSecret(): string {
@@ -1281,6 +1331,7 @@ export class LarkBridgeStore {
               (bot ? this.resolveBotWorkspaceName(bot) : item.botId),
             workingDir: item.workingDir || bot?.defaultWorkingDir || '',
             agentPreset: item.agentPreset || bot?.agentPreset || 'standard',
+            ...(item.runtimeProfileId ? { runtimeProfileId: item.runtimeProfileId } : {}),
             ...(item.model ?? bot?.model ? { model: item.model ?? bot?.model } : {}),
             status,
             dateKey:
@@ -1373,6 +1424,7 @@ export class LarkBridgeStore {
                 : b.botId),
             sessionId: b.sessionId,
             agentPreset: b.agentPreset ?? 'codex',
+            ...(b.runtimeProfileId ? { runtimeProfileId: b.runtimeProfileId } : {}),
             ...(b.model ? { model: b.model } : {}),
             ...(b.reasoningEffort ? { reasoningEffort: b.reasoningEffort } : {}),
             workingDir: b.workingDir ?? bot?.defaultWorkingDir ?? process.cwd(),
@@ -1429,6 +1481,24 @@ export class LarkBridgeStore {
         }
       }
 
+      if (Array.isArray(raw.seenMessages)) {
+        const now = Date.now()
+        const valid = (raw.seenMessages as Array<Partial<SeenMessageEntry>>)
+          .filter(
+            (item): item is SeenMessageEntry =>
+              typeof item?.key === 'string' &&
+              item.key.length > 0 &&
+              typeof item.seenAtMs === 'number' &&
+              Number.isFinite(item.seenAtMs) &&
+              now - item.seenAtMs < SEEN_MESSAGE_TTL_MS,
+          )
+          .sort((a, b) => a.seenAtMs - b.seenAtMs)
+          .slice(-MAX_SEEN_MESSAGES)
+        for (const entry of valid) {
+          this.seenMessages.set(entry.key, entry.seenAtMs)
+        }
+      }
+
       if (Array.isArray(raw.auditEvents)) {
         for (const ev of (raw.auditEvents as LarkAuditEvent[]).slice(0, this.maxAuditEvents)) {
           if (ev?.id) this.auditEvents.push(ev)
@@ -1444,8 +1514,19 @@ export class LarkBridgeStore {
       if (needsPersist) {
         this.persist()
       }
-    } catch {
-      // Leave store empty if unreadable.
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      if (existsSync(this.statePath)) {
+        const backupPath = `${this.statePath}.corrupt-${Date.now()}.bak`
+        try {
+          copyFileSync(this.statePath, backupPath)
+          console.warn(
+            `[lark-bridge] Failed to load state file (${msg}); backed up unreadable file to ${backupPath}`,
+          )
+        } catch {
+          console.warn(`[lark-bridge] Failed to load state file (${msg}); starting with empty store`)
+        }
+      }
     }
   }
 
@@ -1519,6 +1600,7 @@ export class LarkBridgeStore {
       dreamSessions: [...this.dreamSessions.values()],
       reminders: [...this.reminders.values()],
       pendingTurns: [...this.pendingTurns.values()],
+      seenMessages: this.listSeenMessages(),
       listenerTemplates: this.listListenerTemplates(),
       scheduleBindings: [...this.scheduleBindings.values()],
       hourlyBuckets: [...this.hourlyBuckets.values()],

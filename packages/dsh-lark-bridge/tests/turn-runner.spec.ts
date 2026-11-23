@@ -519,4 +519,85 @@ describe('TurnFinalReplyTracker & runTurnAndCollectReply', () => {
       (err: unknown) => err instanceof TurnAbortedError && err.kind === 'disposed',
     )
   })
+
+  it('ignores zero-width/invisible text blocks in TurnFinalReplyTracker and avoids hijacking another caller turn by user/message id', async () => {
+    // 1. Invisible-only text (\u200b) is never treated as final reply or intermediate message,
+    //    and a trailing invisible message does not erase a real prior final text.
+    const intermediates: string[] = []
+    const tracker1 = new TurnFinalReplyTracker({
+      onIntermediate: (t) => {
+        intermediates.push(t)
+      },
+    })
+    tracker1.onEvent({
+      type: 'assistant/message',
+      data: {
+        turn: 1,
+        step: 1,
+        message: { content: [{ type: 'text', text: '\u200b' }, { type: 'tool-call', id: 'c1', name: 'bash', arguments: '{}' }] },
+      },
+    } as unknown as SessionEvent)
+    tracker1.onEvent({ type: 'tool/call', data: { turn: 1, step: 1 } } as unknown as SessionEvent)
+    tracker1.onEvent({
+      type: 'assistant/message',
+      data: { turn: 1, step: 2, message: { content: [{ type: 'text', text: '\u200b\u200c' }] } },
+    } as unknown as SessionEvent)
+    await tracker1.flush()
+    expect(intermediates).toEqual([])
+    expect(tracker1.result()).toBe('')
+
+    const tracker2 = new TurnFinalReplyTracker()
+    tracker2.onEvent({
+      type: 'assistant/message',
+      data: { turn: 1, step: 1, message: { content: [{ type: 'text', text: '真实有效回复' }] } },
+    } as unknown as SessionEvent)
+    tracker2.onEvent({
+      type: 'assistant/message',
+      data: { turn: 1, step: 2, message: { content: [{ type: 'text', text: '\u200b' }] } },
+    } as unknown as SessionEvent)
+    expect(tracker2.result()).toBe('真实有效回复')
+
+    // 2. runTurnAndCollectReply releases a turn whose user/message.id belongs to another caller (e.g. Web UI)
+    //    and keeps waiting for its own userMessage.id turn.
+    const handlers: Array<(s: Session, ev: SessionEvent) => void> = []
+    const session = { id: 'session-isolation' } as unknown as Session
+    const ctx = {
+      on(_event: string, fn: (s: Session, ev: SessionEvent) => void) {
+        handlers.push(fn)
+        return () => {
+          const idx = handlers.indexOf(fn)
+          if (idx >= 0) handlers.splice(idx, 1)
+        }
+      },
+    } as unknown as Context
+    const emit = (ev: Record<string, unknown>) => {
+      for (const h of [...handlers]) h(session, ev as unknown as SessionEvent)
+    }
+
+    const agent = {
+      session,
+      followup(msg: { id?: string }) {
+        // First, an unrelated Web UI turn starts & finishes
+        emit({ type: 'turn/start', data: { turn: 10 } })
+        emit({ type: 'user/message', data: { id: 'web-ui-msg-999', source: { kind: 'user' } } })
+        emit({
+          type: 'assistant/message',
+          data: { turn: 10, message: { content: [{ type: 'text', text: '这是 Web 端的私密回复' }] } },
+        })
+        emit({ type: 'turn/end', data: { turn: 10, reason: { kind: 'completed' } } })
+
+        // Then our actual Feishu turn runs
+        emit({ type: 'turn/start', data: { turn: 11 } })
+        emit({ type: 'user/message', data: { id: msg.id, source: { kind: 'user' } } })
+        emit({
+          type: 'assistant/message',
+          data: { turn: 11, message: { content: [{ type: 'text', text: '这是飞书这轮的正确回复' }] } },
+        })
+        emit({ type: 'turn/end', data: { turn: 11, reason: { kind: 'completed' } } })
+      },
+    } as unknown as Agent
+
+    const reply = await runTurnAndCollectReply(ctx, agent, [{ type: 'text', text: '飞书提问' }])
+    expect(reply).toBe('这是飞书这轮的正确回复')
+  })
 })

@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { normalizeReplyText } from './reply-text.js'
 import { composeSystemReminder } from './router.js'
 import {
   expandWorkingDir,
@@ -208,11 +209,6 @@ export function composeReminderTriggerPrompt(input: ReminderTriggerPromptInput):
 }
 
 export function extractReminderTriggerOutput(rawReply: string): string | undefined {
-  const trimmed = rawReply.trim()
-  if (!trimmed) return undefined
-  if (trimmed.includes(REMINDER_SILENT_SENTINEL)) {
-    const stripped = trimmed.split(REMINDER_SILENT_SENTINEL).join('').trim()
-    if (!stripped) return undefined
-  }
-  return trimmed
+  const normalized = normalizeReplyText(rawReply, { allowSilentSentinel: true })
+  return normalized || undefined
 }

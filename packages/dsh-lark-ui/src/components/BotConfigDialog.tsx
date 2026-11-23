@@ -851,7 +851,7 @@ function EditBotDialog({
     }
   }, [target])
 
-  const patch = (p: Partial<BotConfig>) => setDraft({ ...draft, ...p })
+  const patch = (p: Partial<BotConfig>) => setDraft((prev) => ({ ...prev, ...p }))
   const runtime = runtimes.find((r) => r.id === draft.agentPreset)
   const profileViewRuntime = profileView ? runtimes.find((r) => r.id === profileView.runtimeId) : undefined
 

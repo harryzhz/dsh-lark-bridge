@@ -24,6 +24,7 @@
 | --- | --- | --- |
 | 新建 worktree / 提 PR / 验证发版 / 隐私自检 | [docs/DEVELOPMENT.md](./docs/DEVELOPMENT.md) | Worktree + 分支 + PR 标准流程、Commit 约定、常用脚本与脱敏自检清单 |
 | 改动包分层 / 鉴权路由 / Desktop 接管 / 目录边界 | [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) | 六大模块分层、能力驱动边界、产物目录、HTTP/RPC 与 Electron Desktop 约束 |
+| 了解架构债、中长期重构方向与演进路线 | [docs/ARCHITECTURE_REVIEW.md](./docs/ARCHITECTURE_REVIEW.md) | 七大结构性架构问题审查（上帝对象、写放大、多实例脑裂、会话状态机等）与分阶段演进计划 |
 | 修改前端界面、弹窗、表单或样式（**必读**） | [docs/UI_GUIDELINES.md](./docs/UI_GUIDELINES.md) | 设计令牌、控件右对齐规范、原位子视图与防双层遮罩、级联子配置与标签流样式 |
 | 改动消息路由、话题复用、代答/监听或自动归档 | [docs/SESSION_MANAGEMENT.md](./docs/SESSION_MANAGEMENT.md) | 五级入站路由、多路由别名索引、会话生命周期状态机与典型配置场景 |
 | 涉及凭据、权限边界、脱敏示例或漏洞响应 | [SECURITY.md](./SECURITY.md) | 运行期安全架构、开源防泄露基线与漏洞披露流程 |

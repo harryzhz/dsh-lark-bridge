@@ -14,6 +14,7 @@ import {
   composeScheduleContextReminder,
   composeSystemReminder,
   expandWorkingDir,
+  normalizeReplyText,
   resolveEffectiveAgentRuntime,
   resolveEffectiveWorkingDir,
   type ScheduleTargetContextItem,
@@ -160,7 +161,16 @@ export function formatScheduleRuleSummary(entry: ScheduleEntryLike): string {
   }
 }
 
-function extractReplyToMessageId(routeKey: string): string | undefined {
+function extractReplyToMessageId(
+  routeKey: string,
+  aliasRouteKeys?: readonly string[],
+): string | undefined {
+  if (aliasRouteKeys) {
+    for (let i = aliasRouteKeys.length - 1; i >= 0; i -= 1) {
+      const candidate = extractReplyToMessageId(aliasRouteKeys[i]!)
+      if (candidate) return candidate
+    }
+  }
   const idx = routeKey.indexOf(':')
   if (idx < 0) return undefined
   const secondIdx = routeKey.indexOf(':', idx + 1)
@@ -582,13 +592,24 @@ export class ScheduleNotifier {
       return
     }
     if (event.type === 'turn/end') {
+      if (this.currentTurnBySession.get(sid) === event.data.turn) {
+        this.currentTurnBySession.delete(sid)
+      }
       const key = `${sid}:${event.data.turn}`
       const active = this.activeTurns.get(key)
       if (!active) return
       this.activeTurns.delete(key)
-      if (event.data.reason.kind === 'aborted') return
+      const reasonKind = event.data.reason.kind
+      if (
+        reasonKind === 'aborted' ||
+        reasonKind === 'interrupted' ||
+        reasonKind === 'blocked' ||
+        reasonKind === 'forked'
+      ) {
+        return
+      }
       const errorMessage =
-        event.data.reason.kind === 'error'
+        reasonKind === 'error'
           ? event.data.reason.error.message || '自动化任务执行失败'
           : undefined
       void this.finalizeScheduledTurn(session, active, errorMessage)
@@ -604,6 +625,10 @@ export class ScheduleNotifier {
     if (!entry) return
     const explicit = this.host.store.getScheduleBinding(entry.id)
     if (!explicit?.enabled || !explicit.sendIntermediateMessages) return
+    const cleanStep = normalizeReplyText(stepText, {
+      allowSilentSentinel: explicit.notifyOn !== 'always',
+    })
+    if (!cleanStep) return
 
     const inferredOrigin = await this.resolveInferredOrigin(entry)
     const targets: readonly LarkScheduleTarget[] =
@@ -629,7 +654,7 @@ export class ScheduleNotifier {
           deliveryMode,
           ...(replyToMessageId ? { replyToMessageId } : {}),
           scheduleTitle: entry.title,
-          markdown: stepText,
+          markdown: cleanStep,
           isError: false,
           isIntermediate: true,
           sessionId: session.id,
@@ -697,7 +722,9 @@ export class ScheduleNotifier {
     }
     this.maybeTitleScheduleSession(session, entry.title)
 
-    const replyText = turn.replyTracker.result()
+    const replyText = normalizeReplyText(turn.replyTracker.result(), {
+      allowSilentSentinel: notifyOn !== 'always',
+    })
     const isError = Boolean(errorMessage)
     const latencyMs = Date.now() - turn.startedMs
 
@@ -832,7 +859,8 @@ export class ScheduleNotifier {
         this.host.store.resolveChatName(origin.botId, origin.chatId) ||
         origin.chatName ||
         origin.chatId
-      const replyToMessageId = extractReplyToMessageId(origin.routeKey)
+      const replyToMessageId =
+        origin.replyToMessageId || extractReplyToMessageId(origin.routeKey)
       return {
         botId: origin.botId,
         botName: bot.name,
@@ -851,12 +879,17 @@ export class ScheduleNotifier {
 
     const fromBinding = this.host.store.listBindings().find((b) => b.sessionId === sessionId)
     if (fromBinding) {
+      const replyToMessageId = extractReplyToMessageId(
+        fromBinding.routeKey,
+        fromBinding.aliasRouteKeys,
+      )
       const rec: LarkOriginRecord = {
         botId: fromBinding.botId,
         botName: fromBinding.botName ?? fromBinding.botId,
         larkAppId: fromBinding.larkAppId,
         chatId: fromBinding.chatId,
         ...(fromBinding.chatName ? { chatName: fromBinding.chatName } : {}),
+        ...(replyToMessageId ? { replyToMessageId } : {}),
         workspaceName: fromBinding.workspaceName,
         routeKey: fromBinding.routeKey,
         trigger: fromBinding.trigger,

@@ -3,6 +3,7 @@ import {
   replaceMentionKeysWithNames,
   stripBotMentions,
 } from './message-parser.js'
+import { SILENT_REPLY_SENTINEL } from './reply-text.js'
 import {
   resolveEffectiveAgentRuntime,
   resolveEffectiveReactionEmoji,
@@ -259,9 +260,9 @@ export function composeScheduleContextReminder(input: ScheduleContextReminderInp
 
   const outputRule =
     input.notifyOn === 'non_empty'
-      ? '无需通知时仅输出空文本；'
+      ? `无需通知时仅输出 \`${SILENT_REPLY_SENTINEL}\`（或空文本）；`
       : input.notifyOn === 'error_only'
-        ? '仅在存在异常时输出告警报告，正常时输出空文本；'
+        ? `仅在存在异常时输出告警报告，正常时仅输出 \`${SILENT_REPLY_SENTINEL}\`（或空文本）；`
         : '每次执行均输出汇总结果；'
 
   lines.push(
@@ -382,11 +383,17 @@ function matchesListenerRule(
 
 function buildListenerReminder(listener: GroupListenerRule, msg: InboundLarkMessage): string {
   const name = escapeXmlAttr(listener.name || '群消息监听')
-  return [
+  const lines = [
     `<listener name="${name}" chat_id="${escapeXmlAttr(msg.chatId)}" sender_type="${msg.senderType}" msg_type="${escapeXmlAttr(msg.msgType)}">`,
     listener.prompt.trim(),
-    '</listener>',
-  ].join('\n')
+  ]
+  if (listener.allowSilentEmptyReply) {
+    lines.push(
+      `静默约定：判断无需回复时，仅输出 \`${SILENT_REPLY_SENTINEL}\` 或完全不输出正文（禁止输出空格、零宽字符或解释性拒答）。`,
+    )
+  }
+  lines.push('</listener>')
+  return lines.join('\n')
 }
 
 function buildSubstituteReminder(
@@ -552,10 +559,11 @@ export function decideLarkRouting(
   ) {
     const clean = replaceMentionKeysWithNames(msg.text, msg.mentions)
     const cmd = parseSlashCommand(clean)
-    const activeThreadReplyMode: GroupReplyMode =
-      existingThreadTrigger === 'listener' && !msg.threadId && group?.listener
+    const activeThreadReplyMode: GroupReplyMode = msg.threadId
+      ? 'new-topic'
+      : existingThreadTrigger === 'listener' && group?.listener
         ? group.listener.replyMode
-        : 'new-topic'
+        : groupReplyMode
     if (cmd) {
       return {
         action: 'command',

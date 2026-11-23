@@ -1,3 +1,5 @@
+import { trimInvisibleText } from './reply-text.js'
+
 const LEADING_PUNCT_RE = /^[“‘「『（【《〈〔〖(\[{"']/
 const TRAILING_PUNCT_RE = /[”’」』）】》〉〕〗)\]}"'。，、！？；：.,!?;:]$/
 const NON_SPACE_NON_PUNCT_BEFORE_RE = /[\p{L}\p{N}]$/u
@@ -172,7 +174,7 @@ function formatNonCodeBlock(block: string, target: 'post' | 'card'): string {
 }
 
 function formatMarkdownForLark(markdown: string, target: 'post' | 'card'): string {
-  const normalized = normalizeLineEndings(markdown).trim()
+  const normalized = trimInvisibleText(normalizeLineEndings(markdown))
   if (!normalized) return ''
 
   const lines = normalized.split('\n')
@@ -212,7 +214,7 @@ function formatMarkdownForLark(markdown: string, target: 'post' | 'card'): strin
     .map((seg) => (seg.isCode ? seg.text : formatNonCodeBlock(seg.text, target)))
     .join('\n')
 
-  return formatted.replace(/\n{3,}/g, '\n\n').trim()
+  return trimInvisibleText(formatted.replace(/\n{3,}/g, '\n\n'))
 }
 
 export function formatMarkdownForLarkPost(markdown: string): string {
@@ -228,11 +230,11 @@ export function buildLarkPostPayload(
   options: LarkPostPayloadOptions = {},
 ): Record<string, unknown> {
   const formatted = formatMarkdownForLarkPost(markdown)
-  const title = options.title?.trim()
+  const title = trimInvisibleText(options.title ?? '')
   return {
     zh_cn: {
       ...(title ? { title } : {}),
-      content: [[{ tag: 'md', text: formatted || markdown.trim() || ' ' }]],
+      content: [[{ tag: 'md', text: formatted || trimInvisibleText(markdown) || ' ' }]],
     },
   }
 }
