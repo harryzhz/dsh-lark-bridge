@@ -108,7 +108,27 @@ export async function apply(ctx: Context, rawConfig: LarkBridgeConfig): Promise<
   await manager.start()
 }
 
-export { LarkBridgeManager } from './bridge-manager.js'
+export { LarkBridgeManager, type AgentCliSendInput } from './bridge-manager.js'
+export { AgentToolFacade, type AgentToolFacadeHost } from './agent-tool-facade.js'
+export {
+  BotConnectionPool,
+  type BotConnectionPoolHost,
+  type ManagedTransport,
+} from './bot-connection-pool.js'
+export {
+  InboundPipeline,
+  type ActiveTurnRecord,
+  type InboundPipelineHost,
+} from './inbound-pipeline.js'
+export {
+  SessionActor,
+  SessionCoordinator,
+  type AcquiredAgent,
+  type AgentDecision,
+  type SessionActorState,
+  type SessionCoordinatorHost,
+} from './session-coordinator.js'
+export { SessionTitleGuard } from './session-title-guard.js'
 export {
   buildCliWrapperContent,
   ensureCliAuthEndpoint,

@@ -22,8 +22,8 @@ flowchart LR
 
 | 模块路径 | 职责与边界 |
 | --- | --- |
-| `packages/lark-core` | 纯 TS 飞书多智能体长连接、开放平台与 OAuth 认证、群路由、`<system_reminder>` / `<user_message>` 合成、监听规则、代答协作、卡片与实验性 Dreaming / 主动工作协议层（**零 DSH 依赖**） |
-| `packages/dsh-lark-bridge` | 薄 DSH Host 插件：飞书连接编排（`LarkBridgeManager`）、工程化 `<system_reminder>` 上下文注入、Dreaming 离线记忆整理（`DreamingService`）、一次性智能提醒（`ProactiveReminderService`）、本地目录浏览（`fs-browser`）、运行时目录聚合（`RuntimeCatalog`，可选动态发现 `ctx.externalRuntimes`）、工作区与过期会话自动归档（`WorkspaceGrouping`）、定时任务群通知与上下文注入（`ScheduleNotifier`）、斜杠命令（`slash-commands`）及 Web / Desktop RPC / CLI 鉴权 API |
+| `packages/lark-core` | 纯 TS 飞书多智能体长连接、SDK 脱敏日志与错误码翻译（`lark-logger`）、开放平台与 OAuth 认证、群路由、`<system_reminder>` / `<user_message>` 合成、监听规则、代答协作、卡片与实验性 Dreaming / 主动工作协议层（**零 DSH 依赖**） |
+| `packages/dsh-lark-bridge` | 薄 DSH Host 插件：模块化编排（`LarkBridgeManager` 协调 `BotConnectionPool` / `SessionCoordinator` & `SessionActor` / `InboundPipeline` / `AgentToolFacade` / `SessionTitleGuard` / `InstanceLock` / `SplitBrainDetector` / `Diagnostics`）、基于 Node/Electron 原生 `node:sqlite` WAL 的分层仓储与自动迁移引擎（`storage/*`）、Dreaming 离线记忆整理、一次性智能提醒、本地目录浏览、运行时目录聚合、工作区与过期会话归档、定时任务群通知、斜杠命令及 Web / Desktop RPC / CLI 鉴权 API |
 | `packages/dsh-lark-ui` | DSH Client 插件：基于 `@deepseek-ai/dsh-client-ui-primitives` 原生组件构建的概览、智能体、群聊、自动化（定时任务 + 提醒事项）与会话管理界面及悬浮配置窗 |
 | `packages/dsh-bundle` | 自托管 Web Profile 装配工具（`cordis.patch.yml`、`dsh-lark-ctl.mjs`，支持 `--external-agents` 按需叠加独立外部运行时插件）与 Agent 辅助命令行源码（`lark-bridge.mjs`） |
 | 根包 `@harryzhz/dsh-lark-bridge` | `package.json` + `cordis.patch.yml` + `scripts/prepare-root.mjs`，面向 DSH Desktop / Web「添加插件」发布的零侵入独立双端 Bundle（整合 Host + Client UI + `lark-bridge` CLI + Skill，支持 GitHub 仓库直装 / Release `.tgz` / 本地目录安装） |
@@ -39,7 +39,7 @@ flowchart LR
 
 | 产物类型 | 存放路径 | 约束 |
 | --- | --- | --- |
-| 产品运行期全局数据与状态 | `~/.dsh/lark-bridge/`（`$DSH_HOME/lark-bridge`） | 包含 `state.json`、`cli-endpoint.json`、`open-platform-session.json`、`user-oauth-tokens.json`（POSIX `0o700` / `0o600`） |
+| 产品运行期全局数据与状态 | `~/.dsh/lark-bridge/`（`$DSH_HOME/lark-bridge`） | 包含 `lark-bridge.db`（SQLite WAL 主库）、`config.snapshot.json`（低频配置只读灾备快照）、`bridge.lock`（本机 PID 互斥锁）、`backups/`（迁移前 JSON 原样备份与热备）、`cli-endpoint.json`、`open-platform-session.json`、`user-oauth-tokens.json`（POSIX `0o700` / `0o600`） |
 | 目标工作区产品产物（如消息附件） | `<workingDir>/.dsh-lark-bridge/` | 自动写入目标仓库 `.gitignore` |
 | 主动代码修改隔离工作树 | `<workingDir>/.worktrees/` | 自动写入目标仓库 `.gitignore` |
 | 本仓库研发临时产物 | `<本仓库>/.local/` | 仅用于开发 `dsh-lark-bridge` 自身；**严禁将产品运行产物写入目标工作区的 `.local/` 目录** |

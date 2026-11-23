@@ -192,6 +192,14 @@ export async function dispatchLarkApiRequest(
         const result = await manager.agentSend(body)
         return ok({ ok: true, ...result })
       }
+      if (method === 'POST' && segments[1] === 'silence') {
+        const body = bodyRecord(request.body) as { sessionId?: string; reason?: string }
+        const result = manager.agentSilenceTurn({
+          ...(body.sessionId ? { sessionId: body.sessionId } : {}),
+          ...(body.reason ? { reason: body.reason } : {}),
+        })
+        return ok({ ok: true, ...result })
+      }
       if (method === 'GET' && segments[1] === 'history') {
         const sessionId = url.searchParams.get('sessionId') ?? undefined
         const botId = url.searchParams.get('botId') ?? undefined

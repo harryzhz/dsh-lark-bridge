@@ -15,6 +15,7 @@ description: DSH 飞书桥接（dsh-lark-bridge）辅助技能与 CLI。用于�
 2. **输出与主动发送分工**：
    - 常规文字/Markdown 回复直接作为当轮最终响应输出即可，不要再用 `lark-bridge send` 重复发送同一份正文。
    - 仅在发送本地图片/文件附件、原始飞书 Schema 2.0 卡片 JSON、中途阶段播报或跨群/跨人推送时调用 `lark-bridge send`。
+   - 旁听监听或主动提醒轮次判断**无需向飞书群发送任何消息**时，优先运行 `lark-bridge silence --reason "<简要原因>"`（结构化静默控制面，即便末尾伴随总结说明也不会误发到群），纯文本环境可输出 `<no_reply/>` 或 `<no_reminder_needed/>` 兜底。
 
 ## 二、常用命令速查
 
@@ -126,4 +127,22 @@ lark-bridge schedule create \
 # 绑定已有定时任务到指定飞书群或立即试跑
 lark-bridge schedule bind <scheduleId> --bot <botId> --chat <chatId> --mode chat --notify non_empty
 lark-bridge schedule run <scheduleId>
+```
+
+### 7. 结构化静默、存储迁移维护与健康自检
+
+```bash
+# 旁听监听或提醒轮次明确不发送飞书消息（彻底阻断尾部解释文本误发）
+lark-bridge silence --reason "常规确认消息，无需介入"
+
+# SQLite 存储状态、预演迁移、完整性校验、热备份、脱敏导出、压缩与回滚
+lark-bridge db status
+lark-bridge db migrate --dry-run
+lark-bridge db verify --against ~/.dsh/lark-bridge/backups/<pre-sqlite-backup>.json
+lark-bridge db backup
+lark-bridge db export --redact --out ./.dsh-lark-bridge/tmp/redacted-state.json
+lark-bridge db compact
+
+# 一键离线+在线健康诊断（SQLite 完整性、实例锁、ACK 延迟、跨主机多实例冲突告警）
+lark-bridge doctor
 ```

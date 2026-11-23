@@ -14,6 +14,7 @@ const HELP = `lark-bridge — DSH 飞书桥接辅助 CLI（零密钥暴露，自
   lark-bridge members [--bot <botId>] [--chat <chatId>] [--query <关键词>]
   lark-bridge users search <query> [--bot <botId>]
   lark-bridge send [text] [选项]
+  lark-bridge silence [--reason <原因>] [--session <id>]
   lark-bridge history [--bot <botId>] [--chat <chatId>] [--thread <rootOrThreadId|none>] [--limit <n>]
   lark-bridge message <messageId> [--bot <botId>] [--download-dir <dir>] [--no-download] [--raw]
   lark-bridge reminder list [--status active|archived|all]
@@ -603,6 +604,17 @@ async function main() {
       `/bots/${encodeURIComponent(botId)}/users/search?q=${encodeURIComponent(query)}`,
     )
     printJson({ ok: true, botId, users: data.users })
+    return
+  }
+
+  if (cmd === 'silence') {
+    const reason = String(flags.reason ?? positionals.slice(1).join(' ')).trim() || undefined
+    printJson(
+      await apiRequest(endpoint, 'POST', '/agent/silence', {
+        ...(sessionId ? { sessionId } : {}),
+        ...(reason ? { reason } : {}),
+      }),
+    )
     return
   }
 
