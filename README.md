@@ -1,8 +1,8 @@
 # dsh-lark-bridge
 
-> 本项目受 [dsh-superagent](https://github.com/deepseek-ai/dsh-superagent-prototype) 和 [botmux](https://github.com/deepcoldy/botmux) 项目启发。
+> 本项目受 [dsh-superagent](https://github.com/deepseek-ai/dsh-superagent-prototype) 和 [botmux](https://github.com/deepcoldy/botmux) 启发。
 
-面向 [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness) Desktop 与 Web 的飞书（Lark）智能体桥接、让 Agent 参与到群协作与主动协作的插件：通过飞书官方 WebSocket 长连接把群聊、话题和本地代码工作区打通，无需公网域名或反向代理。
+面向 [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness) Desktop 与 Web 的飞书（Lark）智能体桥接、让 Agent 参与到飞书协作与主动协作的插件：通过飞书官方 WebSocket 长连接把私聊、群聊、话题和本地代码工作区打通，无需公网域名或反向代理。
 
 默认直接使用 DSH 原生预设与模型，不改动用户默认配置；如需接入 Codex、Antigravity、Claude Code 或 TRAE CLI，按需安装配套插件 [dsh-external-agents](https://github.com/harryzhz/dsh-external-agents) 即可自动发现。
 
