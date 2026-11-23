@@ -18,7 +18,7 @@ export interface Choice<T extends string> {
 }
 
 export const REPLY_MODES: readonly Choice<GroupReplyMode>[] = [
-  { value: 'new-topic', label: '新建话题' },
+  { value: 'new-topic', label: '话题内回复' },
   { value: 'reply', label: '引用回复' },
   { value: 'chat', label: '直接发送' },
 ]

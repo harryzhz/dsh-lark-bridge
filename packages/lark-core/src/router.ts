@@ -52,6 +52,40 @@ function resolveGroupReplyMode(bot: LarkBotConfig, group?: LarkGroupConfig): Gro
   return bot.groupReplyMode
 }
 
+function resolveReplyModeInContext(
+  configured: GroupReplyMode,
+  msg: InboundLarkMessage,
+): GroupReplyMode {
+  return msg.threadId ? 'new-topic' : configured
+}
+
+function resolveThreadRouteKey(
+  bot: LarkBotConfig,
+  msg: InboundLarkMessage,
+  runtime: RoutingRuntimeContext,
+): string {
+  const primaryAnchor = msg.rootId ?? msg.threadId ?? msg.messageId
+  const primaryKey = buildRouteKey(bot.larkAppId, msg.chatId, primaryAnchor)
+  if (runtime.hasActiveSessionForRoute(primaryKey)) return primaryKey
+  if (msg.rootId && msg.threadId && msg.threadId !== msg.rootId) {
+    const threadIdKey = buildRouteKey(bot.larkAppId, msg.chatId, msg.threadId)
+    if (runtime.hasActiveSessionForRoute(threadIdKey)) return threadIdKey
+  }
+  return primaryKey
+}
+
+function resolveSessionRouteKey(
+  bot: LarkBotConfig,
+  msg: InboundLarkMessage,
+  sessionMode: GroupSessionMode,
+  runtime: RoutingRuntimeContext,
+): string {
+  if (sessionMode === 'thread') {
+    return resolveThreadRouteKey(bot, msg, runtime)
+  }
+  return buildRouteKey(bot.larkAppId, msg.chatId, routeScopeForSessionMode(sessionMode, msg))
+}
+
 function resolveGroupSessionMode(
   bot: LarkBotConfig,
   group?: LarkGroupConfig,
@@ -451,18 +485,17 @@ export function decideLarkRouting(
   }
 
   const groupReplyMode = resolveGroupReplyMode(bot, group)
+  const effectiveGroupReplyMode = resolveReplyModeInContext(groupReplyMode, msg)
   const groupSessionMode = resolveGroupSessionMode(bot, group)
   const mentionTriggerMode = resolveMentionTriggerMode(bot, group)
-  const threadAnchor = msg.rootId ?? msg.threadId ?? msg.messageId
-  const threadRouteKey = buildRouteKey(bot.larkAppId, msg.chatId, threadAnchor)
+  const threadRouteKey = resolveThreadRouteKey(bot, msg, runtime)
   const chatRouteKey = buildRouteKey(bot.larkAppId, msg.chatId, 'chat')
 
   // 2. Group chat: direct @bot mention
   const mentionedBot = Boolean(msg.botOpenId && mentionsOpenId(msg, msg.botOpenId))
   if (mentionedBot) {
     const clean = stripBotMentions(msg.text, msg.mentions, msg.botOpenId)
-    const scope = routeScopeForSessionMode(groupSessionMode, msg)
-    const routeKey = buildRouteKey(bot.larkAppId, msg.chatId, scope)
+    const routeKey = resolveSessionRouteKey(bot, msg, groupSessionMode, runtime)
     const cmd = parseSlashCommand(clean)
     if (cmd) {
       const cmdRouteKey = groupSessionMode === 'chat' ? chatRouteKey : threadRouteKey
@@ -472,7 +505,7 @@ export function decideLarkRouting(
         routeKey: cmdRouteKey,
         workingDir,
         workspaceName,
-        replyMode: groupReplyMode,
+        replyMode: effectiveGroupReplyMode,
       }
     }
     const userText = clean || (msg.imageKeys.length > 0 ? '[图片消息]' : '')
@@ -487,7 +520,7 @@ export function decideLarkRouting(
       ...(model ? { model } : {}),
       ...(reasoningEffort ? { reasoningEffort } : {}),
       sessionMode: groupSessionMode,
-      replyMode: groupReplyMode,
+      replyMode: effectiveGroupReplyMode,
       useCard,
       sendIntermediateMessages,
       ...(receivedReactionEmoji ? { receivedReactionEmoji } : {}),
@@ -570,13 +603,13 @@ export function decideLarkRouting(
         sub.activeThreadFollowup && groupSessionMode === 'per_message'
           ? 'thread'
           : groupSessionMode
-      const scope = routeScopeForSessionMode(effectiveSubSessionMode, msg)
+      const routeKey = resolveSessionRouteKey(bot, msg, effectiveSubSessionMode, runtime)
       const userText = replaceMentionKeysWithNames(msg.text, msg.mentions) || `[${msg.msgType}]`
       const turnReminders = [buildSubstituteReminder(matchedTarget.name, sub.disclosure, msg)]
       return {
         action: 'agent',
         trigger: 'substitute',
-        routeKey: buildRouteKey(bot.larkAppId, msg.chatId, scope),
+        routeKey,
         workingDir,
         workspaceName,
         ...(resolvedChatName ? { chatName: resolvedChatName } : {}),
@@ -584,7 +617,7 @@ export function decideLarkRouting(
         ...(model ? { model } : {}),
         ...(reasoningEffort ? { reasoningEffort } : {}),
         sessionMode: effectiveSubSessionMode,
-        replyMode: groupReplyMode,
+        replyMode: effectiveGroupReplyMode,
         useCard,
         sendIntermediateMessages,
         ...(receivedReactionEmoji ? { receivedReactionEmoji } : {}),
@@ -607,13 +640,13 @@ export function decideLarkRouting(
       return { action: 'ignore', reason: check.reason ?? 'listener_filtered' }
     }
     const listener = group.listener
-    const scope = routeScopeForSessionMode(listener.sessionMode, msg)
+    const routeKey = resolveSessionRouteKey(bot, msg, listener.sessionMode, runtime)
     const userText = replaceMentionKeysWithNames(msg.text, msg.mentions) || `[${msg.msgType}]`
     const turnReminders = [buildListenerReminder(listener, msg)]
     return {
       action: 'agent',
       trigger: 'listener',
-      routeKey: buildRouteKey(bot.larkAppId, msg.chatId, scope),
+      routeKey,
       workingDir,
       workspaceName,
       ...(resolvedChatName ? { chatName: resolvedChatName } : {}),
@@ -621,7 +654,7 @@ export function decideLarkRouting(
       ...(model ? { model } : {}),
       ...(reasoningEffort ? { reasoningEffort } : {}),
       sessionMode: listener.sessionMode,
-      replyMode: listener.replyMode,
+      replyMode: resolveReplyModeInContext(listener.replyMode, msg),
       useCard,
       sendIntermediateMessages,
       ...(receivedReactionEmoji ? { receivedReactionEmoji } : {}),

@@ -45,6 +45,7 @@ import {
   type LarkReminderOrigin,
   type LarkUserSearchHit,
   type ReplyCardImage,
+  type SendLarkReplyResult,
   type SubstituteTarget,
 } from '@dsh-lark/lark-core'
 import {
@@ -104,6 +105,24 @@ export interface AgentCliSendInput {
 
 const DEFAULT_HISTORICAL_ARCHIVE_MS = 60 * 60_000
 
+function extractMessageScope(routeKey: string): string | undefined {
+  const parts = routeKey.split(':')
+  const scope = parts.slice(2).join(':')
+  return scope.startsWith('om_') ? scope : undefined
+}
+
+function extractBindingReplyAnchor(
+  binding: Pick<LarkSessionBinding, 'routeKey' | 'aliasRouteKeys'>,
+): string | undefined {
+  if (binding.aliasRouteKeys) {
+    for (let i = binding.aliasRouteKeys.length - 1; i >= 0; i -= 1) {
+      const candidate = extractMessageScope(binding.aliasRouteKeys[i]!)
+      if (candidate) return candidate
+    }
+  }
+  return extractMessageScope(binding.routeKey)
+}
+
 /**
  * Owns Lark long connections, Open Platform & OAuth workflows, engineered
  * `<system_reminder>` injection, CLI auth & agent endpoints, and session lifecycle.
@@ -118,7 +137,10 @@ export class LarkBridgeManager {
   readonly sessionHandoff = new LoopbackSessionHandoff()
   private readonly directoryEnricher: LarkDirectoryEnricher
   private readonly transports = new Map<string, ManagedTransport>()
+  /** Live DSH agent handles keyed by `sessionId` (decoupled from route aliases). */
   private readonly handles = new Map<string, AgentHandle>()
+  /** Serializes concurrent first-turn session creations for the same routeKey. */
+  private readonly pendingAcquires = new Map<string, Promise<AcquiredAgent>>()
   private readonly inFlightTurns = new Map<string, number>()
   private readonly dedup = new MessageDeduplicator()
   private readonly workspaces: WorkspaceGrouping
@@ -564,16 +586,17 @@ export class LarkBridgeManager {
   }
 
   async unbindRoute(routeKey: string, options: { archive?: boolean } = {}): Promise<boolean> {
-    const handle = this.handles.get(routeKey)
+    const removed = this.store.deleteBinding(routeKey)
+    if (!removed) return false
+    const handle = this.handles.get(removed.sessionId)
     if (handle) {
-      this.handles.delete(routeKey)
+      this.handles.delete(removed.sessionId)
       await handle.dispose().catch(() => {})
     }
-    const removed = this.store.deleteBinding(routeKey)
-    if (removed && options.archive) {
+    if (options.archive) {
       await this.archiveManagedSession(removed.sessionId)
     }
-    return Boolean(removed)
+    return true
   }
 
   /**
@@ -677,9 +700,7 @@ export class LarkBridgeManager {
       const binding = this.store.listBindings().find((b) => b.sessionId === sid)
       if (binding) {
         const botStatus = bots.find((b) => b.botId === binding.botId)
-        const parts = binding.routeKey.split(':')
-        const scope = parts.slice(2).join(':')
-        const replyToMessageId = scope.startsWith('om_') ? scope : undefined
+        const replyToMessageId = extractBindingReplyAnchor(binding)
         return {
           sessionId: sid,
           bound: true,
@@ -1252,8 +1273,8 @@ export class LarkBridgeManager {
         !otherTurnsInFlight &&
         (acquired.disposeAfter || decision.autoCloseAfterCompletion || isNeverRepliedListener)
       ) {
-        const handle = this.handles.get(decision.routeKey)
-        this.handles.delete(decision.routeKey)
+        const handle = this.handles.get(acquired.sessionId)
+        this.handles.delete(acquired.sessionId)
         this.store.deleteBinding(decision.routeKey)
         if (handle) {
           await handle.dispose().catch(() => {})
@@ -1388,12 +1409,13 @@ export class LarkBridgeManager {
           bot: { ...bot, dshSessionLinkInCard: false, replyFooterEnabled: false },
         })
       : undefined
-    await transport.sendReply({
+    const sent = await transport.sendReply({
       chatId: msg.chatId,
       replyToMessageId: msg.messageId,
       replyMode: decision.replyMode,
       ...(card ? { card } : { text }),
     })
+    this.syncReplyRouteAliases(bot, msg, decision, sent)
   }
 
   private async deliverReply(
@@ -1419,12 +1441,42 @@ export class LarkBridgeManager {
           sessionUrl: this.sessionWebUrl(sessionId),
         })
       : undefined
-    await transport.sendReply({
+    const sent = await transport.sendReply({
       chatId: msg.chatId,
       replyToMessageId: msg.messageId,
       replyMode: decision.replyMode,
       ...(card ? { card } : { text }),
     })
+    this.syncReplyRouteAliases(bot, msg, decision, sent)
+  }
+
+  /**
+   * Keeps thread-scoped sessions anchored across Feishu reply topology changes:
+   * - When a quoted reply is promoted to a new Feishu topic (`reply_in_thread: true`),
+   *   Feishu re-roots the topic on `msg.messageId` (`sent.rootId`) and assigns `sent.threadId`;
+   * - When replying directly into the main chat (`replyMode: 'chat'`), binds `sent.messageId`
+   *   so quoting the bot's reply seamlessly continues the same session.
+   */
+  private syncReplyRouteAliases(
+    bot: LarkBotConfig,
+    msg: InboundLarkMessage,
+    decision: AgentDecision,
+    sent: SendLarkReplyResult | undefined,
+  ): void {
+    if (msg.chatType !== 'group' || decision.sessionMode !== 'thread') return
+    const scopes = new Set<string>()
+    if (sent?.rootId) scopes.add(sent.rootId)
+    if (sent?.threadId) scopes.add(sent.threadId)
+    if (decision.replyMode === 'new-topic' && !msg.threadId && msg.messageId) {
+      scopes.add(msg.messageId)
+    }
+    if (decision.replyMode === 'chat' && sent?.messageId) {
+      scopes.add(sent.messageId)
+    }
+    for (const scope of scopes) {
+      const aliasKey = buildRouteKey(bot.larkAppId, msg.chatId, scope)
+      this.store.bindRouteAlias(decision.routeKey, aliasKey)
+    }
   }
 
   private async acquireAgent(
@@ -1433,12 +1485,41 @@ export class LarkBridgeManager {
     decision: AgentDecision,
   ): Promise<AcquiredAgent> {
     const reuseSession = decision.sessionMode !== 'per_message'
+    if (!reuseSession) {
+      return this.acquireAgentUnlocked(bot, msg, decision, false)
+    }
+
+    while (true) {
+      const lockKey = this.store.getBinding(decision.routeKey)?.routeKey ?? decision.routeKey
+      const inflight = this.pendingAcquires.get(lockKey)
+      if (inflight) {
+        await inflight.catch(() => undefined)
+        continue
+      }
+      const task = this.acquireAgentUnlocked(bot, msg, decision, true)
+      this.pendingAcquires.set(lockKey, task)
+      try {
+        return await task
+      } finally {
+        if (this.pendingAcquires.get(lockKey) === task) {
+          this.pendingAcquires.delete(lockKey)
+        }
+      }
+    }
+  }
+
+  private async acquireAgentUnlocked(
+    bot: LarkBotConfig,
+    msg: InboundLarkMessage,
+    decision: AgentDecision,
+    reuseSession: boolean,
+  ): Promise<AcquiredAgent> {
     const existing = reuseSession ? this.store.getBinding(decision.routeKey) : undefined
     if (existing) {
       const targetCwd = expandWorkingDir(decision.workingDir) || decision.workingDir
       const existingCwd = expandWorkingDir(existing.workingDir) || existing.workingDir
       if (existing.agentPreset !== decision.agentPreset || existingCwd !== targetCwd) {
-        await this.unbindRoute(decision.routeKey, { archive: false })
+        await this.unbindRoute(existing.routeKey, { archive: false })
       } else {
         const resumed = await this.resumeAgent(bot, existing, decision)
         if (resumed) return resumed
@@ -1484,7 +1565,7 @@ export class LarkBridgeManager {
     })
     this.schedules.instrumentAgent(handle.agent)
     await this.workspaces.attachSession(resolvedCwd, decision.workspaceName, sessionId)
-    this.handles.set(decision.routeKey, handle)
+    this.handles.set(sessionId, handle)
 
     const now = Date.now()
     const idleCloseMs = decision.idleCloseMs
@@ -1535,10 +1616,10 @@ export class LarkBridgeManager {
                 },
               },
         )
-        this.handles.set(decision.routeKey, handle)
+        this.handles.set(binding.sessionId, handle)
         agent = handle.agent
       } catch {
-        this.store.deleteBinding(decision.routeKey)
+        this.store.deleteBinding(binding.routeKey)
         return undefined
       }
     }
@@ -1829,6 +1910,23 @@ export class LarkBridgeManager {
       | undefined
   }
 
+  private async replaceRouteBinding(next: LarkSessionBinding): Promise<void> {
+    const prev = this.store.getBinding(next.routeKey)
+    this.store.upsertBinding(next)
+    if (
+      prev &&
+      prev.routeKey === next.routeKey &&
+      prev.sessionId !== next.sessionId &&
+      (this.inFlightTurns.get(prev.sessionId) ?? 0) === 0
+    ) {
+      const oldHandle = this.handles.get(prev.sessionId)
+      if (oldHandle) {
+        this.handles.delete(prev.sessionId)
+        await oldHandle.dispose().catch(() => {})
+      }
+    }
+  }
+
   private async sendScheduleMessage(input: {
     readonly botId: string
     readonly chatId: string
@@ -1877,7 +1975,7 @@ export class LarkBridgeManager {
       const idleMinutes = group?.idleCloseMinutes ?? bot.idleCloseMinutes
       const rawDir = liveSession?.header.cwd || group?.workingDir.trim() || bot.defaultWorkingDir
       const chatName = this.store.resolveChatName(bot.id, input.chatId)
-      this.store.upsertBinding({
+      await this.replaceRouteBinding({
         routeKey: buildRouteKey(bot.larkAppId, input.chatId, scopeId),
         botId: bot.id,
         botName: bot.name,
@@ -1893,6 +1991,12 @@ export class LarkBridgeManager {
         lastActivityMs: now,
         ...(idleMinutes > 0 ? { idleCloseMs: idleMinutes * 60_000 } : {}),
       })
+      if (sent.threadId) {
+        this.store.bindRouteAlias(
+          buildRouteKey(bot.larkAppId, input.chatId, scopeId),
+          buildRouteKey(bot.larkAppId, input.chatId, sent.threadId),
+        )
+      }
     }
   }
 
@@ -2007,8 +2111,9 @@ export class LarkBridgeManager {
       const runtime = resolveEffectiveAgentRuntime(bot, group)
       const rawDir = item.workingDir || group?.workingDir.trim() || bot.defaultWorkingDir
       const chatName = this.store.resolveChatName(bot.id, chatId)
-      this.store.upsertBinding({
-        routeKey: buildRouteKey(bot.larkAppId, chatId, scopeId),
+      const reminderRouteKey = buildRouteKey(bot.larkAppId, chatId, scopeId)
+      await this.replaceRouteBinding({
+        routeKey: reminderRouteKey,
         botId: bot.id,
         botName: bot.name,
         larkAppId: bot.larkAppId,
@@ -2024,6 +2129,12 @@ export class LarkBridgeManager {
         lastActivityMs: now,
         ...(idleMinutes > 0 ? { idleCloseMs: idleMinutes * 60_000 } : {}),
       })
+      if (sent.threadId) {
+        this.store.bindRouteAlias(
+          reminderRouteKey,
+          buildRouteKey(bot.larkAppId, chatId, sent.threadId),
+        )
+      }
     }
     return { ...(sent.messageId ? { messageId: sent.messageId } : {}) }
   }

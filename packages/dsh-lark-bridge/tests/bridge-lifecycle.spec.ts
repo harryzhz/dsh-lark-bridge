@@ -1008,4 +1008,374 @@ describe('LarkBridgeManager prompt injection, title hygiene & auto-archiving', (
 
     await manager.stop()
   })
+
+  it('keeps the same session across quoted-chain to topic promotion, chat-mode reply followup, concurrent creation, and store reload', async () => {
+    const dir = makeTempDir()
+    const workDir = makeTempDir()
+    const store = new LarkBridgeStore(dir)
+    const bot = store.upsertBot({
+      id: 'collab-bot',
+      name: 'CollabBot',
+      enabled: false,
+      larkAppId: 'cli_collab',
+      larkAppSecret: 'sec_collab',
+      defaultWorkingDir: workDir,
+      groupReplyMode: 'reply',
+      groupSessionMode: 'thread',
+      mentionTriggerMode: 'mention_and_active_thread',
+      useInteractiveCard: false,
+    })
+    store.upsertGroup({
+      botId: 'collab-bot',
+      chatId: 'oc_collab',
+      chatName: '协作研发群',
+      enabled: true,
+      replyMode: 'reply',
+      sessionMode: 'inherit',
+      mentionTriggerMode: 'inherit',
+      listener: {
+        enabled: true,
+        name: '工作日常',
+        prompt: '必要时参与讨论，否则静默。',
+        scope: 'all',
+        replyMode: 'reply',
+        sessionMode: 'thread',
+        allowSilentEmptyReply: true,
+        autoCloseAfterCompletion: false,
+        excludeKeywords: ['@'],
+      },
+    })
+
+    const listeners = new Map<string, Array<(...args: unknown[]) => void>>()
+    const emit = (event: string, ...args: unknown[]) => {
+      for (const fn of listeners.get(event) ?? []) fn(...args)
+    }
+    const archivedSessionIds: string[] = []
+    const disposedSessionIds: string[] = []
+    const liveAgents = new Map<string, unknown>()
+    const submittedBySession = new Map<string, string[]>()
+    const turnCounters = new Map<string, number>()
+    let releaseSlowCreate: (() => void) | undefined
+    let slowCreateGate = false
+
+    const fakeCtx = {
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      on(event: string, fn: (...args: unknown[]) => void) {
+        const list = listeners.get(event) ?? []
+        list.push(fn)
+        listeners.set(event, list)
+        return () => {
+          listeners.set(event, (listeners.get(event) ?? []).filter((f) => f !== fn))
+        }
+      },
+      sessions: { get: () => undefined },
+      agents: {
+        get: (id: string) => liveAgents.get(id),
+        create: vi.fn(async ({ sessionId }: { sessionId: string }) => {
+          if (slowCreateGate) {
+            await new Promise<void>((resolve) => {
+              releaseSlowCreate = resolve
+            })
+          }
+          const sessionObj = {
+            id: sessionId,
+            header: { cwd: workDir, agentPreset: 'codex' },
+            append: vi.fn(),
+            snapshotEvents: () => [],
+          } as unknown as Session
+          const agent = {
+            session: sessionObj,
+            followup: (userMsg: { content: Array<{ type: string; text?: string }> }) => {
+              const turn = (turnCounters.get(sessionId) ?? 0) + 1
+              turnCounters.set(sessionId, turn)
+              const prompts = submittedBySession.get(sessionId) ?? []
+              prompts.push(userMsg.content.map((b) => b.text ?? '').join('\n'))
+              submittedBySession.set(sessionId, prompts)
+              emit('session/event', sessionObj, { type: 'turn/start', data: { turn } })
+              emit('session/event', sessionObj, {
+                type: 'assistant/message',
+                data: { turn, message: { content: [{ type: 'text', text: `回复第 ${turn} 轮` }] } },
+              })
+              emit('session/event', sessionObj, {
+                type: 'turn/end',
+                data: { turn, reason: { kind: 'completed' } },
+              })
+            },
+          }
+          liveAgents.set(sessionId, agent)
+          return {
+            agent,
+            dispose: vi.fn(async () => {
+              disposedSessionIds.push(sessionId)
+              liveAgents.delete(sessionId)
+            }),
+          }
+        }),
+      },
+      get(service: string) {
+        if (service === 'workspaceRegistry') {
+          return {
+            list: () => [],
+            create: async (_d: string, title?: string) => ({
+              title: title ?? 'ws',
+              setTitle: vi.fn(),
+              attachSession: vi.fn(),
+            }),
+            archiveSession: vi.fn(async (sid: string) => {
+              if (!archivedSessionIds.includes(sid)) archivedSessionIds.push(sid)
+            }),
+          }
+        }
+        return undefined
+      },
+    } as unknown as Context
+
+    const manager = new LarkBridgeManager(
+      fakeCtx,
+      {
+        dataDir: dir,
+        publicBaseUrl: 'http://192.0.2.10:3880',
+        idleSweepIntervalMs: 0,
+        maxAuditEvents: 100,
+        autoInstallCliAndSkill: false,
+      },
+      store,
+    )
+    await manager.start()
+    store.upsertBot({ ...bot, enabled: true })
+
+    let nextSendResult: { messageId?: string; rootId?: string; threadId?: string } = {
+      messageId: 'om_m2',
+      rootId: 'om_m1',
+    }
+    const fakeTransport = {
+      state: { botOpenId: 'ou_bot' },
+      resolveUserSummary: vi.fn().mockResolvedValue({ openId: 'ou_user_1', name: 'Sam' }),
+      addReaction: vi.fn().mockResolvedValue('r1'),
+      removeReaction: vi.fn().mockResolvedValue(undefined),
+      sendReply: vi.fn(async () => nextSendResult),
+      downloadImageAsBase64: vi.fn().mockResolvedValue(undefined),
+    }
+    const handleInbound = (
+      manager as unknown as { handleInbound: (b: string, t: unknown, m: unknown) => Promise<void> }
+    ).handleInbound.bind(manager)
+
+    // 1. M1 (top-level @bot) creates S1 and replies as a regular quote M2 (no threadId)
+    await handleInbound('collab-bot', fakeTransport, {
+      botId: 'collab-bot',
+      larkAppId: 'cli_collab',
+      botOpenId: 'ou_bot',
+      messageId: 'om_m1',
+      chatId: 'oc_collab',
+      chatType: 'group',
+      msgType: 'text',
+      senderOpenId: 'ou_user_1',
+      senderType: 'user',
+      text: '@_bot_1 帮忙 review 下 MR 234',
+      rawContent: '{}',
+      mentions: [{ key: '@_bot_1', openId: 'ou_bot', name: 'CollabBot' }],
+      imageKeys: [],
+      createTimeMs: Date.now(),
+    })
+    expect(store.listBindings()).toHaveLength(1)
+    const s1 = store.listBindings()[0]!.sessionId
+
+    // 2. Group switches to replyMode='new-topic'; M3 quotes M2 (rootId=om_m1, no threadId) with @bot.
+    //    Bot replies M4 with reply_in_thread=true -> Feishu promotes M3 to topic root (rootId=om_m3, threadId=omt_promoted_1).
+    store.upsertGroup({
+      ...store.getGroup('collab-bot', 'oc_collab')!,
+      replyMode: 'new-topic',
+    })
+    nextSendResult = {
+      messageId: 'om_m4',
+      rootId: 'om_m3',
+      threadId: 'omt_promoted_1',
+    }
+    await handleInbound('collab-bot', fakeTransport, {
+      botId: 'collab-bot',
+      larkAppId: 'cli_collab',
+      botOpenId: 'ou_bot',
+      messageId: 'om_m3',
+      chatId: 'oc_collab',
+      chatType: 'group',
+      rootId: 'om_m1',
+      parentId: 'om_m2',
+      msgType: 'text',
+      senderOpenId: 'ou_user_1',
+      senderType: 'user',
+      text: '@_bot_1 需要 cherry-pick 拉新分支吗？',
+      rawContent: '{}',
+      mentions: [{ key: '@_bot_1', openId: 'ou_bot', name: 'CollabBot' }],
+      imageKeys: [],
+      createTimeMs: Date.now(),
+    })
+    expect(store.listBindings()).toHaveLength(1)
+    expect(store.listBindings()[0]?.sessionId).toBe(s1)
+    expect(store.listBindings()[0]?.aliasRouteKeys).toEqual(
+      expect.arrayContaining(['cli_collab:oc_collab:om_m3', 'cli_collab:oc_collab:omt_promoted_1']),
+    )
+    expect(manager.resolveAgentContext(s1).replyToMessageId).toBe('om_m3')
+
+    // 3. M5 ("你帮我拉下", un-mentioned, inside promoted topic: rootId=om_m3, threadId=omt_promoted_1)
+    //    MUST reuse S1 via active-thread instead of falling through to listener & creating S2!
+    nextSendResult = {
+      messageId: 'om_m6',
+      rootId: 'om_m3',
+      threadId: 'omt_promoted_1',
+    }
+    await handleInbound('collab-bot', fakeTransport, {
+      botId: 'collab-bot',
+      larkAppId: 'cli_collab',
+      botOpenId: 'ou_bot',
+      messageId: 'om_m5',
+      chatId: 'oc_collab',
+      chatType: 'group',
+      rootId: 'om_m3',
+      parentId: 'om_m3',
+      threadId: 'omt_promoted_1',
+      msgType: 'text',
+      senderOpenId: 'ou_user_1',
+      senderType: 'user',
+      text: '你帮我拉下',
+      rawContent: '{}',
+      mentions: [],
+      imageKeys: [],
+      createTimeMs: Date.now(),
+    })
+    expect(fakeCtx.agents.create).toHaveBeenCalledTimes(1)
+    expect(store.listBindings()).toHaveLength(1)
+    expect(submittedBySession.get(s1)).toHaveLength(3)
+    expect(submittedBySession.get(s1)?.[2]).toContain('<user_message>\n你帮我拉下\n</user_message>')
+    expect(submittedBySession.get(s1)?.[2]).not.toContain('<listener ')
+
+    // 4. Persisted reload preserves both aliasRouteKeys and explicit hasReplied=false
+    store.upsertBinding({
+      routeKey: 'cli_collab:oc_collab:om_pending_listener',
+      botId: 'collab-bot',
+      larkAppId: 'cli_collab',
+      chatType: 'group',
+      chatId: 'oc_collab',
+      workspaceName: 'ws',
+      sessionId: 'session-pending-listener',
+      agentPreset: 'codex',
+      workingDir: workDir,
+      trigger: 'listener',
+      hasReplied: false,
+      createdAtMs: Date.now(),
+      lastActivityMs: Date.now(),
+    })
+    const reloadedStore = new LarkBridgeStore(dir)
+    expect(reloadedStore.getBinding('cli_collab:oc_collab:om_m3')?.sessionId).toBe(s1)
+    expect(reloadedStore.getBinding('cli_collab:oc_collab:omt_promoted_1')?.sessionId).toBe(s1)
+    expect(reloadedStore.getBinding('cli_collab:oc_collab:om_pending_listener')?.hasReplied).toBe(false)
+    store.deleteBinding('cli_collab:oc_collab:om_pending_listener')
+
+    // 5. Unbinding via alias routeKey disposes handle by sessionId, clears all aliases, and archives S1
+    expect(await manager.unbindRoute('cli_collab:oc_collab:om_m3', { archive: true })).toBe(true)
+    expect(store.getBinding('cli_collab:oc_collab:om_m1')).toBeUndefined()
+    expect(store.getBinding('cli_collab:oc_collab:om_m3')).toBeUndefined()
+    expect(store.getBinding('cli_collab:oc_collab:omt_promoted_1')).toBeUndefined()
+    expect(disposedSessionIds).toContain(s1)
+    expect(archivedSessionIds).toContain(s1)
+
+    // 6. replyMode='chat' + sessionMode='thread' binds sent.messageId so quoting the bot's chat reply continues the session
+    store.upsertGroup({
+      ...store.getGroup('collab-bot', 'oc_collab')!,
+      replyMode: 'chat',
+      sessionMode: 'thread',
+    })
+    nextSendResult = { messageId: 'om_bot_chat_msg' }
+    await handleInbound('collab-bot', fakeTransport, {
+      botId: 'collab-bot',
+      larkAppId: 'cli_collab',
+      botOpenId: 'ou_bot',
+      messageId: 'om_chat_q1',
+      chatId: 'oc_collab',
+      chatType: 'group',
+      msgType: 'text',
+      senderOpenId: 'ou_user_1',
+      senderType: 'user',
+      text: '@_bot_1 查下服务延迟',
+      rawContent: '{}',
+      mentions: [{ key: '@_bot_1', openId: 'ou_bot', name: 'CollabBot' }],
+      imageKeys: [],
+      createTimeMs: Date.now(),
+    })
+    const sChat = store.getBinding('cli_collab:oc_collab:om_chat_q1')?.sessionId
+    expect(sChat).toBeTruthy()
+    expect(store.getBinding('cli_collab:oc_collab:om_bot_chat_msg')?.sessionId).toBe(sChat)
+
+    nextSendResult = { messageId: 'om_bot_chat_msg_2', rootId: 'om_bot_chat_msg' }
+    await handleInbound('collab-bot', fakeTransport, {
+      botId: 'collab-bot',
+      larkAppId: 'cli_collab',
+      botOpenId: 'ou_bot',
+      messageId: 'om_chat_q2',
+      chatId: 'oc_collab',
+      chatType: 'group',
+      rootId: 'om_bot_chat_msg',
+      parentId: 'om_bot_chat_msg',
+      msgType: 'text',
+      senderOpenId: 'ou_user_1',
+      senderType: 'user',
+      text: '能看下 P99 吗',
+      rawContent: '{}',
+      mentions: [],
+      imageKeys: [],
+      createTimeMs: Date.now(),
+    })
+    expect(fakeCtx.agents.create).toHaveBeenCalledTimes(2)
+    expect(submittedBySession.get(sChat!)).toHaveLength(2)
+
+    // 7. Concurrent first messages for the same new thread serialize creation instead of spawning duplicate sessions
+    slowCreateGate = true
+    const createCountBeforeRace = (fakeCtx.agents.create as ReturnType<typeof vi.fn>).mock.calls.length
+    nextSendResult = { messageId: 'om_race_reply', rootId: 'om_race_root', threadId: 'omt_race' }
+    const race1 = handleInbound('collab-bot', fakeTransport, {
+      botId: 'collab-bot',
+      larkAppId: 'cli_collab',
+      botOpenId: 'ou_bot',
+      messageId: 'om_race_root',
+      chatId: 'oc_collab',
+      chatType: 'group',
+      msgType: 'text',
+      senderOpenId: 'ou_user_1',
+      senderType: 'user',
+      text: '@_bot_1 第一条并发消息',
+      rawContent: '{}',
+      mentions: [{ key: '@_bot_1', openId: 'ou_bot', name: 'CollabBot' }],
+      imageKeys: [],
+      createTimeMs: Date.now(),
+    })
+    const race2 = handleInbound('collab-bot', fakeTransport, {
+      botId: 'collab-bot',
+      larkAppId: 'cli_collab',
+      botOpenId: 'ou_bot',
+      messageId: 'om_race_second',
+      chatId: 'oc_collab',
+      chatType: 'group',
+      rootId: 'om_race_root',
+      parentId: 'om_race_root',
+      msgType: 'text',
+      senderOpenId: 'ou_user_1',
+      senderType: 'user',
+      text: '@_bot_1 第二条并发消息',
+      rawContent: '{}',
+      mentions: [{ key: '@_bot_1', openId: 'ou_bot', name: 'CollabBot' }],
+      imageKeys: [],
+      createTimeMs: Date.now(),
+    })
+    await vi.waitFor(() => expect(releaseSlowCreate).toBeTypeOf('function'))
+    slowCreateGate = false
+    releaseSlowCreate!()
+    await Promise.all([race1, race2])
+
+    expect((fakeCtx.agents.create as ReturnType<typeof vi.fn>).mock.calls.length).toBe(
+      createCountBeforeRace + 1,
+    )
+    const raceSid = store.getBinding('cli_collab:oc_collab:om_race_root')!.sessionId
+    expect(submittedBySession.get(raceSid)).toHaveLength(2)
+
+    await manager.stop()
+  })
 })

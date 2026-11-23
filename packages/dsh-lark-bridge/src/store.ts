@@ -138,6 +138,7 @@ export class LarkBridgeStore {
   private readonly groups = new Map<string, LarkGroupConfig>()
   private readonly discoveredChats = new Map<string, DiscoveredLarkChat>()
   private readonly bindings = new Map<string, LarkSessionBinding>()
+  private readonly routeAliases = new Map<string, string>()
   private readonly managedSessions = new Map<string, LarkManagedSession>()
   private readonly dreamStates = new Map<string, LarkDreamRunState>()
   private readonly dreamSessions = new Map<string, LarkDreamSession>()
@@ -223,7 +224,10 @@ export class LarkBridgeStore {
       if (grp.botId === id) this.groups.delete(key)
     }
     for (const [key, binding] of this.bindings) {
-      if (binding.botId === id) this.bindings.delete(key)
+      if (binding.botId === id) {
+        this.unindexBindingAliases(binding)
+        this.bindings.delete(key)
+      }
     }
     this.botMetrics.delete(id)
     this.dreamStates.delete(id)
@@ -496,28 +500,130 @@ export class LarkBridgeStore {
       .sort((a, b) => b.lastActivityMs - a.lastActivityMs)
   }
 
+  private resolvePrimaryRouteKey(routeKey: string): string {
+    if (this.bindings.has(routeKey)) return routeKey
+    return this.routeAliases.get(routeKey) ?? routeKey
+  }
+
+  private normalizeAliases(primaryRouteKey: string, aliases?: readonly string[]): string[] {
+    if (!aliases || aliases.length === 0) return []
+    const out: string[] = []
+    for (const raw of aliases) {
+      const clean = raw.trim()
+      if (!clean || clean === primaryRouteKey || out.includes(clean)) continue
+      out.push(clean)
+    }
+    return out
+  }
+
+  private unindexBindingAliases(binding: LarkSessionBinding): void {
+    for (const alias of binding.aliasRouteKeys ?? []) {
+      if (this.routeAliases.get(alias) === binding.routeKey) {
+        this.routeAliases.delete(alias)
+      }
+    }
+  }
+
+  private indexBindingAliases(binding: LarkSessionBinding): void {
+    for (const alias of binding.aliasRouteKeys ?? []) {
+      if (alias && alias !== binding.routeKey) {
+        this.routeAliases.set(alias, binding.routeKey)
+      }
+    }
+  }
+
+  private detachAliasFromOwner(aliasRouteKey: string, excludePrimaryKey?: string): void {
+    const ownerKey = this.routeAliases.get(aliasRouteKey)
+    if (!ownerKey || ownerKey === excludePrimaryKey) return
+    this.routeAliases.delete(aliasRouteKey)
+    const owner = this.bindings.get(ownerKey)
+    if (!owner?.aliasRouteKeys) return
+    const remaining = owner.aliasRouteKeys.filter((k) => k !== aliasRouteKey)
+    const updated: LarkSessionBinding = { ...owner }
+    if (remaining.length > 0) {
+      ;(updated as { aliasRouteKeys?: readonly string[] }).aliasRouteKeys = remaining
+    } else {
+      delete (updated as { aliasRouteKeys?: readonly string[] }).aliasRouteKeys
+    }
+    this.bindings.set(ownerKey, updated)
+  }
+
   getBinding(routeKey: string): LarkSessionBinding | undefined {
-    return this.bindings.get(routeKey)
+    return this.bindings.get(this.resolvePrimaryRouteKey(routeKey))
   }
 
   upsertBinding(binding: LarkSessionBinding): void {
-    this.bindings.set(binding.routeKey, binding)
+    const prev = this.bindings.get(binding.routeKey)
+    if (prev) {
+      this.unindexBindingAliases(prev)
+    }
+    this.detachAliasFromOwner(binding.routeKey, binding.routeKey)
+
+    const rawAliases =
+      binding.aliasRouteKeys !== undefined
+        ? binding.aliasRouteKeys
+        : prev && prev.sessionId === binding.sessionId
+          ? prev.aliasRouteKeys
+          : undefined
+    const aliases = this.normalizeAliases(binding.routeKey, rawAliases).filter((alias) => {
+      const directOwner = this.bindings.get(alias)
+      return !directOwner || directOwner.sessionId === binding.sessionId
+    })
+    for (const alias of aliases) {
+      this.detachAliasFromOwner(alias, binding.routeKey)
+    }
+
+    const normalized: LarkSessionBinding = { ...binding }
+    if (aliases.length > 0) {
+      ;(normalized as { aliasRouteKeys?: readonly string[] }).aliasRouteKeys = aliases
+    } else {
+      delete (normalized as { aliasRouteKeys?: readonly string[] }).aliasRouteKeys
+    }
+
+    this.bindings.set(normalized.routeKey, normalized)
+    this.indexBindingAliases(normalized)
     this.upsertManagedSession({
-      sessionId: binding.sessionId,
-      botId: binding.botId,
-      chatId: binding.chatId,
-      routeKey: binding.routeKey,
-      trigger: binding.trigger,
-      createdAtMs: binding.createdAtMs,
-      lastActivityMs: binding.lastActivityMs,
-      ...(binding.idleCloseMs ? { idleCloseMs: binding.idleCloseMs } : {}),
+      sessionId: normalized.sessionId,
+      botId: normalized.botId,
+      chatId: normalized.chatId,
+      routeKey: normalized.routeKey,
+      trigger: normalized.trigger,
+      createdAtMs: normalized.createdAtMs,
+      lastActivityMs: normalized.lastActivityMs,
+      ...(normalized.idleCloseMs ? { idleCloseMs: normalized.idleCloseMs } : {}),
     })
   }
 
+  bindRouteAlias(routeKey: string, aliasRouteKey: string): boolean {
+    const cleanAlias = aliasRouteKey.trim()
+    if (!cleanAlias) return false
+    const primaryKey = this.resolvePrimaryRouteKey(routeKey)
+    const existing = this.bindings.get(primaryKey)
+    if (!existing || cleanAlias === primaryKey) return false
+    if (existing.aliasRouteKeys?.includes(cleanAlias)) return false
+
+    const directOwner = this.bindings.get(cleanAlias)
+    if (directOwner && directOwner.sessionId !== existing.sessionId) {
+      return false
+    }
+    this.detachAliasFromOwner(cleanAlias, primaryKey)
+
+    const nextAliases = [...(existing.aliasRouteKeys ?? []), cleanAlias]
+    const updated: LarkSessionBinding = {
+      ...existing,
+      aliasRouteKeys: nextAliases,
+    }
+    this.bindings.set(primaryKey, updated)
+    this.routeAliases.set(cleanAlias, primaryKey)
+    this.persist()
+    return true
+  }
+
   touchBinding(routeKey: string, now = Date.now()): void {
-    const existing = this.bindings.get(routeKey)
+    const primaryKey = this.resolvePrimaryRouteKey(routeKey)
+    const existing = this.bindings.get(primaryKey)
     if (!existing) return
-    this.bindings.set(routeKey, { ...existing, lastActivityMs: now })
+    this.bindings.set(primaryKey, { ...existing, lastActivityMs: now })
     const ms = this.managedSessions.get(existing.sessionId)
     if (ms && !ms.archivedAtMs) {
       this.managedSessions.set(existing.sessionId, { ...ms, lastActivityMs: now })
@@ -526,9 +632,10 @@ export class LarkBridgeStore {
   }
 
   markBindingReplied(routeKey: string, now = Date.now()): void {
-    const existing = this.bindings.get(routeKey)
+    const primaryKey = this.resolvePrimaryRouteKey(routeKey)
+    const existing = this.bindings.get(primaryKey)
     if (!existing) return
-    this.bindings.set(routeKey, { ...existing, hasReplied: true, lastActivityMs: now })
+    this.bindings.set(primaryKey, { ...existing, hasReplied: true, lastActivityMs: now })
     const ms = this.managedSessions.get(existing.sessionId)
     if (ms && !ms.archivedAtMs) {
       this.managedSessions.set(existing.sessionId, { ...ms, lastActivityMs: now })
@@ -537,9 +644,11 @@ export class LarkBridgeStore {
   }
 
   deleteBinding(routeKey: string): LarkSessionBinding | undefined {
-    const existing = this.bindings.get(routeKey)
+    const primaryKey = this.resolvePrimaryRouteKey(routeKey)
+    const existing = this.bindings.get(primaryKey)
     if (!existing) return undefined
-    this.bindings.delete(routeKey)
+    this.unindexBindingAliases(existing)
+    this.bindings.delete(primaryKey)
     this.persist()
     return existing
   }
@@ -1156,8 +1265,15 @@ export class LarkBridgeStore {
           if (!b?.routeKey || !b?.sessionId || !b?.botId || !b?.chatId) continue
           const bot = this.bots.get(b.botId)
           const grp = this.groups.get(buildGroupKey(b.botId, b.chatId))
+          const aliasRouteKeys = this.normalizeAliases(
+            b.routeKey,
+            Array.isArray(b.aliasRouteKeys)
+              ? b.aliasRouteKeys.filter((k): k is string => typeof k === 'string')
+              : undefined,
+          )
           const binding: LarkSessionBinding = {
             routeKey: b.routeKey,
+            ...(aliasRouteKeys.length > 0 ? { aliasRouteKeys } : {}),
             botId: b.botId,
             botName: b.botName ?? bot?.name,
             larkAppId: b.larkAppId ?? bot?.larkAppId ?? '',
@@ -1181,17 +1297,20 @@ export class LarkBridgeStore {
             workingDir: b.workingDir ?? bot?.defaultWorkingDir ?? process.cwd(),
             trigger: b.trigger ?? 'mention',
             ...(b.listenerName ? { listenerName: b.listenerName } : {}),
+            ...(typeof b.hasReplied === 'boolean' ? { hasReplied: b.hasReplied } : {}),
             createdAtMs: b.createdAtMs ?? Date.now(),
             lastActivityMs: b.lastActivityMs ?? Date.now(),
             ...(b.idleCloseMs ? { idleCloseMs: b.idleCloseMs } : {}),
           }
           this.bindings.set(binding.routeKey, binding)
+          this.indexBindingAliases(binding)
           if (!this.managedSessions.has(binding.sessionId)) {
             this.managedSessions.set(binding.sessionId, {
               sessionId: binding.sessionId,
               botId: binding.botId,
               chatId: binding.chatId,
               routeKey: binding.routeKey,
+              ...(binding.trigger ? { trigger: binding.trigger } : {}),
               createdAtMs: binding.createdAtMs,
               lastActivityMs: binding.lastActivityMs,
               ...(binding.idleCloseMs ? { idleCloseMs: binding.idleCloseMs } : {}),

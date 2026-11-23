@@ -54,6 +54,7 @@ export interface LarkBridgeConfig {
 
 export interface LarkSessionBinding {
   readonly routeKey: string
+  readonly aliasRouteKeys?: readonly string[]
   readonly botId: string
   readonly botName?: string
   readonly larkAppId: string

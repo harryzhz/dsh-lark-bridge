@@ -1111,4 +1111,123 @@ describe('decideLarkRouting, <user_message> format, memberOverrides & title inte
       allowSilentEmptyReply: false,
     })
   })
+
+  it('keeps replies inside existing Feishu topics (threadId set) and falls back to threadId route matching', () => {
+    const bot = createBot({
+      groupReplyMode: 'chat',
+      groupSessionMode: 'thread',
+      mentionTriggerMode: 'mention_and_active_thread',
+    })
+    const chatReplyGroup = LarkGroupConfigSchema.parse({
+      key: 'dsh-bot:oc_in_topic',
+      botId: 'dsh-bot',
+      chatId: 'oc_in_topic',
+      enabled: true,
+      replyMode: 'chat',
+      sessionMode: 'thread',
+      listener: {
+        enabled: true,
+        name: '工作日常',
+        prompt: '必要时回复',
+        scope: 'all',
+        replyMode: 'chat',
+        sessionMode: 'thread',
+      },
+    })
+
+    // 1. Top-level message (no threadId) still honors configured replyMode='chat'
+    expect(
+      decideLarkRouting(
+        bot,
+        createMessage({
+          chatId: 'oc_in_topic',
+          messageId: 'om_top_1',
+          text: '@_bot_1 顶层提问',
+          mentions: [{ key: '@_bot_1', openId: 'ou_bot', name: 'DSH-Bot' }],
+        }),
+        { groupConfig: chatReplyGroup, hasActiveSessionForRoute: () => false },
+      ),
+    ).toMatchObject({ action: 'agent', trigger: 'mention', replyMode: 'chat' })
+
+    // 2. Inside an existing Feishu topic (threadId set), @bot, command, substitute, and listener all stay in-topic ('new-topic')
+    const inTopicMention = decideLarkRouting(
+      bot,
+      createMessage({
+        chatId: 'oc_in_topic',
+        messageId: 'om_t_msg_1',
+        rootId: 'om_t_root',
+        threadId: 'omt_topic_1',
+        text: '@_bot_1 话题内提问',
+        mentions: [{ key: '@_bot_1', openId: 'ou_bot', name: 'DSH-Bot' }],
+      }),
+      { groupConfig: chatReplyGroup, hasActiveSessionForRoute: () => false },
+    )
+    expect(inTopicMention).toMatchObject({ action: 'agent', trigger: 'mention', replyMode: 'new-topic' })
+
+    const inTopicCmd = decideLarkRouting(
+      bot,
+      createMessage({
+        chatId: 'oc_in_topic',
+        messageId: 'om_t_cmd',
+        rootId: 'om_t_root',
+        threadId: 'omt_topic_1',
+        text: '@_bot_1 /status',
+        mentions: [{ key: '@_bot_1', openId: 'ou_bot', name: 'DSH-Bot' }],
+      }),
+      { groupConfig: chatReplyGroup, hasActiveSessionForRoute: () => false },
+    )
+    expect(inTopicCmd).toMatchObject({ action: 'command', replyMode: 'new-topic' })
+
+    const inTopicSub = decideLarkRouting(
+      bot,
+      createMessage({
+        chatId: 'oc_in_topic',
+        messageId: 'om_t_sub',
+        rootId: 'om_t_root',
+        threadId: 'omt_topic_1',
+        text: '@_user_1 这个方案怎么看',
+        mentions: [{ key: '@_user_1', openId: 'ou_owner', name: 'Alex Chen' }],
+      }),
+      { groupConfig: chatReplyGroup, hasActiveSessionForRoute: () => false },
+    )
+    expect(inTopicSub).toMatchObject({ action: 'agent', trigger: 'substitute', replyMode: 'new-topic' })
+
+    const inTopicListener = decideLarkRouting(
+      bot,
+      createMessage({
+        chatId: 'oc_in_topic',
+        messageId: 'om_t_list',
+        rootId: 'om_t_root',
+        threadId: 'omt_topic_1',
+        text: '有人看下构建日志吗',
+      }),
+      { groupConfig: chatReplyGroup, hasActiveSessionForRoute: () => false },
+    )
+    expect(inTopicListener).toMatchObject({ action: 'agent', trigger: 'listener', replyMode: 'new-topic' })
+
+    // 3. When only threadId (omt_*) matches an active session, active-thread resolves via threadId fallback
+    const threadIdKey = 'cli_dsh_app:oc_in_topic:omt_topic_1'
+    const fallbackFollowup = decideLarkRouting(
+      bot,
+      createMessage({
+        chatId: 'oc_in_topic',
+        messageId: 'om_t_follow',
+        rootId: 'om_new_root',
+        threadId: 'omt_topic_1',
+        text: '帮我继续查下',
+      }),
+      {
+        groupConfig: chatReplyGroup,
+        hasActiveSessionForRoute: (k) => k === threadIdKey,
+        getRouteTrigger: (k) => (k === threadIdKey ? 'mention' : undefined),
+        hasRouteReplied: () => true,
+      },
+    )
+    expect(fallbackFollowup).toMatchObject({
+      action: 'agent',
+      trigger: 'active-thread',
+      routeKey: threadIdKey,
+      replyMode: 'new-topic',
+    })
+  })
 })

@@ -114,7 +114,17 @@ function formatFriendlyLocalTime(iso: string): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
-function extractThreadReplyId(routeKey: string): string | undefined {
+function extractThreadReplyId(
+  routeKey: string,
+  aliasRouteKeys?: readonly string[],
+): string | undefined {
+  if (aliasRouteKeys) {
+    for (let i = aliasRouteKeys.length - 1; i >= 0; i -= 1) {
+      const parts = aliasRouteKeys[i]!.split(':')
+      const scope = parts.slice(2).join(':')
+      if (scope.startsWith('om_')) return scope
+    }
+  }
   const parts = routeKey.split(':')
   const scope = parts.slice(2).join(':')
   return scope.startsWith('om_') ? scope : undefined
@@ -680,7 +690,7 @@ export class ProactiveReminderService {
       const binding = this.host.store.listBindings().find((b) => b.sessionId === sid)
       if (binding) {
         const isP2p = binding.chatType === 'p2p' || binding.trigger === 'p2p'
-        const threadReply = extractThreadReplyId(binding.routeKey)
+        const threadReply = extractThreadReplyId(binding.routeKey, binding.aliasRouteKeys)
         sessionOrigin = {
           botId: binding.botId,
           botName: binding.botName ?? binding.botId,
