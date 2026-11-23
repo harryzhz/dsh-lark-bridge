@@ -1148,12 +1148,12 @@ export function migrateLegacyJsonToSqlite(
 
 function redactString(value: string): string {
   return value
-    .replace(/\bcli_[a-f0-9]{12,}\b/gi, 'cli_REDACTED')
-    .replace(/\bou_[a-f0-9]{16,}\b/gi, 'ou_REDACTED')
-    .replace(/\boc_[a-f0-9]{16,}\b/gi, 'oc_REDACTED')
-    .replace(/\bon_[a-f0-9]{16,}\b/gi, 'on_REDACTED')
-    .replace(/\bom_[a-f0-9]{16,}\b/gi, 'om_REDACTED')
-    .replace(/\bomt_[a-f0-9]{12,}\b/gi, 'omt_REDACTED')
+    .replace(/(?<![A-Za-z0-9])cli_[a-zA-Z0-9]{10,}/g, 'cli_REDACTED')
+    .replace(/(?<![A-Za-z0-9])ou_[a-zA-Z0-9]{12,}/g, 'ou_REDACTED')
+    .replace(/(?<![A-Za-z0-9])oc_[a-zA-Z0-9]{12,}/g, 'oc_REDACTED')
+    .replace(/(?<![A-Za-z0-9])on_[a-zA-Z0-9]{12,}/g, 'on_REDACTED')
+    .replace(/(?<![A-Za-z0-9])om_[a-zA-Z0-9]{12,}/g, 'om_REDACTED')
+    .replace(/(?<![A-Za-z0-9])omt_[a-zA-Z0-9]{10,}/g, 'omt_REDACTED')
 }
 
 function redactDeep<T>(value: T): T {
@@ -1162,10 +1162,11 @@ function redactDeep<T>(value: T): T {
   if (!value || typeof value !== 'object') return value
   const out: Record<string, unknown> = {}
   for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    const safeKey = redactString(k)
     if (k === 'larkAppSecret' || k === 'viewerTicketSecret') {
-      out[k] = v ? 'REDACTED' : ''
+      out[safeKey] = v ? 'REDACTED' : ''
     } else {
-      out[k] = redactDeep(v)
+      out[safeKey] = redactDeep(v)
     }
   }
   return out as T

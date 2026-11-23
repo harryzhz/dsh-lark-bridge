@@ -81,6 +81,7 @@ function makeRichLegacyState(now = Date.now()) {
           templateKey: 'project',
           name: '项目讨论',
           prompt: '自定义监听规则',
+          memberOverrides: { [`${'ou'}_${'0123456789abcdef'.repeat(2)}`]: true },
         },
       },
     ],
@@ -458,7 +459,9 @@ describe('SQLite WAL storage, atomic auto-migration & db CLI', () => {
     const redactedText = readFileSync(redactedPath, 'utf8')
     expect(redactedText).not.toContain('mock-secret-value')
     expect(redactedText).not.toContain('a'.repeat(64))
+    expect(redactedText).not.toContain('0123456789abcdef')
     expect(redactedText).toContain('"REDACTED"')
+    expect(redactedText).toContain('"ou_REDACTED"')
 
     // 8. compact
     const compacted = runDbCliCommand('compact', { 'data-dir': dir })
