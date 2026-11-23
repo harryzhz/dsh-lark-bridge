@@ -215,6 +215,13 @@ const CSS = `
 }
 
 /* Overview */
+.fb-alert-card { padding: 12px 16px; display: flex; flex-direction: column; gap: 10px; }
+.fb-alert-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.fb-alert-row + .fb-alert-row { padding-top: 10px; border-top: 0.5px solid var(--dsw-alias-border-l2); }
+.fb-alert-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.fb-alert-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13.5px; font-weight: 500; color: var(--dsw-alias-label-primary); }
+.fb-alert-detail { font-size: 12.5px; line-height: 18px; color: var(--dsw-alias-label-secondary); }
+.fb-alert-hint { font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary); }
 .fb-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
 .fb-stat { padding: 16px 18px; }
 .fb-stat-label { font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary); }

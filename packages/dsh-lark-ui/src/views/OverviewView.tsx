@@ -1,9 +1,10 @@
 import { useState } from 'react'
-import { StateDot, Tag } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, StateDot, Tag } from '@deepseek-ai/dsh-client-ui-primitives'
+import { bridgeApi } from '../api.js'
 import { Avatar } from '../components/fields.js'
 import { resolveModelDisplayName, resolveRuntimeDisplayName } from '../components/options.js'
 import { formatDuration, formatTime } from '../state.js'
-import type { AuditEventKind, CockpitPayload, ModelGroup, RuntimeOption } from '../types.js'
+import type { AuditEventKind, CockpitPayload, DiagnosticAlert, ModelGroup, RuntimeOption } from '../types.js'
 
 const EVENT_TONE: Record<AuditEventKind, { label: string; tone: 'neutral' | 'success' | 'info' | 'warning' | 'danger' | 'quiet' }> = {
   inbound: { label: '收到', tone: 'info' },
@@ -30,9 +31,19 @@ export function OverviewView({
   models: readonly ModelGroup[]
 }) {
   const [hoveredHourKey, setHoveredHourKey] = useState<string | null>(null)
+  const [dismissedAlertIds, setDismissedAlertIds] = useState<Record<string, boolean>>({})
 
   if (!cockpit) return <div className="fb-card fb-empty">加载中…</div>
   const { summary, hourlySeries, botRows, topGroups, recentEvents } = cockpit
+  const visibleAlerts = (cockpit.alerts ?? []).filter(
+    (a) => a.severity !== 'info' && !dismissedAlertIds[a.id],
+  )
+  const handleAckAlert = async (alert: DiagnosticAlert) => {
+    setDismissedAlertIds((prev) => ({ ...prev, [alert.id]: true }))
+    if (alert.code === 'split_brain' && alert.botId) {
+      await bridgeApi.clearSplitBrainAlert(alert.botId).catch(() => {})
+    }
+  }
   const slotTotals = hourlySeries.map((h) => Math.max(h.inbound, h.replied) + h.errors)
   const peak = Math.max(1, ...slotTotals)
   const silent24h = summary.silentSkipped24h ?? 0
@@ -44,6 +55,37 @@ export function OverviewView({
 
   return (
     <>
+      {visibleAlerts.length > 0 && (
+        <section className="fb-section">
+          <div className="fb-card fb-alert-card">
+            {visibleAlerts.map((alert) => (
+              <div key={alert.id} className="fb-alert-row">
+                <div className="fb-alert-main">
+                  <div className="fb-alert-head">
+                    <Tag tone={alert.severity === 'error' ? 'danger' : 'warning'}>
+                      {alert.severity === 'error' ? '异常' : '告警'}
+                    </Tag>
+                    <span>{alert.title}</span>
+                  </div>
+                  <div className="fb-alert-detail">{alert.detail}</div>
+                  <div className="fb-alert-hint">{alert.suggestion}</div>
+                </div>
+                {alert.code === 'split_brain' && alert.botId && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => {
+                      void handleAckAlert(alert)
+                    }}
+                  >
+                    已处理
+                  </Button>
+                )}
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
       <section className="fb-section">
         <div className="fb-stats">
           <Stat label="智能体在线" value={`${summary.onlineBots}`} unit={`/ ${summary.totalBots}`} foot={summary.serviceHealthy ? '连接正常' : '存在离线智能体'} />

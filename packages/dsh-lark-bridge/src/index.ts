@@ -185,6 +185,24 @@ export {
   type LarkViewerPrincipal,
   type ViewerCarrierScriptOptions,
 } from './session-viewer.js'
+export {
+  buildBridgeDiagnostics,
+  buildDiagnosticAlerts,
+  isNodeVersionSqliteReady,
+  runOfflineDoctor,
+  type BotDiagnosticItem,
+  type BridgeDiagnosticsPayload,
+  type OfflineDoctorReport,
+} from './diagnostics.js'
+export {
+  INSTANCE_LOCK_FILENAME,
+  InstanceLock,
+  InstanceLockConflictError,
+  type CoordinationBackend,
+  type InstanceLockPayload,
+  type InstanceLockStatus,
+} from './instance-lock.js'
+export { SplitBrainDetector, type SplitBrainAlert } from './split-brain-detector.js'
 export { LarkBridgeStore } from './store.js'
 export {
   BridgeDatabase,

@@ -61,6 +61,9 @@ export function inspectInstanceLockFile(dataDir: string): ActiveLockSummary {
   }
 }
 
+export { runOfflineDoctor, type OfflineDoctorReport } from '../diagnostics.js'
+export { resolveDataDir }
+
 function resolveDataDir(rawFlag?: string): string {
   if (rawFlag && rawFlag.trim()) return resolve(rawFlag.trim())
   const dshHome = process.env.DSH_HOME?.trim() || join(homedir(), '.dsh')

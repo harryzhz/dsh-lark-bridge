@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 import { networkInterfaces } from 'node:os'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
@@ -56,15 +56,21 @@ import {
   installLocalCliAndSkill,
   type CliAuthEndpoint,
 } from './cli-support.js'
+import {
+  buildBridgeDiagnostics,
+  type BridgeDiagnosticsPayload,
+} from './diagnostics.js'
 import { LarkDirectoryEnricher } from './directory-enrichment.js'
 import { DreamingService } from './dreaming-service.js'
 import { assertExistingWorkingDirectory } from './fs-browser.js'
+import { InstanceLock } from './instance-lock.js'
 import { ProactiveReminderService } from './reminder-service.js'
 import { RuntimeCatalog } from './runtime-catalog.js'
 import { ScheduleNotifier, type ScheduleCreateInputLike } from './schedule-notifier.js'
 import { LoopbackSessionHandoff, isLoopbackOrigin } from './session-handoff.js'
 import { LarkSessionViewerService } from './session-viewer.js'
 import { handleSlashCommand } from './slash-commands.js'
+import { SplitBrainDetector } from './split-brain-detector.js'
 import type { LarkBridgeStore } from './store.js'
 import { TurnAbortedError, runTurnAndCollectReply } from './turn-runner.js'
 import {
@@ -94,6 +100,7 @@ interface AcquiredAgent {
 
 interface ActiveTurnRecord {
   readonly id: string
+  readonly traceId: string
   readonly botId: string
   readonly chatId: string
   readonly chatName?: string
@@ -109,6 +116,10 @@ interface ActiveTurnRecord {
   intermediateSentCount: number
   settled: boolean
   reactionRemoved: boolean
+}
+
+function createTraceId(): string {
+  return `tr_${randomBytes(4).toString('hex')}`
 }
 
 const SHUTDOWN_TURN_CLEANUP_TIMEOUT_MS = 5_000
@@ -163,6 +174,9 @@ export class LarkBridgeManager {
   readonly cliAuth: CliAuthEndpoint
   readonly sessionHandoff = new LoopbackSessionHandoff()
   readonly sessionViewer: LarkSessionViewerService
+  readonly splitBrain = new SplitBrainDetector()
+  private readonly instanceLock: InstanceLock
+  private readonly startedAtMs = Date.now()
   private readonly directoryEnricher: LarkDirectoryEnricher
   private readonly transports = new Map<string, ManagedTransport>()
   /** Serializes concurrent `syncBot(botId)` calls so a bot never spawns duplicate WSClients. */
@@ -192,6 +206,7 @@ export class LarkBridgeManager {
     readonly store: LarkBridgeStore,
   ) {
     this.dedup.hydrate(store.listSeenMessages?.() ?? [])
+    this.instanceLock = new InstanceLock(config.dataDir)
     this.runtimes = new RuntimeCatalog(ctx)
     this.workspaces = new WorkspaceGrouping(ctx, store)
     this.platform = new LarkPlatformManager(config.dataDir)
@@ -232,6 +247,14 @@ export class LarkBridgeManager {
   }
 
   async start(): Promise<void> {
+    if (this.config.enableInstanceLock !== false) {
+      const lockStatus = this.instanceLock.acquire()
+      if (lockStatus.recoveredStaleLock) {
+        this.ctx.logger.warn(
+          `[lark-bridge] recovered stale instance lock from PID=${lockStatus.recoveredStaleLock.pid} (${lockStatus.recoveredStaleLock.host})`,
+        )
+      }
+    }
     this.sessionViewer.attachToHost()
     if (this.config.autoInstallCliAndSkill !== false) {
       installLocalCliAndSkill(this.config.dataDir, this.cliAuth.endpointFile, this.ctx.logger)
@@ -298,6 +321,23 @@ export class LarkBridgeManager {
     this.handles.clear()
     this.store.flushSeenMessages?.()
     this.store.flushConfigSnapshot?.()
+    this.instanceLock.release()
+  }
+
+  getDiagnostics(): BridgeDiagnosticsPayload {
+    return buildBridgeDiagnostics({
+      store: this.store,
+      botStatuses: this.listBotStatuses(),
+      getTransportDiagnostics: (botId) =>
+        this.transports.get(botId)?.transport.getDiagnosticsSnapshot?.(),
+      splitBrainAlerts: this.splitBrain.listAlerts(),
+      instanceLock: this.instanceLock.status(),
+      startedAtMs: this.startedAtMs,
+    })
+  }
+
+  clearSplitBrainAlert(botId: string): boolean {
+    return this.splitBrain.clearAlert(botId)
   }
 
   async recoverStalePendingTurns(botId?: string, nowMs = Date.now()): Promise<number> {
@@ -371,6 +411,7 @@ export class LarkBridgeManager {
       allowSilentEmptyReply: record.allowSilentEmptyReply,
       ...(record.reactionId ? { reactionId: record.reactionId } : {}),
       ...(record.sessionId ? { sessionId: record.sessionId } : {}),
+      ...(record.traceId ? { traceId: record.traceId } : {}),
       startedAtMs: record.startedAtMs,
     })
   }
@@ -1354,6 +1395,21 @@ export class LarkBridgeManager {
       onChatMembershipChange: () => {
         void this.syncJoinedChats(bot.id)
       },
+      onExternalSelfMessage: (ev) => {
+        const currentBot = this.store.getBot(bot.id) ?? bot
+        const { shouldAudit, alert } = this.splitBrain.recordExternalSelfMessage(ev, currentBot.name)
+        this.ctx.logger.warn(
+          `[lark-bridge][bot=${bot.id}] split-brain detected: observed external self message ${ev.messageId} in chat ${ev.chatId} (count=${alert.observedCount})`,
+        )
+        if (shouldAudit) {
+          this.store.recordEvent({
+            botId: bot.id,
+            chatId: ev.chatId,
+            kind: 'error',
+            summary: `检测到多实例冲突（${ev.larkAppId}）：群内观测到非本实例发出的自身消息（${ev.messageId}），请检查是否有另一台设备同时在线`,
+          })
+        }
+      },
       onBotProfile: (profile) => {
         this.hydratedProfileBots.add(bot.id)
         this.store.updateBotProfile(bot.id, profile, {
@@ -1405,6 +1461,7 @@ export class LarkBridgeManager {
     if (!bot) return
     const dedupKey = `${bot.larkAppId}:${msg.messageId}`
     if (!this.dedup.claim(dedupKey)) return
+    const traceId = createTraceId()
 
     const groupConfig = msg.chatType === 'group' ? this.store.getGroup(bot.id, msg.chatId) : undefined
     const knownChatName =
@@ -1433,6 +1490,7 @@ export class LarkBridgeManager {
         this.store.recordEvent({
           botId: bot.id,
           chatId: msg.chatId,
+          traceId,
           kind: 'ignored',
           summary: `规则过滤（${decision.reason}）`,
         })
@@ -1454,6 +1512,7 @@ export class LarkBridgeManager {
         botId: bot.id,
         chatId: msg.chatId,
         routeKey: decision.routeKey,
+        traceId,
         kind: 'command',
         summary: `/${decision.command.name} ${decision.command.args}`.trim(),
       })
@@ -1487,7 +1546,7 @@ export class LarkBridgeManager {
     }
 
     this.store.rememberSeenMessage?.(dedupKey)
-    await this.runAgentTurn(bot, transport, msg, decision, groupConfig)
+    await this.runAgentTurn(bot, transport, msg, decision, groupConfig, traceId)
   }
 
   private async acquireSessionTurnSlot(
@@ -1536,6 +1595,7 @@ export class LarkBridgeManager {
     msg: InboundLarkMessage,
     decision: AgentDecision,
     groupConfig?: LarkGroupConfig,
+    traceId = createTraceId(),
   ): Promise<void> {
     const startedMs = Date.now()
     const resolvedChatName = decision.chatName || this.store.resolveChatName(bot.id, msg.chatId)
@@ -1553,6 +1613,7 @@ export class LarkBridgeManager {
     }
 
     const activeTurn = this.registerActiveTurn({
+      traceId,
       botId: bot.id,
       chatId: msg.chatId,
       ...(resolvedChatName ? { chatName: resolvedChatName } : {}),
@@ -1597,6 +1658,7 @@ export class LarkBridgeManager {
         ...chatName,
         routeKey: decision.routeKey,
         sessionId: acquired.sessionId,
+        traceId,
         kind: 'inbound',
         summary: `${decision.listenerName ? `监听「${decision.listenerName}」` : decision.trigger} → ${decision.agentPreset} · ${decision.workspaceName}`,
       })
@@ -1651,6 +1713,7 @@ export class LarkBridgeManager {
           chatId: msg.chatId,
           routeKey: decision.routeKey,
           sessionId: acquired.sessionId,
+          traceId,
           durationMs: latencyMs,
           kind: 'silent_skip',
           summary: '判断无需回复，已静默',
@@ -1674,6 +1737,7 @@ export class LarkBridgeManager {
           chatId: msg.chatId,
           routeKey: decision.routeKey,
           sessionId: acquired.sessionId,
+          traceId,
           durationMs: latencyMs,
           kind: 'reply',
           summary:
@@ -1705,7 +1769,9 @@ export class LarkBridgeManager {
       }
       if (!this.claimActiveTurn(activeTurn)) return
       const errorMsg = err instanceof Error ? err.message : String(err)
-      this.ctx.logger.error(`[lark-bridge] turn handling failed: ${errorMsg}`)
+      this.ctx.logger.error(
+        `[lark-bridge][trace=${traceId}][bot=${bot.id}][msg=${msg.messageId}] turn handling failed: ${errorMsg}`,
+      )
       if (err instanceof TurnAbortedError) {
         activeTurn.reactionRemoved = true
         await this.deliverInterruptedTurnCleanup({
@@ -1723,6 +1789,7 @@ export class LarkBridgeManager {
           ...chatName,
           routeKey: decision.routeKey,
           ...(trackedSessionId ? { sessionId: trackedSessionId } : {}),
+          traceId,
           kind: 'error',
           summary: errorMsg,
         })

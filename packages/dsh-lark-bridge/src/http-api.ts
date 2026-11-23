@@ -127,7 +127,27 @@ export async function dispatchLarkApiRequest(
       const cockpit = manager.store.buildCockpit(statuses, (sid) =>
         manager.sessionWebUrl(sid),
       )
-      return ok({ ok: true, ...cockpit })
+      const alerts = manager.getDiagnostics?.().alerts ?? []
+      return ok({ ok: true, ...cockpit, alerts })
+    }
+
+    if (method === 'GET' && pathname === 'diagnostics') {
+      const diagnostics = manager.getDiagnostics()
+      return ok(diagnostics)
+    }
+
+    if (
+      method === 'POST' &&
+      segments[0] === 'diagnostics' &&
+      segments[1] === 'split-brain' &&
+      segments[2] &&
+      segments[3] === 'clear'
+    ) {
+      if (principalKind !== 'owner' || isCliAuthenticated) {
+        return ok({ ok: false, error: 'owner_web_session_required' }, 403)
+      }
+      const cleared = manager.clearSplitBrainAlert(segments[2])
+      return ok({ ok: true, cleared })
     }
 
     // ── Desktop renderer session-open channel (owner-only) ──────────────
@@ -607,6 +627,10 @@ export async function dispatchLarkApiRequest(
     }
 
     if (method === 'GET' && pathname === 'events') {
+      const traceId = url.searchParams.get('traceId')?.trim()
+      if (traceId) {
+        return ok({ ok: true, events: manager.store.listEventsByTrace(traceId) })
+      }
       const limit = Number(url.searchParams.get('limit') ?? 100)
       return ok({ ok: true, events: manager.store.listEvents(limit) })
     }

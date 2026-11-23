@@ -424,6 +424,17 @@ export interface AuditEvent {
   summary: string
 }
 
+export interface DiagnosticAlert {
+  id: string
+  code: 'split_brain' | 'storage_integrity' | 'bot_disconnected' | 'stale_lock_recovered'
+  severity: 'info' | 'warning' | 'error'
+  botId?: string
+  title: string
+  detail: string
+  suggestion: string
+  timestampMs: number
+}
+
 export interface CockpitPayload {
   summary: {
     serviceHealthy: boolean
@@ -441,6 +452,7 @@ export interface CockpitPayload {
     avgLatencyMs: number
     p95LatencyMs: number
   }
+  alerts?: DiagnosticAlert[]
   hourlySeries: Array<{
     hourKey: string
     label: string

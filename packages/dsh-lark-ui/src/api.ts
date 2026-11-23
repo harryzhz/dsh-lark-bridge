@@ -229,4 +229,7 @@ export const bridgeApi = {
 
   unbind: (routeKey: string) => del(`/bindings/${seg(routeKey)}`),
   rotateViewerSecret: () => post<{ ok: boolean }>('/viewer/rotate-secret'),
+  diagnostics: () => request<Record<string, unknown>>('/diagnostics'),
+  clearSplitBrainAlert: (botId: string) =>
+    post<{ ok: boolean; cleared: boolean }>(`/diagnostics/split-brain/${seg(botId)}/clear`),
 }

@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
-import { runDbCliCommand } from '@dsh-lark/dsh-lark-bridge/db-cli'
+import { resolveDataDir, runDbCliCommand, runOfflineDoctor } from '@dsh-lark/dsh-lark-bridge/db-cli'
 
 const HELP = `lark-bridge — DSH 飞书桥接辅助 CLI（零密钥暴露，自动感知当前会话上下文）
 
@@ -34,6 +34,7 @@ const HELP = `lark-bridge — DSH 飞书桥接辅助 CLI（零密钥暴露，自
   lark-bridge db export [--data-dir <目录>] [--out <输出路径>] [--redact]
   lark-bridge db rollback --from <backup.json> [--to-json] [--data-dir <目录>] [--force]
   lark-bridge db compact [--data-dir <目录>] [--force]
+  lark-bridge doctor [--data-dir <目录>] [--json]
 
 send 选项:
   --bot <botId>             指定发送智能体（默认使用当前会话绑定的智能体）
@@ -485,6 +486,29 @@ async function main() {
     const result = runDbCliCommand(sub, flags)
     printJson(result)
     if (!result.ok) {
+      process.exitCode = 1
+    }
+    return
+  }
+
+  if (cmd === 'doctor') {
+    const dataDir = resolveDataDir(typeof flags['data-dir'] === 'string' ? flags['data-dir'] : undefined)
+    const offline = runOfflineDoctor(dataDir)
+    let live = null
+    let liveError = null
+    try {
+      const endpoint = loadEndpointConfig()
+      live = await apiRequest(endpoint, 'GET', '/diagnostics')
+    } catch (err) {
+      liveError = err instanceof Error ? err.message : String(err)
+    }
+    const overallOk = offline.ok && (live ? Boolean(live.ok) : true)
+    printJson({
+      ok: overallOk,
+      offline,
+      ...(live ? { live } : { liveUnavailableReason: liveError }),
+    })
+    if (!overallOk) {
       process.exitCode = 1
     }
     return

@@ -51,6 +51,7 @@ export interface LarkBridgeConfig {
   readonly idleSweepIntervalMs: number
   readonly maxAuditEvents: number
   readonly autoInstallCliAndSkill?: boolean
+  readonly enableInstanceLock?: boolean
 }
 
 export interface LarkSessionBinding {
@@ -272,8 +273,20 @@ export interface LarkCockpitSummary {
   readonly p95LatencyMs: number
 }
 
+export interface LarkDiagnosticAlert {
+  readonly id: string
+  readonly code: 'split_brain' | 'storage_integrity' | 'bot_disconnected' | 'stale_lock_recovered'
+  readonly severity: 'info' | 'warning' | 'error'
+  readonly botId?: string
+  readonly title: string
+  readonly detail: string
+  readonly suggestion: string
+  readonly timestampMs: number
+}
+
 export interface LarkCockpitPayload {
   readonly summary: LarkCockpitSummary
+  readonly alerts?: readonly LarkDiagnosticAlert[]
   readonly hourlySeries: readonly {
     readonly hourKey: string
     readonly label: string
