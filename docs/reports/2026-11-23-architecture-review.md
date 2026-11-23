@@ -1,6 +1,10 @@
 # 架构设计全面审查与演进建议
 
-本文档记录对 `dsh-lark-bridge` 现有架构的系统性审查结果：从生产故障（空消息、双回复、会话生命周期漂移、状态回滚）反推底层结构性根因，梳理当前 7 项中长期架构债与分阶段演进建议。
+> **文档类型**：阶段性架构审查报告（历史归档参考）  
+> **审查日期**：2026-11-23  
+> **当前状态**：已完成主体重构（Phase 1–3 已分别合入 PR #1 / PR #2；现行系统架构请以 [architecture/overview.md](../architecture/overview.md) 为准）
+
+本文档记录 `2026-11-23` 对 `dsh-lark-bridge` 原有架构的系统性审查结果：从生产故障（空消息、双回复、会话生命周期漂移、状态回滚）反推底层结构性根因，梳理 7 项中长期架构债与分阶段演进路线。
 
 > [!NOTE]
 > 本文档聚焦**中长期结构性设计问题**；排查过程中定位到的确定性功能缺陷（零宽字符空回复、飞书 3 秒 ACK 超时重投、并发 `WSClient` 泄漏、同会话并发 `turn` 抢占、`runtimeProfileId` 重载丢失、`active-thread` 回复模式误覆盖等）已在当前分支中先行修复并补齐回归测试。
@@ -156,5 +160,5 @@ flowchart LR
 | --- | --- | --- | --- |
 | **Phase 1（已完成）** | P0 | 非阻塞 <5ms ACK、24h 持久化去重、不可见字符与 `<no_reply/>` 全链路防御、同会话 FIFO 串行队列、并发 `syncBot`/`WSClient` 锁、`runtimeProfileId` 持久化 | 已合入 `main`：根治线上空白气泡、双回复、重启丢绑定、并发串台 |
 | **Phase 2（已完成）** | P1 | 基于 `node:sqlite` WAL 的 16 表分层仓储（`storage/*`）、低频 `config.snapshot.json` 自动灾备、7 步原子自动迁移与 `lark-bridge db` 工具链；本机 PID 互斥锁（`InstanceLock`）+ 跨主机同 `appId` 脑裂探测告警（`SplitBrainDetector` + UI 横幅） | 已落地：单轮对话写入脱离 356 KB 全量 JSON 重写，主线程写入降至 <5 ms O(1)，彻底消除多实例脑裂盲区与配置误损风险 |
-| **Phase 3（已完成）** | P1 | 拆解 `LarkBridgeManager` 为 `BotConnectionPool` / `SessionCoordinator` & `SessionActor`（5 态状态机）/ `InboundPipeline` / `AgentToolFacade` / `SessionTitleGuard`；补齐全链路 `traceId`、飞书 SDK 结构化脱敏日志与错误码翻译、`/diagnostics` 与 `lark-bridge doctor`；新增结构化静默控制协议 `lark-bridge silence` | 已落地：核心门面瘦身至 ~360 行，消除空闲归档/运行竞态，支持控制面强制静默与一键诊断排障 |
+| **Phase 3（已完成）** | P1 | 拆解 `LarkBridgeManager` 为 `BotConnectionPool` / `SessionCoordinator` & `SessionActor`（5 态状态机）/ `InboundPipeline` / `AgentToolFacade` / `SessionTitleGuard`；补齐全链路 `traceId`、飞书 SDK 结构化脱敏日志与错误码翻译、`/diagnostics` 与 `lark-bridge doctor`；新增结构化静默控制协议 `lark-bridge silence` | 已落地：核心门面瘦身至 ~500 行，消除空闲归档/运行竞态，支持控制面强制静默与一键诊断排障 |
 | **Phase 4（持续演进）** | P2 | 推动 DSH Host 上游提供正式 `sessionTitle` 标题预处理扩展点以彻底移除反射包装；按团队多节点需求扩展 `CoordinationBackend` 共享后端 | `SessionTitleGuard` 与 `CoordinationBackend` 隔离边界已就绪，等待上游扩展点开放后无缝替换 |

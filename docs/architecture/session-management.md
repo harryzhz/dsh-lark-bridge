@@ -3,9 +3,9 @@
 本文档系统说明 `dsh-lark-bridge` 在飞书（Lark）消息拓扑与 DeepSeek Harness（DSH）会话之间的映射、路由、复用、热切换与自动归档机制，并给出典型配置模式下的端到端示例。
 
 > 核心源码参考：
-> - 路由与上下文协议：[packages/lark-core/src/router.ts](../packages/lark-core/src/router.ts)、[packages/lark-core/src/types.ts](../packages/lark-core/src/types.ts)、[packages/lark-core/src/lark-transport.ts](../packages/lark-core/src/lark-transport.ts)
-> - 会话编排与生命周期：[packages/dsh-lark-bridge/src/bridge-manager.ts](../packages/dsh-lark-bridge/src/bridge-manager.ts)、[packages/dsh-lark-bridge/src/store.ts](../packages/dsh-lark-bridge/src/store.ts)、[packages/dsh-lark-bridge/src/workspace-grouping.ts](../packages/dsh-lark-bridge/src/workspace-grouping.ts)
-> - 特殊会话与交互入口：[packages/dsh-lark-bridge/src/slash-commands.ts](../packages/dsh-lark-bridge/src/slash-commands.ts)、[packages/dsh-lark-bridge/src/schedule-notifier.ts](../packages/dsh-lark-bridge/src/schedule-notifier.ts)、[packages/dsh-lark-bridge/src/reminder-service.ts](../packages/dsh-lark-bridge/src/reminder-service.ts)、[packages/dsh-lark-bridge/src/dreaming-service.ts](../packages/dsh-lark-bridge/src/dreaming-service.ts)
+> - 路由与上下文协议：[packages/lark-core/src/router.ts](../../packages/lark-core/src/router.ts)、[packages/lark-core/src/types.ts](../../packages/lark-core/src/types.ts)、[packages/lark-core/src/lark-transport.ts](../../packages/lark-core/src/lark-transport.ts)
+> - 会话编排与生命周期：[packages/dsh-lark-bridge/src/session-coordinator.ts](../../packages/dsh-lark-bridge/src/session-coordinator.ts)、[packages/dsh-lark-bridge/src/inbound-pipeline.ts](../../packages/dsh-lark-bridge/src/inbound-pipeline.ts)、[packages/dsh-lark-bridge/src/store.ts](../../packages/dsh-lark-bridge/src/store.ts)、[packages/dsh-lark-bridge/src/workspace-grouping.ts](../../packages/dsh-lark-bridge/src/workspace-grouping.ts)
+> - 特殊会话与交互入口：[packages/dsh-lark-bridge/src/slash-commands.ts](../../packages/dsh-lark-bridge/src/slash-commands.ts)、[packages/dsh-lark-bridge/src/schedule-notifier.ts](../../packages/dsh-lark-bridge/src/schedule-notifier.ts)、[packages/dsh-lark-bridge/src/reminder-service.ts](../../packages/dsh-lark-bridge/src/reminder-service.ts)、[packages/dsh-lark-bridge/src/dreaming-service.ts](../../packages/dsh-lark-bridge/src/dreaming-service.ts)
 
 ---
 
@@ -35,10 +35,10 @@ flowchart LR
 
 | 状态层 | 存储位置 | 键值映射 | 核心职责 |
 |---|---|---|---|
-| **活跃路由绑定 `bindings` + 别名索引 `routeAliases`** | 内存 `Map` + 持久化 `$DSH_HOME/lark-bridge/lark-bridge-state.json` | 主键 `routeKey` → `LarkSessionBinding`（含可选 `aliasRouteKeys`）；内存 `aliasRouteKey` → `primaryRouteKey` | 决定**会话复用**与**活跃话题免 `@` 续聊**的唯一索引；支持多飞书锚点（原引用根、升级后话题根、`omt_*` 话题 ID、`chat` 模式直发消息 ID）透明指向同一份主绑定，确保单点真相且 UI 会话列表不重复 |
-| **受管会话台账 `managedSessions`** | 同上（按 `lastActivityMs` 淘汰，上限 600 条） | `sessionId` → `LarkManagedSession` | 覆盖所有桥接创建的会话（含 `per_message`、已解绑会话、`schedule`、`reminder`、`dreaming`），支撑**超时兜底归档**与 **Dreaming 增量整理** |
-| **进程内句柄与并发控制** | `LarkBridgeManager` 内存 `handles` / `pendingAcquires` / `inFlightTurns` | `sessionId` → `AgentHandle`；`primaryRouteKey` → `Promise`；`sessionId` → `number` | 按 `sessionId` 管理运行时句柄避免覆写泄漏；同路由并发首消息串行复用单次创建；`inFlightTurns > 1` 时延迟释放句柄 |
-| **DSH 原生归属与溯源** | DSH Session 事件流 + `workspaceRegistry` | `sessionId` → `plugin:lark-bridge/origin` & `workspaceId` | 挂载到目标工作区、维护会话标题净化、供定时任务/提醒反推来源群与话题、供启动期历史会话识别与归档 |
+| **活跃路由绑定 `bindings` + 别名索引 `binding_aliases`** | SQLite WAL 主库 `$DSH_HOME/lark-bridge/lark-bridge.db`（外键级联） | 主键 `routeKey` → `LarkSessionBinding`（含关联 `aliasRouteKeys`）；`aliasRouteKey` → `primaryRouteKey` | 决定**会话复用**与**活跃话题免 `@` 续聊**的唯一索引；支持多飞书锚点（原引用根、升级后话题根、`omt_*` 话题 ID、`chat` 模式直发消息 ID）透明指向同一份主绑定，确保单点真相且 UI 会话列表不重复 |
+| **受管会话台账 `managed_sessions`** | 同上（按 `lastActivityMs` 淘汰，上限 600 条） | `sessionId` → `LarkManagedSession` | 覆盖所有桥接创建的会话（含 `per_message`、已解绑会话、`schedule`、`reminder`、`dreaming`），支撑**超时兜底归档**与 **Dreaming 增量整理** |
+| **进程内句柄与并发控制** | `SessionCoordinator` 内存 `SessionActor`（5 态：`creating → idle → running → closing → archived`）与 `pendingAcquires` | `sessionId` → `SessionActor`（持有 `AgentHandle` 与 FIFO 串行队列）；`primaryRouteKey` → `Promise` | 按 `sessionId` 独占管理运行时句柄与回合串行化避免覆写泄漏；同路由并发首消息串行复用单次创建；`running` 期间阻塞空闲归档与抢占释放 |
+| **DSH 原生归属与溯源** | DSH Session 事件流 + `workspaceRegistry` | `sessionId` → `plugin:lark-bridge/origin` & `workspaceId` | 挂载到目标工作区、经 `SessionTitleGuard` 维护会话标题净化、供定时任务/提醒反推来源群与话题、供启动期历史会话识别与归档 |
 
 ---
 
@@ -96,7 +96,7 @@ flowchart LR
 
 ## 4. 五级入站路由决策链
 
-每条经 WebSocket 长连接到达的消息先通过 `MessageDeduplicator`（按 `{larkAppId}:{messageId}` 去重），过滤禁用智能体与机器人自发消息后，严格按 **1 → 5 短路优先级** 路由（[router.ts:407-674](../packages/lark-core/src/router.ts#L407-L674)）：
+每条经 WebSocket 长连接到达的消息先通过 `MessageDeduplicator`（按 `{larkAppId}:{messageId}` 去重），过滤禁用智能体与机器人自发消息后，严格按 **1 → 5 短路优先级** 路由（[router.ts:417-687](../../packages/lark-core/src/router.ts#L417-L687)）：
 
 ```mermaid
 flowchart TD
@@ -162,7 +162,7 @@ stateDiagram-v2
 
 ### 5.1 复用、热切换、并发保护与强制重建
 
-当 `decision.sessionMode !== 'per_message'` 时（[bridge-manager.ts:1475-1660](../packages/dsh-lark-bridge/src/bridge-manager.ts#L1475-L1660)）：
+当 `decision.sessionMode !== 'per_message'` 时（见 [session-coordinator.ts](../../packages/dsh-lark-bridge/src/session-coordinator.ts)）：
 
 | 场景 | 行为 | 是否保留原对话历史 |
 |---|---|---|
