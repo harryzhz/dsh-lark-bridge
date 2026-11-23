@@ -23,7 +23,7 @@ const FORBIDDEN_FILE_PATTERNS = [
   { name: 'private key or certificate', regex: /\.(pem|key|p12|pfx|jks|keystore)$/i },
   {
     name: 'runtime credential/state cache',
-    regex: /(^|\/)(open-platform-session|user-oauth-tokens|cli-endpoint|state)\.json$/i,
+    regex: /(^|\/)(open-platform-session|user-oauth-tokens|cli-endpoint|state|config\.snapshot)\.json$|(^|\/)lark-bridge-state[^/]*\.json$|(^|\/)bridge\.lock$|\.(db|db-wal|db-shm|sqlite|sqlite3)$/i,
   },
   { name: 'release tarball', regex: /\.tgz$/i },
 ]

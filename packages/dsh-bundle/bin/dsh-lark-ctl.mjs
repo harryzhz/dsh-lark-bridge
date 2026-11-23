@@ -234,6 +234,10 @@ try {
       String(flags['dsh-home'] || process.env.DSH_HOME || join(homedir(), '.dsh')),
     )
     installCliAndSkillAssets(dshHome)
+  } else if (cmd === 'db' || cmd === 'doctor') {
+    execFileSync(process.execPath, [larkBridgeCliEntry, ...process.argv.slice(2)], {
+      stdio: 'inherit',
+    })
   } else {
     console.log(`Usage: dsh-lark-ctl <command> [options]
 
@@ -245,6 +249,8 @@ Commands:
                        [--dsh-home ~/.dsh] [--dsh-bin /path/to/dsh] [--host <ipv4>] [--port 3880] [--label io.dsh.lark-bridge] [--load]
   install-cli          Install or refresh the lark-bridge CLI wrapper & Agent skill only
                        [--dsh-home ~/.dsh]
+  db                   SQLite storage status, migration, verify, backup, export, rollback & compact
+  doctor               Run storage, lock & bridge health diagnostics
 `)
   }
 } catch (err) {

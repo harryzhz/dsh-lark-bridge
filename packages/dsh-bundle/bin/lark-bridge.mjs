@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
+import { runDbCliCommand } from '@dsh-lark/dsh-lark-bridge/db-cli'
 
 const HELP = `lark-bridge — DSH 飞书桥接辅助 CLI（零密钥暴露，自动感知当前会话上下文）
 
@@ -26,6 +27,13 @@ const HELP = `lark-bridge — DSH 飞书桥接辅助 CLI（零密钥暴露，自
   lark-bridge schedule create --title <标题> (--prompt <文本> | --prompt-file <路径>) (--cron <表达式> | --daily <HH:MM> | --weekly <1,2..@HH:MM> | --every <秒> | --after <秒>) [--tz Asia/Shanghai] [--bot <botId> --chat <chatId>] [--mode chat|thread] [--notify non_empty|always|error_only] [--cwd <目录>] [--preset <id>]
   lark-bridge schedule bind <scheduleId> --bot <botId> --chat <chatId> [--mode chat|thread] [--notify non_empty|always|error_only]
   lark-bridge schedule run <scheduleId>
+  lark-bridge db status [--data-dir <目录>]
+  lark-bridge db migrate [--data-dir <目录>] [--from <state.json>] [--dry-run] [--force]
+  lark-bridge db verify [--data-dir <目录>] [--against <backup.json>]
+  lark-bridge db backup [--data-dir <目录>] [--out <输出路径>]
+  lark-bridge db export [--data-dir <目录>] [--out <输出路径>] [--redact]
+  lark-bridge db rollback --from <backup.json> [--to-json] [--data-dir <目录>] [--force]
+  lark-bridge db compact [--data-dir <目录>] [--force]
 
 send 选项:
   --bot <botId>             指定发送智能体（默认使用当前会话绑定的智能体）
@@ -46,7 +54,20 @@ send 选项:
 `
 
 const MULTI_FLAGS = new Set(['image', 'file', 'mention'])
-const BOOL_FLAGS = new Set(['help', 'h', 'thread', 'top-level', 'text-only', 'no-download', 'raw'])
+const BOOL_FLAGS = new Set([
+  'help',
+  'h',
+  'thread',
+  'top-level',
+  'text-only',
+  'no-download',
+  'raw',
+  'dry-run',
+  'force',
+  'redact',
+  'to-json',
+  'json',
+])
 
 function parseCliArgs(argv) {
   const positionals = []
@@ -456,6 +477,16 @@ async function main() {
 
   if (cmd === 'worktree') {
     handleWorktreeCommand(positionals, flags)
+    return
+  }
+
+  if (cmd === 'db') {
+    const sub = positionals[1] ?? 'status'
+    const result = runDbCliCommand(sub, flags)
+    printJson(result)
+    if (!result.ok) {
+      process.exitCode = 1
+    }
     return
   }
 

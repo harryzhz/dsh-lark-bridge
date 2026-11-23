@@ -297,6 +297,7 @@ export class LarkBridgeManager {
     await Promise.all([...this.handles.values()].map((h) => h.dispose().catch(() => {})))
     this.handles.clear()
     this.store.flushSeenMessages?.()
+    this.store.flushConfigSnapshot?.()
   }
 
   async recoverStalePendingTurns(botId?: string, nowMs = Date.now()): Promise<number> {

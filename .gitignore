@@ -21,6 +21,12 @@ open-platform-session.json
 user-oauth-tokens.json
 cli-endpoint.json
 state.json
+lark-bridge-state*.json
+config.snapshot.json
+bridge.lock
+*.db
+*.db-wal
+*.db-shm
 .dsh-lark-bridge/
 .worktrees/
 *.tgz

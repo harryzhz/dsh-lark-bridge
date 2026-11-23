@@ -103,6 +103,7 @@ export interface LarkPendingTurn {
   readonly allowSilentEmptyReply: boolean
   readonly reactionId?: string
   readonly sessionId?: string
+  readonly traceId?: string
   readonly startedAtMs: number
 }
 
@@ -144,6 +145,7 @@ export interface LarkAuditEvent {
   readonly chatName?: string
   readonly routeKey?: string
   readonly sessionId?: string
+  readonly traceId?: string
   readonly durationMs?: number
   readonly kind:
     | 'inbound'
