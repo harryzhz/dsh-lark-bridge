@@ -21,7 +21,6 @@ import {
   SENDER_TYPES,
   SESSION_MODES,
   TRIGGER_MODES,
-  groupRouterModeOptions,
   withInherit,
 } from '../presets.js'
 import type {
@@ -29,6 +28,8 @@ import type {
   ChatMemberItem,
   GroupConfig,
   GroupListenerRule,
+  GroupRouterConfig,
+  GroupRouterMode,
   GroupView,
   ListenerTemplate,
   ModelGroup,
@@ -57,6 +58,27 @@ import {
   reactionOptionsWithInherit,
 } from './options.js'
 import { RuntimeProfilePanel } from './RuntimeProfileDialog.js'
+import {
+  formatTriageSummary,
+  resolveNativeModelLabel,
+  TriageConfigFields,
+} from './TriageConfigFields.js'
+
+const DEFAULT_GROUP_ROUTER: GroupRouterConfig = {
+  mode: 'inherit',
+  provider: '',
+  model: '',
+  scope: 'passive_only',
+  timeoutMs: 4000,
+  customPrompt: '',
+  coalesceQueuedMessages: true,
+}
+
+const GROUP_ROUTER_MODES: ReadonlyArray<{ readonly value: GroupRouterMode; readonly label: string }> = [
+  { value: 'inherit', label: '跟随智能体' },
+  { value: 'override', label: '独立配置' },
+  { value: 'off', label: '关闭' },
+]
 
 type Section = 'basic' | 'runtime' | 'conversation' | 'role' | 'listener'
 
@@ -315,6 +337,7 @@ export function GroupConfigDialog({
 
       {section === 'runtime' && (
         <>
+          <GroupTitle>主运行时</GroupTitle>
           <SettingRow
             title="运行时来源"
             desc={runtimeMode === 'inherit' ? `当前继承：${inheritedSummary}` : undefined}
@@ -356,6 +379,76 @@ export function GroupConfigDialog({
               />
             </NestedSettings>
           )}
+
+          <GroupTitle>智能分流</GroupTitle>
+          <div className="fb-banner" style={{ margin: '6px 0 2px' }}>
+            <div className="fb-row-desc" style={{ minWidth: 0, flex: 1 }}>
+              使用轻量原生模型前置判断本群消息意图，闲聊与确认语静默跳过或轻回复，正式任务直接交由主运行时处理，并在忙碌时自动合批排队消息。
+            </div>
+          </div>
+          {(() => {
+            const currentRouter: GroupRouterConfig = {
+              ...DEFAULT_GROUP_ROUTER,
+              ...(draft.router ?? {}),
+            }
+            const botRouterModelLabel = bot?.router?.model
+              ? resolveNativeModelLabel(bot.router.provider, bot.router.model, models)
+              : ''
+            const emptyGroupModelLabel = botRouterModelLabel
+              ? `跟随智能体（${botRouterModelLabel}）`
+              : '跟随智能体 / DSH 默认原生模型'
+            return (
+              <>
+                <SettingRow
+                  title="分流策略"
+                  desc={
+                    currentRouter.mode === 'inherit'
+                      ? `当前继承：${formatTriageSummary(bot?.router, models)}`
+                      : undefined
+                  }
+                >
+                  <SegmentedControl
+                    id={`fb-router-mode-${draft.key}`}
+                    label="分流策略"
+                    value={currentRouter.mode}
+                    options={GROUP_ROUTER_MODES}
+                    onChange={(nextMode) => {
+                      if (nextMode === 'override' && currentRouter.mode !== 'override') {
+                        const base = bot?.router
+                        patch({
+                          router: {
+                            mode: 'override',
+                            provider: currentRouter.provider || base?.provider || '',
+                            model: currentRouter.model || base?.model || '',
+                            scope: base?.scope ?? currentRouter.scope,
+                            timeoutMs: base?.timeoutMs ?? currentRouter.timeoutMs,
+                            customPrompt: currentRouter.customPrompt || base?.customPrompt || '',
+                            coalesceQueuedMessages:
+                              base?.coalesceQueuedMessages ?? currentRouter.coalesceQueuedMessages,
+                          },
+                        })
+                        return
+                      }
+                      patch({ router: { ...currentRouter, mode: nextMode } })
+                    }}
+                  />
+                </SettingRow>
+                {currentRouter.mode === 'override' && (
+                  <NestedSettings>
+                    <TriageConfigFields
+                      value={currentRouter}
+                      runtimes={runtimes}
+                      models={models}
+                      emptyModelLabel={emptyGroupModelLabel}
+                      onChange={(next) =>
+                        patch({ router: { ...currentRouter, mode: 'override', ...next } })
+                      }
+                    />
+                  </NestedSettings>
+                )}
+              </>
+            )
+          })()}
         </>
       )}
 
@@ -615,16 +708,6 @@ function GroupConversationAndMessageSection({
           value={draft.sessionMode}
           options={withInherit(SESSION_MODES, bot.groupSessionMode)}
           onChange={(sessionMode) => patch({ sessionMode })}
-        />
-      </SettingRow>
-      <SettingRow title="Router 分流">
-        <SelectMenu
-          value={draft.routerMode ?? 'inherit'}
-          options={groupRouterModeOptions(
-            Boolean(bot.experimental?.router?.enabled),
-            bot.experimental?.router?.scope ?? 'passive_only',
-          )}
-          onChange={(routerMode) => patch({ routerMode })}
         />
       </SettingRow>
       <SettingRow title="空闲自动归档">

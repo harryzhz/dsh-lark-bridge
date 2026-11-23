@@ -290,7 +290,7 @@ export class LlmTriageService {
     })
 
     if (!this.ctx.llm || typeof this.ctx.llm.stream !== 'function') {
-      return failOpen('宿主原生 LLM 接口不可用，自动直通 Worker')
+      return failOpen('宿主原生 LLM 接口不可用，自动直通主运行时')
     }
 
     const target = await this.runtimes
@@ -300,7 +300,7 @@ export class LlmTriageService {
       })
       .catch(() => undefined)
     if (!target) {
-      return failOpen('未配置可用的原生分流模型，自动直通 Worker')
+      return failOpen('未配置可用的原生分流模型，自动直通主运行时')
     }
 
     const reasoningPlan = await this.resolveTriageReasoningPlan(target.provider, target.model)
@@ -437,7 +437,7 @@ export class LlmTriageService {
         `[lark-bridge][trace=${input.traceId}][bot=${input.bot.id}] triage fail-open (${target.provider}/${target.model}): ${msg}`,
       )
       return failOpen(
-        timedOut ? '分流超时，自动直通 Worker' : '分流异常，自动直通 Worker',
+        timedOut ? '分流超时，自动直通主运行时' : '分流异常，自动直通主运行时',
         target,
       )
     } finally {

@@ -124,17 +124,17 @@ export function shouldFastBypassTriage(
   decision: Pick<AgentRoutingDecision, 'trigger' | 'userText'>,
 ): { readonly bypass: boolean; readonly reason?: string } {
   if (msg.imageKeys.length > 0 || msg.msgType === 'image') {
-    return { bypass: true, reason: '包含图片附件，直通 Worker' }
+    return { bypass: true, reason: '包含图片附件，直通主运行时' }
   }
   if (msg.msgType === 'file' || msg.msgType === 'media' || msg.msgType === 'merge_forward') {
-    return { bypass: true, reason: `消息类型 ${msg.msgType} 直通 Worker` }
+    return { bypass: true, reason: `消息类型 ${msg.msgType} 直通主运行时` }
   }
   if (decision.trigger !== 'listener') {
     if (decision.userText.length > FAST_BYPASS_TEXT_CHARS) {
-      return { bypass: true, reason: '长文本任务，直通 Worker' }
+      return { bypass: true, reason: '长文本任务，直通主运行时' }
     }
     if (decision.userText.includes('```')) {
-      return { bypass: true, reason: '包含代码块，直通 Worker' }
+      return { bypass: true, reason: '包含代码块，直通主运行时' }
     }
   }
   return { bypass: false }
@@ -298,7 +298,7 @@ function normalizeVerdictObject(
   const reason =
     typeof obj.reason === 'string' && obj.reason.trim()
       ? clipText(obj.reason.trim(), 80)
-      : 'Router 判定'
+      : '智能分流判定'
   const rawReply =
     typeof obj.reply_text === 'string'
       ? obj.reply_text.trim()
@@ -313,12 +313,12 @@ function normalizeVerdictObject(
     return { action: 'handoff', reason }
   }
   if (rawAction === 'quick_reply') {
-    // Invariant: once a Worker owns the route, never allow Router quick_reply to split persona/context.
+    // Invariant: once the main agent owns the route, never allow quick_reply to split persona/context.
     if (hasActiveWorker) {
-      return { action: 'handoff', reason: `${reason}（已有活跃 Worker，转交接管）` }
+      return { action: 'handoff', reason: `${reason}（已有活跃会话，转交主运行时）` }
     }
     if (!rawReply) {
-      return { action: 'handoff', reason: '轻回复内容为空，回退移交 Worker', fallback: true }
+      return { action: 'handoff', reason: '轻回复内容为空，回退直通主运行时', fallback: true }
     }
     return { action: 'quick_reply', reason, replyText: rawReply }
   }
@@ -350,7 +350,7 @@ export function parseTriageVerdict(input: {
 
   return {
     action: 'handoff',
-    reason: '分流解析失败，自动直通 Worker',
+    reason: '分流解析失败，自动直通主运行时',
     fallback: true,
   }
 }

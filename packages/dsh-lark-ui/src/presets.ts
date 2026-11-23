@@ -1,7 +1,6 @@
 import { LARK_EMOJI_ASSETS } from './assets/lark-emoji.js'
 import type {
   GroupReplyMode,
-  GroupRouterMode,
   GroupSessionMode,
   Inheritable,
   ListenerMsgType,
@@ -98,31 +97,14 @@ export const ROUTER_SCOPE_MODES: readonly Choice<RouterScopeMode>[] = [
   {
     value: 'passive_only',
     label: '仅监听与活跃话题',
-    desc: '显式 @ 智能体直达 Worker，仅对主动监听与活跃话题续聊做快筛',
+    desc: '显式 @ 智能体直达主运行时，仅对主动监听与活跃话题续聊做分流',
   },
   {
     value: 'all_group',
     label: '全部群消息',
-    desc: '包含显式 @ 在内的全部群聊触发均先由轻量 Router 分流（私聊除外）',
+    desc: '包含显式 @ 在内的全部群聊消息均先经轻量模型分流（私聊除外）',
   },
 ]
-
-export function groupRouterModeOptions(
-  botRouterEnabled: boolean,
-  botScope: RouterScopeMode,
-): Choice<GroupRouterMode>[] {
-  const inheritedText = !botRouterEnabled
-    ? '关闭'
-    : botScope === 'all_group'
-      ? '全部群消息'
-      : '仅监听与活跃话题'
-  return [
-    { value: 'inherit', label: `跟随智能体（${inheritedText}）` },
-    { value: 'passive_only', label: '仅监听与活跃话题' },
-    { value: 'all_group', label: '全部群消息' },
-    { value: 'off', label: '关闭' },
-  ]
-}
 
 export const REASONING_EFFORTS: readonly Choice<string>[] = [
   { value: 'none', label: 'None' },

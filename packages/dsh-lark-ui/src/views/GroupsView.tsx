@@ -92,6 +92,10 @@ export function GroupsView({
                 <div className="fb-item-title">
                   <span title={g.chatName}>{g.chatName}</span>
                   {g.runtimeSource === 'group' && <Tag tone="neutral">独立运行时</Tag>}
+                  {cfg.router?.mode === 'override' && <Tag tone="neutral">独立分流</Tag>}
+                  {cfg.router?.mode === 'off' && bot?.router?.enabled && (
+                    <Tag tone="neutral">已关分流</Tag>
+                  )}
                   {cfg.listener.enabled && <Tag tone="info">监听中</Tag>}
                   {!g.inChat && <Tag tone="warning">智能体不在群内</Tag>}
                 </div>

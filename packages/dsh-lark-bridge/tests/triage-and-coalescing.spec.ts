@@ -307,8 +307,8 @@ function makeGroupMsg(overrides: Partial<InboundLarkMessage> = {}): InboundLarkM
   }
 }
 
-describe('Experimental Router/Worker Triage Gate & Busy-Queue Coalescing', () => {
-  it('silences listener chatter with zero Worker session and zero reaction flicker', async () => {
+describe('Smart Triage Gate, Per-Group Overrides & Busy-Queue Coalescing', () => {
+  it('silences listener chatter with zero main session and zero reaction flicker', async () => {
     const h = createHarness({
       triageStream: () => makeToolCallStream({ action: 'silent', reason: '日常确认语' }),
     })
@@ -322,13 +322,11 @@ describe('Experimental Router/Worker Triage Gate & Busy-Queue Coalescing', () =>
       defaultWorkingDir: h.dir,
       agentPreset: 'standard',
       receivedReactionEmoji: 'OnIt',
-      experimental: {
-        router: {
-          enabled: true,
-          provider: 'deepseek',
-          model: 'deepseek-chat',
-          scope: 'passive_only',
-        },
+      router: {
+        enabled: true,
+        provider: 'deepseek',
+        model: 'deepseek-chat',
+        scope: 'passive_only',
       },
     })
     h.store.upsertGroup({
@@ -356,7 +354,7 @@ describe('Experimental Router/Worker Triage Gate & Busy-Queue Coalescing', () =>
     expect(fx.addedReactions).toHaveLength(0)
     expect(fx.sentReplies).toHaveLength(0)
     const ev = h.store.listEvents(10).find((e) => e.kind === 'silent_skip')
-    expect(ev?.summary).toContain('Router 分流静默：日常确认语')
+    expect(ev?.summary).toContain('智能分流静默：日常确认语')
 
     await h.manager.stop()
     h.store.close()
@@ -392,13 +390,11 @@ describe('Experimental Router/Worker Triage Gate & Busy-Queue Coalescing', () =>
       agentPreset: 'standard',
       receivedReactionEmoji: 'OnIt',
       useInteractiveCard: true,
-      experimental: {
-        router: {
-          enabled: true,
-          provider: 'deepseek',
-          model: 'deepseek-chat',
-          scope: 'all_group',
-        },
+      router: {
+        enabled: true,
+        provider: 'deepseek',
+        model: 'deepseek-chat',
+        scope: 'all_group',
       },
     })
 
@@ -484,14 +480,12 @@ describe('Experimental Router/Worker Triage Gate & Busy-Queue Coalescing', () =>
       defaultWorkingDir: h.dir,
       agentPreset: 'standard',
       receivedReactionEmoji: 'OnIt',
-      experimental: {
-        router: {
-          enabled: true,
-          provider: 'deepseek',
-          model: 'deepseek-chat',
-          scope: 'passive_only',
-          timeoutMs: 1000,
-        },
+      router: {
+        enabled: true,
+        provider: 'deepseek',
+        model: 'deepseek-chat',
+        scope: 'passive_only',
+        timeoutMs: 1000,
       },
     })
 
@@ -555,14 +549,12 @@ describe('Experimental Router/Worker Triage Gate & Busy-Queue Coalescing', () =>
       defaultWorkingDir: h.dir,
       agentPreset: 'standard',
       receivedReactionEmoji: 'OnIt',
-      experimental: {
-        router: {
-          enabled: true,
-          provider: 'deepseek',
-          model: 'deepseek-chat',
-          scope: 'passive_only',
-          coalesceQueuedMessages: true,
-        },
+      router: {
+        enabled: true,
+        provider: 'deepseek',
+        model: 'deepseek-chat',
+        scope: 'passive_only',
+        coalesceQueuedMessages: true,
       },
     })
 
@@ -679,13 +671,11 @@ describe('Experimental Router/Worker Triage Gate & Busy-Queue Coalescing', () =>
       larkAppSecret: 'sec_demo',
       defaultWorkingDir: h.dir,
       agentPreset: 'standard',
-      experimental: {
-        router: {
-          enabled: true,
-          provider: 'deepseek',
-          model: 'deepseek-reasoner',
-          scope: 'all_group',
-        },
+      router: {
+        enabled: true,
+        provider: 'deepseek',
+        model: 'deepseek-reasoner',
+        scope: 'all_group',
       },
     })
 
@@ -703,6 +693,86 @@ describe('Experimental Router/Worker Triage Gate & Busy-Queue Coalescing', () =>
     expect(h.triageCalls[0]?.reasoningEffort).toBe('low')
     expect(h.triageCalls[0]?.temperature).toBeUndefined()
     expect(h.triageCalls[0]?.maxTokens).toBe(1024)
+
+    await h.manager.stop()
+    h.store.close()
+  })
+
+  it('supports per-group independent smart triage model, scope, and custom prompt overrides even when Bot default is off', async () => {
+    const h = createHarness({
+      triageStream: () => makeToolCallStream({ action: 'silent', reason: '群独立规则静默' }),
+      workerReply: () => '主运行时直达回复',
+    })
+    const fx = makeFakeTransport()
+
+    // Bot default smart triage is OFF
+    h.store.upsertBot({
+      id: 'bot-1',
+      name: 'DevBot',
+      larkAppId: 'cli_demo',
+      larkAppSecret: 'sec_demo',
+      defaultWorkingDir: h.dir,
+      agentPreset: 'standard',
+      receivedReactionEmoji: 'OnIt',
+      router: { enabled: false },
+    })
+
+    // Group A overrides with its own custom provider/model, all_group scope, and customPrompt
+    h.store.upsertGroup({
+      botId: 'bot-1',
+      chatId: 'oc_group_a',
+      chatName: '独立分流群 A',
+      enabled: true,
+      router: {
+        mode: 'override',
+        provider: 'custom-plan-cli',
+        model: 'plan-fast',
+        scope: 'all_group',
+        timeoutMs: 3000,
+        customPrompt: '群 A 专属分流规则：纯致谢静默',
+        coalesceQueuedMessages: true,
+      },
+    })
+
+    // Group B inherits Bot default (OFF) -> goes straight to main runtime
+    h.store.upsertGroup({
+      botId: 'bot-1',
+      chatId: 'oc_group_b',
+      chatName: '普通群 B',
+      enabled: true,
+      router: { mode: 'inherit' },
+    })
+
+    await h.manager.inbound.handleInbound(
+      'bot-1',
+      fx.transport,
+      makeGroupMsg({
+        chatId: 'oc_group_a',
+        messageId: 'om_a_1',
+        text: '@DevBot 辛苦啦',
+        mentions: [{ key: '@_user_1', openId: 'ou_bot', name: 'DevBot' }],
+      }),
+    )
+    expect(h.triageCalls).toHaveLength(1)
+    expect(h.triageCalls[0]?.provider).toBe('custom-plan-cli')
+    expect(h.triageCalls[0]?.model).toBe('plan-fast')
+    expect(h.triageCalls[0]?.system).toContain('群 A 专属分流规则')
+    expect(h.createdSessions).toHaveLength(0)
+
+    await h.manager.inbound.handleInbound(
+      'bot-1',
+      fx.transport,
+      makeGroupMsg({
+        chatId: 'oc_group_b',
+        messageId: 'om_b_1',
+        text: '@DevBot 辛苦啦',
+        mentions: [{ key: '@_user_1', openId: 'ou_bot', name: 'DevBot' }],
+      }),
+    )
+    // Group B did NOT call triage and went straight to main runtime
+    expect(h.triageCalls).toHaveLength(1)
+    expect(h.createdSessions).toHaveLength(1)
+    expect(fx.sentReplies).toHaveLength(1)
 
     await h.manager.stop()
     h.store.close()

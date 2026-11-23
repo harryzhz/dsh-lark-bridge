@@ -908,7 +908,7 @@ export class InboundPipeline {
         traceId,
         durationMs: result.durationMs,
         kind: 'silent_skip',
-        summary: `Router 分流静默：${result.verdict.reason}`,
+        summary: `智能分流静默：${result.verdict.reason}`,
       })
       return { handled: true }
     }
@@ -949,13 +949,13 @@ export class InboundPipeline {
           traceId,
           durationMs: latencyMs,
           kind: 'reply',
-          summary: `Router 快速回复（${replyText.length} 字）：${result.verdict.reason}`,
+          summary: `智能分流快回（${replyText.length} 字）：${result.verdict.reason}`,
         })
         return { handled: true }
       }
     }
 
-    const prefix = result.verdict.fallback ? 'Router 回退移交' : 'Router 移交'
+    const prefix = result.verdict.fallback ? '分流回退直通' : '分流转交'
     return {
       handled: false,
       triageNote: `${prefix}：${result.verdict.reason}（${result.durationMs}ms）`,

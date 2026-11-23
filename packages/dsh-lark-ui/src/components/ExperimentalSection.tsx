@@ -8,20 +8,13 @@ import {
   type StateDotState,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { bridgeApi } from '../api.js'
-import {
-  DEFAULT_DREAMING_SCOPES,
-  REMINDER_CREATION_MODES,
-  ROUTER_SCOPE_MODES,
-} from '../presets.js'
+import { DEFAULT_DREAMING_SCOPES, REMINDER_CREATION_MODES } from '../presets.js'
 import { formatTime } from '../state.js'
 import type {
   BotDreamingConfig,
   BotExperimentalConfig,
   BotProactiveConfig,
-  BotRouterConfig,
   DreamRunState,
-  ModelGroup,
-  RuntimeOption,
 } from '../types.js'
 import {
   EditableScopeList,
@@ -30,9 +23,7 @@ import {
   NumberField,
   SelectMenu,
   SettingRow,
-  TextArea,
   TextField,
-  type SelectOption,
 } from './fields.js'
 
 export interface DreamStatusPresentation {
@@ -105,8 +96,6 @@ export function ExperimentalSection({
   botId,
   experimental,
   dreamState,
-  runtimes = [],
-  models = [],
   onChange,
   onOpenSession,
   onStateUpdated,
@@ -114,8 +103,6 @@ export function ExperimentalSection({
   botId: string | null
   experimental: BotExperimentalConfig
   dreamState?: DreamRunState | undefined
-  runtimes?: readonly RuntimeOption[]
-  models?: readonly ModelGroup[]
   onChange: (next: BotExperimentalConfig) => void
   onOpenSession?: ((sessionId: string) => void) | undefined
   onStateUpdated?: ((next: DreamRunState) => void) | undefined
@@ -123,41 +110,11 @@ export function ExperimentalSection({
   const [runningNow, setRunningNow] = useState(false)
   const [runError, setRunError] = useState('')
 
-  const { dreaming, proactive, router } = experimental
+  const { dreaming, proactive } = experimental
   const patchDreaming = (p: Partial<BotDreamingConfig>) =>
     onChange({ ...experimental, dreaming: { ...dreaming, ...p } })
   const patchProactive = (p: Partial<BotProactiveConfig>) =>
     onChange({ ...experimental, proactive: { ...proactive, ...p } })
-  const patchRouter = (p: Partial<BotRouterConfig>) =>
-    onChange({ ...experimental, router: { ...router, ...p } })
-
-  const externalProviders = new Set(
-    runtimes.filter((r) => r.kind === 'external' && r.providerId).map((r) => r.providerId!),
-  )
-  const nativeGroups = models.filter((g) => {
-    if (g.models.length === 0) return false
-    if (g.isExternal !== undefined) return !g.isExternal
-    return !externalProviders.has(g.provider) && !g.provider.endsWith('-cli')
-  })
-  const routerModelValue =
-    router.provider && router.model ? `${router.provider}::${router.model}` : router.model || ''
-  const routerModelOptions: SelectOption<string>[] = [{ value: '', label: '跟随 DSH 默认原生模型' }]
-  for (const group of nativeGroups) {
-    const groupLabel = group.name || group.provider
-    for (const m of group.models) {
-      routerModelOptions.push({
-        value: `${group.provider}::${m.id}`,
-        label: m.name || m.id,
-        group: groupLabel,
-      })
-    }
-  }
-  if (routerModelValue && !routerModelOptions.some((o) => o.value === routerModelValue)) {
-    routerModelOptions.push({
-      value: routerModelValue,
-      label: router.provider ? `${router.provider} / ${router.model}` : router.model,
-    })
-  }
 
   const triggerDreamNow = async () => {
     if (!botId) return
@@ -327,89 +284,6 @@ export function ExperimentalSection({
               onChange={(branchPrefix) => patchProactive({ branchPrefix })}
               placeholder="agent/"
               mono
-            />
-          </SettingRow>
-        </NestedSettings>
-      )}
-
-      <GroupTitle>Router 快速分流</GroupTitle>
-      <div className="fb-banner" style={{ margin: '6px 0 2px' }}>
-        <div className="fb-row-desc" style={{ minWidth: 0, flex: 1 }}>
-          使用无状态轻量原生模型先判断群聊消息意图：闲聊与确认语直接静默或轻文本回应，不创建会话也不阻塞队列；正式任务安静贴上表情并直接移交当前 Agent 运行时作为 Worker 接管，超时或异常自动回退直通 Worker。
-        </div>
-      </div>
-
-      <SettingRow title="启用 Router / Worker 分流">
-        <Switch
-          label="启用 Router / Worker 分流"
-          checked={router.enabled}
-          onChange={(enabled) => patchRouter({ enabled })}
-        />
-      </SettingRow>
-
-      {router.enabled && (
-        <NestedSettings>
-          {nativeGroups.length === 0 && (
-            <div className="fb-banner" data-tone="warn" style={{ margin: '4px 0 6px' }}>
-              <div className="fb-row-desc" style={{ minWidth: 0, flex: 1 }}>
-                当前未检测到可用的 DSH 原生模型服务商，请先在 DSH「设置 → 模型」配置至少一个轻量模型；未就绪期间消息将自动直通 Worker。
-              </div>
-            </div>
-          )}
-          <SettingRow title="分流模型" desc="建议选择响应快、低思考的原生模型">
-            <SelectMenu
-              value={routerModelValue}
-              options={routerModelOptions}
-              onChange={(nextVal) => {
-                if (!nextVal) {
-                  patchRouter({ provider: '', model: '' })
-                  return
-                }
-                const sep = nextVal.indexOf('::')
-                if (sep > 0) {
-                  patchRouter({
-                    provider: nextVal.slice(0, sep),
-                    model: nextVal.slice(sep + 2),
-                  })
-                } else {
-                  patchRouter({ provider: '', model: nextVal })
-                }
-              }}
-            />
-          </SettingRow>
-          <SettingRow title="生效范围">
-            <SelectMenu
-              value={router.scope}
-              options={ROUTER_SCOPE_MODES}
-              onChange={(scope) => patchRouter({ scope })}
-            />
-          </SettingRow>
-          <SettingRow title="分流超时" desc="超时自动直通 Worker，避免阻塞正式任务">
-            <NumberField
-              value={Math.round(router.timeoutMs / 1000)}
-              min={1}
-              onChange={(secs) =>
-                patchRouter({ timeoutMs: Math.min(15, Math.max(1, Math.round(secs))) * 1000 })
-              }
-              suffix="秒"
-            />
-          </SettingRow>
-          <SettingRow
-            title="忙碌队列合批"
-            desc="Worker 运行期间堆积的多条有效消息自动合并为一轮增量提交"
-          >
-            <Switch
-              label="忙碌队列合批"
-              checked={router.coalesceQueuedMessages}
-              onChange={(coalesceQueuedMessages) => patchRouter({ coalesceQueuedMessages })}
-            />
-          </SettingRow>
-          <SettingRow title="补充判断规则" desc="可选，追加团队特定的静默或移交约定" stack>
-            <TextArea
-              value={router.customPrompt}
-              onChange={(customPrompt) => patchRouter({ customPrompt })}
-              rows={4}
-              placeholder="例如：涉及发版审批、数据库变更或线上报错的消息一律移交 Worker；打卡和日常问候静默跳过"
             />
           </SettingRow>
         </NestedSettings>

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   DEFAULT_BOT_ROUTER_CONFIG,
+  DEFAULT_GROUP_ROUTER_CONFIG,
   LarkBotConfigSchema,
   LarkGroupConfigSchema,
   buildRouteKey,
@@ -70,21 +71,39 @@ function makeDecision(overrides: Partial<AgentRoutingDecision> = {}): AgentRouti
   }
 }
 
-describe('Router/Worker triage config, scope resolution & protocol', () => {
-  it('applies backward-compatible defaults and group-level overrides cleanly', () => {
-    const legacyBot = makeBot({ experimental: { dreaming: { enabled: false } } })
-    expect(legacyBot.experimental.router).toEqual(DEFAULT_BOT_ROUTER_CONFIG)
+describe('Smart triage config, per-group overrides & protocol', () => {
+  it('applies formal defaults, migrates legacy experimental.router & routerMode, and resolves full per-group overrides', () => {
+    const defaultBot = makeBot({ experimental: { dreaming: { enabled: false } } })
+    expect(defaultBot.router).toEqual(DEFAULT_BOT_ROUTER_CONFIG)
 
-    const bot = makeBot({
+    // Seamless migration from earlier experimental.router placement
+    const migratedBot = makeBot({
       experimental: {
+        dreaming: { enabled: false },
         router: {
           enabled: true,
           provider: 'deepseek',
           model: 'deepseek-chat',
-          scope: 'passive_only',
+          scope: 'all_group',
           timeoutMs: 3500,
-          coalesceQueuedMessages: true,
         },
+      },
+    })
+    expect(migratedBot.router.enabled).toBe(true)
+    expect(migratedBot.router.provider).toBe('deepseek')
+    expect(migratedBot.router.model).toBe('deepseek-chat')
+    expect(migratedBot.router.scope).toBe('all_group')
+    expect(migratedBot.router.timeoutMs).toBe(3500)
+
+    const bot = makeBot({
+      router: {
+        enabled: true,
+        provider: 'deepseek',
+        model: 'deepseek-chat',
+        scope: 'passive_only',
+        timeoutMs: 3500,
+        customPrompt: 'Bot 默认规则',
+        coalesceQueuedMessages: true,
       },
     })
 
@@ -93,39 +112,89 @@ describe('Router/Worker triage config, scope resolution & protocol', () => {
       botId: 'bot-triage',
       chatId: 'oc_team',
     })
-    expect(inheritedGroup.routerMode).toBe('inherit')
+    expect(inheritedGroup.router).toEqual(DEFAULT_GROUP_ROUTER_CONFIG)
 
     const effDefault = resolveEffectiveRouterConfig(bot, inheritedGroup)
+    expect(effDefault.source).toBe('bot')
     expect(effDefault.enabled).toBe(true)
     expect(effDefault.scope).toBe('passive_only')
+    expect(effDefault.customPrompt).toBe('Bot 默认规则')
     expect(effDefault.coalesceQueuedMessages).toBe(true)
 
-    const allGroup = LarkGroupConfigSchema.parse({
-      key: 'bot-triage:oc_all',
+    // Full per-group override (model, scope, timeout, coalescing, customPrompt)
+    const customGroup = LarkGroupConfigSchema.parse({
+      key: 'bot-triage:oc_custom',
       botId: 'bot-triage',
-      chatId: 'oc_all',
+      chatId: 'oc_custom',
+      router: {
+        mode: 'override',
+        provider: 'arkcli-agent-plan',
+        model: 'doubao-seed-2.1-lite',
+        scope: 'all_group',
+        timeoutMs: 5000,
+        customPrompt: '本群仅处理告警与发布',
+        coalesceQueuedMessages: false,
+      },
+    })
+    const effCustom = resolveEffectiveRouterConfig(bot, customGroup)
+    expect(effCustom).toEqual({
+      source: 'group',
+      enabled: true,
+      provider: 'arkcli-agent-plan',
+      model: 'doubao-seed-2.1-lite',
+      scope: 'all_group',
+      timeoutMs: 5000,
+      customPrompt: '本群仅处理告警与发布',
+      coalesceQueuedMessages: false,
+    })
+
+    // Group override leaving provider/model blank inherits Bot router model
+    const partialOverrideGroup = LarkGroupConfigSchema.parse({
+      key: 'bot-triage:oc_partial',
+      botId: 'bot-triage',
+      chatId: 'oc_partial',
+      router: { mode: 'override', scope: 'all_group' },
+    })
+    const effPartial = resolveEffectiveRouterConfig(bot, partialOverrideGroup)
+    expect(effPartial.provider).toBe('deepseek')
+    expect(effPartial.model).toBe('deepseek-chat')
+    expect(effPartial.scope).toBe('all_group')
+
+    // Legacy group routerMode migration
+    const migratedGroup = LarkGroupConfigSchema.parse({
+      key: 'bot-triage:oc_legacy',
+      botId: 'bot-triage',
+      chatId: 'oc_legacy',
       routerMode: 'all_group',
     })
-    expect(resolveEffectiveRouterConfig(bot, allGroup).scope).toBe('all_group')
+    expect(migratedGroup.router.mode).toBe('override')
+    expect(migratedGroup.router.scope).toBe('all_group')
 
     const disabledGroup = LarkGroupConfigSchema.parse({
       key: 'bot-triage:oc_off',
       botId: 'bot-triage',
       chatId: 'oc_off',
-      routerMode: 'off',
+      router: { mode: 'off' },
     })
     const effOff = resolveEffectiveRouterConfig(bot, disabledGroup)
+    expect(effOff.source).toBe('group')
     expect(effOff.enabled).toBe(false)
     expect(effOff.coalesceQueuedMessages).toBe(false)
+
+    // Group can enable smart triage even when Bot default is off
+    const offBot = makeBot({ router: { enabled: false } })
+    expect(resolveEffectiveRouterConfig(offBot, customGroup).enabled).toBe(true)
   })
 
   it('enforces passive_only vs all_group scope boundaries and excludes p2p', () => {
     const passiveCfg = {
+      source: 'bot' as const,
       ...DEFAULT_BOT_ROUTER_CONFIG,
       enabled: true,
       scope: 'passive_only' as const,
     }
     const allGroupCfg = {
+      source: 'bot' as const,
       ...DEFAULT_BOT_ROUTER_CONFIG,
       enabled: true,
       scope: 'all_group' as const,
@@ -181,7 +250,7 @@ describe('Router/Worker triage config, scope resolution & protocol', () => {
       hasActiveWorker: true,
     })
     expect(v2.action).toBe('handoff')
-    expect(v2.reason).toContain('已有活跃 Worker')
+    expect(v2.reason).toContain('已有活跃会话')
 
     // 3. JSON fallback when model does not emit a tool call
     const v3 = parseTriageVerdict({
