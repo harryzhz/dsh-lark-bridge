@@ -30,6 +30,7 @@ import type {
   BotDreamingConfig,
   BotProactiveConfig,
   BotRecord,
+  BotRouterConfig,
   DreamRunState,
   ModelGroup,
   OpenPlatformAppItem,
@@ -59,6 +60,7 @@ import {
   reactionOptions,
 } from './options.js'
 import { RuntimeProfilePanel } from './RuntimeProfileDialog.js'
+import { TriageConfigFields } from './TriageConfigFields.js'
 import { UserSearchPicker } from './UserSearchPicker.js'
 
 type Section = 'basic' | 'runtime' | 'conversation' | 'role' | 'access' | 'experimental'
@@ -85,6 +87,16 @@ export const DEFAULT_PROACTIVE_CONFIG: BotProactiveConfig = {
   reminderCreationMode: 'silent',
   autoCodeEnabled: false,
   branchPrefix: 'agent/',
+}
+
+export const DEFAULT_ROUTER_CONFIG: BotRouterConfig = {
+  enabled: false,
+  provider: '',
+  model: '',
+  scope: 'passive_only',
+  timeoutMs: 4000,
+  customPrompt: '',
+  coalesceQueuedMessages: true,
 }
 
 export function newBotConfig(
@@ -127,6 +139,7 @@ export function newBotConfig(
     idleCloseMinutes: 720,
     role: { enabled: false, name: '', systemPrompt: '' },
     substituteMode: { enabled: false, targets: [], disclosure: 'none', activeThreadFollowup: true },
+    router: { ...DEFAULT_ROUTER_CONFIG },
     experimental: {
       dreaming: { ...DEFAULT_DREAMING_CONFIG, scopes: [...DEFAULT_DREAMING_CONFIG.scopes] },
       proactive: { ...DEFAULT_PROACTIVE_CONFIG },
@@ -151,6 +164,10 @@ function toBotConfig(record: BotRecord): BotConfig {
     adminUsers: cloned.adminUsers ?? [],
     adminUserProfiles: cloned.adminUserProfiles ?? [],
     sessionLinkGuestReadOnly: cloned.sessionLinkGuestReadOnly ?? true,
+    router: {
+      ...DEFAULT_ROUTER_CONFIG,
+      ...(cloned.router ?? {}),
+    },
     experimental: {
       dreaming: {
         ...DEFAULT_DREAMING_CONFIG,
@@ -1004,29 +1021,58 @@ function EditBotDialog({
       )}
 
       {section === 'runtime' && (
-        <AgentRuntimeFields
-          value={{
-            agentPreset: draft.agentPreset,
-            runtimeProfileId: draft.runtimeProfileId ?? '',
-            model: draft.model ?? '',
-            reasoningEffort: draft.reasoningEffort ?? '',
-          }}
-          runtimes={runtimes}
-          models={models}
-          profileRevision={profileRevision}
-          onProfilesChanged={onProfilesChanged}
-          onManageProfiles={(rt, pid) =>
-            setProfileView({ runtimeId: rt.id, ...(pid ? { initialProfileId: pid } : {}) })
-          }
-          onChange={({ agentPreset, runtimeProfileId, model, reasoningEffort }) =>
-            patch({
-              agentPreset,
-              runtimeProfileId: runtimeProfileId?.trim() || undefined,
-              model: model || undefined,
-              reasoningEffort: reasoningEffort || undefined,
-            })
-          }
-        />
+        <>
+          <GroupTitle>主运行时</GroupTitle>
+          <AgentRuntimeFields
+            value={{
+              agentPreset: draft.agentPreset,
+              runtimeProfileId: draft.runtimeProfileId ?? '',
+              model: draft.model ?? '',
+              reasoningEffort: draft.reasoningEffort ?? '',
+            }}
+            runtimes={runtimes}
+            models={models}
+            profileRevision={profileRevision}
+            onProfilesChanged={onProfilesChanged}
+            onManageProfiles={(rt, pid) =>
+              setProfileView({ runtimeId: rt.id, ...(pid ? { initialProfileId: pid } : {}) })
+            }
+            onChange={({ agentPreset, runtimeProfileId, model, reasoningEffort }) =>
+              patch({
+                agentPreset,
+                runtimeProfileId: runtimeProfileId?.trim() || undefined,
+                model: model || undefined,
+                reasoningEffort: reasoningEffort || undefined,
+              })
+            }
+          />
+
+          <GroupTitle>智能分流</GroupTitle>
+          <div className="fb-banner" style={{ margin: '6px 0 2px' }}>
+            <div className="fb-row-desc" style={{ minWidth: 0, flex: 1 }}>
+              使用轻量原生模型先判断群聊消息意图：闲聊与确认语直接静默或轻文本回应，不创建会话也不阻塞队列；正式任务安静贴上表情并直接交由主运行时接管处理，超时或异常自动直通主运行时。各群聊也可在群配置中单独覆盖。
+            </div>
+          </div>
+
+          <SettingRow title="启用智能分流">
+            <Switch
+              label="启用智能分流"
+              checked={draft.router.enabled}
+              onChange={(enabled) => patch({ router: { ...draft.router, enabled } })}
+            />
+          </SettingRow>
+
+          {draft.router.enabled && (
+            <NestedSettings>
+              <TriageConfigFields
+                value={draft.router}
+                runtimes={runtimes}
+                models={models}
+                onChange={(next) => patch({ router: { ...draft.router, ...next } })}
+              />
+            </NestedSettings>
+          )}
+        </>
       )}
 
       {section === 'conversation' && <BotConversationAndMessageSection draft={draft} patch={patch} />}

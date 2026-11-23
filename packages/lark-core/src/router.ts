@@ -65,12 +65,14 @@ function resolveThreadRouteKey(
   msg: InboundLarkMessage,
   runtime: RoutingRuntimeContext,
 ): string {
+  const isRouteActive = (key: string) =>
+    runtime.hasActiveSessionForRoute(key) || Boolean(runtime.hasEphemeralRouterThread?.(key))
   const primaryAnchor = msg.rootId ?? msg.threadId ?? msg.messageId
   const primaryKey = buildRouteKey(bot.larkAppId, msg.chatId, primaryAnchor)
-  if (runtime.hasActiveSessionForRoute(primaryKey)) return primaryKey
+  if (isRouteActive(primaryKey)) return primaryKey
   if (msg.rootId && msg.threadId && msg.threadId !== msg.rootId) {
     const threadIdKey = buildRouteKey(bot.larkAppId, msg.chatId, msg.threadId)
-    if (runtime.hasActiveSessionForRoute(threadIdKey)) return threadIdKey
+    if (isRouteActive(threadIdKey)) return threadIdKey
   }
   return primaryKey
 }
@@ -544,6 +546,9 @@ export function decideLarkRouting(
   }
 
   // 3. Group chat: active thread continuation (without re-mentioning agent)
+  const hasWorkerSession = runtime.hasActiveSessionForRoute(threadRouteKey)
+  const hasEphemeralThread =
+    !hasWorkerSession && Boolean(runtime.hasEphemeralRouterThread?.(threadRouteKey))
   const existingThreadTrigger = runtime.getRouteTrigger?.(threadRouteKey)
   const hasThreadReplied = runtime.hasRouteReplied?.(threadRouteKey) ?? true
   const allowThreadFollowup =
@@ -555,7 +560,7 @@ export function decideLarkRouting(
   if (
     allowThreadFollowup &&
     (msg.rootId || msg.threadId) &&
-    runtime.hasActiveSessionForRoute(threadRouteKey)
+    (hasWorkerSession || hasEphemeralThread)
   ) {
     const clean = replaceMentionKeysWithNames(msg.text, msg.mentions)
     const cmd = parseSlashCommand(clean)

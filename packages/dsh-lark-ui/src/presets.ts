@@ -7,6 +7,7 @@ import type {
   ListenerSenderType,
   ListenerTemplate,
   ReminderCreationMode,
+  RouterScopeMode,
   ScheduleDeliveryMode,
   ScheduleNotifyOn,
 } from './types.js'
@@ -90,6 +91,19 @@ export const REMINDER_CREATION_MODES: readonly Choice<ReminderCreationMode>[] = 
   { value: 'silent', label: '静默创建' },
   { value: 'notify', label: '创建时发送提示' },
   { value: 'confirm', label: '创建前请求确认' },
+]
+
+export const ROUTER_SCOPE_MODES: readonly Choice<RouterScopeMode>[] = [
+  {
+    value: 'passive_only',
+    label: '仅监听与活跃话题',
+    desc: '显式 @ 智能体直达主运行时，仅对主动监听与活跃话题续聊做分流',
+  },
+  {
+    value: 'all_group',
+    label: '全部群消息',
+    desc: '包含显式 @ 在内的全部群聊消息均先经轻量模型分流（私聊除外）',
+  },
 ]
 
 export const REASONING_EFFORTS: readonly Choice<string>[] = [

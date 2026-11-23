@@ -248,6 +248,71 @@ export class RuntimeCatalog {
     return this.directory()?.get(presetId)?.providerId
   }
 
+  /** Whether a provider id belongs to an external CLI runtime rather than a native DSH LLM adapter. */
+  isExternalProvider(providerId: string | undefined): boolean {
+    if (!providerId) return true
+    const externalProviders = new Set([
+      ...(this.directory()?.list() ?? []).map((r) => r.providerId),
+      ...this.listExposedPresets().map((p) => p.providerId),
+    ])
+    if (externalProviders.has(providerId)) return true
+    const configurableProviders = this.listConfigurableProviderIds()
+    if (configurableProviders.has(providerId)) return false
+    return providerId.endsWith('-cli')
+  }
+
+  /**
+   * Resolve a native DSH LLM `(provider, model)` pair suitable for direct stateless `ctx.llm.stream()` calls
+   * (such as fast Router triage). Never returns external CLI providers.
+   */
+  async resolveNativeLlmTarget(input: {
+    readonly provider?: string
+    readonly model?: string
+  } = {}): Promise<{ readonly provider: string; readonly model: string } | undefined> {
+    if (!this.ctx.llm) return undefined
+    const externalProviders = new Set([
+      ...(this.directory()?.list() ?? []).map((r) => r.providerId),
+      ...this.listExposedPresets().map((p) => p.providerId),
+    ])
+    const isExt = (id: string | undefined): boolean => this.isExternalProvider(id)
+
+    const explicitProvider = input.provider?.trim() || undefined
+    const explicitModel = input.model?.trim() || undefined
+    const defaultSel = this.readAgentDefaultSelection()
+    const nativeDefault =
+      defaultSel?.provider && defaultSel?.model && !isExt(defaultSel.provider)
+        ? { provider: defaultSel.provider, model: defaultSel.model }
+        : undefined
+
+    if (explicitProvider && explicitModel && !isExt(explicitProvider)) {
+      const nativeIds = this.listNativeProviderIds(externalProviders)
+      if (nativeIds.length === 0 || nativeIds.includes(explicitProvider)) {
+        return { provider: explicitProvider, model: explicitModel }
+      }
+    }
+
+    if (explicitModel) {
+      const resolvedProvider = await this.findNativeProviderForModel(
+        explicitModel,
+        explicitProvider && !isExt(explicitProvider) ? explicitProvider : nativeDefault?.provider,
+        externalProviders,
+      )
+      if (resolvedProvider && !isExt(resolvedProvider)) {
+        return { provider: resolvedProvider, model: explicitModel }
+      }
+    }
+
+    if (explicitProvider && !isExt(explicitProvider)) {
+      const models = await this.listProviderModelsSafe(explicitProvider)
+      if (models[0]?.id) {
+        return { provider: explicitProvider, model: models[0].id }
+      }
+    }
+
+    if (nativeDefault) return nativeDefault
+    return await this.findFirstNativeModel(externalProviders)
+  }
+
   /** Exposed profile presets dynamically registered by `dsh-external-agents`. */
   listExposedPresets(): readonly ExposedExternalPresetSummary[] {
     const raw = this.directory()?.listExposedPresets?.() ?? []
@@ -478,13 +543,33 @@ export class RuntimeCatalog {
     }
   }
 
+  private listConfigurableProviderIds(): ReadonlySet<string> {
+    if (typeof this.ctx.llm?.listConfigurableProviders !== 'function') return new Set()
+    try {
+      return new Set(
+        this.ctx.llm
+          .listConfigurableProviders()
+          .map((p) => p.provider)
+          .filter(Boolean),
+      )
+    } catch {
+      return new Set()
+    }
+  }
+
   private listNativeProviderIds(externalProviders: ReadonlySet<string>): string[] {
     if (typeof this.ctx.llm?.listProviders !== 'function') return []
+    const configurableProviders = this.listConfigurableProviderIds()
     try {
       return this.ctx.llm
         .listProviders()
         .map((p) => p.id)
-        .filter((id) => Boolean(id) && !externalProviders.has(id) && !id.endsWith('-cli'))
+        .filter(
+          (id) =>
+            Boolean(id) &&
+            !externalProviders.has(id) &&
+            (configurableProviders.has(id) || !id.endsWith('-cli')),
+        )
     } catch {
       return []
     }

@@ -28,6 +28,8 @@ export interface SubstituteMode {
 }
 
 export type ReminderCreationMode = 'silent' | 'notify' | 'confirm'
+export type RouterScopeMode = 'passive_only' | 'all_group'
+export type GroupRouterMode = 'inherit' | 'override' | 'off'
 
 export interface BotDreamingConfig {
   enabled: boolean
@@ -42,6 +44,26 @@ export interface BotProactiveConfig {
   reminderCreationMode: ReminderCreationMode
   autoCodeEnabled: boolean
   branchPrefix: string
+}
+
+export interface BotRouterConfig {
+  enabled: boolean
+  provider: string
+  model: string
+  scope: RouterScopeMode
+  timeoutMs: number
+  customPrompt: string
+  coalesceQueuedMessages: boolean
+}
+
+export interface GroupRouterConfig {
+  mode: GroupRouterMode
+  provider: string
+  model: string
+  scope: RouterScopeMode
+  timeoutMs: number
+  customPrompt: string
+  coalesceQueuedMessages: boolean
 }
 
 export interface BotExperimentalConfig {
@@ -188,6 +210,7 @@ export interface BotConfig {
   idleCloseMinutes: number
   role: RoleDefinition
   substituteMode: SubstituteMode
+  router: BotRouterConfig
   experimental: BotExperimentalConfig
 }
 
@@ -267,6 +290,7 @@ export interface GroupConfig {
   replyFooterModel: Inheritable<'on' | 'off'>
   signatureMode: 'inherit' | 'custom' | 'off'
   signature: string
+  router?: GroupRouterConfig
   role: GroupRoleConfig
   listener: GroupListenerRule
 }
@@ -588,6 +612,7 @@ export interface CatalogModelItem {
 export interface ModelGroup {
   provider: string
   name?: string
+  isExternal?: boolean
   models: CatalogModelItem[]
 }
 

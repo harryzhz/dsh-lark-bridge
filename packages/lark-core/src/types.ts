@@ -121,6 +121,49 @@ export const DEFAULT_BOT_PROACTIVE_CONFIG: z.output<typeof BotProactiveConfigSch
   branchPrefix: 'agent/',
 }
 
+export const RouterScopeModeSchema = z.enum(['passive_only', 'all_group'])
+export const GroupRouterModeSchema = z.enum(['inherit', 'override', 'off'])
+
+export const BotRouterConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+  provider: z.string().default(''),
+  model: z.string().default(''),
+  scope: RouterScopeModeSchema.default('passive_only'),
+  timeoutMs: z.number().int().min(1000).max(15000).default(4000),
+  customPrompt: z.string().default(''),
+  coalesceQueuedMessages: z.boolean().default(true),
+})
+
+export const DEFAULT_BOT_ROUTER_CONFIG: z.output<typeof BotRouterConfigSchema> = {
+  enabled: false,
+  provider: '',
+  model: '',
+  scope: 'passive_only',
+  timeoutMs: 4000,
+  customPrompt: '',
+  coalesceQueuedMessages: true,
+}
+
+export const GroupRouterConfigSchema = z.object({
+  mode: GroupRouterModeSchema.default('inherit'),
+  provider: z.string().default(''),
+  model: z.string().default(''),
+  scope: RouterScopeModeSchema.default('passive_only'),
+  timeoutMs: z.number().int().min(1000).max(15000).default(4000),
+  customPrompt: z.string().default(''),
+  coalesceQueuedMessages: z.boolean().default(true),
+})
+
+export const DEFAULT_GROUP_ROUTER_CONFIG: z.output<typeof GroupRouterConfigSchema> = {
+  mode: 'inherit',
+  provider: '',
+  model: '',
+  scope: 'passive_only',
+  timeoutMs: 4000,
+  customPrompt: '',
+  coalesceQueuedMessages: true,
+}
+
 function migrateLegacyExperimentalInput(input: unknown): unknown {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return input
   const rec = { ...(input as Record<string, unknown>) }
@@ -178,6 +221,18 @@ function migrateLegacyWorkspaceField(input: unknown): unknown {
       .map((u) => (u && typeof u === 'object' ? (u as { openId?: unknown }).openId : undefined))
       .filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
   }
+  if (
+    rec.router === undefined &&
+    rec.experimental &&
+    typeof rec.experimental === 'object' &&
+    !Array.isArray(rec.experimental) &&
+    'router' in (rec.experimental as Record<string, unknown>)
+  ) {
+    const exp = { ...(rec.experimental as Record<string, unknown>) }
+    rec.router = exp.router
+    delete exp.router
+    rec.experimental = exp
+  }
   delete rec.workspaceGroupName
   delete rec.brandLabel
   delete rec.replyFooterBrand
@@ -230,7 +285,7 @@ export const LarkBotConfigSchema = z.preprocess(
     receivedReactionEmoji: z.string().default('OnIt'),
     idleCloseMinutes: z.number().min(0).default(720),
 
-    // Persona, substitute collaboration & experimental capabilities
+    // Persona, substitute collaboration, Router triage & experimental capabilities
     role: RoleDefinitionSchema.default({ enabled: false, name: '', systemPrompt: '' }),
     substituteMode: SubstituteModeSchema.default({
       enabled: false,
@@ -238,6 +293,7 @@ export const LarkBotConfigSchema = z.preprocess(
       disclosure: 'none',
       activeThreadFollowup: true,
     }),
+    router: BotRouterConfigSchema.default(DEFAULT_BOT_ROUTER_CONFIG),
     experimental: BotExperimentalConfigSchema.default({
       dreaming: DEFAULT_BOT_DREAMING_CONFIG,
       proactive: DEFAULT_BOT_PROACTIVE_CONFIG,
@@ -289,6 +345,15 @@ function migrateLegacyGroupFields(input: unknown): unknown {
   if (typeof rec.receivedReactionEmoji === 'string' && rec.receivedReactionEmoji.trim() === '') {
     rec.receivedReactionEmoji = 'inherit'
   }
+  if (rec.router === undefined && typeof rec.routerMode === 'string') {
+    const legacyMode = rec.routerMode.trim()
+    if (legacyMode === 'off') {
+      rec.router = { mode: 'off' }
+    } else if (legacyMode === 'passive_only' || legacyMode === 'all_group') {
+      rec.router = { mode: 'override', scope: legacyMode }
+    }
+  }
+  delete rec.routerMode
   return rec
 }
 
@@ -329,7 +394,8 @@ export const LarkGroupConfigSchema = z.preprocess(
     signatureMode: z.enum(['inherit', 'custom', 'off']).default('inherit'),
     signature: z.string().default(''),
 
-    // Group-level role & passive listener
+    // Group-level router triage, role & passive listener
+    router: GroupRouterConfigSchema.default(DEFAULT_GROUP_ROUTER_CONFIG),
     role: GroupRoleConfigSchema.default({ mode: 'inherit', name: '', systemPrompt: '' }),
     listener: GroupListenerRuleSchema.default({
       enabled: false,
@@ -460,6 +526,10 @@ export type SubstituteMode = z.infer<typeof SubstituteModeSchema>
 export type ReminderCreationMode = z.infer<typeof ReminderCreationModeSchema>
 export type BotDreamingConfig = z.output<typeof BotDreamingConfigSchema>
 export type BotProactiveConfig = z.output<typeof BotProactiveConfigSchema>
+export type RouterScopeMode = z.infer<typeof RouterScopeModeSchema>
+export type GroupRouterMode = z.infer<typeof GroupRouterModeSchema>
+export type BotRouterConfig = z.output<typeof BotRouterConfigSchema>
+export type GroupRouterConfig = z.output<typeof GroupRouterConfigSchema>
 export type BotExperimentalConfig = z.output<typeof BotExperimentalConfigSchema>
 export type GroupReplyMode = z.infer<typeof GroupReplyModeSchema>
 export type GroupSessionMode = z.infer<typeof GroupSessionModeSchema>
@@ -618,6 +688,7 @@ export interface RoutingRuntimeContext {
   readonly groupConfig?: LarkGroupConfig
   readonly chatName?: string
   readonly hasActiveSessionForRoute: (routeKey: string) => boolean
+  readonly hasEphemeralRouterThread?: (routeKey: string) => boolean
   readonly getRouteTrigger?: (routeKey: string) => string | undefined
   readonly hasRouteReplied?: (routeKey: string) => boolean
 }
@@ -797,6 +868,63 @@ export function resolveEffectiveGuestReadOnly(
   if (group?.sessionLinkGuestReadOnly === 'on') return true
   if (group?.sessionLinkGuestReadOnly === 'off') return false
   return bot.sessionLinkGuestReadOnly
+}
+
+export interface EffectiveRouterConfig {
+  readonly source: 'bot' | 'group'
+  readonly enabled: boolean
+  readonly provider: string
+  readonly model: string
+  readonly scope: RouterScopeMode
+  readonly timeoutMs: number
+  readonly customPrompt: string
+  readonly coalesceQueuedMessages: boolean
+}
+
+export function resolveEffectiveRouterConfig(
+  bot: Pick<LarkBotConfig, 'router'>,
+  group?: Pick<LarkGroupConfig, 'router'>,
+): EffectiveRouterConfig {
+  const base = bot.router ?? DEFAULT_BOT_ROUTER_CONFIG
+  const groupRouter = group?.router
+  if (!groupRouter || groupRouter.mode === 'inherit') {
+    return {
+      source: 'bot',
+      enabled: base.enabled,
+      provider: base.provider.trim(),
+      model: base.model.trim(),
+      scope: base.scope,
+      timeoutMs: base.timeoutMs,
+      customPrompt: base.customPrompt.trim(),
+      coalesceQueuedMessages: base.enabled && base.coalesceQueuedMessages,
+    }
+  }
+  if (groupRouter.mode === 'off') {
+    return {
+      source: 'group',
+      enabled: false,
+      provider: base.provider.trim(),
+      model: base.model.trim(),
+      scope: base.scope,
+      timeoutMs: base.timeoutMs,
+      customPrompt: '',
+      coalesceQueuedMessages: false,
+    }
+  }
+  const groupProvider = groupRouter.provider.trim()
+  const groupModel = groupRouter.model.trim()
+  const provider = groupProvider || base.provider.trim()
+  const model = groupModel || (groupProvider ? '' : base.model.trim())
+  return {
+    source: 'group',
+    enabled: true,
+    provider,
+    model,
+    scope: groupRouter.scope,
+    timeoutMs: groupRouter.timeoutMs,
+    customPrompt: groupRouter.customPrompt.trim(),
+    coalesceQueuedMessages: groupRouter.coalesceQueuedMessages,
+  }
 }
 
 export function toPublicBotView(bot: LarkBotConfig): LarkBotPublicView {

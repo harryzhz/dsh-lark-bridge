@@ -19,6 +19,21 @@ export type AgentDecision = Extract<ReturnType<typeof decideLarkRouting>, { acti
 
 export type SessionActorState = 'creating' | 'idle' | 'running' | 'closing' | 'archived'
 
+export type CoalescedTurnSlot<T> =
+  | { readonly role: 'aborted' }
+  | { readonly role: 'follower' }
+  | {
+      readonly role: 'leader'
+      readonly items: readonly T[]
+      readonly release: () => void
+      readonly finishBatch: () => void
+    }
+
+interface WaitingBatch<T> {
+  readonly items: T[]
+  readonly followerResolvers: Array<() => void>
+}
+
 export interface AcquiredAgent {
   readonly agent: Agent
   readonly sessionId: string
@@ -46,6 +61,7 @@ export class SessionActor {
   handle?: AgentHandle
   pendingCount = 0
   private mailbox: Promise<void> = Promise.resolve()
+  private waitingBatch: WaitingBatch<unknown> | null = null
 
   constructor(readonly sessionId: string) {}
 
@@ -55,6 +71,103 @@ export class SessionActor {
 
   get isTerminated(): boolean {
     return this.state === 'closing' || this.state === 'archived'
+  }
+
+  abortWaitingBatch(): void {
+    const batch = this.waitingBatch
+    this.waitingBatch = null
+    if (!batch) return
+    while (batch.followerResolvers.length > 0) {
+      batch.followerResolvers.shift()?.()
+    }
+  }
+
+  /**
+   * Acquires an exclusive execution slot with optional busy-queue coalescing:
+   * - Idle session or `coalesce: false`: enters FIFO mailbox immediately with zero added delay.
+   * - Busy session (`state === 'running'`) with `coalesce: true`: the first waiting caller creates
+   *   a pending batch; subsequent callers arriving before that batch starts merge into it as
+   *   followers and settle once the leader completes the combined turn.
+   */
+  async acquireCoalescedTurnSlot<T>(
+    item: T,
+    options: {
+      readonly coalesce: boolean
+      readonly signal: AbortSignal
+      readonly isAborted: () => boolean
+      readonly onLeaderRegistered?: () => void
+    },
+  ): Promise<
+    | { readonly role: 'aborted'; readonly orphanedItems: readonly T[] }
+    | { readonly role: 'follower' }
+    | {
+        readonly role: 'leader'
+        readonly items: readonly T[]
+        readonly release: () => void
+        readonly finishBatch: () => void
+      }
+  > {
+    if (this.isTerminated || options.signal.aborted || options.isAborted()) {
+      return { role: 'aborted', orphanedItems: [item] }
+    }
+
+    if (options.coalesce && this.state === 'running' && this.waitingBatch) {
+      const batch = this.waitingBatch as WaitingBatch<T>
+      batch.items.push(item)
+      await new Promise<void>((resolve) => {
+        let settled = false
+        const done = () => {
+          if (settled) return
+          settled = true
+          options.signal.removeEventListener('abort', onAbort)
+          resolve()
+        }
+        const onAbort = () => {
+          const idx = batch.items.indexOf(item)
+          if (idx >= 0) batch.items.splice(idx, 1)
+          done()
+        }
+        if (options.signal.aborted || options.isAborted() || this.isTerminated) {
+          onAbort()
+          return
+        }
+        options.signal.addEventListener('abort', onAbort, { once: true })
+        batch.followerResolvers.push(done)
+      })
+      return { role: 'follower' }
+    }
+
+    let ownedBatch: WaitingBatch<T> | undefined
+    if (options.coalesce && this.state === 'running') {
+      ownedBatch = { items: [item], followerResolvers: [] }
+      this.waitingBatch = ownedBatch as WaitingBatch<unknown>
+    }
+    options.onLeaderRegistered?.()
+
+    const release = await this.acquireTurnSlot(options.signal, options.isAborted)
+    if (ownedBatch && this.waitingBatch === (ownedBatch as WaitingBatch<unknown>)) {
+      this.waitingBatch = null
+    }
+
+    const finishBatch = () => {
+      if (!ownedBatch) return
+      while (ownedBatch.followerResolvers.length > 0) {
+        ownedBatch.followerResolvers.shift()?.()
+      }
+    }
+
+    if (!release) {
+      const orphanedItems = ownedBatch ? [...ownedBatch.items] : [item]
+      finishBatch()
+      return { role: 'aborted', orphanedItems }
+    }
+
+    return {
+      role: 'leader',
+      items: ownedBatch ? [...ownedBatch.items] : [item],
+      release,
+      finishBatch,
+    }
   }
 
   /**
@@ -169,6 +282,29 @@ export class SessionCoordinator {
   ): Promise<(() => void) | undefined> {
     const actor = this.ensureActor(sessionId, 'idle')
     return actor.acquireTurnSlot(signal, isAborted)
+  }
+
+  async acquireCoalescedTurnSlot<T>(
+    sessionId: string,
+    item: T,
+    options: {
+      readonly coalesce: boolean
+      readonly signal: AbortSignal
+      readonly isAborted: () => boolean
+      readonly onLeaderRegistered?: () => void
+    },
+  ): Promise<
+    | { readonly role: 'aborted'; readonly orphanedItems: readonly T[] }
+    | { readonly role: 'follower' }
+    | {
+        readonly role: 'leader'
+        readonly items: readonly T[]
+        readonly release: () => void
+        readonly finishBatch: () => void
+      }
+  > {
+    const actor = this.ensureActor(sessionId, 'idle')
+    return actor.acquireCoalescedTurnSlot(item, options)
   }
 
   async acquireAgent(
@@ -296,6 +432,7 @@ export class SessionCoordinator {
     await Promise.all(
       actors.map(async (actor) => {
         actor.state = 'closing'
+        actor.abortWaitingBatch()
         const handle = actor.handle
         actor.handle = undefined
         if (handle) {
@@ -324,6 +461,7 @@ export class SessionCoordinator {
     }
     if (actor.state === 'archived') return
     actor.state = 'closing'
+    actor.abortWaitingBatch()
     const handle = actor.handle
     actor.handle = undefined
     if (handle) {

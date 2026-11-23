@@ -5,17 +5,24 @@ import {
   MessageDeduplicator,
   buildReplyCard,
   buildRouteKey,
+  composeCoalescedUserText,
   composeLarkContextReminder,
   composeProactiveSessionReminder,
+  composeRouterHandoffReminder,
   composeTurnPrompt,
   decideLarkRouting,
   normalizeReplyText,
   resolveEffectiveCardBot,
+  resolveEffectiveRouterConfig,
+  shouldFastBypassTriage,
+  shouldRunTriage,
+  type EffectiveRouterConfig,
   type GroupReplyMode,
   type InboundLarkMessage,
   type LarkBotConfig,
   type LarkBotTransport,
   type LarkGroupConfig,
+  type RouterHandoffTurn,
   type SendLarkReplyResult,
 } from '@dsh-lark/lark-core'
 import type { BotConnectionPool } from './bot-connection-pool.js'
@@ -24,6 +31,7 @@ import type { AcquiredAgent, AgentDecision, SessionCoordinator } from './session
 import type { SessionTitleGuard } from './session-title-guard.js'
 import { handleSlashCommand } from './slash-commands.js'
 import type { LarkBridgeStore } from './store.js'
+import type { LlmTriageService } from './triage-service.js'
 import { TurnAbortedError, runTurnAndCollectReply } from './turn-runner.js'
 import type { LarkPendingTurn } from './types.js'
 
@@ -58,10 +66,21 @@ export interface InboundPipelineHost {
   readonly runtimes: RuntimeCatalog
   readonly connections: BotConnectionPool
   readonly sessions: SessionCoordinator
+  readonly triage?: LlmTriageService
   readonly titleGuard: SessionTitleGuard
   readonly shutdownSignal: AbortSignal
   readonly isDisposed: () => boolean
   readonly sessionWebUrl: (sessionId: string) => string
+}
+
+interface QueuedWorkerTurnItem {
+  readonly msg: InboundLarkMessage
+  readonly decision: AgentDecision
+  readonly activeTurn: ActiveTurnRecord
+  readonly traceId: string
+  readonly senderName?: string
+  readonly handoffTurns?: readonly RouterHandoffTurn[]
+  readonly triageNote?: string
 }
 
 function createTraceId(): string {
@@ -126,8 +145,17 @@ export class InboundPipeline {
       groupConfig,
       ...(knownChatName ? { chatName: knownChatName } : {}),
       hasActiveSessionForRoute: (routeKey) => Boolean(this.host.store.getBinding(routeKey)),
-      getRouteTrigger: (routeKey) => this.host.store.getBinding(routeKey)?.trigger,
-      hasRouteReplied: (routeKey) => this.host.store.getBinding(routeKey)?.hasReplied !== false,
+      hasEphemeralRouterThread: (routeKey) =>
+        Boolean(this.host.triage?.context.hasEphemeralThread(routeKey)),
+      getRouteTrigger: (routeKey) =>
+        this.host.store.getBinding(routeKey)?.trigger ??
+        this.host.triage?.context.getEphemeralThreadTrigger(routeKey),
+      hasRouteReplied: (routeKey) => {
+        const binding = this.host.store.getBinding(routeKey)
+        if (binding) return binding.hasReplied !== false
+        if (this.host.triage?.context.hasEphemeralThread(routeKey)) return true
+        return true
+      },
     })
     const decision =
       rawDecision.action !== 'ignore'
@@ -314,6 +342,36 @@ export class InboundPipeline {
       })
     }
 
+    const routerConfig = resolveEffectiveRouterConfig(bot, groupConfig)
+    const senderName = await this.resolveSenderName(transport, msg)
+    const chatScopeKey = `chat:${bot.id}:${msg.chatId}`
+    let triageNote: string | undefined
+
+    if (this.host.triage && shouldRunTriage(decision, routerConfig)) {
+      const triageOutcome = await this.evaluateAndHandleTriage({
+        bot,
+        transport,
+        msg,
+        decision,
+        groupConfig,
+        routerConfig,
+        ...(senderName ? { senderName } : {}),
+        ...(resolvedChatName ? { resolvedChatName } : {}),
+        chatScopeKey,
+        traceId,
+        startedMs,
+      })
+      if (triageOutcome.handled || this.host.isDisposed()) return
+      triageNote = triageOutcome.triageNote
+    } else if (this.host.triage && msg.chatType === 'group') {
+      this.host.triage.context.recordInboundMessage(chatScopeKey, decision.routeKey, {
+        role: 'user',
+        ...(senderName ? { senderName } : {}),
+        text: decision.userText,
+        timestampMs: startedMs,
+      })
+    }
+
     const reaction = decision.receivedReactionEmoji
     const reactionId = reaction ? await transport.addReaction(msg.messageId, reaction) : undefined
     if (this.host.isDisposed()) {
@@ -338,9 +396,21 @@ export class InboundPipeline {
 
     let trackedSessionId: string | undefined
     let acquiredRef: AcquiredAgent | undefined
+    let leaderRegistered = false
     let releaseTurnSlot: (() => void) | undefined
+    let finishBatch: (() => void) | undefined
     let shouldDisposeEphemeral = false
     let shouldArchiveEphemeral = false
+    let batchItems: readonly QueuedWorkerTurnItem[] = [
+      {
+        msg,
+        decision,
+        activeTurn,
+        traceId,
+        ...(senderName ? { senderName } : {}),
+        ...(triageNote ? { triageNote } : {}),
+      },
+    ]
 
     try {
       const acquired = await this.host.sessions.acquireAgent(bot, msg, decision)
@@ -348,213 +418,174 @@ export class InboundPipeline {
       trackedSessionId = acquired.sessionId
       activeTurn.sessionId = trackedSessionId
       this.persistActiveTurn(activeTurn)
-      this.host.sessions.markTurnRegistered(trackedSessionId)
+
+      const handoff = this.host.triage?.context.consumeEphemeralHandoff(decision.routeKey)
+      if (handoff && decision.sessionMode === 'thread') {
+        for (const aliasKey of handoff.aliasRouteKeys) {
+          this.host.store.bindRouteAlias(decision.routeKey, aliasKey)
+        }
+      }
+      const selfItem: QueuedWorkerTurnItem = {
+        msg,
+        decision,
+        activeTurn,
+        traceId,
+        ...(senderName ? { senderName } : {}),
+        ...(handoff?.turns.length ? { handoffTurns: handoff.turns } : {}),
+        ...(triageNote ? { triageNote } : {}),
+      }
+      batchItems = [selfItem]
+
       if (activeTurn.settled || this.host.isDisposed()) {
         shouldDisposeEphemeral = acquired.disposeAfter
         return
       }
 
-      releaseTurnSlot = await this.host.sessions.acquireTurnSlot(
-        trackedSessionId,
-        this.host.shutdownSignal,
-        () => activeTurn.settled || this.host.isDisposed(),
-      )
-      if (!releaseTurnSlot) {
+      const allowCoalesce =
+        routerConfig.coalesceQueuedMessages && decision.sessionMode !== 'per_message'
+      const slot = await this.host.sessions.acquireCoalescedTurnSlot(trackedSessionId, selfItem, {
+        coalesce: allowCoalesce,
+        signal: this.host.shutdownSignal,
+        isAborted: () => activeTurn.settled || this.host.isDisposed(),
+        onLeaderRegistered: () => {
+          leaderRegistered = true
+          this.host.sessions.markTurnRegistered(trackedSessionId!)
+        },
+      })
+
+      if (slot.role === 'follower') {
+        // Leader owns execution, reply delivery, activeTurn settlement, and reaction cleanup.
+        batchItems = []
+        return
+      }
+      if (slot.role === 'aborted') {
+        batchItems = slot.orphanedItems
+        for (const orphaned of slot.orphanedItems) {
+          this.claimActiveTurn(orphaned.activeTurn)
+        }
         shouldDisposeEphemeral = acquired.disposeAfter
         return
       }
 
+      releaseTurnSlot = slot.release
+      finishBatch = slot.finishBatch
+      batchItems = slot.items
+
+      const latestItem = batchItems[batchItems.length - 1] ?? selfItem
+      const batchSize = batchItems.length
+      const effectiveDecision: AgentDecision =
+        batchSize === 1
+          ? latestItem.decision
+          : {
+              ...latestItem.decision,
+              allowSilentEmptyReply: batchItems.every((i) => i.decision.allowSilentEmptyReply),
+              autoCloseAfterCompletion: batchItems.every(
+                (i) => i.decision.autoCloseAfterCompletion,
+              ),
+            }
+
       this.host.titleGuard.ensureCleanSessionTitle(
         acquired.agent.session,
-        msg,
-        decision.userText,
+        latestItem.msg,
+        latestItem.decision.userText,
         acquired.isNew,
       )
 
+      const inboundBaseSummary = `${effectiveDecision.listenerName ? `监听「${effectiveDecision.listenerName}」` : effectiveDecision.trigger} → ${effectiveDecision.agentPreset} · ${effectiveDecision.workspaceName}`
+      const inboundTags = [
+        ...(triageNote ? [triageNote] : []),
+        ...(batchSize > 1 ? [`合并 ${batchSize} 条排队消息`] : []),
+      ]
       this.host.store.recordEvent({
         botId: bot.id,
         chatId: msg.chatId,
         ...chatName,
-        routeKey: decision.routeKey,
+        routeKey: effectiveDecision.routeKey,
         sessionId: acquired.sessionId,
-        traceId,
+        traceId: latestItem.traceId,
         kind: 'inbound',
-        summary: `${decision.listenerName ? `监听「${decision.listenerName}」` : decision.trigger} → ${decision.agentPreset} · ${decision.workspaceName}`,
+        summary:
+          inboundTags.length > 0
+            ? `${inboundBaseSummary}（${inboundTags.join('；')}）`
+            : inboundBaseSummary,
       })
 
-      const content = await this.buildPrompt(
+      const content = await this.buildBatchPrompt(
         bot,
         transport,
-        msg,
-        decision,
+        batchItems,
+        effectiveDecision,
         acquired.isNew,
         resolvedChatName,
       )
-      if (activeTurn.settled || this.host.isDisposed()) {
+      if (batchItems.every((i) => i.activeTurn.settled) || this.host.isDisposed()) {
         shouldDisposeEphemeral = acquired.disposeAfter
         return
       }
 
+      const isSilenced = () => batchItems.some((i) => i.activeTurn.silencedByControl)
       const replyText = await runTurnAndCollectReply(this.host.ctx, acquired.agent, content, {
         signal: this.host.shutdownSignal,
-        ...(decision.sendIntermediateMessages
+        ...(effectiveDecision.sendIntermediateMessages
           ? {
               onIntermediate: async (stepText) => {
-                if (activeTurn.silencedByControl) return
+                if (isSilenced()) return
                 const sent = await this.deliverIntermediateReply(
                   bot,
                   transport,
-                  msg,
-                  decision,
+                  latestItem.msg,
+                  effectiveDecision,
                   stepText,
                 )
                 if (sent) {
-                  activeTurn.intermediateSentCount += 1
-                  this.host.store.markBindingReplied(decision.routeKey)
+                  latestItem.activeTurn.intermediateSentCount += 1
+                  this.host.store.markBindingReplied(effectiveDecision.routeKey)
                 }
               },
             }
           : {}),
       })
-      if (!this.claimActiveTurn(activeTurn)) {
-        shouldDisposeEphemeral = acquired.disposeAfter
-        return
-      }
 
-      const intermediateSentCount = activeTurn.intermediateSentCount
-      const latencyMs = Date.now() - startedMs
-      this.host.store.touchBinding(decision.routeKey)
-      this.host.store.touchManagedSession(acquired.sessionId)
-      this.host.titleGuard.ensureCleanSessionTitle(
-        acquired.agent.session,
-        msg,
-        decision.userText,
-        false,
-      )
-
-      const normalizedReply = activeTurn.silencedByControl
-        ? ''
-        : normalizeReplyText(replyText, {
-            allowSilentSentinel: decision.allowSilentEmptyReply,
-          })
-      const hasFinalText = normalizedReply.length > 0
-      const isSilentSkip =
-        decision.allowSilentEmptyReply &&
-        (activeTurn.silencedByControl || !hasFinalText) &&
-        intermediateSentCount === 0
-
-      if (isSilentSkip) {
-        this.host.store.recordMetric({ botId: bot.id, chatId: msg.chatId, kind: 'silent_skip' })
-        const silentSummary = activeTurn.silencedByControl
-          ? activeTurn.silenceReason
-            ? `工具显式静默：${activeTurn.silenceReason}`
-            : '工具显式静默，已跳过回复'
-          : '判断无需回复，已静默'
-        this.host.store.recordEvent({
-          botId: bot.id,
-          chatId: msg.chatId,
-          routeKey: decision.routeKey,
-          sessionId: acquired.sessionId,
-          traceId,
-          durationMs: latencyMs,
-          kind: 'silent_skip',
-          summary: silentSummary,
-        })
-      } else {
-        if (hasFinalText || intermediateSentCount === 0) {
-          await this.deliverReply(
-            bot,
-            transport,
-            msg,
-            decision,
-            acquired.sessionId,
-            normalizedReply,
-            groupConfig,
-          )
-        }
-        this.host.store.markBindingReplied(decision.routeKey)
-        this.host.store.recordMetric({
-          botId: bot.id,
-          chatId: msg.chatId,
-          ...chatName,
-          kind: 'replied',
-          latencyMs,
-        })
-        this.host.store.recordEvent({
-          botId: bot.id,
-          chatId: msg.chatId,
-          routeKey: decision.routeKey,
-          sessionId: acquired.sessionId,
-          traceId,
-          durationMs: latencyMs,
-          kind: 'reply',
-          summary:
-            intermediateSentCount > 0
-              ? `已发送 ${intermediateSentCount} 条过程消息${hasFinalText ? ` + 最终回复 ${normalizedReply.length} 字` : ''}`
-              : `已回复 ${normalizedReply.length} 字`,
-        })
-      }
-
-      const currentBinding = this.host.store.getBinding(decision.routeKey)
-      const isNeverRepliedListener =
-        isSilentSkip &&
-        decision.trigger === 'listener' &&
-        (acquired.isNew || currentBinding?.hasReplied === false)
-      if (acquired.disposeAfter || decision.autoCloseAfterCompletion || isNeverRepliedListener) {
-        shouldDisposeEphemeral = true
-        shouldArchiveEphemeral = isSilentSkip && (acquired.isNew || isNeverRepliedListener)
-      }
+      const settlement = await this.settleBatchReply({
+        bot,
+        transport,
+        groupConfig,
+        resolvedChatName,
+        acquired,
+        batchItems,
+        effectiveDecision,
+        replyText,
+        startedMs,
+      })
+      shouldDisposeEphemeral = settlement.dispose
+      shouldArchiveEphemeral = settlement.archive
     } catch (err) {
-      if (acquiredRef) {
-        const currentBinding = this.host.store.getBinding(decision.routeKey)
-        const isSilentFailedListener =
-          !this.shouldNotifyInterruptedTurn(activeTurn, activeTurn.intermediateSentCount) &&
-          (acquiredRef.isNew || currentBinding?.hasReplied === false)
-        if (acquiredRef.disposeAfter || isSilentFailedListener) {
-          shouldDisposeEphemeral = true
-          shouldArchiveEphemeral = isSilentFailedListener
-        }
-      }
-      if (!this.claimActiveTurn(activeTurn)) return
-      const errorMsg = err instanceof Error ? err.message : String(err)
-      this.host.ctx.logger.error(
-        `[lark-bridge][trace=${traceId}][bot=${bot.id}][msg=${msg.messageId}] turn handling failed: ${errorMsg}`,
-      )
-      if (err instanceof TurnAbortedError) {
-        activeTurn.reactionRemoved = true
-        await this.deliverInterruptedTurnCleanup({
-          transport,
-          turn: activeTurn,
-          intermediateSentCount: activeTurn.intermediateSentCount,
-          auditSummary: errorMsg,
-          replyText: `${errorMsg}，可重新回复继续。`,
-        })
-      } else {
-        this.host.store.recordMetric({ botId: bot.id, chatId: msg.chatId, kind: 'error' })
-        this.host.store.recordEvent({
-          botId: bot.id,
-          chatId: msg.chatId,
-          ...chatName,
-          routeKey: decision.routeKey,
-          ...(trackedSessionId ? { sessionId: trackedSessionId } : {}),
-          traceId,
-          kind: 'error',
-          summary: errorMsg,
-        })
-        if (this.shouldNotifyInterruptedTurn(activeTurn, activeTurn.intermediateSentCount)) {
+      const failure = await this.handleBatchFailure({
+        bot,
+        transport,
+        msg,
+        decision,
+        resolvedChatName,
+        activeTurn,
+        batchItems,
+        acquiredRef,
+        trackedSessionId,
+        err,
+      })
+      shouldDisposeEphemeral = failure.dispose
+      shouldArchiveEphemeral = failure.archive
+    } finally {
+      for (const item of batchItems) {
+        if (!item.activeTurn.reactionRemoved && item.activeTurn.reactionId) {
+          item.activeTurn.reactionRemoved = true
           await transport
-            .sendReply({
-              chatId: msg.chatId,
-              replyToMessageId: msg.messageId,
-              replyMode: decision.replyMode,
-              text: `执行异常：${errorMsg}`,
-            })
+            .removeReaction(item.msg.messageId, item.activeTurn.reactionId)
             .catch(() => {})
         }
       }
-    } finally {
+      finishBatch?.()
       let otherTurnsInFlight = false
-      if (trackedSessionId) {
+      if (trackedSessionId && leaderRegistered) {
         otherTurnsInFlight = this.host.sessions.markTurnFinished(trackedSessionId)
       }
       if (trackedSessionId && !otherTurnsInFlight && shouldDisposeEphemeral) {
@@ -565,11 +596,388 @@ export class InboundPipeline {
           .catch(() => {})
       }
       releaseTurnSlot?.()
-      if (!activeTurn.reactionRemoved && reactionId) {
-        activeTurn.reactionRemoved = true
-        await transport.removeReaction(msg.messageId, reactionId)
+    }
+  }
+
+  private async settleBatchReply(input: {
+    readonly bot: LarkBotConfig
+    readonly transport: LarkBotTransport
+    readonly groupConfig: LarkGroupConfig | undefined
+    readonly resolvedChatName?: string
+    readonly acquired: AcquiredAgent
+    readonly batchItems: readonly QueuedWorkerTurnItem[]
+    readonly effectiveDecision: AgentDecision
+    readonly replyText: string
+    readonly startedMs: number
+  }): Promise<{ readonly dispose: boolean; readonly archive: boolean }> {
+    const {
+      bot,
+      transport,
+      groupConfig,
+      resolvedChatName,
+      acquired,
+      batchItems,
+      effectiveDecision,
+      replyText,
+      startedMs,
+    } = input
+    const latestItem = batchItems[batchItems.length - 1]!
+    const batchSize = batchItems.length
+    const chatName = resolvedChatName ? { chatName: resolvedChatName } : {}
+
+    let anyClaimed = false
+    for (const item of batchItems) {
+      if (this.claimActiveTurn(item.activeTurn)) anyClaimed = true
+    }
+    if (!anyClaimed) {
+      return { dispose: acquired.disposeAfter, archive: false }
+    }
+
+    const intermediateSentCount = batchItems.reduce(
+      (sum, item) => sum + item.activeTurn.intermediateSentCount,
+      0,
+    )
+    const latencyMs = Date.now() - startedMs
+    this.host.store.touchBinding(effectiveDecision.routeKey)
+    this.host.store.touchManagedSession(acquired.sessionId)
+    this.host.titleGuard.ensureCleanSessionTitle(
+      acquired.agent.session,
+      latestItem.msg,
+      latestItem.decision.userText,
+      false,
+    )
+
+    const silencedItem = batchItems.find((i) => i.activeTurn.silencedByControl)
+    const normalizedReply = silencedItem
+      ? ''
+      : normalizeReplyText(replyText, {
+          allowSilentSentinel: effectiveDecision.allowSilentEmptyReply,
+        })
+    const hasFinalText = normalizedReply.length > 0
+    const isSilentSkip =
+      effectiveDecision.allowSilentEmptyReply &&
+      (Boolean(silencedItem) || !hasFinalText) &&
+      intermediateSentCount === 0
+
+    if (isSilentSkip) {
+      this.host.store.recordMetric({
+        botId: bot.id,
+        chatId: latestItem.msg.chatId,
+        kind: 'silent_skip',
+      })
+      const silentSummary = silencedItem
+        ? silencedItem.activeTurn.silenceReason
+          ? `工具显式静默：${silencedItem.activeTurn.silenceReason}`
+          : '工具显式静默，已跳过回复'
+        : '判断无需回复，已静默'
+      this.host.store.recordEvent({
+        botId: bot.id,
+        chatId: latestItem.msg.chatId,
+        routeKey: effectiveDecision.routeKey,
+        sessionId: acquired.sessionId,
+        traceId: latestItem.traceId,
+        durationMs: latencyMs,
+        kind: 'silent_skip',
+        summary: silentSummary,
+      })
+    } else {
+      if (hasFinalText || intermediateSentCount === 0) {
+        await this.deliverReply(
+          bot,
+          transport,
+          latestItem.msg,
+          effectiveDecision,
+          acquired.sessionId,
+          normalizedReply,
+          groupConfig,
+        )
+      }
+      if (hasFinalText && latestItem.msg.chatType === 'group') {
+        this.host.triage?.context.recordWorkerReply(effectiveDecision.routeKey, normalizedReply)
+      }
+      this.host.store.markBindingReplied(effectiveDecision.routeKey)
+      this.host.store.recordMetric({
+        botId: bot.id,
+        chatId: latestItem.msg.chatId,
+        ...chatName,
+        kind: 'replied',
+        latencyMs,
+      })
+      const batchSuffix = batchSize > 1 ? `（合并 ${batchSize} 条消息）` : ''
+      this.host.store.recordEvent({
+        botId: bot.id,
+        chatId: latestItem.msg.chatId,
+        routeKey: effectiveDecision.routeKey,
+        sessionId: acquired.sessionId,
+        traceId: latestItem.traceId,
+        durationMs: latencyMs,
+        kind: 'reply',
+        summary:
+          (intermediateSentCount > 0
+            ? `已发送 ${intermediateSentCount} 条过程消息${hasFinalText ? ` + 最终回复 ${normalizedReply.length} 字` : ''}`
+            : `已回复 ${normalizedReply.length} 字`) + batchSuffix,
+      })
+    }
+
+    const currentBinding = this.host.store.getBinding(effectiveDecision.routeKey)
+    const isNeverRepliedListener =
+      isSilentSkip &&
+      effectiveDecision.trigger === 'listener' &&
+      (acquired.isNew || currentBinding?.hasReplied === false)
+    const dispose = Boolean(
+      acquired.disposeAfter || effectiveDecision.autoCloseAfterCompletion || isNeverRepliedListener,
+    )
+    const archive = dispose && isSilentSkip && (acquired.isNew || isNeverRepliedListener)
+    return { dispose, archive }
+  }
+
+  private async handleBatchFailure(input: {
+    readonly bot: LarkBotConfig
+    readonly transport: LarkBotTransport
+    readonly msg: InboundLarkMessage
+    readonly decision: AgentDecision
+    readonly resolvedChatName?: string
+    readonly activeTurn: ActiveTurnRecord
+    readonly batchItems: readonly QueuedWorkerTurnItem[]
+    readonly acquiredRef: AcquiredAgent | undefined
+    readonly trackedSessionId: string | undefined
+    readonly err: unknown
+  }): Promise<{ readonly dispose: boolean; readonly archive: boolean }> {
+    const {
+      bot,
+      transport,
+      msg,
+      decision,
+      resolvedChatName,
+      activeTurn,
+      batchItems,
+      acquiredRef,
+      trackedSessionId,
+      err,
+    } = input
+    const chatName = resolvedChatName ? { chatName: resolvedChatName } : {}
+    const latestItem = batchItems[batchItems.length - 1]
+    const targetTurn = latestItem?.activeTurn ?? activeTurn
+    const targetMsg = latestItem?.msg ?? msg
+    const targetDecision = latestItem?.decision ?? decision
+    const totalIntermediate = batchItems.reduce(
+      (sum, item) => sum + item.activeTurn.intermediateSentCount,
+      0,
+    )
+
+    let dispose = false
+    let archive = false
+    if (acquiredRef) {
+      const currentBinding = this.host.store.getBinding(targetDecision.routeKey)
+      const isSilentFailedListener =
+        !this.shouldNotifyInterruptedTurn(targetTurn, totalIntermediate) &&
+        (acquiredRef.isNew || currentBinding?.hasReplied === false)
+      if (acquiredRef.disposeAfter || isSilentFailedListener) {
+        dispose = true
+        archive = isSilentFailedListener
       }
     }
+
+    let anyClaimed = false
+    for (const item of batchItems) {
+      if (this.claimActiveTurn(item.activeTurn)) anyClaimed = true
+    }
+    if (!anyClaimed) return { dispose, archive }
+
+    const errorMsg = err instanceof Error ? err.message : String(err)
+    this.host.ctx.logger.error(
+      `[lark-bridge][trace=${targetTurn.traceId}][bot=${bot.id}][msg=${targetMsg.messageId}] turn handling failed: ${errorMsg}`,
+    )
+    if (err instanceof TurnAbortedError) {
+      for (const item of batchItems) {
+        item.activeTurn.reactionRemoved = true
+        if (item.activeTurn !== targetTurn && item.activeTurn.reactionId) {
+          await transport
+            .removeReaction(item.msg.messageId, item.activeTurn.reactionId)
+            .catch(() => {})
+        }
+      }
+      await this.deliverInterruptedTurnCleanup({
+        transport,
+        turn: targetTurn,
+        intermediateSentCount: totalIntermediate,
+        auditSummary: errorMsg,
+        replyText: `${errorMsg}，可重新回复继续。`,
+      })
+    } else {
+      this.host.store.recordMetric({ botId: bot.id, chatId: msg.chatId, kind: 'error' })
+      this.host.store.recordEvent({
+        botId: bot.id,
+        chatId: msg.chatId,
+        ...chatName,
+        routeKey: targetDecision.routeKey,
+        ...(trackedSessionId ? { sessionId: trackedSessionId } : {}),
+        traceId: targetTurn.traceId,
+        kind: 'error',
+        summary: errorMsg,
+      })
+      if (this.shouldNotifyInterruptedTurn(targetTurn, totalIntermediate)) {
+        await transport
+          .sendReply({
+            chatId: msg.chatId,
+            replyToMessageId: targetMsg.messageId,
+            replyMode: targetDecision.replyMode,
+            text: `执行异常：${errorMsg}`,
+          })
+          .catch(() => {})
+      }
+    }
+    return { dispose, archive }
+  }
+
+  private async evaluateAndHandleTriage(input: {
+    readonly bot: LarkBotConfig
+    readonly transport: LarkBotTransport
+    readonly msg: InboundLarkMessage
+    readonly decision: AgentDecision
+    readonly groupConfig?: LarkGroupConfig
+    readonly routerConfig: EffectiveRouterConfig
+    readonly senderName?: string
+    readonly resolvedChatName?: string
+    readonly chatScopeKey: string
+    readonly traceId: string
+    readonly startedMs: number
+  }): Promise<{ readonly handled: boolean; readonly triageNote?: string }> {
+    const {
+      bot,
+      transport,
+      msg,
+      decision,
+      groupConfig,
+      routerConfig,
+      senderName,
+      resolvedChatName,
+      chatScopeKey,
+      traceId,
+      startedMs,
+    } = input
+    const chatName = resolvedChatName ? { chatName: resolvedChatName } : {}
+
+    const bypass = shouldFastBypassTriage(msg, decision)
+    if (bypass.bypass) {
+      this.host.triage?.context.recordInboundMessage(chatScopeKey, decision.routeKey, {
+        role: 'user',
+        ...(senderName ? { senderName } : {}),
+        text: decision.userText,
+        timestampMs: startedMs,
+      })
+      return { handled: false, ...(bypass.reason ? { triageNote: bypass.reason } : {}) }
+    }
+
+    const existingBinding = this.host.store.getBinding(decision.routeKey)
+    const hasActiveWorker = Boolean(existingBinding)
+    const workerBusy = existingBinding
+      ? this.host.sessions.getActorState(existingBinding.sessionId) === 'running'
+      : false
+
+    const result = await this.host.triage!.evaluate({
+      bot,
+      ...(groupConfig ? { group: groupConfig } : {}),
+      msg,
+      decision,
+      routerConfig,
+      ...(senderName ? { senderName } : {}),
+      ...(resolvedChatName ? { resolvedChatName } : {}),
+      hasActiveWorker,
+      workerBusy,
+      traceId,
+      signal: this.host.shutdownSignal,
+    })
+
+    this.host.triage!.context.recordInboundMessage(chatScopeKey, decision.routeKey, {
+      role: 'user',
+      ...(senderName ? { senderName } : {}),
+      text: decision.userText,
+      timestampMs: startedMs,
+    })
+
+    if (this.host.isDisposed()) return { handled: true }
+
+    if (result.verdict.action === 'silent') {
+      this.host.store.recordMetric({ botId: bot.id, chatId: msg.chatId, kind: 'silent_skip' })
+      this.host.store.recordEvent({
+        botId: bot.id,
+        chatId: msg.chatId,
+        ...chatName,
+        routeKey: decision.routeKey,
+        traceId,
+        durationMs: result.durationMs,
+        kind: 'silent_skip',
+        summary: `智能分流静默：${result.verdict.reason}`,
+      })
+      return { handled: true }
+    }
+
+    if (result.verdict.action === 'quick_reply' && !hasActiveWorker && result.verdict.replyText) {
+      const replyText = normalizeReplyText(result.verdict.replyText)
+      if (replyText) {
+        const sent = await transport.sendReply({
+          chatId: msg.chatId,
+          replyToMessageId: msg.messageId,
+          replyMode: decision.replyMode,
+          text: replyText,
+        })
+        if (decision.sessionMode === 'thread') {
+          const aliasRouteKeys = this.collectReplyAliasKeys(bot, msg, decision, sent)
+          this.host.triage!.context.recordEphemeralQuickReply({
+            routeKey: decision.routeKey,
+            aliasRouteKeys,
+            trigger: decision.trigger,
+            ...(senderName ? { senderName } : {}),
+            userText: decision.userText,
+            routerReply: replyText,
+          })
+        }
+        const latencyMs = Date.now() - startedMs
+        this.host.store.recordMetric({
+          botId: bot.id,
+          chatId: msg.chatId,
+          ...chatName,
+          kind: 'replied',
+          latencyMs,
+        })
+        this.host.store.recordEvent({
+          botId: bot.id,
+          chatId: msg.chatId,
+          ...chatName,
+          routeKey: decision.routeKey,
+          traceId,
+          durationMs: latencyMs,
+          kind: 'reply',
+          summary: `智能分流快回（${replyText.length} 字）：${result.verdict.reason}`,
+        })
+        return { handled: true }
+      }
+    }
+
+    const prefix = result.verdict.fallback ? '分流回退直通' : '分流转交'
+    return {
+      handled: false,
+      triageNote: `${prefix}：${result.verdict.reason}（${result.durationMs}ms）`,
+    }
+  }
+
+  private async resolveSenderName(
+    transport: LarkBotTransport,
+    msg: InboundLarkMessage,
+  ): Promise<string | undefined> {
+    if (
+      msg.senderType !== 'user' ||
+      !msg.senderOpenId ||
+      typeof transport.resolveUserSummary !== 'function'
+    ) {
+      return undefined
+    }
+    const summary = await transport.resolveUserSummary(msg.senderOpenId).catch(() => undefined)
+    if (summary?.name && summary.name !== msg.senderOpenId) {
+      return summary.name
+    }
+    return undefined
   }
 
   private registerActiveTurn(
@@ -680,60 +1088,78 @@ export class InboundPipeline {
     await Promise.all(tasks)
   }
 
-  private async buildPrompt(
+  private async buildBatchPrompt(
     bot: LarkBotConfig,
     transport: LarkBotTransport,
-    msg: InboundLarkMessage,
-    decision: AgentDecision,
+    items: readonly QueuedWorkerTurnItem[],
+    effectiveDecision: AgentDecision,
     isNewSession: boolean,
     resolvedChatName?: string,
   ): Promise<ContentBlock[]> {
+    const primary = items[items.length - 1]!
     const reminders: string[] = []
-    let senderName: string | undefined
-    if (
-      msg.senderType === 'user' &&
-      msg.senderOpenId &&
-      typeof transport.resolveUserSummary === 'function'
-    ) {
-      const summary = await transport.resolveUserSummary(msg.senderOpenId).catch(() => undefined)
-      if (summary?.name && summary.name !== msg.senderOpenId) {
-        senderName = summary.name
-      }
-    }
 
-    if (isNewSession && decision.roleReminder) {
-      reminders.push(decision.roleReminder)
+    if (isNewSession && effectiveDecision.roleReminder) {
+      reminders.push(effectiveDecision.roleReminder)
     }
     if (isNewSession) {
       const proactiveReminder = composeProactiveSessionReminder({
         botId: bot.id,
-        workingDir: decision.workingDir,
+        workingDir: effectiveDecision.workingDir,
         config: bot.experimental.proactive,
       })
       if (proactiveReminder) reminders.push(proactiveReminder)
     }
 
+    const handoffTurns = items.flatMap((i) => i.handoffTurns ?? [])
+    const handoffReminder = composeRouterHandoffReminder(handoffTurns)
+    if (handoffReminder) reminders.push(handoffReminder)
+
     reminders.push(
       composeLarkContextReminder({
         bot,
-        botOpenId: transport.state?.botOpenId ?? msg.botOpenId,
-        msg,
+        botOpenId: transport.state?.botOpenId ?? primary.msg.botOpenId,
+        msg: primary.msg,
         ...(resolvedChatName ? { chatName: resolvedChatName } : {}),
-        ...(senderName ? { senderName } : {}),
-        replyMode: decision.replyMode,
-        useCard: decision.useCard,
+        ...(primary.senderName ? { senderName: primary.senderName } : {}),
+        replyMode: effectiveDecision.replyMode,
+        useCard: effectiveDecision.useCard,
         includeFullGuide: isNewSession,
       }),
     )
-    reminders.push(...decision.turnReminders)
 
-    const text = composeTurnPrompt(reminders, decision.userText)
+    const seenReminders = new Set<string>()
+    for (const item of items) {
+      for (const r of item.decision.turnReminders) {
+        if (!seenReminders.has(r)) {
+          seenReminders.add(r)
+          reminders.push(r)
+        }
+      }
+    }
+
+    const combinedUserText =
+      items.length === 1
+        ? primary.decision.userText
+        : composeCoalescedUserText(
+            items.map((item) => ({
+              messageId: item.msg.messageId,
+              ...(item.senderName ? { senderName: item.senderName } : {}),
+              ...(item.msg.senderOpenId ? { senderOpenId: item.msg.senderOpenId } : {}),
+              text: item.decision.userText,
+              timestampMs: item.msg.createTimeMs,
+            })),
+          )
+
+    const text = composeTurnPrompt(reminders, combinedUserText)
     const blocks: ContentBlock[] = [{ type: 'text', text }]
 
-    for (const imageKey of msg.imageKeys) {
-      const data = await transport.downloadImageAsBase64(msg.messageId, imageKey)
-      if (data) {
-        blocks.push({ type: 'image', mediaType: 'image/png', data } as unknown as ContentBlock)
+    for (const item of items) {
+      for (const imageKey of item.msg.imageKeys) {
+        const data = await transport.downloadImageAsBase64(item.msg.messageId, imageKey)
+        if (data) {
+          blocks.push({ type: 'image', mediaType: 'image/png', data } as unknown as ContentBlock)
+        }
       }
     }
     return blocks
@@ -856,13 +1282,13 @@ export class InboundPipeline {
     this.syncReplyRouteAliases(bot, msg, decision, sent)
   }
 
-  private syncReplyRouteAliases(
+  private collectReplyAliasKeys(
     bot: LarkBotConfig,
     msg: InboundLarkMessage,
     decision: AgentDecision,
     sent: SendLarkReplyResult | undefined,
-  ): void {
-    if (msg.chatType !== 'group' || decision.sessionMode !== 'thread') return
+  ): string[] {
+    if (msg.chatType !== 'group' || decision.sessionMode !== 'thread') return []
     const scopes = new Set<string>()
     if (sent?.rootId) scopes.add(sent.rootId)
     if (sent?.threadId) scopes.add(sent.threadId)
@@ -872,8 +1298,16 @@ export class InboundPipeline {
     if (decision.replyMode === 'chat' && sent?.messageId) {
       scopes.add(sent.messageId)
     }
-    for (const scope of scopes) {
-      const aliasKey = buildRouteKey(bot.larkAppId, msg.chatId, scope)
+    return [...scopes].map((scope) => buildRouteKey(bot.larkAppId, msg.chatId, scope))
+  }
+
+  private syncReplyRouteAliases(
+    bot: LarkBotConfig,
+    msg: InboundLarkMessage,
+    decision: AgentDecision,
+    sent: SendLarkReplyResult | undefined,
+  ): void {
+    for (const aliasKey of this.collectReplyAliasKeys(bot, msg, decision, sent)) {
       this.host.store.bindRouteAlias(decision.routeKey, aliasKey)
     }
   }
