@@ -303,7 +303,7 @@ export class LlmTriageService {
       return failOpen('未配置可用的原生分流模型，自动直通 Worker')
     }
 
-    const leastEffort = await this.resolveLeastReasoningEffort(target.provider, target.model)
+    const reasoningPlan = await this.resolveTriageReasoningPlan(target.provider, target.model)
     const chatScopeKey = `chat:${input.bot.id}:${input.msg.chatId}`
     const recentMessages = this.context.getRecentMessages(input.decision.routeKey, chatScopeKey)
     const lastWorkerReplyExcerpt = input.hasActiveWorker
@@ -373,12 +373,12 @@ export class LlmTriageService {
       const stream = this.ctx.llm.stream({
         provider: target.provider,
         model: target.model,
-        ...(leastEffort ? { reasoningEffort: leastEffort } : {}),
+        ...(reasoningPlan.effort ? { reasoningEffort: reasoningPlan.effort } : {}),
         system,
         messages: [{ role: 'user', content: [{ type: 'text', text: userText }] }],
         tools: [toolSchema],
-        maxTokens: 256,
-        temperature: 0.1,
+        maxTokens: reasoningPlan.reasoningActive ? 1024 : 256,
+        ...(reasoningPlan.reasoningActive ? {} : { temperature: 0.1 }),
         signal: controller.signal,
       })
 
@@ -446,18 +446,24 @@ export class LlmTriageService {
     }
   }
 
-  private async resolveLeastReasoningEffort(
+  private async resolveTriageReasoningPlan(
     provider: string,
     model: string,
-  ): Promise<ReasoningEffortId | undefined> {
-    if (typeof this.ctx.llm?.resolveModelInfo !== 'function') return undefined
+  ): Promise<{ readonly effort?: ReasoningEffortId; readonly reasoningActive: boolean }> {
+    if (typeof this.ctx.llm?.resolveModelInfo !== 'function') {
+      return { reasoningActive: false }
+    }
     try {
       const info = await this.ctx.llm.resolveModelInfo(provider, model)
       const efforts = info?.reasoning?.efforts
-      if (!efforts || efforts.length === 0) return undefined
-      return efforts[0]?.id
+      if (!efforts || efforts.length === 0) return { reasoningActive: false }
+      const least = efforts[0]?.id
+      if (!least) return { reasoningActive: false }
+      const normalized = String(least).trim().toLowerCase()
+      const reasoningActive = normalized !== 'off' && normalized !== 'none'
+      return { effort: least, reasoningActive }
     } catch {
-      return undefined
+      return { reasoningActive: false }
     }
   }
 }

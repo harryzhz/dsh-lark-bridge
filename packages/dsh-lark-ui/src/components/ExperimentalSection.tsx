@@ -134,13 +134,11 @@ export function ExperimentalSection({
   const externalProviders = new Set(
     runtimes.filter((r) => r.kind === 'external' && r.providerId).map((r) => r.providerId!),
   )
-  const nativeGroups = models.filter(
-    (g) =>
-      !g.isExternal &&
-      !externalProviders.has(g.provider) &&
-      !g.provider.endsWith('-cli') &&
-      g.models.length > 0,
-  )
+  const nativeGroups = models.filter((g) => {
+    if (g.models.length === 0) return false
+    if (g.isExternal !== undefined) return !g.isExternal
+    return !externalProviders.has(g.provider) && !g.provider.endsWith('-cli')
+  })
   const routerModelValue =
     router.provider && router.model ? `${router.provider}::${router.model}` : router.model || ''
   const routerModelOptions: SelectOption<string>[] = [{ value: '', label: '跟随 DSH 默认原生模型' }]

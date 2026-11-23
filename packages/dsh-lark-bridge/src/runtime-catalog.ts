@@ -251,12 +251,14 @@ export class RuntimeCatalog {
   /** Whether a provider id belongs to an external CLI runtime rather than a native DSH LLM adapter. */
   isExternalProvider(providerId: string | undefined): boolean {
     if (!providerId) return true
-    if (providerId.endsWith('-cli')) return true
     const externalProviders = new Set([
       ...(this.directory()?.list() ?? []).map((r) => r.providerId),
       ...this.listExposedPresets().map((p) => p.providerId),
     ])
-    return externalProviders.has(providerId)
+    if (externalProviders.has(providerId)) return true
+    const configurableProviders = this.listConfigurableProviderIds()
+    if (configurableProviders.has(providerId)) return false
+    return providerId.endsWith('-cli')
   }
 
   /**
@@ -272,8 +274,7 @@ export class RuntimeCatalog {
       ...(this.directory()?.list() ?? []).map((r) => r.providerId),
       ...this.listExposedPresets().map((p) => p.providerId),
     ])
-    const isExt = (id: string | undefined): boolean =>
-      !id || externalProviders.has(id) || id.endsWith('-cli')
+    const isExt = (id: string | undefined): boolean => this.isExternalProvider(id)
 
     const explicitProvider = input.provider?.trim() || undefined
     const explicitModel = input.model?.trim() || undefined
@@ -542,13 +543,33 @@ export class RuntimeCatalog {
     }
   }
 
+  private listConfigurableProviderIds(): ReadonlySet<string> {
+    if (typeof this.ctx.llm?.listConfigurableProviders !== 'function') return new Set()
+    try {
+      return new Set(
+        this.ctx.llm
+          .listConfigurableProviders()
+          .map((p) => p.provider)
+          .filter(Boolean),
+      )
+    } catch {
+      return new Set()
+    }
+  }
+
   private listNativeProviderIds(externalProviders: ReadonlySet<string>): string[] {
     if (typeof this.ctx.llm?.listProviders !== 'function') return []
+    const configurableProviders = this.listConfigurableProviderIds()
     try {
       return this.ctx.llm
         .listProviders()
         .map((p) => p.id)
-        .filter((id) => Boolean(id) && !externalProviders.has(id) && !id.endsWith('-cli'))
+        .filter(
+          (id) =>
+            Boolean(id) &&
+            !externalProviders.has(id) &&
+            (configurableProviders.has(id) || !id.endsWith('-cli')),
+        )
     } catch {
       return []
     }

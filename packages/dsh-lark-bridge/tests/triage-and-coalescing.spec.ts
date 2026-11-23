@@ -115,12 +115,28 @@ function createHarness(options: {
     llm: {
       listProviders: () => [
         { id: 'deepseek', name: 'DeepSeek' },
+        { id: 'custom-plan-cli', name: 'Agent Plan' },
         { id: 'codex-cli', name: 'Codex CLI' },
+      ],
+      listConfigurableProviders: () => [
+        { provider: 'deepseek', displayName: 'DeepSeek', settingsNs: 'llm-deepseek', settingsPath: [] },
+        {
+          provider: 'custom-plan-cli',
+          displayName: 'Agent Plan',
+          settingsNs: 'llm-pi-ai',
+          settingsPath: ['providers', 'custom-plan-cli'],
+          declared: true,
+        },
       ],
       listModels: async (provider: string) =>
         provider === 'deepseek'
-          ? [{ provider: 'deepseek', id: 'deepseek-chat', name: 'DeepSeek Chat' }]
-          : [],
+          ? [
+              { provider: 'deepseek', id: 'deepseek-chat', name: 'DeepSeek Chat' },
+              { provider: 'deepseek', id: 'deepseek-reasoner', name: 'DeepSeek Reasoner' },
+            ]
+          : provider === 'custom-plan-cli'
+            ? [{ provider: 'custom-plan-cli', id: 'plan-fast', name: 'Plan Fast' }]
+            : [],
       resolveModelInfo: async (provider: string, model: string) => ({
         provider,
         id: model,
@@ -635,8 +651,12 @@ describe('Experimental Router/Worker Triage Gate & Busy-Queue Coalescing', () =>
     h.store.close()
   })
 
-  it('tags native vs external model groups on GET /api/lark-bridge/models for Router UI selection', async () => {
-    const h = createHarness()
+  it('tags native and custom configurable providers accurately on GET /api/lark-bridge/models and adapts call params for reasoning models', async () => {
+    const h = createHarness({
+      triageStream: () => makeToolCallStream({ action: 'silent', reason: '纯确认' }),
+    })
+    const fx = makeFakeTransport()
+
     const res = await dispatchLarkApiRequest(h.ctx, h.manager, {
       method: 'GET',
       path: '/api/lark-bridge/models',
@@ -647,7 +667,42 @@ describe('Experimental Router/Worker Triage Gate & Busy-Queue Coalescing', () =>
     const groups = (res.payload as { groups: Array<{ provider: string; isExternal?: boolean }> })
       .groups
     expect(groups.find((g) => g.provider === 'deepseek')?.isExternal).toBe(false)
+    // Custom configurable provider even with `-cli` suffix must stay native (not misclassified as external CLI)
+    expect(groups.find((g) => g.provider === 'custom-plan-cli')?.isExternal).toBe(false)
     expect(groups.find((g) => g.provider === 'codex-cli')?.isExternal).toBe(true)
+
+    // Reasoning-enabled triage model must omit `temperature` and raise `maxTokens` to 1024
+    h.store.upsertBot({
+      id: 'bot-1',
+      name: 'DevBot',
+      larkAppId: 'cli_demo',
+      larkAppSecret: 'sec_demo',
+      defaultWorkingDir: h.dir,
+      agentPreset: 'standard',
+      experimental: {
+        router: {
+          enabled: true,
+          provider: 'deepseek',
+          model: 'deepseek-reasoner',
+          scope: 'all_group',
+        },
+      },
+    })
+
+    await h.manager.inbound.handleInbound(
+      'bot-1',
+      fx.transport,
+      makeGroupMsg({
+        messageId: 'om_reason_1',
+        text: '@DevBot 谢谢',
+        mentions: [{ key: '@_user_1', openId: 'ou_bot', name: 'DevBot' }],
+      }),
+    )
+
+    expect(h.triageCalls).toHaveLength(1)
+    expect(h.triageCalls[0]?.reasoningEffort).toBe('low')
+    expect(h.triageCalls[0]?.temperature).toBeUndefined()
+    expect(h.triageCalls[0]?.maxTokens).toBe(1024)
 
     await h.manager.stop()
     h.store.close()
