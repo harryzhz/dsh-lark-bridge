@@ -8,6 +8,7 @@ import type {
   CockpitPayload,
   DirectoryBrowseResult,
   DreamRunState,
+  DreamSession,
   GroupConfig,
   GroupView,
   ImportExistingBotInput,
@@ -103,6 +104,14 @@ export const bridgeApi = {
   bots: async () => (await request<{ bots: BotRecord[] }>('/bots')).bots,
   groups: async () => (await request<{ groups: GroupView[] }>('/groups')).groups,
   bindings: async () => (await request<{ bindings: SessionBinding[] }>('/bindings')).bindings,
+  sessionsOverview: async () => {
+    const res = await request<{ bindings: SessionBinding[]; dreamSessions?: DreamSession[] }>('/bindings')
+    return {
+      bindings: res.bindings ?? [],
+      dreamSessions: res.dreamSessions ?? [],
+    }
+  },
+  deleteDreamSession: (sessionId: string) => del(`/dream-sessions/${seg(sessionId)}`),
   events: async (limit = 120) => (await request<{ events: AuditEvent[] }>(`/events?limit=${limit}`)).events,
   runtimes: async () => (await request<{ runtimes: RuntimeOption[] }>('/runtimes')).runtimes,
   models: async () => (await request<{ groups: ModelGroup[] }>('/models')).groups,

@@ -221,10 +221,15 @@ function LarkBridgePage() {
         {tab === 'sessions' && (
           <SessionsView
             bindings={data.bindings}
+            dreamSessions={data.dreamSessions}
             events={data.events}
             runtimes={data.runtimes}
+            models={data.models}
             onOpen={(sid) => openDshSession?.(sid)}
             onUnbind={(b) => void act(() => bridgeApi.unbind(b.routeKey), '会话已归档')}
+            onDeleteDreamSession={(s) =>
+              void act(() => bridgeApi.deleteDreamSession(s.sessionId), '已移除记录')
+            }
           />
         )}
       </div>

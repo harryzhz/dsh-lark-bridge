@@ -98,6 +98,23 @@ export interface LarkDreamRunState {
   readonly processedSessionIds: readonly string[]
 }
 
+export interface LarkDreamSession {
+  readonly sessionId: string
+  readonly botId: string
+  readonly botName?: string
+  readonly workspaceName: string
+  readonly workingDir: string
+  readonly agentPreset: string
+  readonly model?: string
+  readonly status: 'running' | 'succeeded' | 'failed'
+  readonly dateKey: string
+  readonly processedCount: number
+  readonly summary?: string
+  readonly createdAtMs: number
+  readonly lastActivityMs: number
+  readonly durationMs?: number
+}
+
 export interface LarkAuditEvent {
   readonly id: string
   readonly timestampMs: number

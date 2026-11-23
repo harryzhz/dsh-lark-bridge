@@ -7,6 +7,7 @@ import type {
   AuthStatusPayload,
   BotRecord,
   CockpitPayload,
+  DreamSession,
   GroupView,
   ListenerTemplate,
   ModelGroup,
@@ -24,6 +25,7 @@ export interface BridgeData {
   scheduleAvailable: boolean
   reminders: ReminderItem[]
   bindings: SessionBinding[]
+  dreamSessions: DreamSession[]
   events: AuditEvent[]
   runtimes: RuntimeOption[]
   models: ModelGroup[]
@@ -39,6 +41,7 @@ const EMPTY: BridgeData = {
   scheduleAvailable: true,
   reminders: [],
   bindings: [],
+  dreamSessions: [],
   events: [],
   runtimes: [],
   models: [],
@@ -67,13 +70,13 @@ export function useBridgeData(): BridgeData & {
 
   const refresh = useCallback(async () => {
     try {
-      const [cockpit, bots, groups, schedulePayload, reminders, bindings, events] = await Promise.all([
+      const [cockpit, bots, groups, schedulePayload, reminders, sessionOverview, events] = await Promise.all([
         bridgeApi.cockpit(),
         bridgeApi.bots(),
         bridgeApi.groups(),
         bridgeApi.schedules(),
         bridgeApi.reminders('all'),
-        bridgeApi.bindings(),
+        bridgeApi.sessionsOverview(),
         bridgeApi.events(),
       ])
       setData((prev) => ({
@@ -84,7 +87,8 @@ export function useBridgeData(): BridgeData & {
         schedules: schedulePayload.schedules,
         scheduleAvailable: schedulePayload.available,
         reminders,
-        bindings,
+        bindings: sessionOverview.bindings,
+        dreamSessions: sessionOverview.dreamSessions,
         events,
         listenerTemplates: cockpit.listenerTemplates?.length
           ? [...cockpit.listenerTemplates]

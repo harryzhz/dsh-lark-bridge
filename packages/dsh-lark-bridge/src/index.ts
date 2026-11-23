@@ -161,6 +161,7 @@ export {
   type LarkCockpitPayload,
   type LarkCockpitSummary,
   type LarkDreamRunState,
+  type LarkDreamSession,
   type LarkGroupView,
   type LarkManagedSession,
   type LarkOriginRecord,

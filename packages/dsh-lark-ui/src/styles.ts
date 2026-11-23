@@ -545,6 +545,76 @@ const CSS = `
   background: var(--dsw-alias-bg-module-platform); font-size: 13px;
 }
 .fb-banner > :first-child { flex: 1; min-width: 0; }
+.fb-dream-card {
+  margin: 6px 0 2px;
+  padding: 12px 14px;
+  border-radius: var(--dsw-radius-md);
+  background: var(--dsw-alias-bg-module-platform);
+}
+.fb-dream-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+.fb-dream-desc {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-tertiary);
+}
+.fb-dream-actions {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+}
+.fb-dream-actions button {
+  width: 100%;
+  justify-content: center;
+  white-space: nowrap;
+}
+.fb-dream-status {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 0.5px solid var(--dsw-alias-border-l2);
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+.fb-dream-status-dot {
+  flex: none;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+}
+.fb-dream-status-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.fb-dream-status-title {
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-secondary);
+}
+.fb-dream-status-title[data-error] {
+  color: var(--dsw-alias-state-error-primary);
+}
+.fb-dream-status-note {
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-tertiary);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
+}
 .fb-banner button,
 .fb-toolbar > button,
 .fb-dir-toolbar button,

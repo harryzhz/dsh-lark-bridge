@@ -550,11 +550,26 @@ export async function dispatchLarkApiRequest(
         ...b,
         sessionUrl: manager.sessionWebUrl(b.sessionId),
       }))
+      const dreamSessions = (manager.store.listDreamSessions?.() ?? []).map((s) => ({
+        ...s,
+        sessionUrl: manager.sessionWebUrl(s.sessionId),
+      }))
       return ok({
         ok: true,
         bindings,
+        dreamSessions,
         archivedSessionIds: manager.listArchivedSessionIds(),
       })
+    }
+
+    if (method === 'DELETE' && segments[0] === 'dream-sessions' && segments[1] && segments.length === 2) {
+      const sessionId = segments[1]
+      const target = manager.store.listDreamSessions?.().find((s) => s.sessionId === sessionId)
+      if (target?.status === 'running') {
+        return ok({ ok: false, error: 'dream_session_running' }, 400)
+      }
+      const deleted = manager.store.deleteDreamSession?.(sessionId) ?? false
+      return ok({ ok: deleted }, deleted ? 200 : 404)
     }
 
     if (method === 'POST' && pathname === 'sessions/sweep') {

@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -209,6 +209,8 @@ describe('DreamingService dual-gate scheduling, product dataDir isolation & nati
       dreaming,
       cliAuth,
       listBotStatuses: () => [],
+      listArchivedSessionIds: () => archivedSessions,
+      sessionWebUrl: (sid: string) => `http://127.0.0.1:3880/#session=${sid}`,
     } as unknown as LarkBridgeManager
     const admitter: ConnectionAdmitter = { admit: () => ({ peer: { principal: { kind: 'owner' } } }) }
     const handler = createLarkHttpHandler(fakeCtx, admitter, manager)
@@ -230,5 +232,153 @@ describe('DreamingService dual-gate scheduling, product dataDir isolation & nati
     expect((webRes.json.dreamState as { status: string; lastSummary: string }).status).toBe('succeeded')
     expect((webRes.json.dreamState as { lastSummary: string }).lastSummary).toContain('已核查当前代码库')
     expect(archivedSessions.length).toBeGreaterThanOrEqual(2)
+
+    // 4. GET /api/lark-bridge/bindings exposes unified dreamSessions (both runs preserved), and DELETE removes finished entries.
+    const bindingsRes = await invokeHandler(handler, { url: '/api/lark-bridge/bindings' })
+    expect(bindingsRes.status).toBe(200)
+    const dreamSessions = bindingsRes.json.dreamSessions as Array<Record<string, unknown>>
+    expect(dreamSessions).toHaveLength(2)
+    expect(dreamSessions[0]).toMatchObject({
+      botId: 'dsh-agent',
+      botName: '研发智能体',
+      status: 'succeeded',
+      summary: '已核查当前代码库，无需新增记忆',
+    })
+    expect(String(dreamSessions[0]?.sessionUrl)).toContain('#session=')
+    expect(dreamSessions[1]).toMatchObject({
+      botId: 'dsh-agent',
+      status: 'succeeded',
+      processedCount: 2,
+      summary: '已更新 2 条记忆并清理 1 条过期配置说明',
+    })
+
+    const olderSessionId = String(dreamSessions[1]?.sessionId)
+    const delRes = await invokeHandler(handler, {
+      method: 'DELETE',
+      url: `/api/lark-bridge/dream-sessions/${encodeURIComponent(olderSessionId)}`,
+    })
+    expect(delRes.status).toBe(200)
+    expect(store.listDreamSessions()).toHaveLength(1)
+
+    // Running Dreaming session cannot be deleted while active
+    store.upsertDreamSession({
+      sessionId: 'sess-dream-running',
+      botId: 'dsh-agent',
+      workspaceName: 'work',
+      workingDir: workDir,
+      agentPreset: 'standard',
+      status: 'running',
+      dateKey: '2026-11-23',
+      processedCount: 1,
+      createdAtMs: Date.now(),
+      lastActivityMs: Date.now(),
+    })
+    const delRunningRes = await invokeHandler(handler, {
+      method: 'DELETE',
+      url: '/api/lark-bridge/dream-sessions/sess-dream-running',
+    })
+    expect(delRunningRes.status).toBe(400)
+  })
+
+  it('backfills legacy dreamStates and auditEvents once, recovers interrupted running records, and never resurrects deleted entries', () => {
+    const dataDir = makeTempDir()
+    const legacyState = {
+      version: 3,
+      bots: [
+        {
+          id: 'bot-legacy',
+          name: '老版本智能体',
+          enabled: true,
+          larkAppId: 'cli_legacy',
+          larkAppSecret: 'sec_legacy',
+          defaultWorkingDir: '~',
+          agentPreset: 'standard',
+        },
+      ],
+      groups: [],
+      bindings: [],
+      managedSessions: [],
+      dreamStates: [
+        {
+          botId: 'bot-legacy',
+          status: 'succeeded',
+          lastDreamAtMs: 1_760_000_000_000,
+          lastCheckedDateKey: '2026-11-23',
+          lastSessionId: 'session-legacy-latest',
+          lastProcessedCount: 9,
+          lastSummary: '已整理 9 个会话 · 已完成只读核查',
+          processedSessionIds: ['s1'],
+        },
+      ],
+      listenerTemplates: [],
+      scheduleBindings: [],
+      hourlyBuckets: [],
+      botMetrics: [],
+      groupTraffic: [],
+      auditEvents: [
+        {
+          id: 'ev-latest',
+          timestampMs: 1_760_000_000_000,
+          botId: 'bot-legacy',
+          botName: '老版本智能体',
+          sessionId: 'session-legacy-latest',
+          durationMs: 4200,
+          kind: 'lifecycle',
+          summary: 'Dreaming 完成：已整理 9 个会话',
+        },
+        {
+          id: 'ev-older',
+          timestampMs: 1_759_900_000_000,
+          botId: 'bot-legacy',
+          botName: '老版本智能体',
+          sessionId: 'session-legacy-older',
+          durationMs: 3100,
+          kind: 'lifecycle',
+          summary: 'Dreaming 完成：已整理 3 个会话',
+        },
+      ],
+    }
+    writeFileSync(join(dataDir, 'lark-bridge-state.json'), JSON.stringify(legacyState, null, 2), 'utf8')
+
+    // First load migrates both latest dreamState and older auditEvent without duplicating latest
+    const store1 = new LarkBridgeStore(dataDir)
+    const sessions1 = store1.listDreamSessions()
+    expect(sessions1).toHaveLength(2)
+    expect(sessions1[0]).toMatchObject({
+      sessionId: 'session-legacy-latest',
+      processedCount: 9,
+      summary: '已完成只读核查',
+      status: 'succeeded',
+    })
+    expect(sessions1[1]).toMatchObject({
+      sessionId: 'session-legacy-older',
+      processedCount: 3,
+      durationMs: 3100,
+      status: 'succeeded',
+    })
+
+    // Deleting a backfilled entry persists and must NOT resurrect on reload
+    expect(store1.deleteDreamSession('session-legacy-older')).toBe(true)
+    store1.upsertDreamSession({
+      sessionId: 'session-interrupted',
+      botId: 'bot-legacy',
+      workspaceName: 'demo',
+      workingDir: '~',
+      agentPreset: 'standard',
+      status: 'running',
+      dateKey: '2026-11-23',
+      processedCount: 1,
+      createdAtMs: 1_760_100_000_000,
+      lastActivityMs: 1_760_100_000_000,
+    })
+
+    const store2 = new LarkBridgeStore(dataDir)
+    const sessions2 = store2.listDreamSessions()
+    expect(sessions2.map((s) => s.sessionId)).toEqual(['session-interrupted', 'session-legacy-latest'])
+    expect(sessions2[0]).toMatchObject({
+      sessionId: 'session-interrupted',
+      status: 'failed',
+      summary: '执行因服务重启中断',
+    })
   })
 })

@@ -33,6 +33,19 @@ describe('bridgeApi Desktop & Web Connection RPC transport', () => {
         if (req.path === '/bots/import-existing' && req.method === 'POST') {
           return { ok: true, value: { ok: true, bot: { id: 'demo', name: 'Demo', larkAppId: 'cli_demo' } } }
         }
+        if (req.path === '/bindings' && req.method === 'GET') {
+          return {
+            ok: true,
+            value: {
+              ok: true,
+              bindings: [{ routeKey: 'atlas:oc_1', sessionId: 'sess-chat-1' }],
+              dreamSessions: [{ sessionId: 'sess-dream-1', botId: 'atlas', status: 'succeeded' }],
+            },
+          }
+        }
+        if (req.path === '/dream-sessions/sess-dream-1' && req.method === 'DELETE') {
+          return { ok: true, value: { ok: true } }
+        }
         return { ok: false, error: { code: 'lark-bridge/error', message: 'not_found' } }
       },
     }
@@ -56,6 +69,13 @@ describe('bridgeApi Desktop & Web Connection RPC transport', () => {
     })
     expect(imported.bot.name).toBe('Demo')
 
+    const overview = await bridgeApi.sessionsOverview()
+    expect(overview.bindings).toHaveLength(1)
+    expect(overview.dreamSessions).toHaveLength(1)
+    expect(overview.dreamSessions[0]?.sessionId).toBe('sess-dream-1')
+
+    await bridgeApi.deleteDreamSession('sess-dream-1')
+
     await expect(bridgeApi.deleteBot('missing')).rejects.toThrow('not_found')
 
     expect(fetchSpy).not.toHaveBeenCalled()
@@ -76,6 +96,8 @@ describe('bridgeApi Desktop & Web Connection RPC transport', () => {
           body: { larkAppId: 'cli_demo', defaultWorkingDir: '~', agentPreset: 'standard' },
         },
       },
+      { channel: '/api', endpoint: 'lark-bridge-rpc', payload: { method: 'GET', path: '/bindings' } },
+      { channel: '/api', endpoint: 'lark-bridge-rpc', payload: { method: 'DELETE', path: '/dream-sessions/sess-dream-1' } },
       { channel: '/api', endpoint: 'lark-bridge-rpc', payload: { method: 'DELETE', path: '/bots/missing' } },
     ])
   })

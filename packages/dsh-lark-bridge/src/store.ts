@@ -24,6 +24,7 @@ import type {
   LarkBotMetrics,
   LarkCockpitPayload,
   LarkDreamRunState,
+  LarkDreamSession,
   LarkGroupTraffic,
   LarkGroupView,
   LarkHourlyBucket,
@@ -77,6 +78,7 @@ interface PersistedStateV3 {
   readonly bindings: LarkSessionBinding[]
   readonly managedSessions: LarkManagedSession[]
   readonly dreamStates?: LarkDreamRunState[]
+  readonly dreamSessions?: LarkDreamSession[]
   readonly reminders?: LarkReminderItem[]
   readonly listenerTemplates: ListenerTemplate[]
   readonly scheduleBindings: LarkScheduleBinding[]
@@ -89,7 +91,26 @@ interface PersistedStateV3 {
 const MAX_LATENCY_SAMPLES = 80
 const MAX_HOURLY_BUCKETS = 48
 const MAX_MANAGED_SESSIONS = 600
+const MAX_DREAM_SESSIONS = 100
 const MAX_ARCHIVED_REMINDERS = 300
+
+function stripDreamSummaryPrefix(raw?: string): string | undefined {
+  if (!raw) return undefined
+  const trimmed = raw
+    .trim()
+    .replace(/^已整理\s+\d+\s+个会话(?:\s*·\s*)?/, '')
+    .replace(/^整理失败[：:]\s*/, '')
+    .trim()
+  return trimmed || undefined
+}
+
+function formatLocalDateKey(ms: number): string {
+  const d = new Date(ms)
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  return `${y}-${m}-${day}`
+}
 
 function formatHourKey(ms: number): string {
   const d = new Date(ms)
@@ -119,6 +140,7 @@ export class LarkBridgeStore {
   private readonly bindings = new Map<string, LarkSessionBinding>()
   private readonly managedSessions = new Map<string, LarkManagedSession>()
   private readonly dreamStates = new Map<string, LarkDreamRunState>()
+  private readonly dreamSessions = new Map<string, LarkDreamSession>()
   private readonly reminders = new Map<string, LarkReminderItem>()
   private readonly listenerTemplates = new Map<string, ListenerTemplate>()
   private readonly scheduleBindings = new Map<string, LarkScheduleBinding>()
@@ -205,6 +227,9 @@ export class LarkBridgeStore {
     }
     this.botMetrics.delete(id)
     this.dreamStates.delete(id)
+    for (const [sid, ds] of this.dreamSessions) {
+      if (ds.botId === id) this.dreamSessions.delete(sid)
+    }
     for (const [remId, rem] of this.reminders) {
       if (rem.origin.botId === id) this.reminders.delete(remId)
     }
@@ -570,6 +595,49 @@ export class LarkBridgeStore {
     this.dreamStates.set(normalized.botId, normalized)
     this.persist()
     return normalized
+  }
+
+  listDreamSessions(botId?: string): LarkDreamSession[] {
+    return [...this.dreamSessions.values()]
+      .filter((s) => !botId || s.botId === botId)
+      .map((s) => {
+        const bot = this.bots.get(s.botId)
+        return {
+          ...s,
+          ...(bot?.name ? { botName: bot.name } : {}),
+          workspaceName: bot ? this.resolveBotWorkspaceName(bot) : s.workspaceName,
+        }
+      })
+      .sort((a, b) => b.lastActivityMs - a.lastActivityMs)
+  }
+
+  upsertDreamSession(entry: LarkDreamSession): LarkDreamSession {
+    const existing = this.dreamSessions.get(entry.sessionId)
+    const next: LarkDreamSession = {
+      ...(existing ?? {}),
+      ...entry,
+    }
+    this.dreamSessions.set(next.sessionId, next)
+    this.pruneDreamSessions()
+    this.persist()
+    return next
+  }
+
+  deleteDreamSession(sessionId: string): boolean {
+    const existed = this.dreamSessions.delete(sessionId)
+    if (existed) this.persist()
+    return existed
+  }
+
+  private pruneDreamSessions(): void {
+    if (this.dreamSessions.size <= MAX_DREAM_SESSIONS) return
+    const sorted = [...this.dreamSessions.values()].sort(
+      (a, b) => a.lastActivityMs - b.lastActivityMs,
+    )
+    while (sorted.length > MAX_DREAM_SESSIONS) {
+      const oldest = sorted.shift()
+      if (oldest) this.dreamSessions.delete(oldest.sessionId)
+    }
   }
 
   listReminders(filter: 'active' | 'archived' | 'all' = 'all'): LarkReminderItem[] {
@@ -1018,6 +1086,51 @@ export class LarkBridgeStore {
         }
       }
 
+      if (Array.isArray(raw.dreamSessions)) {
+        for (const item of raw.dreamSessions as Partial<LarkDreamSession>[]) {
+          if (!item?.sessionId || !item?.botId) continue
+          const bot = this.bots.get(item.botId)
+          const wasRunning = item.status === 'running'
+          const status: LarkDreamSession['status'] =
+            item.status === 'succeeded' || item.status === 'failed'
+              ? item.status
+              : 'failed'
+          const createdAtMs = typeof item.createdAtMs === 'number' ? item.createdAtMs : Date.now()
+          const lastActivityMs =
+            typeof item.lastActivityMs === 'number' ? item.lastActivityMs : createdAtMs
+          const summary = wasRunning
+            ? '执行因服务重启中断'
+            : typeof item.summary === 'string' && item.summary.trim()
+              ? item.summary.trim()
+              : undefined
+          this.dreamSessions.set(item.sessionId, {
+            sessionId: item.sessionId,
+            botId: item.botId,
+            ...(item.botName ?? bot?.name ? { botName: item.botName ?? bot?.name } : {}),
+            workspaceName:
+              item.workspaceName ||
+              (bot ? this.resolveBotWorkspaceName(bot) : item.botId),
+            workingDir: item.workingDir || bot?.defaultWorkingDir || '',
+            agentPreset: item.agentPreset || bot?.agentPreset || 'standard',
+            ...(item.model ?? bot?.model ? { model: item.model ?? bot?.model } : {}),
+            status,
+            dateKey:
+              typeof item.dateKey === 'string' && item.dateKey.trim()
+                ? item.dateKey.trim()
+                : formatLocalDateKey(lastActivityMs),
+            processedCount:
+              typeof item.processedCount === 'number' && Number.isFinite(item.processedCount)
+                ? item.processedCount
+                : 0,
+            ...(summary ? { summary } : {}),
+            createdAtMs,
+            lastActivityMs,
+            ...(typeof item.durationMs === 'number' ? { durationMs: item.durationMs } : {}),
+          })
+          if (wasRunning) needsPersist = true
+        }
+      }
+
       if (Array.isArray(raw.reminders)) {
         for (const rem of raw.reminders) {
           const parsed = LarkReminderItemSchema.safeParse(rem)
@@ -1111,12 +1224,75 @@ export class LarkBridgeStore {
         }
       }
 
+      // One-time backfill for legacy state files that predated `dreamSessions`.
+      if (!Array.isArray(raw.dreamSessions)) {
+        const backfilled = this.backfillLegacyDreamSessions()
+        if (backfilled > 0) needsPersist = true
+      }
+
       if (needsPersist) {
         this.persist()
       }
     } catch {
       // Leave store empty if unreadable.
     }
+  }
+
+  private backfillLegacyDreamSessions(): number {
+    let added = 0
+    for (const ds of this.dreamStates.values()) {
+      if (!ds.lastSessionId || this.dreamSessions.has(ds.lastSessionId)) continue
+      if (ds.status !== 'succeeded' && ds.status !== 'failed') continue
+      const bot = this.bots.get(ds.botId)
+      const ts = ds.lastDreamAtMs ?? Date.now()
+      const cleanSummary = stripDreamSummaryPrefix(ds.lastSummary)
+      this.dreamSessions.set(ds.lastSessionId, {
+        sessionId: ds.lastSessionId,
+        botId: ds.botId,
+        ...(bot?.name ? { botName: bot.name } : {}),
+        workspaceName: bot ? this.resolveBotWorkspaceName(bot) : ds.botId,
+        workingDir: bot?.defaultWorkingDir ?? '',
+        agentPreset: bot?.agentPreset ?? 'standard',
+        ...(bot?.model ? { model: bot.model } : {}),
+        status: ds.status,
+        dateKey: ds.lastCheckedDateKey || formatLocalDateKey(ts),
+        processedCount: ds.lastProcessedCount ?? 0,
+        ...(cleanSummary ? { summary: cleanSummary } : {}),
+        createdAtMs: ts,
+        lastActivityMs: ts,
+      })
+      added += 1
+    }
+
+    for (const ev of this.auditEvents) {
+      if (!ev.sessionId || this.dreamSessions.has(ev.sessionId)) continue
+      const isDreamDone = ev.summary.startsWith('Dreaming 完成')
+      const isDreamFail = ev.summary.startsWith('Dreaming 失败')
+      if (!isDreamDone && !isDreamFail) continue
+      const bot = this.bots.get(ev.botId)
+      const countMatch = /已整理\s+(\d+)\s+个会话/.exec(ev.summary)
+      const failReason = isDreamFail ? ev.summary.replace(/^Dreaming 失败[：:]\s*/, '').trim() : undefined
+      this.dreamSessions.set(ev.sessionId, {
+        sessionId: ev.sessionId,
+        botId: ev.botId,
+        ...(ev.botName ?? bot?.name ? { botName: ev.botName ?? bot?.name } : {}),
+        workspaceName: bot ? this.resolveBotWorkspaceName(bot) : ev.botId,
+        workingDir: bot?.defaultWorkingDir ?? '',
+        agentPreset: bot?.agentPreset ?? 'standard',
+        ...(bot?.model ? { model: bot.model } : {}),
+        status: isDreamFail ? 'failed' : 'succeeded',
+        dateKey: formatLocalDateKey(ev.timestampMs),
+        processedCount: countMatch ? Number(countMatch[1]) : 0,
+        ...(failReason ? { summary: failReason } : {}),
+        createdAtMs: ev.timestampMs,
+        lastActivityMs: ev.timestampMs,
+        ...(ev.durationMs !== undefined ? { durationMs: ev.durationMs } : {}),
+      })
+      added += 1
+    }
+
+    if (added > 0) this.pruneDreamSessions()
+    return added
   }
 
   private persist(): void {
@@ -1128,6 +1304,7 @@ export class LarkBridgeStore {
       bindings: [...this.bindings.values()],
       managedSessions: [...this.managedSessions.values()],
       dreamStates: [...this.dreamStates.values()],
+      dreamSessions: [...this.dreamSessions.values()],
       reminders: [...this.reminders.values()],
       listenerTemplates: this.listListenerTemplates(),
       scheduleBindings: [...this.scheduleBindings.values()],

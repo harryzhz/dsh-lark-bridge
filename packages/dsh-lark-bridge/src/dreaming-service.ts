@@ -26,6 +26,7 @@ const TICK_INTERVAL_MS = 60_000
 const MAX_SESSIONS_PER_DREAM = 20
 const MAX_EVENTS_PER_SESSION = 120
 const MAX_TRANSCRIPT_CHARS_PER_SESSION = 2800
+const MAX_DREAM_NOTE_CHARS = 160
 
 export interface DreamingHost {
   readonly ctx: Context
@@ -184,6 +185,7 @@ export class DreamingService {
         ? this.host.store.resolveBotWorkspaceName(bot)
         : resolveEffectiveWorkspaceName(bot)
     const sessionId = brandString<SessionId>(`session-${randomUUID()}`)
+    let createdSession = false
 
     try {
       const digestPath = await this.writeTranscriptDigest(bot.id, dateKey, batch)
@@ -226,6 +228,7 @@ export class DreamingService {
           })
         },
       })
+      createdSession = true
 
       const titleSvc = this.host.ctx.get('sessionTitle' as never) as
         | { rename?: (s: Session, t: string) => unknown }
@@ -237,6 +240,38 @@ export class DreamingService {
       }
       await this.host.workspaces.attachSession(workingDir, workspaceName, sessionId)
 
+      this.host.store.upsertManagedSession?.({
+        sessionId,
+        botId: bot.id,
+        chatId: 'dream:internal',
+        routeKey: `dream:${bot.id}`,
+        trigger: 'dreaming',
+        createdAtMs: startedMs,
+        lastActivityMs: startedMs,
+      })
+      this.host.store.upsertDreamSession?.({
+        sessionId,
+        botId: bot.id,
+        botName: bot.name,
+        workspaceName,
+        workingDir,
+        agentPreset: bot.agentPreset,
+        ...(launch.model ?? bot.model ? { model: launch.model ?? bot.model } : {}),
+        status: 'running',
+        dateKey,
+        processedCount: batch.length,
+        summary: '正在盘点增量会话与代码库并整理记忆…',
+        createdAtMs: startedMs,
+        lastActivityMs: startedMs,
+      })
+      this.host.store.upsertDreamState({
+        ...prev,
+        status: 'running',
+        lastCheckedDateKey: dateKey,
+        lastSessionId: sessionId,
+        lastSummary: '正在盘点增量会话与代码库并整理记忆…',
+      })
+
       let replyText = ''
       try {
         replyText = await this.host.runTurn(handle.agent, [{ type: 'text', text: prompt }])
@@ -245,15 +280,39 @@ export class DreamingService {
       }
 
       await this.host.workspaces.archiveSession(sessionId)
+      this.host.store.markSessionArchived?.(sessionId)
 
+      const finishedMs = Date.now()
+      const durationMs = finishedMs - startedMs
       const nextProcessed = [
         ...prev.processedSessionIds,
         ...batch.map((s) => s.sessionId).filter((id) => !processedSet.has(id)),
       ]
-      const cleanNote = replyText.replace(/\s+/g, ' ').trim().slice(0, 80)
+      const normalizedReply = replyText.replace(/\s+/g, ' ').trim()
+      const cleanNote =
+        normalizedReply.length > MAX_DREAM_NOTE_CHARS
+          ? `${normalizedReply.slice(0, MAX_DREAM_NOTE_CHARS).trimEnd()}…`
+          : normalizedReply
       const summaryNote = cleanNote
         ? `已整理 ${batch.length} 个会话 · ${cleanNote}`
         : `已整理 ${batch.length} 个会话`
+
+      this.host.store.upsertDreamSession?.({
+        sessionId,
+        botId: bot.id,
+        botName: bot.name,
+        workspaceName,
+        workingDir,
+        agentPreset: bot.agentPreset,
+        ...(launch.model ?? bot.model ? { model: launch.model ?? bot.model } : {}),
+        status: 'succeeded',
+        dateKey,
+        processedCount: batch.length,
+        ...(cleanNote ? { summary: cleanNote } : {}),
+        createdAtMs: startedMs,
+        lastActivityMs: finishedMs,
+        durationMs,
+      })
 
       const updated = this.host.store.upsertDreamState({
         botId,
@@ -269,24 +328,45 @@ export class DreamingService {
       this.host.store.recordEvent({
         botId,
         sessionId,
-        durationMs: Date.now() - startedMs,
+        durationMs,
         kind: 'lifecycle',
         summary: `Dreaming 完成：已整理 ${batch.length} 个会话`,
       })
       return updated
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
+      const finishedMs = Date.now()
       this.host.ctx.logger.error(`[lark-bridge] dreaming failed for "${bot.name}": ${msg}`)
+      if (createdSession) {
+        await this.host.workspaces.archiveSession(sessionId).catch(() => {})
+        this.host.store.markSessionArchived?.(sessionId)
+        this.host.store.upsertDreamSession?.({
+          sessionId,
+          botId: bot.id,
+          botName: bot.name,
+          workspaceName,
+          workingDir,
+          agentPreset: bot.agentPreset,
+          ...(bot.model ? { model: bot.model } : {}),
+          status: 'failed',
+          dateKey,
+          processedCount: batch.length,
+          summary: msg,
+          createdAtMs: startedMs,
+          lastActivityMs: finishedMs,
+          durationMs: finishedMs - startedMs,
+        })
+      }
       const failed = this.host.store.upsertDreamState({
         ...prev,
         status: 'failed',
         lastCheckedDateKey: dateKey,
-        lastSessionId: sessionId,
+        ...(createdSession ? { lastSessionId: sessionId } : {}),
         lastSummary: `整理失败：${msg}`,
       })
       this.host.store.recordEvent({
         botId,
-        sessionId,
+        ...(createdSession ? { sessionId } : {}),
         kind: 'error',
         summary: `Dreaming 失败：${msg}`,
       })

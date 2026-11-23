@@ -1,9 +1,11 @@
 import { useState } from 'react'
 import {
   Button,
+  IconNewChatOutlineRegular,
   IconPlayOutlineRegular,
   StateDot,
   Switch,
+  type StateDotState,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { bridgeApi } from '../api.js'
 import { DEFAULT_DREAMING_SCOPES, REMINDER_CREATION_MODES } from '../presets.js'
@@ -23,6 +25,72 @@ import {
   SettingRow,
   TextField,
 } from './fields.js'
+
+export interface DreamStatusPresentation {
+  readonly dot: StateDotState
+  readonly title: string
+  readonly detail?: string
+  readonly isError?: boolean
+}
+
+export function buildDreamStatusPresentation(
+  dreamState: DreamRunState | undefined,
+  runError: string,
+  isRunning: boolean,
+): DreamStatusPresentation | null {
+  if (runError) {
+    return { dot: 'error', title: '运行异常', detail: runError, isError: true }
+  }
+  if (isRunning) {
+    return {
+      dot: 'ongoing',
+      title: '正在整理记忆…',
+      detail: '正在盘点增量会话与代码库并整理记忆…',
+    }
+  }
+  if (!dreamState) return null
+
+  const timeLabel = dreamState.lastDreamAtMs ? formatTime(dreamState.lastDreamAtMs) : ''
+  const rawSummary = dreamState.lastSummary?.trim() ?? ''
+
+  if (dreamState.status === 'failed') {
+    const detail = rawSummary.replace(/^整理失败[：:]\s*/, '').trim()
+    return {
+      dot: 'error',
+      title: timeLabel ? `最近整理失败 · ${timeLabel}` : '最近整理失败',
+      ...(detail ? { detail } : {}),
+      isError: true,
+    }
+  }
+
+  if (dreamState.status === 'skipped') {
+    if (!rawSummary) return null
+    return {
+      dot: 'idle',
+      title: dreamState.lastCheckedDateKey
+        ? `上次检查 ${dreamState.lastCheckedDateKey}`
+        : '上次检查已跳过',
+      detail: rawSummary,
+    }
+  }
+
+  if (dreamState.status === 'succeeded') {
+    const countMatch = /^已整理\s+(\d+)\s+个会话(?:\s*·\s*)?([\s\S]*)$/.exec(rawSummary)
+    const count = dreamState.lastProcessedCount ?? (countMatch ? Number(countMatch[1]) : undefined)
+    const detail = (countMatch ? (countMatch[2] ?? '') : rawSummary).trim()
+    const titleParts = [
+      timeLabel ? `最近整理 ${timeLabel}` : '最近整理已完成',
+      count !== undefined ? `已整理 ${count} 个会话` : null,
+    ].filter(Boolean)
+    return {
+      dot: 'done',
+      title: titleParts.join(' · '),
+      ...(detail ? { detail } : {}),
+    }
+  }
+
+  return rawSummary ? { dot: 'idle', title: rawSummary } : null
+}
 
 export function ExperimentalSection({
   botId,
@@ -63,56 +131,58 @@ export function ExperimentalSection({
   }
 
   const isRunning = runningNow || dreamState?.status === 'running'
-  const statusDot =
-    isRunning
-      ? 'ongoing'
-      : dreamState?.status === 'succeeded'
-        ? 'done'
-        : dreamState?.status === 'failed'
-          ? 'error'
-          : 'idle'
-
-  const statusLine = runError
-    ? `运行异常：${runError}`
-    : dreamState?.lastSummary
-      ? `最近整理：${dreamState.lastDreamAtMs ? `${formatTime(dreamState.lastDreamAtMs)} · ` : ''}${dreamState.lastSummary}`
-      : ''
+  const statusView = buildDreamStatusPresentation(dreamState, runError, isRunning)
 
   return (
     <>
       <GroupTitle>Dreaming 记忆整理</GroupTitle>
-      <div className="fb-banner" style={{ margin: '6px 0 2px' }}>
-        <div className="fb-row-desc" style={{ minWidth: 0, flex: 1 }}>
-          <div>
+      <div className="fb-dream-card">
+        <div className="fb-dream-head">
+          <div className="fb-dream-desc">
             到达整理时间且新增会话达到阈值后，自动汇总近期增量对话摘要并结合代码库变更唤醒智能体，调用其自身长期记忆机制提炼关键认知、合并重复项并清理纠偏过期内容。
           </div>
-          {statusLine && (
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 4 }}>
-              <StateDot state={statusDot} />
-              <span>{statusLine}</span>
+          {botId && (
+            <div className="fb-dream-actions">
+              <Button
+                size="sm"
+                variant="outline"
+                icon={<IconPlayOutlineRegular size={14} />}
+                disabled={isRunning}
+                onClick={() => void triggerDreamNow()}
+              >
+                {isRunning ? '整理中…' : '立即整理'}
+              </Button>
+              {dreamState?.lastSessionId && onOpenSession && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  icon={<IconNewChatOutlineRegular size={14} />}
+                  onClick={() => onOpenSession(dreamState.lastSessionId!)}
+                >
+                  查看会话
+                </Button>
+              )}
             </div>
           )}
         </div>
-        {botId && (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flex: 'none' }}>
-            {dreamState?.lastSessionId && onOpenSession && (
-              <Button
-                size="sm"
-                variant="ghost"
-                onClick={() => onOpenSession(dreamState.lastSessionId!)}
+        {statusView && (
+          <div className="fb-dream-status">
+            <span className="fb-dream-status-dot">
+              <StateDot state={statusView.dot} />
+            </span>
+            <div className="fb-dream-status-body">
+              <div
+                className="fb-dream-status-title fb-num"
+                data-error={statusView.isError ? '' : undefined}
               >
-                查看会话
-              </Button>
-            )}
-            <Button
-              size="sm"
-              variant="outline"
-              icon={<IconPlayOutlineRegular size={14} />}
-              disabled={isRunning}
-              onClick={() => void triggerDreamNow()}
-            >
-              {isRunning ? '整理中…' : '立即整理'}
-            </Button>
+                {statusView.title}
+              </div>
+              {statusView.detail && (
+                <div className="fb-dream-status-note" title={statusView.detail}>
+                  {statusView.detail}
+                </div>
+              )}
+            </div>
           </div>
         )}
       </div>

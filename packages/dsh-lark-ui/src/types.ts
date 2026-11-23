@@ -60,6 +60,24 @@ export interface DreamRunState {
   processedSessionIds: string[]
 }
 
+export interface DreamSession {
+  sessionId: string
+  botId: string
+  botName?: string
+  workspaceName: string
+  workingDir: string
+  agentPreset: string
+  model?: string
+  status: 'running' | 'succeeded' | 'failed'
+  dateKey: string
+  processedCount: number
+  summary?: string
+  createdAtMs: number
+  lastActivityMs: number
+  durationMs?: number
+  sessionUrl?: string
+}
+
 export type ReminderStatus = 'pending_confirm' | 'scheduled' | 'running' | 'archived'
 export type ReminderResolution = 'reminded' | 'silent_ok' | 'cancelled' | 'rejected' | 'error'
 
