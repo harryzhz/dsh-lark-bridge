@@ -128,7 +128,11 @@ export function ScheduleConfigDialog({
         />
 
         <SettingRow title="启用飞书通知">
-          <Switch label="启用飞书通知" checked={draft.enabled} onChange={(enabled) => setDraft({ ...draft, enabled })} />
+          <Switch
+            label="启用飞书通知"
+            checked={draft.enabled}
+            onChange={(enabled) => setDraft((prev) => (prev ? { ...prev, enabled } : prev))}
+          />
         </SettingRow>
 
         {draft.enabled && (
@@ -145,10 +149,14 @@ export function ScheduleConfigDialog({
                   values={selectedTokens}
                   options={groupChoices}
                   onChange={(next) =>
-                    setDraft({
-                      ...draft,
-                      targets: next.map(decodeTarget).filter((v): v is ScheduleTarget => Boolean(v)),
-                    })
+                    setDraft((prev) =>
+                      prev
+                        ? {
+                            ...prev,
+                            targets: next.map(decodeTarget).filter((v): v is ScheduleTarget => Boolean(v)),
+                          }
+                        : prev,
+                    )
                   }
                 />
               )}
@@ -158,7 +166,9 @@ export function ScheduleConfigDialog({
               <SelectMenu
                 value={draft.deliveryMode}
                 options={SCHEDULE_DELIVERY_MODES}
-                onChange={(deliveryMode) => setDraft({ ...draft, deliveryMode })}
+                onChange={(deliveryMode) =>
+                  setDraft((prev) => (prev ? { ...prev, deliveryMode } : prev))
+                }
               />
             </SettingRow>
 
@@ -166,7 +176,7 @@ export function ScheduleConfigDialog({
               <SelectMenu
                 value={draft.notifyOn}
                 options={SCHEDULE_NOTIFY_ON}
-                onChange={(notifyOn) => setDraft({ ...draft, notifyOn })}
+                onChange={(notifyOn) => setDraft((prev) => (prev ? { ...prev, notifyOn } : prev))}
               />
             </SettingRow>
 
@@ -174,7 +184,9 @@ export function ScheduleConfigDialog({
               <Switch
                 label="发送中间过程消息"
                 checked={Boolean(draft.sendIntermediateMessages)}
-                onChange={(sendIntermediateMessages) => setDraft({ ...draft, sendIntermediateMessages })}
+                onChange={(sendIntermediateMessages) =>
+                  setDraft((prev) => (prev ? { ...prev, sendIntermediateMessages } : prev))
+                }
               />
             </SettingRow>
           </NestedSettings>

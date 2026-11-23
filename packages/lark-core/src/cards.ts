@@ -1,5 +1,6 @@
 import { formatMarkdownForLarkCard } from './markdown.js'
 import type { LarkReminderItem } from './proactive.js'
+import { trimInvisibleText } from './reply-text.js'
 import type { LarkBotConfig } from './types.js'
 
 export interface ReplyCardImage {
@@ -22,7 +23,7 @@ function buildBodyElementsWithImages(
   markdown: string,
   images: readonly ReplyCardImage[] | undefined,
 ): Record<string, unknown>[] {
-  const trimmed = markdown.trim()
+  const trimmed = trimInvisibleText(markdown)
   if (!images || images.length === 0) {
     const formatted = formatMarkdownForLarkCard(trimmed)
     return [{ tag: 'markdown', content: formatted || '(空回复)' }]

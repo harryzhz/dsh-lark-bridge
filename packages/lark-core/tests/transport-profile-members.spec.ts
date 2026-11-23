@@ -1,3 +1,4 @@
+import * as lark from '@larksuiteoapi/node-sdk'
 import { describe, expect, it, vi } from 'vitest'
 import { LarkBotConfigSchema, LarkBotTransport, type LarkBotProfile } from '../src/index.js'
 
@@ -189,5 +190,148 @@ describe('LarkBotTransport profile description sync & member/bot avatar resoluti
         avatarUrl: 'https://cdn.example.com/peer-bot.png',
       },
     ])
+  })
+
+  it('refuses blank/invisible-only sendReply payloads, ACKs inbound events without blocking on onMessage, and prevents WSClient leaks on concurrent start/stop', async () => {
+    const logs: string[] = []
+    let releaseMessageHandler!: () => void
+    const onMessageStarted = vi.fn()
+    const onChatMembershipChange = vi.fn()
+
+    const transport = new LarkBotTransport(createBot(), {
+      onMessage: async () => {
+        onMessageStarted()
+        await new Promise<void>((resolve) => {
+          releaseMessageHandler = resolve
+        })
+      },
+      onChatMembershipChange,
+      logger: (_level, msg) => logs.push(msg),
+    })
+
+    const internalClient = (
+      transport as unknown as {
+        client: {
+          request: ReturnType<typeof vi.fn>
+          im: {
+            message: {
+              create: ReturnType<typeof vi.fn>
+              reply: ReturnType<typeof vi.fn>
+            }
+          }
+        }
+      }
+    ).client
+    internalClient.im.message.create = vi.fn()
+    internalClient.im.message.reply = vi.fn()
+
+    // 1. Blank / zero-width replies are refused at the transport boundary without hitting Feishu API
+    expect(
+      await transport.sendReply({ chatId: 'oc_demo', replyMode: 'chat', text: '\u200b' }),
+    ).toEqual({})
+    expect(
+      await transport.sendReply({
+        chatId: 'oc_demo',
+        replyToMessageId: 'om_1',
+        replyMode: 'reply',
+        text: ' \u200c\uFEFF\n ',
+      }),
+    ).toEqual({})
+    expect(internalClient.im.message.create).not.toHaveBeenCalled()
+    expect(internalClient.im.message.reply).not.toHaveBeenCalled()
+    expect(logs.some((l) => l.includes('Refused to send blank reply'))).toBe(true)
+
+    // 2. Non-blocking ACK + subscribed event handlers + concurrent start/stop WSClient leak guard
+    let capturedDispatcher: lark.EventDispatcher | undefined
+    const closeSpy = vi.fn()
+    let releaseProfile!: () => void
+    internalClient.request = vi.fn(async (req: { url: string }) => {
+      if (req.url === '/open-apis/bot/v3/info/') {
+        await new Promise<void>((resolve) => {
+          releaseProfile = resolve
+        })
+        return { bot: { open_id: 'ou_bot_self', app_name: 'AlphaBot' } }
+      }
+      return {}
+    })
+
+    const wsStartSpy = vi
+      .spyOn(lark.WSClient.prototype, 'start')
+      .mockImplementation(async function (this: lark.WSClient, params: { eventDispatcher: lark.EventDispatcher }) {
+        capturedDispatcher = params.eventDispatcher
+      })
+    const wsCloseSpy = vi
+      .spyOn(lark.WSClient.prototype, 'close')
+      .mockImplementation(function () {
+        closeSpy()
+      })
+
+    try {
+      // Concurrent start() calls share one startup and only spawn one WSClient
+      const p1 = transport.start()
+      const p2 = transport.start()
+      await vi.waitFor(() => expect(releaseProfile).toBeTypeOf('function'))
+      releaseProfile()
+      await Promise.all([p1, p2])
+      expect(wsStartSpy).toHaveBeenCalledTimes(1)
+      expect(capturedDispatcher).toBeDefined()
+
+      // im.message.receive_v1 resolves immediately without awaiting slow onMessage (preventing Feishu 3s ACK timeout)
+      const invokeResult = capturedDispatcher!.invoke(
+        {
+          schema: '2.0',
+          header: { event_type: 'im.message.receive_v1' },
+          event: {
+            sender: { sender_id: { open_id: 'ou_user_1' }, sender_type: 'user' },
+            message: {
+              message_id: 'om_ack_fast',
+              chat_id: 'oc_demo',
+              chat_type: 'group',
+              message_type: 'text',
+              content: '{"text":"hello"}',
+            },
+          },
+        },
+        { needCheck: false },
+      )
+      await expect(invokeResult).resolves.toBeUndefined()
+      await vi.waitFor(() => expect(onMessageStarted).toHaveBeenCalledTimes(1))
+      releaseMessageHandler()
+
+      // Common subscribed events are registered so SDK does not spam unhandled-event warnings
+      await capturedDispatcher!.invoke(
+        { schema: '2.0', header: { event_type: 'im.message.reaction.created_v1' }, event: {} },
+        { needCheck: false },
+      )
+      await capturedDispatcher!.invoke(
+        { schema: '2.0', header: { event_type: 'im.chat.member.bot.added_v1' }, event: {} },
+        { needCheck: false },
+      )
+      expect(onChatMembershipChange).toHaveBeenCalledTimes(1)
+
+      await transport.stop()
+      expect(closeSpy).toHaveBeenCalledTimes(1)
+
+      // Calling stop() mid-start (during fetchBotProfile) aborts startup without creating a zombie WSClient
+      wsStartSpy.mockClear()
+      let releaseAbortedProfile!: () => void
+      internalClient.request = vi.fn(async (req: { url: string }) => {
+        if (req.url === '/open-apis/bot/v3/info/') {
+          await new Promise<void>((resolve) => {
+            releaseAbortedProfile = resolve
+          })
+        }
+        return {}
+      })
+      const startAborted = transport.start()
+      await vi.waitFor(() => expect(releaseAbortedProfile).toBeTypeOf('function'))
+      await transport.stop()
+      releaseAbortedProfile()
+      await startAborted
+      expect(wsStartSpy).not.toHaveBeenCalled()
+    } finally {
+      wsStartSpy.mockRestore()
+      wsCloseSpy.mockRestore()
+    }
   })
 })

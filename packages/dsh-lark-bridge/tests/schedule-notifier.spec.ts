@@ -574,4 +574,118 @@ describe('ScheduleNotifier, <system_reminder><schedule> injection & /api/lark-br
 
     await manager.stop()
   })
+
+  it('silences zero-width/sentinel scheduled outputs, skips interrupted/blocked turns, and resolves promoted aliasRouteKeys', async () => {
+    const dir = makeTempDir()
+    const store = new LarkBridgeStore(dir)
+    store.upsertBot({
+      id: 'dsh-bot',
+      name: 'DSH-Bot',
+      larkAppId: 'cli_123',
+      larkAppSecret: 'sec',
+      defaultWorkingDir: '~',
+    })
+    store.upsertBinding({
+      routeKey: 'cli_123:oc_team:om_initial_1',
+      aliasRouteKeys: ['cli_123:oc_team:om_promoted_root', 'cli_123:oc_team:omt_topic_1'],
+      botId: 'dsh-bot',
+      botName: 'DSH-Bot',
+      larkAppId: 'cli_123',
+      chatId: 'oc_team',
+      chatName: '研发协作群',
+      workspaceName: 'DSH-Bot',
+      sessionId: 'session-promoted',
+      agentPreset: 'codex',
+      workingDir: '/repo',
+      trigger: 'mention',
+      createdAtMs: 1000,
+      lastActivityMs: 1000,
+    })
+
+    const listeners = new Map<string, Array<(...args: unknown[]) => void>>()
+    const emit = (event: string, ...args: unknown[]) => {
+      for (const fn of listeners.get(event) ?? []) fn(...args)
+    }
+
+    const entry: ScheduleEntryLike = {
+      id: 'sched-silent-check',
+      kind: 'daily',
+      title: '巡检静默测试',
+      prompt: '无异常输出 <no_reply/>',
+      status: 'active',
+      scheduledAt: '2026-11-23T09:00:00.000Z',
+      time: '09:00:00',
+      target: { kind: 'new', create: { cwd: '/repo' } },
+      involvedSessionIds: ['session-promoted'],
+    }
+    const scheduleService: HostScheduleService = {
+      catalog: async () => [entry],
+      view: async () => entry,
+      run: async () => entry,
+    }
+    const fakeCtx = {
+      logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn() },
+      sessions: { get: () => undefined },
+      on(event: string, fn: (...args: unknown[]) => void) {
+        const list = listeners.get(event) ?? []
+        list.push(fn)
+        listeners.set(event, list)
+        return () => {}
+      },
+      get(name: string) {
+        return name === 'schedule' ? scheduleService : undefined
+      },
+    } as unknown as Context
+
+    const sendScheduleMessage = vi.fn().mockResolvedValue(undefined)
+    const archiveSession = vi.fn().mockResolvedValue(true)
+    const notifier = new ScheduleNotifier({
+      ctx: fakeCtx,
+      store,
+      workspaces: { attachSession: vi.fn().mockResolvedValue(undefined), archiveSession } as unknown as WorkspaceGrouping,
+      sendScheduleMessage,
+    })
+    notifier.start()
+
+    // 1. Inferred origin resolves promoted alias message id `om_promoted_root`
+    const views = await notifier.listViews()
+    expect(views.schedules[0]?.inferredOrigin?.replyToMessageId).toBe('om_promoted_root')
+
+    // 2. Zero-width & `<no_reply/>` replies are silently skipped and archived
+    const runWith = async (sid: string, msgId: string, text: string, endKind = 'completed') => {
+      const s = { id: sid, header: { cwd: '/repo' } } as unknown as Session
+      ;(entry as { lastDelivery?: unknown }).lastDelivery = {
+        scheduledAt: '2026-11-23T09:00:00.000Z',
+        deliveredAt: '2026-11-23T09:00:01.000Z',
+        messageId: msgId,
+        targetSessionId: sid,
+      }
+      emit('session/event', s, { type: 'turn/start', data: { turn: 1 } })
+      emit('session/event', s, { type: 'user/message', data: { id: msgId, source: { kind: 'schedule' } } })
+      emit('session/event', s, {
+        type: 'assistant/message',
+        data: { turn: 1, step: 1, message: { content: [{ type: 'text', text }] } },
+      })
+      emit('session/event', s, { type: 'turn/end', data: { turn: 1, reason: { kind: endKind } } })
+      await new Promise((r) => setTimeout(r, 20))
+    }
+
+    await runWith('sess-zwsp', 'm-zwsp', '\u200b')
+    await runWith('sess-sentinel', 'm-sentinel', '<no_reply/>')
+    // 3. Interrupted turn does not falsely notify even under notifyOn='always'
+    store.upsertScheduleBinding({
+      scheduleId: entry.id,
+      enabled: true,
+      targets: [{ botId: 'dsh-bot', chatId: 'oc_team' }],
+      deliveryMode: 'thread',
+      notifyOn: 'always',
+      sendIntermediateMessages: false,
+    })
+    await runWith('sess-interrupted', 'm-interrupted', '', 'interrupted')
+
+    expect(sendScheduleMessage).not.toHaveBeenCalled()
+    expect(archiveSession).toHaveBeenCalledWith('sess-zwsp')
+    expect(archiveSession).toHaveBeenCalledWith('sess-sentinel')
+    notifier.stop()
+  })
 })

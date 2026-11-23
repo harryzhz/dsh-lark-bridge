@@ -26,11 +26,13 @@ import {
   expandWorkingDir,
   extractPureUserIntent,
   hasInjectedPromptMarkup,
+  normalizeReplyText,
   resolveEffectiveAgentRuntime,
   resolveEffectiveCardBot,
   resolveEffectiveWorkingDir,
   resolveEffectiveWorkspaceName,
   slugifyBotId,
+  trimInvisibleText,
   type DiscoveredLarkChat,
   type GroupReplyMode,
   type InboundLarkMessage,
@@ -163,10 +165,14 @@ export class LarkBridgeManager {
   readonly sessionViewer: LarkSessionViewerService
   private readonly directoryEnricher: LarkDirectoryEnricher
   private readonly transports = new Map<string, ManagedTransport>()
+  /** Serializes concurrent `syncBot(botId)` calls so a bot never spawns duplicate WSClients. */
+  private readonly botSyncQueues = new Map<string, Promise<void>>()
   /** Live DSH agent handles keyed by `sessionId` (decoupled from route aliases). */
   private readonly handles = new Map<string, AgentHandle>()
   /** Serializes concurrent first-turn session creations for the same routeKey. */
   private readonly pendingAcquires = new Map<string, Promise<AcquiredAgent>>()
+  /** Serializes concurrent agent turns targeting the same sessionId in FIFO order. */
+  private readonly sessionTurnQueues = new Map<string, Promise<void>>()
   private readonly inFlightTurns = new Map<string, number>()
   private readonly activeTurns = new Map<string, ActiveTurnRecord>()
   private readonly shutdownController = new AbortController()
@@ -185,6 +191,7 @@ export class LarkBridgeManager {
     private readonly config: LarkBridgeConfig,
     readonly store: LarkBridgeStore,
   ) {
+    this.dedup.hydrate(store.listSeenMessages?.() ?? [])
     this.runtimes = new RuntimeCatalog(ctx)
     this.workspaces = new WorkspaceGrouping(ctx, store)
     this.platform = new LarkPlatformManager(config.dataDir)
@@ -289,6 +296,7 @@ export class LarkBridgeManager {
     this.transports.clear()
     await Promise.all([...this.handles.values()].map((h) => h.dispose().catch(() => {})))
     this.handles.clear()
+    this.store.flushSeenMessages?.()
   }
 
   async recoverStalePendingTurns(botId?: string, nowMs = Date.now()): Promise<number> {
@@ -701,13 +709,31 @@ export class LarkBridgeManager {
     botId: string,
     options: { readonly preserveLocalDescription?: boolean } = {},
   ): Promise<void> {
+    const prev = this.botSyncQueues.get(botId) ?? Promise.resolve()
+    const run = prev
+      .catch(() => {})
+      .then(() => this.syncBotSerialized(botId, options))
+    this.botSyncQueues.set(botId, run)
+    try {
+      await run
+    } finally {
+      if (this.botSyncQueues.get(botId) === run) {
+        this.botSyncQueues.delete(botId)
+      }
+    }
+  }
+
+  private async syncBotSerialized(
+    botId: string,
+    options: { readonly preserveLocalDescription?: boolean } = {},
+  ): Promise<void> {
     const existing = this.transports.get(botId)
     if (existing) {
-      await existing.transport.stop().catch(() => {})
       this.transports.delete(botId)
+      await existing.transport.stop().catch(() => {})
     }
     const bot = this.store.getBot(botId)
-    if (!bot) return
+    if (!bot || this.disposed) return
     await this.workspaces.syncBot(bot)
     await this.workspaces.reconcileBindings()
     if (bot.enabled && !this.disposed) {
@@ -1078,7 +1104,7 @@ export class LarkBridgeManager {
       })
     }
 
-    let markdown = (input.text ?? '').trim()
+    let markdown = trimInvisibleText(input.text ?? '')
     if (input.mentions && input.mentions.length > 0) {
       const mentionPrefix = input.mentions
         .filter((m) => m.openId.trim())
@@ -1301,12 +1327,21 @@ export class LarkBridgeManager {
   }
 
   private async archiveManagedSession(sessionId: string): Promise<boolean> {
+    await this.reminders.disposeSessionHandle(sessionId).catch(() => {})
     const archived = await this.workspaces.archiveSession(sessionId)
     this.store.markSessionArchived(sessionId)
     return archived
   }
 
   private async startBot(bot: LarkBotConfig): Promise<void> {
+    if (this.disposed) return
+    const prev = this.transports.get(bot.id)
+    if (prev) {
+      this.transports.delete(bot.id)
+      await prev.transport.stop().catch(() => {})
+    }
+    if (this.disposed) return
+
     const transport: LarkBotTransport = new LarkBotTransport(bot, {
       onMessage: (msg) => this.handleInbound(bot.id, transport, msg),
       onCardAction: async (action) => {
@@ -1314,6 +1349,9 @@ export class LarkBridgeManager {
           ...(action.operatorOpenId ? { operatorOpenId: action.operatorOpenId } : {}),
         })
         return toast ? { toast } : undefined
+      },
+      onChatMembershipChange: () => {
+        void this.syncJoinedChats(bot.id)
       },
       onBotProfile: (profile) => {
         this.hydratedProfileBots.add(bot.id)
@@ -1327,7 +1365,19 @@ export class LarkBridgeManager {
         ),
     })
     this.transports.set(bot.id, { config: bot, transport })
-    await transport.start()
+    try {
+      await transport.start()
+    } catch (err) {
+      if (this.transports.get(bot.id)?.transport === transport) {
+        this.transports.delete(bot.id)
+      }
+      await transport.stop().catch(() => {})
+      throw err
+    }
+    if (this.disposed || this.transports.get(bot.id)?.transport !== transport) {
+      await transport.stop().catch(() => {})
+      return
+    }
     this.store.recordEvent({
       botId: bot.id,
       kind: 'lifecycle',
@@ -1347,8 +1397,13 @@ export class LarkBridgeManager {
     transport: LarkBotTransport,
     msg: InboundLarkMessage,
   ): Promise<void> {
+    if (this.disposed) return
+    const managed = this.transports.get(botId)
+    if (managed && managed.transport !== transport) return
     const bot = this.store.getBot(botId)
-    if (!bot || !this.dedup.claim(`${bot.larkAppId}:${msg.messageId}`)) return
+    if (!bot) return
+    const dedupKey = `${bot.larkAppId}:${msg.messageId}`
+    if (!this.dedup.claim(dedupKey)) return
 
     const groupConfig = msg.chatType === 'group' ? this.store.getGroup(bot.id, msg.chatId) : undefined
     const knownChatName =
@@ -1393,6 +1448,7 @@ export class LarkBridgeManager {
       })
 
     if (decision.action === 'command') {
+      this.store.rememberSeenMessage?.(dedupKey)
       this.store.recordEvent({
         botId: bot.id,
         chatId: msg.chatId,
@@ -1429,7 +1485,48 @@ export class LarkBridgeManager {
       return
     }
 
+    this.store.rememberSeenMessage?.(dedupKey)
     await this.runAgentTurn(bot, transport, msg, decision, groupConfig)
+  }
+
+  private async acquireSessionTurnSlot(
+    sessionId: string,
+    activeTurn: ActiveTurnRecord,
+  ): Promise<(() => void) | undefined> {
+    const prev = this.sessionTurnQueues.get(sessionId) ?? Promise.resolve()
+    let release!: () => void
+    const next = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const tail = prev.then(() => next)
+    this.sessionTurnQueues.set(sessionId, tail)
+
+    const releaseOnce = () => {
+      release()
+      if (this.sessionTurnQueues.get(sessionId) === tail) {
+        this.sessionTurnQueues.delete(sessionId)
+      }
+    }
+
+    let onAbort: (() => void) | undefined
+    const aborted = new Promise<'aborted'>((resolve) => {
+      if (this.shutdownController.signal.aborted || this.disposed || activeTurn.settled) {
+        resolve('aborted')
+        return
+      }
+      onAbort = () => resolve('aborted')
+      this.shutdownController.signal.addEventListener('abort', onAbort, { once: true })
+    })
+
+    const outcome = await Promise.race([prev.then(() => 'ready' as const), aborted])
+    if (onAbort) {
+      this.shutdownController.signal.removeEventListener('abort', onAbort)
+    }
+    if (outcome === 'aborted' || this.disposed || activeTurn.settled) {
+      releaseOnce()
+      return undefined
+    }
+    return releaseOnce
   }
 
   private async runAgentTurn(
@@ -1468,14 +1565,29 @@ export class LarkBridgeManager {
       transport,
     })
     let trackedSessionId: string | undefined
+    let acquiredRef: AcquiredAgent | undefined
+    let releaseTurnSlot: (() => void) | undefined
+    let shouldDisposeEphemeral = false
+    let shouldArchiveEphemeral = false
 
     try {
       const acquired = await this.acquireAgent(bot, msg, decision)
+      acquiredRef = acquired
       trackedSessionId = acquired.sessionId
       activeTurn.sessionId = trackedSessionId
       this.persistActiveTurn(activeTurn)
       this.inFlightTurns.set(trackedSessionId, (this.inFlightTurns.get(trackedSessionId) ?? 0) + 1)
-      if (activeTurn.settled || this.disposed) return
+      if (activeTurn.settled || this.disposed) {
+        shouldDisposeEphemeral = acquired.disposeAfter
+        return
+      }
+
+      releaseTurnSlot = await this.acquireSessionTurnSlot(trackedSessionId, activeTurn)
+      if (!releaseTurnSlot) {
+        shouldDisposeEphemeral = acquired.disposeAfter
+        return
+      }
+
       this.ensureCleanSessionTitle(acquired.agent.session, msg, decision, acquired.isNew)
 
       this.store.recordEvent({
@@ -1496,20 +1608,28 @@ export class LarkBridgeManager {
         acquired.isNew,
         resolvedChatName,
       )
-      if (activeTurn.settled || this.disposed) return
+      if (activeTurn.settled || this.disposed) {
+        shouldDisposeEphemeral = acquired.disposeAfter
+        return
+      }
       const replyText = await runTurnAndCollectReply(this.ctx, acquired.agent, content, {
         signal: this.shutdownController.signal,
         ...(decision.sendIntermediateMessages
           ? {
               onIntermediate: async (stepText) => {
-                await this.deliverIntermediateReply(bot, transport, msg, decision, stepText)
-                activeTurn.intermediateSentCount += 1
-                this.store.markBindingReplied(decision.routeKey)
+                const sent = await this.deliverIntermediateReply(bot, transport, msg, decision, stepText)
+                if (sent) {
+                  activeTurn.intermediateSentCount += 1
+                  this.store.markBindingReplied(decision.routeKey)
+                }
               },
             }
           : {}),
       })
-      if (!this.claimActiveTurn(activeTurn)) return
+      if (!this.claimActiveTurn(activeTurn)) {
+        shouldDisposeEphemeral = acquired.disposeAfter
+        return
+      }
 
       const intermediateSentCount = activeTurn.intermediateSentCount
       const latencyMs = Date.now() - startedMs
@@ -1517,7 +1637,10 @@ export class LarkBridgeManager {
       this.store.touchManagedSession(acquired.sessionId)
       this.ensureCleanSessionTitle(acquired.agent.session, msg, decision, false)
 
-      const hasFinalText = replyText.trim().length > 0
+      const normalizedReply = normalizeReplyText(replyText, {
+        allowSilentSentinel: decision.allowSilentEmptyReply,
+      })
+      const hasFinalText = normalizedReply.length > 0
       const isSilentSkip =
         decision.allowSilentEmptyReply && !hasFinalText && intermediateSentCount === 0
       if (isSilentSkip) {
@@ -1533,7 +1656,15 @@ export class LarkBridgeManager {
         })
       } else {
         if (hasFinalText || intermediateSentCount === 0) {
-          await this.deliverReply(bot, transport, msg, decision, acquired.sessionId, replyText, groupConfig)
+          await this.deliverReply(
+            bot,
+            transport,
+            msg,
+            decision,
+            acquired.sessionId,
+            normalizedReply,
+            groupConfig,
+          )
         }
         this.store.markBindingReplied(decision.routeKey)
         this.store.recordMetric({ botId: bot.id, chatId: msg.chatId, ...chatName, kind: 'replied', latencyMs })
@@ -1546,32 +1677,31 @@ export class LarkBridgeManager {
           kind: 'reply',
           summary:
             intermediateSentCount > 0
-              ? `已发送 ${intermediateSentCount} 条过程消息${hasFinalText ? ` + 最终回复 ${replyText.trim().length} 字` : ''}`
-              : `已回复 ${replyText.trim().length} 字`,
+              ? `已发送 ${intermediateSentCount} 条过程消息${hasFinalText ? ` + 最终回复 ${normalizedReply.length} 字` : ''}`
+              : `已回复 ${normalizedReply.length} 字`,
         })
       }
 
-      const otherTurnsInFlight = (this.inFlightTurns.get(acquired.sessionId) ?? 1) > 1
       const currentBinding = this.store.getBinding(decision.routeKey)
       const isNeverRepliedListener =
         isSilentSkip &&
         decision.trigger === 'listener' &&
         (acquired.isNew || currentBinding?.hasReplied === false)
-      if (
-        !otherTurnsInFlight &&
-        (acquired.disposeAfter || decision.autoCloseAfterCompletion || isNeverRepliedListener)
-      ) {
-        const handle = this.handles.get(acquired.sessionId)
-        this.handles.delete(acquired.sessionId)
-        this.store.deleteBinding(decision.routeKey)
-        if (handle) {
-          await handle.dispose().catch(() => {})
-        }
-        if (isSilentSkip && (acquired.isNew || isNeverRepliedListener)) {
-          await this.archiveManagedSession(acquired.sessionId)
-        }
+      if (acquired.disposeAfter || decision.autoCloseAfterCompletion || isNeverRepliedListener) {
+        shouldDisposeEphemeral = true
+        shouldArchiveEphemeral = isSilentSkip && (acquired.isNew || isNeverRepliedListener)
       }
     } catch (err) {
+      if (acquiredRef) {
+        const currentBinding = this.store.getBinding(decision.routeKey)
+        const isSilentFailedListener =
+          !this.shouldNotifyInterruptedTurn(activeTurn, activeTurn.intermediateSentCount) &&
+          (acquiredRef.isNew || currentBinding?.hasReplied === false)
+        if (acquiredRef.disposeAfter || isSilentFailedListener) {
+          shouldDisposeEphemeral = true
+          shouldArchiveEphemeral = isSilentFailedListener
+        }
+      }
       if (!this.claimActiveTurn(activeTurn)) return
       const errorMsg = err instanceof Error ? err.message : String(err)
       this.ctx.logger.error(`[lark-bridge] turn handling failed: ${errorMsg}`)
@@ -1595,24 +1725,42 @@ export class LarkBridgeManager {
           kind: 'error',
           summary: errorMsg,
         })
-        await transport
-          .sendReply({
-            chatId: msg.chatId,
-            replyToMessageId: msg.messageId,
-            replyMode: decision.replyMode,
-            text: `执行异常：${errorMsg}`,
-          })
-          .catch(() => {})
+        if (this.shouldNotifyInterruptedTurn(activeTurn, activeTurn.intermediateSentCount)) {
+          await transport
+            .sendReply({
+              chatId: msg.chatId,
+              replyToMessageId: msg.messageId,
+              replyMode: decision.replyMode,
+              text: `执行异常：${errorMsg}`,
+            })
+            .catch(() => {})
+        }
       }
     } finally {
+      let otherTurnsInFlight = false
       if (trackedSessionId) {
         const nextCount = (this.inFlightTurns.get(trackedSessionId) ?? 1) - 1
         if (nextCount <= 0) {
           this.inFlightTurns.delete(trackedSessionId)
         } else {
           this.inFlightTurns.set(trackedSessionId, nextCount)
+          otherTurnsInFlight = true
         }
       }
+      if (trackedSessionId && !otherTurnsInFlight && shouldDisposeEphemeral) {
+        const handle = this.handles.get(trackedSessionId)
+        this.handles.delete(trackedSessionId)
+        if (this.store.getBinding(decision.routeKey)?.sessionId === trackedSessionId) {
+          this.store.deleteBinding(decision.routeKey)
+        }
+        if (handle) {
+          await handle.dispose().catch(() => {})
+        }
+        if (shouldArchiveEphemeral) {
+          await this.archiveManagedSession(trackedSessionId).catch(() => {})
+        }
+      }
+      releaseTurnSlot?.()
       if (!activeTurn.reactionRemoved && reactionId) {
         activeTurn.reactionRemoved = true
         await transport.removeReaction(msg.messageId, reactionId)
@@ -1630,7 +1778,11 @@ export class LarkBridgeManager {
   ): Promise<ContentBlock[]> {
     const reminders: string[] = []
     let senderName: string | undefined
-    if (msg.senderOpenId && typeof transport.resolveUserSummary === 'function') {
+    if (
+      msg.senderType === 'user' &&
+      msg.senderOpenId &&
+      typeof transport.resolveUserSummary === 'function'
+    ) {
       const summary = await transport.resolveUserSummary(msg.senderOpenId).catch(() => undefined)
       if (summary?.name && summary.name !== msg.senderOpenId) {
         senderName = summary.name
@@ -1725,9 +1877,11 @@ export class LarkBridgeManager {
     msg: InboundLarkMessage,
     decision: AgentDecision,
     stepText: string,
-  ): Promise<void> {
-    const text = stepText.trim()
-    if (!text) return
+  ): Promise<boolean> {
+    const text = normalizeReplyText(stepText, {
+      allowSilentSentinel: decision.allowSilentEmptyReply,
+    })
+    if (!text) return false
     const card = decision.useCard
       ? buildReplyCard({
           markdown: text,
@@ -1741,6 +1895,7 @@ export class LarkBridgeManager {
       ...(card ? { card } : { text }),
     })
     this.syncReplyRouteAliases(bot, msg, decision, sent)
+    return true
   }
 
   private async deliverReply(
@@ -1752,7 +1907,7 @@ export class LarkBridgeManager {
     replyText: string,
     groupConfig?: LarkGroupConfig,
   ): Promise<void> {
-    const text = replyText.trim() || '（已完成，无文本输出）'
+    const text = normalizeReplyText(replyText) || '（已完成，无文本输出）'
     const cardBot = resolveEffectiveCardBot(bot, msg.chatType === 'group' ? groupConfig : undefined)
     const modelLabel =
       decision.useCard && cardBot.replyFooterEnabled && cardBot.replyFooterModel

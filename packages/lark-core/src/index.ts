@@ -8,7 +8,14 @@ export {
   type ReplyCardImage,
   type ReplyCardOptions,
 } from './cards.js'
-export { MessageDeduplicator } from './dedup.js'
+export { MessageDeduplicator, type SeenMessageEntry } from './dedup.js'
+export {
+  SILENT_REPLY_SENTINEL,
+  hasVisibleText,
+  normalizeReplyText,
+  trimInvisibleText,
+  type NormalizeReplyTextOptions,
+} from './reply-text.js'
 export {
   LarkBotTransport,
   type CardActionEvent,
