@@ -17,14 +17,23 @@ export {
   type NormalizeReplyTextOptions,
 } from './reply-text.js'
 export {
+  createLarkSdkLogger,
+  explainLarkErrorCode,
+  formatSdkLogArgs,
+  type LarkSdkErrorRecord,
+  type LarkSdkLoggerAdapter,
+} from './lark-logger.js'
+export {
   LarkBotTransport,
   type CardActionEvent,
+  type ExternalSelfMessageEvent,
   type LarkBotProfile,
   type LarkTransportCallbacks,
   type ListChatMembersOptions,
   type SendLarkProactiveOptions,
   type SendLarkReplyOptions,
   type SendLarkReplyResult,
+  type TransportDiagnosticsSnapshot,
 } from './lark-transport.js'
 export {
   buildLarkPostPayload,

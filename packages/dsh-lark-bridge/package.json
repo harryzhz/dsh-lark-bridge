@@ -9,6 +9,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./db-cli": {
+      "types": "./dist/storage/db-cli.d.ts",
+      "import": "./dist/storage/db-cli.js"
     }
   },
   "dependencies": {

@@ -1,6 +1,7 @@
 import { extname } from 'node:path'
 import { Readable } from 'node:stream'
 import * as lark from '@larksuiteoapi/node-sdk'
+import { createLarkSdkLogger, type LarkSdkErrorRecord } from './lark-logger.js'
 import { buildLarkPostPayload } from './markdown.js'
 import { parseLarkMessageContent } from './message-parser.js'
 import { hasVisibleText } from './reply-text.js'
@@ -45,12 +46,30 @@ export interface ListChatMembersOptions {
   }) => Promise<string | undefined> | string | undefined
 }
 
+export interface ExternalSelfMessageEvent {
+  readonly botId: string
+  readonly larkAppId: string
+  readonly botOpenId: string
+  readonly chatId: string
+  readonly messageId: string
+  readonly createTimeMs: number
+}
+
+export interface TransportDiagnosticsSnapshot {
+  readonly ackP50Ms: number
+  readonly ackP95Ms: number
+  readonly ackSamples: number
+  readonly sentCacheSize: number
+  readonly sdkErrors: readonly LarkSdkErrorRecord[]
+}
+
 export interface LarkTransportCallbacks {
   readonly onMessage: (message: InboundLarkMessage) => Promise<void> | void
   readonly onCardAction?: (
     action: CardActionEvent,
   ) => Promise<{ toast?: string } | void> | { toast?: string } | void
   readonly onChatMembershipChange?: () => Promise<void> | void
+  readonly onExternalSelfMessage?: (event: ExternalSelfMessageEvent) => void
   readonly onStatusChange?: () => void
   readonly onBotProfile?: (profile: LarkBotProfile) => void
   readonly logger?: (level: 'info' | 'warn' | 'error', message: string) => void
@@ -154,6 +173,10 @@ interface CachedUserDetail {
 
 const USER_DETAIL_TTL_MS = 30 * 60_000
 const CONTACT_DENIED_TTL_MS = 5 * 60_000
+const SENT_MESSAGE_TTL_MS = 10 * 60_000
+const MAX_SENT_MESSAGE_CACHE = 500
+const MAX_ACK_SAMPLES = 100
+const SPLIT_BRAIN_STARTUP_GRACE_MS = 5_000
 
 async function searchDirectoryWithUserToken(
   query: string,
@@ -219,6 +242,7 @@ function pickDirectoryMatch(
 
 export class LarkBotTransport {
   private readonly client: lark.Client
+  private readonly sdkLogger: ReturnType<typeof createLarkSdkLogger>
   private wsClient?: lark.WSClient
   private startPromise?: Promise<void>
   private lifecycleEpoch = 0
@@ -233,15 +257,26 @@ export class LarkBotTransport {
   private readonly userCache = new Map<string, CachedUserDetail>()
   private readonly contactDeniedUntilMs = new Map<string, number>()
   private readonly observedChatBots = new Map<string, Map<string, string>>()
+  private readonly sentMessageIds = new Map<string, number>()
+  private readonly ackLatenciesMs: number[] = []
+  private readonly sdkErrors = new Map<string, { code: string; count: number; lastAtMs: number; hint?: string }>()
 
   constructor(
     private readonly bot: LarkBotConfig,
     private readonly callbacks: LarkTransportCallbacks,
   ) {
+    this.sdkLogger = createLarkSdkLogger({
+      botId: bot.id,
+      botName: bot.name,
+      emit: (level, message) => this.log(level, message),
+      onErrorCode: (code, hint) => this.recordSdkErrorCode(code, hint),
+    })
     this.client = new lark.Client({
       appId: bot.larkAppId,
       appSecret: bot.larkAppSecret,
       disableTokenCache: false,
+      loggerLevel: lark.LoggerLevel.warn,
+      logger: this.sdkLogger,
     })
     if (bot.avatarUrl) {
       this.botAvatarUrl = bot.avatarUrl
@@ -249,6 +284,72 @@ export class LarkBotTransport {
     if (bot.description) {
       this.botDescription = bot.description
     }
+  }
+
+  getDiagnosticsSnapshot(): TransportDiagnosticsSnapshot {
+    const sorted = [...this.ackLatenciesMs].sort((a, b) => a - b)
+    const p50 =
+      sorted.length > 0
+        ? Math.round((sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.5))] ?? 0) * 100) / 100
+        : 0
+    const p95 =
+      sorted.length > 0
+        ? Math.round((sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))] ?? 0) * 100) / 100
+        : 0
+    return {
+      ackP50Ms: p50,
+      ackP95Ms: p95,
+      ackSamples: sorted.length,
+      sentCacheSize: this.sentMessageIds.size,
+      sdkErrors: [...this.sdkErrors.values()].sort((a, b) => b.lastAtMs - a.lastAtMs),
+    }
+  }
+
+  wasSentByThisInstance(messageId: string, now = Date.now()): boolean {
+    if (!messageId) return false
+    this.pruneSentMessageIds(now)
+    const ts = this.sentMessageIds.get(messageId)
+    return ts !== undefined && now - ts < SENT_MESSAGE_TTL_MS
+  }
+
+  private recordSentMessageId(messageId?: string, now = Date.now()): void {
+    if (!messageId) return
+    this.sentMessageIds.delete(messageId)
+    this.sentMessageIds.set(messageId, now)
+    this.pruneSentMessageIds(now)
+  }
+
+  private pruneSentMessageIds(now: number): void {
+    for (const [id, ts] of this.sentMessageIds) {
+      if (now - ts >= SENT_MESSAGE_TTL_MS) {
+        this.sentMessageIds.delete(id)
+      } else {
+        break
+      }
+    }
+    while (this.sentMessageIds.size > MAX_SENT_MESSAGE_CACHE) {
+      const oldest = this.sentMessageIds.keys().next().value
+      if (oldest === undefined) break
+      this.sentMessageIds.delete(oldest)
+    }
+  }
+
+  private recordAckLatency(durationMs: number): void {
+    if (!Number.isFinite(durationMs) || durationMs < 0) return
+    this.ackLatenciesMs.push(durationMs)
+    if (this.ackLatenciesMs.length > MAX_ACK_SAMPLES) {
+      this.ackLatenciesMs.splice(0, this.ackLatenciesMs.length - MAX_ACK_SAMPLES)
+    }
+  }
+
+  private recordSdkErrorCode(code: string, hint?: string): void {
+    const prev = this.sdkErrors.get(code)
+    this.sdkErrors.set(code, {
+      code,
+      count: (prev?.count ?? 0) + 1,
+      lastAtMs: Date.now(),
+      ...(hint ? { hint } : prev?.hint ? { hint: prev.hint } : {}),
+    })
   }
 
   get state() {
@@ -296,21 +397,41 @@ export class LarkBotTransport {
 
     if (epoch !== this.lifecycleEpoch) return
 
-    const dispatcher = new lark.EventDispatcher({}).register({
+    const dispatcher = new lark.EventDispatcher({
+      loggerLevel: lark.LoggerLevel.warn,
+      logger: this.sdkLogger,
+    }).register({
       'im.message.receive_v1': (data: unknown) => {
         if (epoch !== this.lifecycleEpoch) return
+        const t0 = performance.now()
         this.lastEventAtMs = Date.now()
         try {
           const parsed = this.normalizeReceiveEvent(data)
           if (!parsed) return
-          if (parsed.senderType === 'bot' && parsed.senderOpenId && parsed.senderOpenId !== this.botOpenId) {
-            let botsInChat = this.observedChatBots.get(parsed.chatId)
-            if (!botsInChat) {
-              botsInChat = new Map()
-              this.observedChatBots.set(parsed.chatId, botsInChat)
-            }
-            if (!botsInChat.has(parsed.senderOpenId)) {
-              botsInChat.set(parsed.senderOpenId, parsed.senderOpenId)
+          if (parsed.senderType === 'bot' && parsed.senderOpenId) {
+            if (this.botOpenId && parsed.senderOpenId === this.botOpenId) {
+              const afterGrace =
+                !this.startedAtMs ||
+                parsed.createTimeMs >= this.startedAtMs + SPLIT_BRAIN_STARTUP_GRACE_MS
+              if (afterGrace && !this.wasSentByThisInstance(parsed.messageId)) {
+                this.callbacks.onExternalSelfMessage?.({
+                  botId: this.bot.id,
+                  larkAppId: this.bot.larkAppId,
+                  botOpenId: this.botOpenId,
+                  chatId: parsed.chatId,
+                  messageId: parsed.messageId,
+                  createTimeMs: parsed.createTimeMs,
+                })
+              }
+            } else if (parsed.senderOpenId !== this.botOpenId) {
+              let botsInChat = this.observedChatBots.get(parsed.chatId)
+              if (!botsInChat) {
+                botsInChat = new Map()
+                this.observedChatBots.set(parsed.chatId, botsInChat)
+              }
+              if (!botsInChat.has(parsed.senderOpenId)) {
+                botsInChat.set(parsed.senderOpenId, parsed.senderOpenId)
+              }
             }
           }
           // Return immediately so WSClient ACKs Feishu well within the 3-second deadline
@@ -324,6 +445,8 @@ export class LarkBotTransport {
         } catch (err) {
           this.lastError = err instanceof Error ? err.message : String(err)
           this.log('error', `im.message.receive_v1 normalize failed: ${this.lastError}`)
+        } finally {
+          this.recordAckLatency(performance.now() - t0)
         }
       },
       'card.action.trigger': async (data: unknown) => {
@@ -362,6 +485,7 @@ export class LarkBotTransport {
       appId: this.bot.larkAppId,
       appSecret: this.bot.larkAppSecret,
       loggerLevel: lark.LoggerLevel.warn,
+      logger: this.sdkLogger,
     })
     if (epoch !== this.lifecycleEpoch) {
       try {
@@ -587,6 +711,7 @@ export class LarkBotTransport {
         },
       })
       const data = (res as { data?: { message_id?: string; root_id?: string; thread_id?: string } })?.data
+      this.recordSentMessageId(data?.message_id)
       return {
         messageId: data?.message_id,
         rootId: data?.root_id,
@@ -605,6 +730,7 @@ export class LarkBotTransport {
       },
     })
     const data = (res as { data?: { message_id?: string; root_id?: string; thread_id?: string } })?.data
+    this.recordSentMessageId(data?.message_id)
     return {
       messageId: data?.message_id,
       rootId: data?.root_id,
@@ -636,6 +762,7 @@ export class LarkBotTransport {
         },
       })
       const data = (res as { data?: { message_id?: string; root_id?: string; thread_id?: string } })?.data
+      this.recordSentMessageId(data?.message_id)
       return {
         messageId: data?.message_id,
         rootId: data?.root_id,
@@ -652,6 +779,7 @@ export class LarkBotTransport {
       },
     })
     const data = (res as { data?: { message_id?: string; root_id?: string; thread_id?: string } })?.data
+    this.recordSentMessageId(data?.message_id)
     return {
       messageId: data?.message_id,
       rootId: data?.root_id,

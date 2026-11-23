@@ -39,7 +39,7 @@ export const Config: z<Partial<LarkBridgeConfig>, LarkBridgeConfig> = z.object({
   dataDir: z.string().default(''),
   publicBaseUrl: z.string().default(''),
   idleSweepIntervalMs: z.number().min(0).default(5 * 60_000),
-  maxAuditEvents: z.number().min(20).max(2000).default(200),
+  maxAuditEvents: z.number().min(20).max(10_000).default(2000),
   autoInstallCliAndSkill: z.boolean().default(true),
 }) as z<Partial<LarkBridgeConfig>, LarkBridgeConfig>
 
@@ -53,7 +53,16 @@ export async function apply(ctx: Context, rawConfig: LarkBridgeConfig): Promise<
   const store = new LarkBridgeStore(config.dataDir, config.maxAuditEvents)
   const manager = new LarkBridgeManager(ctx, config, store)
 
-  ctx.effect(() => () => manager.stop(), 'dsh-lark-bridge.lifecycle')
+  ctx.effect(
+    () => async () => {
+      try {
+        await manager.stop()
+      } finally {
+        store.close()
+      }
+    },
+    'dsh-lark-bridge.lifecycle',
+  )
 
   // 1. Register carrier-independent `/api/lark-bridge-rpc` exact Fetch route on DSH Connection
   //    so both DSH Web and DSH Electron Desktop UI (`file://` + `__DSH_TRANSPORT__`) communicate
@@ -99,7 +108,27 @@ export async function apply(ctx: Context, rawConfig: LarkBridgeConfig): Promise<
   await manager.start()
 }
 
-export { LarkBridgeManager } from './bridge-manager.js'
+export { LarkBridgeManager, type AgentCliSendInput } from './bridge-manager.js'
+export { AgentToolFacade, type AgentToolFacadeHost } from './agent-tool-facade.js'
+export {
+  BotConnectionPool,
+  type BotConnectionPoolHost,
+  type ManagedTransport,
+} from './bot-connection-pool.js'
+export {
+  InboundPipeline,
+  type ActiveTurnRecord,
+  type InboundPipelineHost,
+} from './inbound-pipeline.js'
+export {
+  SessionActor,
+  SessionCoordinator,
+  type AcquiredAgent,
+  type AgentDecision,
+  type SessionActorState,
+  type SessionCoordinatorHost,
+} from './session-coordinator.js'
+export { SessionTitleGuard } from './session-title-guard.js'
 export {
   buildCliWrapperContent,
   ensureCliAuthEndpoint,
@@ -176,7 +205,46 @@ export {
   type LarkViewerPrincipal,
   type ViewerCarrierScriptOptions,
 } from './session-viewer.js'
+export {
+  buildBridgeDiagnostics,
+  buildDiagnosticAlerts,
+  isNodeVersionSqliteReady,
+  runOfflineDoctor,
+  type BotDiagnosticItem,
+  type BridgeDiagnosticsPayload,
+  type OfflineDoctorReport,
+} from './diagnostics.js'
+export {
+  INSTANCE_LOCK_FILENAME,
+  InstanceLock,
+  InstanceLockConflictError,
+  type CoordinationBackend,
+  type InstanceLockPayload,
+  type InstanceLockStatus,
+} from './instance-lock.js'
+export { SplitBrainDetector, type SplitBrainAlert } from './split-brain-detector.js'
 export { LarkBridgeStore } from './store.js'
+export {
+  BridgeDatabase,
+  CONFIG_SNAPSHOT_FILENAME,
+  DB_FILENAME,
+  LEGACY_STATE_FILENAME,
+  type AppliedMigrationRecord,
+  type IntegrityCheckResult,
+  type StorageStats,
+} from './storage/database.js'
+export {
+  exportDbToV3Json,
+  migrateLegacyJsonToSqlite,
+  parseLegacyStatePayload,
+  rollbackDbFromJson,
+  verifyDbAgainstJson,
+  type CrossVerifyReport,
+  type MigrationVerificationReport,
+  type PersistedStateV3,
+  type RollbackResult,
+} from './storage/legacy-migrator.js'
+export { runDbCliCommand, inspectInstanceLockFile, type ActiveLockSummary, type DbCliResult } from './storage/db-cli.js'
 export {
   TurnAbortedError,
   TurnFinalReplyTracker,

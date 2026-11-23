@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
+import { resolveDataDir, runDbCliCommand, runOfflineDoctor } from '@dsh-lark/dsh-lark-bridge/db-cli'
 
 const HELP = `lark-bridge — DSH 飞书桥接辅助 CLI（零密钥暴露，自动感知当前会话上下文）
 
@@ -13,6 +14,7 @@ const HELP = `lark-bridge — DSH 飞书桥接辅助 CLI（零密钥暴露，自
   lark-bridge members [--bot <botId>] [--chat <chatId>] [--query <关键词>]
   lark-bridge users search <query> [--bot <botId>]
   lark-bridge send [text] [选项]
+  lark-bridge silence [--reason <原因>] [--session <id>]
   lark-bridge history [--bot <botId>] [--chat <chatId>] [--thread <rootOrThreadId|none>] [--limit <n>]
   lark-bridge message <messageId> [--bot <botId>] [--download-dir <dir>] [--no-download] [--raw]
   lark-bridge reminder list [--status active|archived|all]
@@ -26,6 +28,14 @@ const HELP = `lark-bridge — DSH 飞书桥接辅助 CLI（零密钥暴露，自
   lark-bridge schedule create --title <标题> (--prompt <文本> | --prompt-file <路径>) (--cron <表达式> | --daily <HH:MM> | --weekly <1,2..@HH:MM> | --every <秒> | --after <秒>) [--tz Asia/Shanghai] [--bot <botId> --chat <chatId>] [--mode chat|thread] [--notify non_empty|always|error_only] [--cwd <目录>] [--preset <id>]
   lark-bridge schedule bind <scheduleId> --bot <botId> --chat <chatId> [--mode chat|thread] [--notify non_empty|always|error_only]
   lark-bridge schedule run <scheduleId>
+  lark-bridge db status [--data-dir <目录>]
+  lark-bridge db migrate [--data-dir <目录>] [--from <state.json>] [--dry-run] [--force]
+  lark-bridge db verify [--data-dir <目录>] [--against <backup.json>]
+  lark-bridge db backup [--data-dir <目录>] [--out <输出路径>]
+  lark-bridge db export [--data-dir <目录>] [--out <输出路径>] [--redact]
+  lark-bridge db rollback --from <backup.json> [--to-json] [--data-dir <目录>] [--force]
+  lark-bridge db compact [--data-dir <目录>] [--force]
+  lark-bridge doctor [--data-dir <目录>] [--json]
 
 send 选项:
   --bot <botId>             指定发送智能体（默认使用当前会话绑定的智能体）
@@ -46,7 +56,20 @@ send 选项:
 `
 
 const MULTI_FLAGS = new Set(['image', 'file', 'mention'])
-const BOOL_FLAGS = new Set(['help', 'h', 'thread', 'top-level', 'text-only', 'no-download', 'raw'])
+const BOOL_FLAGS = new Set([
+  'help',
+  'h',
+  'thread',
+  'top-level',
+  'text-only',
+  'no-download',
+  'raw',
+  'dry-run',
+  'force',
+  'redact',
+  'to-json',
+  'json',
+])
 
 function parseCliArgs(argv) {
   const positionals = []
@@ -459,6 +482,39 @@ async function main() {
     return
   }
 
+  if (cmd === 'db') {
+    const sub = positionals[1] ?? 'status'
+    const result = runDbCliCommand(sub, flags)
+    printJson(result)
+    if (!result.ok) {
+      process.exitCode = 1
+    }
+    return
+  }
+
+  if (cmd === 'doctor') {
+    const dataDir = resolveDataDir(typeof flags['data-dir'] === 'string' ? flags['data-dir'] : undefined)
+    const offline = runOfflineDoctor(dataDir)
+    let live = null
+    let liveError = null
+    try {
+      const endpoint = loadEndpointConfig()
+      live = await apiRequest(endpoint, 'GET', '/diagnostics')
+    } catch (err) {
+      liveError = err instanceof Error ? err.message : String(err)
+    }
+    const overallOk = offline.ok && (live ? Boolean(live.ok) : true)
+    printJson({
+      ok: overallOk,
+      offline,
+      ...(live ? { live } : { liveUnavailableReason: liveError }),
+    })
+    if (!overallOk) {
+      process.exitCode = 1
+    }
+    return
+  }
+
   const endpoint = loadEndpointConfig()
   const sessionId = String(flags.session || process.env.DSH_SESSION_ID || '').trim() || undefined
   const qSession = sessionId ? `sessionId=${encodeURIComponent(sessionId)}` : ''
@@ -548,6 +604,17 @@ async function main() {
       `/bots/${encodeURIComponent(botId)}/users/search?q=${encodeURIComponent(query)}`,
     )
     printJson({ ok: true, botId, users: data.users })
+    return
+  }
+
+  if (cmd === 'silence') {
+    const reason = String(flags.reason ?? positionals.slice(1).join(' ')).trim() || undefined
+    printJson(
+      await apiRequest(endpoint, 'POST', '/agent/silence', {
+        ...(sessionId ? { sessionId } : {}),
+        ...(reason ? { reason } : {}),
+      }),
+    )
     return
   }
 

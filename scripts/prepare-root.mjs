@@ -4,7 +4,7 @@
  * Can run with ONLY root `devDependencies` (`esbuild`) during Git installs (`prepare`)
  * or full workspace builds (`build:bundles`).
  */
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { build } from 'esbuild'
@@ -13,6 +13,7 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const rootPackageName = JSON.parse(readFileSync(resolve(repoRoot, 'package.json'), 'utf8')).name
 const distDir = resolve(repoRoot, 'dist')
 const bridgeEntry = resolve(repoRoot, 'packages/dsh-lark-bridge/src/index.ts')
+const dbCliEntry = resolve(repoRoot, 'packages/dsh-lark-bridge/src/storage/db-cli.ts')
 const uiClientEntry = resolve(repoRoot, 'packages/dsh-lark-ui/src/client.tsx')
 const larkCoreEntry = resolve(repoRoot, 'packages/lark-core/src/index.ts')
 const cliSource = resolve(repoRoot, 'packages/dsh-bundle/bin/lark-bridge.mjs')
@@ -93,9 +94,31 @@ ${bundledCode}
 `
   writeFileSync(clientOut, wrapped, 'utf8')
 
-  // 3. Copy standalone `lark-bridge` CLI next to `dist/index.js`
+  // 3. Bundle standalone `lark-bridge` CLI next to `dist/index.js` (includes offline `db` migration engine)
   if (existsSync(cliSource)) {
-    copyFileSync(cliSource, cliOut)
+    await build({
+      entryPoints: [cliSource],
+      outfile: cliOut,
+      bundle: true,
+      format: 'esm',
+      platform: 'node',
+      target: ['node22'],
+      sourcemap: false,
+      plugins: [
+        {
+          name: 'lark-cli-source-aliases',
+          setup(buildApi) {
+            buildApi.onResolve({ filter: /^@dsh-lark\/dsh-lark-bridge\/db-cli$/ }, () => ({
+              path: dbCliEntry,
+            }))
+            buildApi.onResolve({ filter: /^@dsh-lark\/lark-core$/ }, () => ({
+              path: larkCoreEntry,
+            }))
+          },
+        },
+      ],
+      external: ['node:*', '@larksuiteoapi/node-sdk', 'qrcode-terminal'],
+    })
     if (process.platform !== 'win32') {
       chmodSync(cliOut, 0o755)
     }

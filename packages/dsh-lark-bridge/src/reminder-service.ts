@@ -142,6 +142,7 @@ export class ProactiveReminderService {
   private nextDueTimer: ReturnType<typeof setTimeout> | null = null
   private readonly runningIds = new Set<string>()
   private readonly sessionHandles = new Map<string, AgentHandle>()
+  private readonly activeReminderSessions = new Map<string, { silenced: boolean; reason?: string }>()
   private disposed = false
 
   constructor(private readonly host: ReminderServiceHost) {}
@@ -180,6 +181,17 @@ export class ProactiveReminderService {
     if (!handle) return
     this.sessionHandles.delete(sessionId)
     await handle.dispose().catch(() => {})
+  }
+
+  /**
+   * Structured control-plane silence hook (`lark-bridge silence`) for active reminder sessions.
+   */
+  markSessionSilent(sessionId: string, reason?: string): boolean {
+    const state = this.activeReminderSessions.get(sessionId)
+    if (!state) return false
+    state.silenced = true
+    if (reason?.trim()) state.reason = reason.trim()
+    return true
   }
 
   /**
@@ -645,20 +657,27 @@ export class ProactiveReminderService {
     readonly startedMs: number
   }): Promise<LarkReminderItem> {
     const { item, bot, handle, sessionId, prompt, startedMs } = input
+    const controlState: { silenced: boolean; reason?: string } = { silenced: false }
+    this.activeReminderSessions.set(sessionId, controlState)
     try {
       const replyText = await this.host.runTurn(handle.agent, [{ type: 'text', text: prompt }])
       const finishedMs = Date.now()
       const durationMs = finishedMs - startedMs
       this.host.store.touchManagedSession?.(sessionId, finishedMs)
 
-      const output = extractReminderTriggerOutput(replyText)
+      const output = controlState.silenced ? undefined : extractReminderTriggerOutput(replyText)
       if (!output) {
+        const silentReason = controlState.silenced
+          ? controlState.reason
+            ? `工具显式静默：${controlState.reason}`
+            : '工具显式静默，已归档'
+          : '无需打扰，已静默归档'
         const silentArchived = this.host.store.upsertReminder({
           ...item,
           status: 'archived',
           resolution: 'silent_ok',
           lastSessionId: sessionId,
-          resultSummary: '无需打扰，已静默归档',
+          resultSummary: silentReason,
           updatedAtMs: finishedMs,
           archivedAtMs: finishedMs,
         })
@@ -673,7 +692,7 @@ export class ProactiveReminderService {
           sessionId,
           durationMs,
           kind: 'silent_skip',
-          summary: `提醒事项「${item.title}」无需打扰，已静默归档`,
+          summary: `提醒事项「${item.title}」${silentReason}`,
         })
         return silentArchived
       }
@@ -730,6 +749,7 @@ export class ProactiveReminderService {
       })
       return failed
     } finally {
+      this.activeReminderSessions.delete(sessionId)
       this.runningIds.delete(item.id)
     }
   }

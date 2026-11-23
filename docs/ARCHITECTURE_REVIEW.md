@@ -152,9 +152,9 @@ flowchart LR
 
 ## 3. 分阶段演进路线图
 
-| 阶段 | 优先级 | 目标改造项 | 预期收益 |
+| 阶段 | 优先级 | 目标改造项 | 当前状态与实际收益 |
 | --- | --- | --- | --- |
-| **Phase 1（已完成）** | P0 | 非阻塞 <5ms ACK、24h 持久化去重、不可见字符与 `<no_reply/>` 全链路防御、同会话 FIFO 串行队列、并发 `syncBot`/`WSClient` 锁、`runtimeProfileId` 持久化 | 根治线上空白气泡、双回复、重启丢绑定、并发串台 |
-| **Phase 2（近期）** | P1 | 存储拆分（`config.json` vs `runtime` vs `telemetry`）+ 防抖合并刷盘；本机实例锁 + 跨主机同 `appId` 冲突探测告警 | 主线程同步写盘降低 >85%；彻底消除配置损坏风险与多实例脑裂盲区 |
-| **Phase 3（中期）** | P1 | 拆解 `LarkBridgeManager` 为 `BotConnectionPool` / `SessionActor` / `InboundPipeline` / `AgentToolFacade`；补齐全链路 `traceId` 与 `doctor` 自检 | 单模块 <500 行，彻底消除会话全生命周期边界竞态，排障效率提升一个量级 |
-| **Phase 4（长期）** | P2 | 推动 DSH 原生扩展点替代 `sessionTitle` Monkey-Patch；探索工具化 `skip_reply` 控制协议 | 零私有 API 耦合，跨模型静默控制准确率逼近 100% |
+| **Phase 1（已完成）** | P0 | 非阻塞 <5ms ACK、24h 持久化去重、不可见字符与 `<no_reply/>` 全链路防御、同会话 FIFO 串行队列、并发 `syncBot`/`WSClient` 锁、`runtimeProfileId` 持久化 | 已合入 `main`：根治线上空白气泡、双回复、重启丢绑定、并发串台 |
+| **Phase 2（已完成）** | P1 | 基于 `node:sqlite` WAL 的 16 表分层仓储（`storage/*`）、低频 `config.snapshot.json` 自动灾备、7 步原子自动迁移与 `lark-bridge db` 工具链；本机 PID 互斥锁（`InstanceLock`）+ 跨主机同 `appId` 脑裂探测告警（`SplitBrainDetector` + UI 横幅） | 已落地：单轮对话写入脱离 356 KB 全量 JSON 重写，主线程写入降至 <5 ms O(1)，彻底消除多实例脑裂盲区与配置误损风险 |
+| **Phase 3（已完成）** | P1 | 拆解 `LarkBridgeManager` 为 `BotConnectionPool` / `SessionCoordinator` & `SessionActor`（5 态状态机）/ `InboundPipeline` / `AgentToolFacade` / `SessionTitleGuard`；补齐全链路 `traceId`、飞书 SDK 结构化脱敏日志与错误码翻译、`/diagnostics` 与 `lark-bridge doctor`；新增结构化静默控制协议 `lark-bridge silence` | 已落地：核心门面瘦身至 ~360 行，消除空闲归档/运行竞态，支持控制面强制静默与一键诊断排障 |
+| **Phase 4（持续演进）** | P2 | 推动 DSH Host 上游提供正式 `sessionTitle` 标题预处理扩展点以彻底移除反射包装；按团队多节点需求扩展 `CoordinationBackend` 共享后端 | `SessionTitleGuard` 与 `CoordinationBackend` 隔离边界已就绪，等待上游扩展点开放后无缝替换 |
