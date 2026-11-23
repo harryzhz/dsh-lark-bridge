@@ -67,7 +67,7 @@ const SECTIONS: readonly ConfigSection<Section>[] = [
   { key: 'runtime', label: 'Agent 运行时', icon: <IconAgentPresetOutlineRegular size={16} /> },
   { key: 'conversation', label: '会话与消息', icon: <IconNewChatOutlineRegular size={16} /> },
   { key: 'role', label: '角色设定', icon: <IconPersonalizationOutlineRegular size={16} /> },
-  { key: 'access', label: '私聊与代答', icon: <IconUsersOutlineRegular size={16} /> },
+  { key: 'access', label: '权限与代答', icon: <IconUsersOutlineRegular size={16} /> },
   { key: 'experimental', label: '实验性', icon: <IconSparkleRegular size={16} /> },
 ]
 
@@ -111,9 +111,12 @@ export function newBotConfig(
     p2pSessionMode: 'chat',
     allowedUsers: [],
     allowedUserProfiles: [],
+    adminUsers: [],
+    adminUserProfiles: [],
     sendIntermediateMessages: false,
     useInteractiveCard: true,
     dshSessionLinkInCard: true,
+    sessionLinkGuestReadOnly: true,
     replyFooterEnabled: true,
     replyFooterModel: true,
     replyFooterSignature: true,
@@ -143,6 +146,9 @@ function toBotConfig(record: BotRecord): BotConfig {
   return {
     ...cloned,
     larkAppSecret: '',
+    adminUsers: cloned.adminUsers ?? [],
+    adminUserProfiles: cloned.adminUserProfiles ?? [],
+    sessionLinkGuestReadOnly: cloned.sessionLinkGuestReadOnly ?? true,
     experimental: {
       dreaming: {
         ...DEFAULT_DREAMING_CONFIG,
@@ -1027,6 +1033,20 @@ function BotConversationAndMessageSection({
           <SettingRow title="附带会话链接" desc="卡片底部提供跳转 DSH 接管会话的入口">
             <Switch label="附带会话链接" checked={draft.dshSessionLinkInCard} onChange={(dshSessionLinkInCard) => patch({ dshSessionLinkInCard })} />
           </SettingRow>
+          {draft.dshSessionLinkInCard && (
+            <NestedSettings>
+              <SettingRow
+                title="允许群成员只读查看"
+                desc="未登录 DSH 的群成员点击卡片链接可只读观看该会话，无权发消息或改配置"
+              >
+                <Switch
+                  label="允许群成员只读查看"
+                  checked={draft.sessionLinkGuestReadOnly}
+                  onChange={(sessionLinkGuestReadOnly) => patch({ sessionLinkGuestReadOnly })}
+                />
+              </SettingRow>
+            </NestedSettings>
+          )}
           <SettingRow title="显示模型信息">
             <Switch
               label="显示模型信息"
@@ -1047,13 +1067,21 @@ function BotConversationAndMessageSection({
   )
 }
 
-function resolveAllowedUsersAsTargets(draft: BotConfig): SubstituteTarget[] {
+function resolveUsersAsTargets(
+  draft: BotConfig,
+  userIds: readonly string[],
+  primaryProfiles: readonly SubstituteTarget[] | undefined,
+): SubstituteTarget[] {
   const byId = new Map<string, SubstituteTarget>()
-  for (const p of draft.allowedUserProfiles ?? []) byId.set(p.openId, p)
-  for (const t of draft.substituteMode.targets) {
-    if (!byId.has(t.openId)) byId.set(t.openId, t)
+  for (const p of primaryProfiles ?? []) byId.set(p.openId, p)
+  for (const p of [
+    ...(draft.allowedUserProfiles ?? []),
+    ...(draft.adminUserProfiles ?? []),
+    ...draft.substituteMode.targets,
+  ]) {
+    if (!byId.has(p.openId)) byId.set(p.openId, p)
   }
-  return draft.allowedUsers.map((openId) => byId.get(openId) ?? { openId, name: openId })
+  return userIds.map((openId) => byId.get(openId) ?? { openId, name: openId })
 }
 
 function AccessSection({
@@ -1072,7 +1100,8 @@ function AccessSection({
   const sub = draft.substituteMode
   const setSub = (p: Partial<BotConfig['substituteMode']>) => patch({ substituteMode: { ...sub, ...p } })
   const userAuth = botId ? auth?.userAuth.find((u) => u.botId === botId) : undefined
-  const allowedTargets = resolveAllowedUsersAsTargets(draft)
+  const allowedTargets = resolveUsersAsTargets(draft, draft.allowedUsers, draft.allowedUserProfiles)
+  const adminTargets = resolveUsersAsTargets(draft, draft.adminUsers ?? [], draft.adminUserProfiles)
 
   const renderSearchHint = (prefix: string) =>
     botId ? (
@@ -1126,6 +1155,25 @@ function AccessSection({
           </SettingRow>
         </NestedSettings>
       )}
+
+      <GroupTitle>管理权限</GroupTitle>
+      <SettingRow
+        title="智能体管理员"
+        desc={renderSearchHint('仅管理员可点击群内提醒确认/取消按钮；留空时需在 DSH 控制台处理。')}
+        stack
+      >
+        <UserSearchPicker
+          botId={botId}
+          values={adminTargets}
+          onChange={(next) =>
+            patch({
+              adminUsers: next.map((u) => u.openId),
+              adminUserProfiles: next,
+            })
+          }
+          placeholder="输入姓名、邮箱或 ou_xxx 搜索添加管理员…"
+        />
+      </SettingRow>
 
       <GroupTitle>代答</GroupTitle>
       <SettingRow title="代答指定成员" desc="群里 @ 这些成员时，由智能体先行检索并协助回复">

@@ -34,6 +34,7 @@ import {
   parseLarkMessageContent,
   renderQrSvgDataUrl,
   resolveEffectiveCardBot,
+  resolveEffectiveGuestReadOnly,
   resolveEffectiveReactionEmoji,
   resolveEffectiveWorkspaceName,
   type InboundLarkMessage,
@@ -1229,5 +1230,56 @@ describe('decideLarkRouting, <user_message> format, memberOverrides & title inte
       routeKey: threadIdKey,
       replyMode: 'new-topic',
     })
+  })
+
+  it('resolves guest read-only visibility across bot/group overrides and migrates adminUserProfiles', () => {
+    const bot = createBot({
+      adminUserProfiles: [{ openId: 'ou_admin_1', name: 'Alex Chen' }],
+      dshSessionLinkInCard: true,
+      sessionLinkGuestReadOnly: true,
+    })
+    expect(bot.adminUsers).toEqual(['ou_admin_1'])
+    expect(resolveEffectiveGuestReadOnly(bot)).toBe(true)
+
+    // Explicit empty adminUsers must not be overwritten by stale adminUserProfiles
+    const clearedBot = createBot({
+      adminUsers: [],
+      adminUserProfiles: [{ openId: 'ou_admin_1', name: 'Alex Chen' }],
+    })
+    expect(clearedBot.adminUsers).toEqual([])
+
+    const groupInherit = LarkGroupConfigSchema.parse({
+      key: buildGroupKey('dsh-bot', 'oc_guest_1'),
+      botId: 'dsh-bot',
+      chatId: 'oc_guest_1',
+    })
+    expect(resolveEffectiveGuestReadOnly(bot, groupInherit)).toBe(true)
+
+    const groupOff = LarkGroupConfigSchema.parse({
+      key: buildGroupKey('dsh-bot', 'oc_guest_2'),
+      botId: 'dsh-bot',
+      chatId: 'oc_guest_2',
+      sessionLinkGuestReadOnly: 'off',
+    })
+    expect(resolveEffectiveGuestReadOnly(bot, groupOff)).toBe(false)
+
+    const groupLinkOff = LarkGroupConfigSchema.parse({
+      key: buildGroupKey('dsh-bot', 'oc_guest_3'),
+      botId: 'dsh-bot',
+      chatId: 'oc_guest_3',
+      dshSessionLinkInCard: 'off',
+      sessionLinkGuestReadOnly: 'on',
+    })
+    expect(resolveEffectiveGuestReadOnly(bot, groupLinkOff)).toBe(false)
+
+    const botGuestOff = createBot({ dshSessionLinkInCard: true, sessionLinkGuestReadOnly: false })
+    expect(resolveEffectiveGuestReadOnly(botGuestOff)).toBe(false)
+    const groupOn = LarkGroupConfigSchema.parse({
+      key: buildGroupKey('dsh-bot', 'oc_guest_4'),
+      botId: 'dsh-bot',
+      chatId: 'oc_guest_4',
+      sessionLinkGuestReadOnly: 'on',
+    })
+    expect(resolveEffectiveGuestReadOnly(botGuestOff, groupOn)).toBe(true)
   })
 })

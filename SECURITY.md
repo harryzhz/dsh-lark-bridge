@@ -16,8 +16,10 @@
   - 面向 Agent 会话注入的 `lark-bridge` CLI 仅持有本地受限 Bearer Token（`timingSafeEqual` 校验），严禁访问 `/api/lark-bridge/auth/*`、`bots` 写接口与任何飞书应用密钥或用户 OAuth Token。
 - **鉴权与会话接管边界**：
   - `/api/lark-bridge/*` 与 `/api/lark-bridge-rpc` 默认 fail-closed，必须通过 DSH `ctx.connection.admit(req)` 或本地 CLI Bearer Token 鉴权，写操作额外执行同源（Origin/Host）校验。
-  - 宿主机本地目录浏览接口（`/api/lark-bridge/fs/dirs`）与桌面端会话打开通道（`/api/lark-bridge/desktop/*`）严格限定为 Owner 会话访问。
-  - 飞书消息卡片中的会话接管端点 `/api/lark-bridge/open` 仅在 loopback 监听下启用，使用进程级 32 字节随机密钥签发的 HMAC-SHA256 票据，绝不向飞书消息泄露 DSH 主 `launchToken`；局域网或公网部署自动禁用该端点。
+  - 宿主机本地目录浏览接口（`/api/lark-bridge/fs/dirs`）、只读链接密钥重置接口（`/api/lark-bridge/viewer/rotate-secret`）与桌面端会话打开通道（`/api/lark-bridge/desktop/*`）严格限定为 Owner 会话访问。
+  - **纯 loopback（本机 Desktop / 本地 Web）**：`/api/lark-bridge/open` 使用进程级 32 字节随机密钥签发的 HMAC-SHA256 票据，优先唤起桌面端或经同源跳转完成 Owner 鉴权，绝不向飞书消息泄露 DSH 主 `launchToken`。
+  - **非 loopback（局域网 / 服务器 / 反向代理）**：`/api/lark-bridge/open` 绝不签发 `launchToken`。已认证的 Owner 点击后直接跳转进入完整会话；未登录的群成员仅在持有对应会话的有效 HMAC 票据且对应智能体/群聊开启「允许群成员只读查看」时，通过 DSH 原生 `RemoteAccessService`（`lark-viewer` 只读策略）进入单会话只读视图（仅可见该单会话实时内容，无权发送消息、取消运行、查看其他会话/Dreaming 会话或修改任何 DSH/飞书桥接配置），管理员可随时在控制台一键重置签名密钥令全部历史分享链接立即失效。
+  - **群内指令与卡片按钮权限收紧**：飞书群聊内禁止执行会修改全局/群运行时配置的 `/agent`、`/model` 指令；群内提醒事项卡片的确认/取消按钮默认 fail-closed，仅允许智能体配置的 `adminUsers` 点击（未配置管理员时提示在 DSH 控制台处理）。
 
 ### 部署建议
 

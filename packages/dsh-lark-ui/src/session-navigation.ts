@@ -110,10 +110,12 @@ export async function activateDshSession(options: {
   readonly scope: WorkspaceNavigationScope
   readonly getLayout?: () => LayoutNavigationLike | undefined
   readonly isDisposed?: () => boolean
+  readonly allowUnarchive?: boolean
 }): Promise<boolean> {
   const sid = options.sessionId.trim()
   if (!sid) return false
   const isDisposed = options.isDisposed ?? (() => false)
+  const allowUnarchive = options.allowUnarchive !== false
 
   const ready = await waitForWorkspaceCatalogsReady(options.scope, isDisposed)
   if (!ready || isDisposed()) return false
@@ -127,7 +129,7 @@ export async function activateDshSession(options: {
   options.getLayout?.()?.beginNavigation?.()
 
   const wsSnap = options.scope.workspaces.list.getSnapshot()
-  if (wsSnap.archivedSessionIds?.includes(sid) && options.scope.uiWorkspace.unarchiveSession) {
+  if (allowUnarchive && wsSnap.archivedSessionIds?.includes(sid) && options.scope.uiWorkspace.unarchiveSession) {
     try {
       await options.scope.uiWorkspace.unarchiveSession(sid)
     } catch (err) {

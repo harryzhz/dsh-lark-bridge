@@ -173,6 +173,11 @@ function migrateLegacyWorkspaceField(input: unknown): unknown {
       .map((u) => (u && typeof u === 'object' ? (u as { openId?: unknown }).openId : undefined))
       .filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
   }
+  if (Array.isArray(rec.adminUserProfiles) && !Array.isArray(rec.adminUsers)) {
+    rec.adminUsers = rec.adminUserProfiles
+      .map((u) => (u && typeof u === 'object' ? (u as { openId?: unknown }).openId : undefined))
+      .filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
+  }
   delete rec.workspaceGroupName
   delete rec.brandLabel
   delete rec.replyFooterBrand
@@ -204,16 +209,19 @@ export const LarkBotConfigSchema = z.preprocess(
     mentionTriggerMode: MentionTriggerModeSchema.default('mention_and_active_thread'),
     groupAccessMode: z.enum(['configured_only', 'all_joined']).default('all_joined'),
 
-    // Direct message (P2P) policies
+    // Direct message (P2P) & admin policies
     p2pEnabled: z.boolean().default(true),
     p2pSessionMode: z.enum(['chat', 'per_message']).default('chat'),
     allowedUsers: z.array(z.string()).default([]),
     allowedUserProfiles: z.array(SubstituteTargetSchema).default([]),
+    adminUsers: z.array(z.string()).default([]),
+    adminUserProfiles: z.array(SubstituteTargetSchema).default([]),
 
     // Card, signature & feedback
     sendIntermediateMessages: z.boolean().default(false),
     useInteractiveCard: z.boolean().default(true),
     dshSessionLinkInCard: z.boolean().default(true),
+    sessionLinkGuestReadOnly: z.boolean().default(true),
     replyFooterEnabled: z.boolean().default(true),
     replyFooterModel: z.boolean().default(true),
     replyFooterSignature: z.boolean().default(true),
@@ -313,6 +321,7 @@ export const LarkGroupConfigSchema = z.preprocess(
     intermediateMessages: z.enum(['inherit', 'on', 'off']).default('inherit'),
     replyFormat: z.enum(['inherit', 'card', 'text']).default('inherit'),
     dshSessionLinkInCard: z.enum(['inherit', 'on', 'off']).default('inherit'),
+    sessionLinkGuestReadOnly: z.enum(['inherit', 'on', 'off']).default('inherit'),
     replyFooterModel: z.enum(['inherit', 'on', 'off']).default('inherit'),
     signatureMode: z.enum(['inherit', 'custom', 'off']).default('inherit'),
     signature: z.string().default(''),
@@ -760,6 +769,22 @@ export function resolveEffectiveCardBot(
     replyFooterSignature: hasSignature,
     signature: effectiveSignature,
   }
+}
+
+export function resolveEffectiveGuestReadOnly(
+  bot: Pick<LarkBotConfig, 'dshSessionLinkInCard' | 'sessionLinkGuestReadOnly'>,
+  group?: Pick<LarkGroupConfig, 'dshSessionLinkInCard' | 'sessionLinkGuestReadOnly'>,
+): boolean {
+  const linkEnabled =
+    group?.dshSessionLinkInCard === 'on'
+      ? true
+      : group?.dshSessionLinkInCard === 'off'
+        ? false
+        : bot.dshSessionLinkInCard
+  if (!linkEnabled) return false
+  if (group?.sessionLinkGuestReadOnly === 'on') return true
+  if (group?.sessionLinkGuestReadOnly === 'off') return false
+  return bot.sessionLinkGuestReadOnly
 }
 
 export function toPublicBotView(bot: LarkBotConfig): LarkBotPublicView {

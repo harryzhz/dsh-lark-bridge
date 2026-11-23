@@ -172,9 +172,12 @@ export interface BotConfig {
   p2pSessionMode: 'chat' | 'per_message'
   allowedUsers: string[]
   allowedUserProfiles?: SubstituteTarget[]
+  adminUsers: string[]
+  adminUserProfiles?: SubstituteTarget[]
   sendIntermediateMessages: boolean
   useInteractiveCard: boolean
   dshSessionLinkInCard: boolean
+  sessionLinkGuestReadOnly: boolean
   replyFooterEnabled: boolean
   replyFooterModel: boolean
   replyFooterSignature: boolean
@@ -257,6 +260,7 @@ export interface GroupConfig {
   intermediateMessages: Inheritable<'on' | 'off'>
   replyFormat: Inheritable<'card' | 'text'>
   dshSessionLinkInCard: Inheritable<'on' | 'off'>
+  sessionLinkGuestReadOnly: Inheritable<'on' | 'off'>
   replyFooterModel: Inheritable<'on' | 'off'>
   signatureMode: 'inherit' | 'custom' | 'off'
   signature: string

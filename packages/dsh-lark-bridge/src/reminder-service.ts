@@ -350,10 +350,25 @@ export class ProactiveReminderService {
     return updated
   }
 
-  async handleCardAction(actionValue: Record<string, unknown>): Promise<string | undefined> {
+  async handleCardAction(
+    actionValue: Record<string, unknown>,
+    options: { readonly operatorOpenId?: string } = {},
+  ): Promise<string | undefined> {
     const kind = actionValue.kind
     const reminderId = typeof actionValue.reminderId === 'string' ? actionValue.reminderId : ''
     if (!reminderId) return undefined
+    if (kind !== 'lark_reminder_confirm' && kind !== 'lark_reminder_cancel') {
+      return undefined
+    }
+
+    const existing = this.host.store.getReminder(reminderId)
+    if (!existing) {
+      return '该提醒事项不存在或已删除'
+    }
+    const authError = this.authorizeCardAction(existing, options.operatorOpenId)
+    if (authError) {
+      return authError
+    }
 
     if (kind === 'lark_reminder_confirm') {
       const decision = actionValue.decision === 'approve' ? 'approve' : 'reject'
@@ -364,11 +379,33 @@ export class ProactiveReminderService {
       await this.cancel(reminderId, 'rejected')
       return '已忽略该提醒事项'
     }
-    if (kind === 'lark_reminder_cancel') {
-      await this.cancel(reminderId, 'cancelled')
-      return '已取消该提醒事项'
+    await this.cancel(reminderId, 'cancelled')
+    return '已取消该提醒事项'
+  }
+
+  private authorizeCardAction(
+    item: LarkReminderItem,
+    operatorOpenId: string | undefined,
+  ): string | undefined {
+    const operator = operatorOpenId?.trim()
+    if (!operator) {
+      return '无法确认操作者身份，请在 DSH 控制台处理提醒事项'
     }
-    return undefined
+    const bot = this.host.store.getBot(item.origin.botId)
+    const admins = bot?.adminUsers ?? []
+    if (admins.includes(operator)) {
+      return undefined
+    }
+    if (item.origin.chatType === 'p2p') {
+      if (item.origin.userOpenId && item.origin.userOpenId === operator) {
+        return undefined
+      }
+      return '仅本人或智能体管理员可操作该私聊提醒'
+    }
+    if (admins.length === 0) {
+      return '未配置智能体管理员，请在 DSH 控制台处理提醒事项'
+    }
+    return '仅智能体管理员可操作群内提醒事项'
   }
 
   async tick(nowMs = Date.now()): Promise<void> {

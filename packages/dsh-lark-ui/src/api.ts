@@ -187,4 +187,5 @@ export const bridgeApi = {
     post<{ matched: boolean }>('/desktop/open-ack', { requestId, opened }),
 
   unbind: (routeKey: string) => del(`/bindings/${seg(routeKey)}`),
+  rotateViewerSecret: () => post<{ ok: boolean }>('/viewer/rotate-secret'),
 }

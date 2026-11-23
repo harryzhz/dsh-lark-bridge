@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
@@ -73,6 +73,7 @@ function parseScheduleBinding(raw: unknown): LarkScheduleBinding {
 
 interface PersistedStateV3 {
   readonly version: 3
+  readonly viewerTicketSecret?: string
   readonly bots: LarkBotConfig[]
   readonly groups: LarkGroupConfig[]
   readonly bindings: LarkSessionBinding[]
@@ -134,6 +135,7 @@ function calcStats(values: readonly number[]): { avg: number; p95: number } {
 
 export class LarkBridgeStore {
   private readonly statePath: string
+  private viewerTicketSecret = ''
   private readonly bots = new Map<string, LarkBotConfig>()
   private readonly groups = new Map<string, LarkGroupConfig>()
   private readonly discoveredChats = new Map<string, DiscoveredLarkChat>()
@@ -161,6 +163,20 @@ export class LarkBridgeStore {
     this.load()
   }
 
+  getViewerTicketSecret(): string {
+    if (!this.viewerTicketSecret) {
+      this.viewerTicketSecret = randomBytes(32).toString('hex')
+      this.persist()
+    }
+    return this.viewerTicketSecret
+  }
+
+  rotateViewerTicketSecret(): string {
+    this.viewerTicketSecret = randomBytes(32).toString('hex')
+    this.persist()
+    return this.viewerTicketSecret
+  }
+
   listBots(): LarkBotConfig[] {
     return [...this.bots.values()]
   }
@@ -180,11 +196,14 @@ export class LarkBridgeStore {
     }
     const parsed = LarkBotConfigSchema.parse(candidate)
     const allowedSet = new Set(parsed.allowedUsers)
-    const syncedProfiles = parsed.allowedUserProfiles.filter((p) => allowedSet.has(p.openId))
+    const syncedAllowed = parsed.allowedUserProfiles.filter((p) => allowedSet.has(p.openId))
+    const adminSet = new Set(parsed.adminUsers)
+    const syncedAdmins = parsed.adminUserProfiles.filter((p) => adminSet.has(p.openId))
     const finalBot: LarkBotConfig =
-      syncedProfiles.length === parsed.allowedUserProfiles.length
+      syncedAllowed.length === parsed.allowedUserProfiles.length &&
+      syncedAdmins.length === parsed.adminUserProfiles.length
         ? parsed
-        : { ...parsed, allowedUserProfiles: syncedProfiles }
+        : { ...parsed, allowedUserProfiles: syncedAllowed, adminUserProfiles: syncedAdmins }
     this.bots.set(finalBot.id, finalBot)
     this.persist()
     return finalBot
@@ -1152,6 +1171,10 @@ export class LarkBridgeStore {
         }
       }
 
+      if (typeof raw.viewerTicketSecret === 'string' && raw.viewerTicketSecret.trim().length >= 32) {
+        this.viewerTicketSecret = raw.viewerTicketSecret.trim()
+      }
+
       if (Array.isArray(raw.listenerTemplates)) {
         for (const rawTpl of raw.listenerTemplates) {
           const parsed = ListenerTemplateSchema.safeParse(rawTpl)
@@ -1429,6 +1452,7 @@ export class LarkBridgeStore {
     mkdirSync(this.dataDir, { recursive: true, mode: 0o700 })
     const payload: PersistedStateV3 = {
       version: 3,
+      ...(this.viewerTicketSecret ? { viewerTicketSecret: this.viewerTicketSecret } : {}),
       bots: [...this.bots.values()],
       groups: [...this.groups.values()],
       bindings: [...this.bindings.values()],

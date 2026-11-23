@@ -516,6 +516,10 @@ function GroupConversationAndMessageSection({
         : 'text'
       : draft.replyFormat
   const effectiveUseCard = effectiveFormat === 'card'
+  const effectiveSessionLink =
+    (draft.dshSessionLinkInCard ?? 'inherit') === 'inherit'
+      ? bot.dshSessionLinkInCard
+      : draft.dshSessionLinkInCard === 'on'
   const botSignature =
     bot.replyFooterEnabled && bot.replyFooterSignature ? bot.signature.trim() : ''
   const signatureMode = draft.signatureMode ?? 'inherit'
@@ -604,6 +608,20 @@ function GroupConversationAndMessageSection({
               onChange={(dshSessionLinkInCard) => patch({ dshSessionLinkInCard })}
             />
           </SettingRow>
+          {effectiveSessionLink && (
+            <NestedSettings>
+              <SettingRow title="允许群成员只读查看">
+                <SelectMenu
+                  value={draft.sessionLinkGuestReadOnly ?? 'inherit'}
+                  options={withInherit(
+                    BINARY_SWITCH_MODES,
+                    bot.sessionLinkGuestReadOnly ? 'on' : 'off',
+                  )}
+                  onChange={(sessionLinkGuestReadOnly) => patch({ sessionLinkGuestReadOnly })}
+                />
+              </SettingRow>
+            </NestedSettings>
+          )}
           <SettingRow title="显示模型信息">
             <SelectMenu
               value={draft.replyFooterModel ?? 'inherit'}

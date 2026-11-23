@@ -370,4 +370,60 @@ describe('dsh-lark-ui client entry with real @deepseek-ai/cordis Context', () =>
     releaseSecondWait?.()
     await ctx.fiber.dispose()
   })
+
+  it('activates cleanly in read-only guest viewer mode without registering bridge UI, mutating URL, or unarchiving', async () => {
+    const win = installMockWindow(
+      'https://dsh.example.com/api/lark-bridge/open?session=sess-shared-1&ticket=tkt-demo',
+    )
+    vi.stubGlobal('__DSH_LARK_VIEWER__', { sessionId: 'sess-shared-1', readOnly: true })
+    vi.stubGlobal('__DSH_REMOTE_ACCESS__', { owner: false })
+    vi.stubGlobal('__DSH_TRANSPORT__', { fetch: vi.fn(), openStream: vi.fn() })
+
+    expect(clientPlugin.isReadOnlyViewerPage()).toBe(true)
+    expect(clientPlugin.isDesktopAppRenderer()).toBe(false)
+
+    const ctx = new Context()
+    const cordisErrors = captureCordisErrors(ctx)
+    const injectedSlots: string[] = []
+    provideSiblingService(ctx, 'slots', {
+      inject(slot: string, fn: () => unknown) {
+        injectedSlots.push(slot)
+        fn()
+      },
+      register(def: Record<string, unknown>, component: unknown) {
+        return { def, component }
+      },
+    })
+
+    const rpcCall = vi.fn()
+    provideSiblingService(ctx, 'connection', { rpc: { call: rpcCall } })
+
+    const openSession = vi.fn()
+    const unarchiveSession = vi.fn(async () => {})
+    const wsList = createSource({
+      phase: 'ready',
+      archivedSessionIds: ['sess-shared-1'] as readonly string[],
+    })
+    const sessionsList = createSource({
+      phase: 'ready',
+      byId: { 'sess-shared-1': { id: 'sess-shared-1' } } as Record<string, unknown>,
+    })
+    provideSiblingService(ctx, 'uiWorkspace', { openSession, unarchiveSession })
+    provideSiblingService(ctx, 'workspaces', { list: wsList })
+    provideSiblingService(ctx, 'sessions', { list: sessionsList })
+
+    const fiber = ctx.plugin(clientPlugin as never)
+    await flushMicrotasks()
+
+    expect(cordisErrors).toEqual([])
+    expect(injectedSlots).toEqual([])
+    expect(rpcCall).not.toHaveBeenCalled()
+    expect(unarchiveSession).not.toHaveBeenCalled()
+    expect(openSession).toHaveBeenCalledWith('sess-shared-1')
+    // Must preserve ?session=...&ticket=... in the browser URL so F5 reloads keep working
+    expect(win.history.replaceState).not.toHaveBeenCalled()
+
+    await fiber.dispose()
+    await ctx.fiber.dispose()
+  })
 })

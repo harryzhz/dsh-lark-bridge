@@ -145,14 +145,30 @@ export {
   LoopbackSessionHandoff,
   focusDesktopApp,
   handleLoopbackSessionOpen,
+  handleSessionOpen,
   isLoopbackHostname,
   isLoopbackOrigin,
   isLoopbackRemoteAddress,
   renderDesktopOpenedHtml,
   renderSessionBounceHtml,
+  renderViewerDeniedHtml,
   type DesktopOpenCommand,
   type LoopbackConnectionAuth,
+  type SessionViewerRenderer,
 } from './session-handoff.js'
+export {
+  LARK_VIEWER_GLOBAL_ROLE,
+  LARK_VIEWER_PRINCIPAL_KIND,
+  LARK_VIEWER_SESSION_READ_ROLE,
+  LARK_VIEWER_WORKSPACE_ROLE,
+  LARK_VIEW_RPC_PATH,
+  LARK_VIEW_STREAM_PATH,
+  LarkSessionViewerService,
+  renderViewerCarrierScript,
+  transformViewerIndexHtml,
+  type LarkViewerPrincipal,
+  type ViewerCarrierScriptOptions,
+} from './session-viewer.js'
 export { LarkBridgeStore } from './store.js'
 export {
   LARK_ORIGIN_RECORD_TYPE,

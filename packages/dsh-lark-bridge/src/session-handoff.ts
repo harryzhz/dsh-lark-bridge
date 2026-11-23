@@ -9,6 +9,15 @@ export interface LoopbackConnectionAuth {
   authenticatedUrl?(baseUrl: string): string
 }
 
+export interface SessionViewerRenderer {
+  verifyTicket(sessionId: string, ticket: string): boolean
+  canViewSession(sessionId: string): boolean
+  renderViewerPage(
+    sessionId: string,
+    ticket: string,
+  ): Promise<{ readonly status: number; readonly html?: string; readonly error?: string }>
+}
+
 export interface DesktopOpenCommand {
   readonly requestId: string
   readonly sessionId: string
@@ -382,8 +391,8 @@ function sendPlainText(
   res.end(message)
 }
 
-function sendHtml(res: ServerResponse, method: string, html: string): void {
-  res.writeHead(200, {
+function sendHtml(res: ServerResponse, method: string, html: string, status = 200): void {
+  res.writeHead(status, {
     'content-type': 'text/html; charset=utf-8',
     'cache-control': 'no-store',
     'referrer-policy': 'no-referrer',
@@ -391,6 +400,182 @@ function sendHtml(res: ServerResponse, method: string, html: string): void {
     'x-content-type-options': 'nosniff',
   })
   res.end(method === 'HEAD' ? undefined : html)
+}
+
+/**
+ * Minimal error page for browser users when a read-only share link is invalid,
+ * revoked, or disabled for the session's bot/group.
+ */
+export function renderViewerDeniedHtml(message: string): string {
+  const safeMessage = escapeHtmlAttribute(message)
+  return [
+    '<!doctype html>',
+    '<html lang="zh-CN">',
+    '<head>',
+    '<meta charset="utf-8">',
+    '<meta name="viewport" content="width=device-width, initial-scale=1">',
+    '<meta name="referrer" content="no-referrer">',
+    '<title>无权查看该会话 · DeepSeek Harness</title>',
+    '<style>',
+    ':root{color-scheme:light dark;--bg:#f8f9fb;--card:#fff;--fg:#111827;--muted:#6b7280;--border:#e5e7eb}',
+    '@media(prefers-color-scheme:dark){:root{--bg:#151517;--card:#1e1f23;--fg:#f3f4f6;--muted:#9ca3af;--border:#2d2f36}}',
+    'body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--fg);font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}',
+    '.card{max-width:380px;padding:24px 28px;border-radius:14px;background:var(--card);border:1px solid var(--border);text-align:center}',
+    'h1{margin:0 0 8px;font-size:16px;font-weight:600}',
+    'p{margin:0;font-size:13px;color:var(--muted)}',
+    '</style>',
+    '</head>',
+    '<body>',
+    '<div class="card">',
+    '<h1>无权查看该会话</h1>',
+    `<p>${safeMessage}</p>`,
+    '</div>',
+    '</body>',
+    '</html>',
+  ].join('\n')
+}
+
+function acceptsHtml(req: IncomingMessage): boolean {
+  const accept = singleHeader(req.headers.accept)?.toLowerCase() ?? ''
+  return accept.includes('text/html')
+}
+
+function sendViewerRefusal(req: IncomingMessage, res: ServerResponse, status: number, message: string): void {
+  const method = (req.method ?? 'GET').toUpperCase()
+  if (acceptsHtml(req)) {
+    sendHtml(res, method, renderViewerDeniedHtml(message), status)
+    return
+  }
+  sendPlainText(res, status, `${message}\n`)
+}
+
+function isTopLevelDocumentNavigation(req: IncomingMessage): boolean {
+  if (singleHeader(req.headers.origin)) return false
+  const fetchMode = singleHeader(req.headers['sec-fetch-mode'])?.toLowerCase()
+  if (fetchMode && fetchMode !== 'navigate') return false
+  const fetchDest = singleHeader(req.headers['sec-fetch-dest'])?.toLowerCase()
+  if (fetchDest && fetchDest !== 'document') return false
+  return true
+}
+
+function matchesAnyAllowedAuthority(
+  hostHeader: string | undefined,
+  origins: readonly string[],
+): boolean {
+  if (!hostHeader) return false
+  for (const origin of origins) {
+    if (origin && matchesLiveOriginAuthority(hostHeader, origin)) return true
+  }
+  return false
+}
+
+/**
+ * Unified session-open handler for `GET /api/lark-bridge/open`:
+ * - Pure loopback deployments (Desktop / local `dsh web`): delegates strictly to
+ *   `handleLoopbackSessionOpen` (Desktop handoff or local Owner bounce).
+ * - Non-loopback deployments (LAN / server / reverse proxy): never mints `launchToken`;
+ *   authenticated Owners bounce directly to `/#session=<id>`, while unauthenticated
+ *   group members holding a valid HMAC ticket receive a native read-only DSH viewer page.
+ */
+export async function handleSessionOpen(
+  req: IncomingMessage,
+  res: ServerResponse,
+  options: {
+    readonly liveOrigin: string
+    readonly advertisedOrigin?: string
+    readonly connection: LoopbackConnectionAuth
+    readonly handoff?: LoopbackSessionHandoff
+    readonly viewer?: SessionViewerRenderer
+    readonly focusApp?: () => void
+  },
+): Promise<void> {
+  const { liveOrigin, advertisedOrigin = '', connection, handoff, viewer, focusApp } = options
+  const pureLoopback =
+    Boolean(liveOrigin) &&
+    isLoopbackOrigin(liveOrigin) &&
+    (!advertisedOrigin || isLoopbackOrigin(advertisedOrigin))
+
+  if (pureLoopback) {
+    await handleLoopbackSessionOpen(req, res, {
+      liveOrigin,
+      connection,
+      ...(handoff ? { handoff } : {}),
+      ...(focusApp ? { focusApp } : {}),
+    })
+    return
+  }
+
+  const method = (req.method ?? 'GET').toUpperCase()
+  if (method !== 'GET' && method !== 'HEAD') {
+    sendPlainText(res, 405, 'method not allowed\n', { allow: 'GET, HEAD' })
+    return
+  }
+
+  const authorityBase = advertisedOrigin || liveOrigin
+  if (!authorityBase) {
+    sendPlainText(res, 403, 'forbidden\n')
+    return
+  }
+
+  const parsed = new URL(req.url ?? '/', authorityBase)
+  const sessionId = parsed.searchParams.get('session')?.trim() ?? ''
+  const ticket = parsed.searchParams.get('ticket')?.trim() ?? ''
+  if (!sessionId || sessionId.length > 256 || /[\r\n]/.test(sessionId)) {
+    sendViewerRefusal(req, res, 403, '无效的会话链接。')
+    return
+  }
+
+  // 1. Authenticated DSH Owner -> seamless jump into full Owner session
+  const alreadyOwner = !('rejection' in connection.admit(req))
+  if (alreadyOwner) {
+    if (!isTopLevelDocumentNavigation(req)) {
+      sendPlainText(res, 403, 'forbidden\n')
+      return
+    }
+    let basePath = ''
+    try {
+      const pathname = new URL(authorityBase).pathname.replace(/\/+$/, '')
+      if (pathname && pathname !== '/') basePath = pathname
+    } catch {
+      basePath = ''
+    }
+    sendHtml(res, method, renderSessionBounceHtml(`${basePath}/#session=${encodeURIComponent(sessionId)}`))
+    return
+  }
+
+  // 2. Unauthenticated colleague -> strictly read-only single-session viewer
+  if (!matchesAnyAllowedAuthority(singleHeader(req.headers.host), [liveOrigin, advertisedOrigin])) {
+    sendPlainText(res, 403, 'forbidden\n')
+    return
+  }
+  if (!isTopLevelDocumentNavigation(req)) {
+    sendPlainText(res, 403, 'forbidden\n')
+    return
+  }
+  if (!viewer || !ticket || !viewer.verifyTicket(sessionId, ticket) || !viewer.canViewSession(sessionId)) {
+    sendViewerRefusal(
+      req,
+      res,
+      403,
+      '该链接已失效、签名密钥已重置，或管理员未开启群成员只读查看权限。',
+    )
+    return
+  }
+
+  const rendered = await viewer.renderViewerPage(sessionId, ticket)
+  if (rendered.status !== 200 || !rendered.html) {
+    const status = rendered.status === 403 ? 403 : 503
+    sendViewerRefusal(
+      req,
+      res,
+      status,
+      status === 403
+        ? '无权查看该会话。'
+        : '只读会话视图服务暂不可用，请确认 DSH Web 端服务已就绪。',
+    )
+    return
+  }
+  sendHtml(res, method, rendered.html, 200)
 }
 
 /**

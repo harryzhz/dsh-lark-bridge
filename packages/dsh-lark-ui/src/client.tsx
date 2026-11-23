@@ -230,6 +230,15 @@ function LarkBridgePage() {
             onDeleteDreamSession={(s) =>
               void act(() => bridgeApi.deleteDreamSession(s.sessionId), '已移除记录')
             }
+            onRotateViewerSecret={() =>
+              setConfirm({
+                title: '重置所有只读会话链接？',
+                description:
+                  '重置后将更换签名密钥并断开当前所有访客只读连接，此前已发送到飞书群的只读链接全部失效，新消息卡片不受影响。',
+                confirmLabel: '重置密钥',
+                run: () => act(() => bridgeApi.rotateViewerSecret(), '已重置只读链接密钥，历史分享链接已失效'),
+              })
+            }
           />
         )}
       </div>
@@ -317,7 +326,21 @@ function stripSessionDeepLinkInBrowser(): void {
   }
 }
 
+interface LarkViewerBootConfig {
+  readonly sessionId?: string
+  readonly readOnly?: boolean
+}
+
+export function isReadOnlyViewerPage(): boolean {
+  const g = globalThis as {
+    __DSH_LARK_VIEWER__?: LarkViewerBootConfig
+    __DSH_REMOTE_ACCESS__?: { readonly owner?: boolean }
+  }
+  return Boolean(g.__DSH_LARK_VIEWER__?.readOnly || g.__DSH_REMOTE_ACCESS__?.owner === false)
+}
+
 export function isDesktopAppRenderer(): boolean {
+  if (isReadOnlyViewerPage()) return false
   const loc = typeof window !== 'undefined' ? window.location : undefined
   if (loc?.protocol === 'dsh-app:') return true
   const g = globalThis as { dshDesktop?: unknown; __DSH_TRANSPORT__?: unknown }
@@ -362,9 +385,50 @@ function readOptionalService<T>(
   return ctx[name] as T | undefined
 }
 
+function applyReadOnlyViewerMode(ctx: ClientContext): void {
+  let layoutRef: LayoutNavigationLike | undefined = readOptionalService<LayoutNavigationLike>(ctx, 'layout')
+  const g = globalThis as { __DSH_LARK_VIEWER__?: LarkViewerBootConfig }
+  const targetSessionId =
+    g.__DSH_LARK_VIEWER__?.sessionId?.trim() || parseSessionDeepLinkFromLocation(window.location)
+
+  ctx.inject?.(['layout'], (scope: { layout: LayoutNavigationLike; effect?: ClientContext['effect'] }) => {
+    layoutRef = scope.layout
+    scope.effect?.(() => () => {
+      if (layoutRef === scope.layout) {
+        const current = readOptionalService<LayoutNavigationLike>(ctx, 'layout')
+        layoutRef = current === scope.layout ? undefined : current
+      }
+    }, 'dsh-lark-ui.viewer-layout-ref')
+  })
+
+  if (!targetSessionId) return
+
+  ctx.inject?.(
+    ['uiWorkspace', 'workspaces', 'sessions'],
+    (scope: WorkspaceNavigationScope & { effect?: ClientContext['effect'] }) => {
+      let disposed = false
+      void activateDshSession({
+        sessionId: targetSessionId,
+        scope,
+        getLayout: () => layoutRef ?? readOptionalService<LayoutNavigationLike>(ctx, 'layout'),
+        isDisposed: () => disposed,
+        allowUnarchive: false,
+      })
+      scope.effect?.(() => () => {
+        disposed = true
+      }, 'dsh-lark-ui.viewer-session-opener')
+    },
+  )
+}
+
 export const inject = ['slots'] as const
 
 export function apply(ctx: ClientContext): void {
+  if (isReadOnlyViewerPage()) {
+    applyReadOnlyViewerMode(ctx)
+    return
+  }
+
   ensureLarkUiStyles()
 
   let layoutRef: LayoutNavigationLike | undefined = readOptionalService<LayoutNavigationLike>(ctx, 'layout')

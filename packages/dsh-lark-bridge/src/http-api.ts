@@ -12,9 +12,10 @@ import type { CreateReminderInput, UpdateReminderInput } from './reminder-servic
 import type { ScheduleCreateInputLike } from './schedule-notifier.js'
 import {
   LARK_SESSION_OPEN_PATH,
-  handleLoopbackSessionOpen,
+  handleSessionOpen,
   type LoopbackConnectionAuth,
 } from './session-handoff.js'
+import { LARK_VIEW_RPC_PATH, LARK_VIEW_STREAM_PATH } from './session-viewer.js'
 import type { LarkScheduleDeliveryMode, LarkScheduleNotifyOn } from './types.js'
 
 export interface ConnectionAdmitter extends LoopbackConnectionAuth {
@@ -147,6 +148,16 @@ export async function dispatchLarkApiRequest(
         const matched = requestId ? manager.sessionHandoff.ackCommand(requestId, opened) : false
         return ok({ ok: true, matched })
       }
+    }
+
+    // ── Read-only viewer secret rotation (owner Web/Desktop session only) ─
+    if (method === 'POST' && pathname === 'viewer/rotate-secret') {
+      if (principalKind !== 'owner' || isCliAuthenticated) {
+        return ok({ ok: false, error: 'owner_web_session_required' }, 403)
+      }
+      manager.store.rotateViewerTicketSecret()
+      manager.sessionViewer?.invalidateAccess(true)
+      return ok({ ok: true })
     }
 
     // ── Agent CLI endpoints (never expose app secrets or OAuth tokens) ───
@@ -311,11 +322,16 @@ export async function dispatchLarkApiRequest(
             typeof manager.hydrateAllowedUserProfiles === 'function'
               ? await manager.hydrateAllowedUserProfiles(bot)
               : bot.allowedUserProfiles
+          const adminUserProfiles =
+            typeof manager.hydrateAdminUserProfiles === 'function'
+              ? await manager.hydrateAdminUserProfiles(bot)
+              : bot.adminUserProfiles
           const refreshed = manager.store.getBot(bot.id) ?? bot
           const dreamState = manager.store.getDreamState?.(refreshed.id)
           return {
             ...toPublicBotView(refreshed),
             allowedUserProfiles,
+            adminUserProfiles,
             avatarUrl: statuses.get(refreshed.id)?.avatarUrl || refreshed.avatarUrl || '',
             effectiveWorkspaceName:
               typeof manager.store.resolveBotWorkspaceName === 'function'
@@ -371,6 +387,7 @@ export async function dispatchLarkApiRequest(
         await manager.ensureBotProfileHydrated?.(saved.id)
       }
       const refreshed = manager.store.getBot(saved.id) ?? saved
+      manager.sessionViewer?.invalidateAccess()
       return ok(
         {
           ok: true,
@@ -407,6 +424,7 @@ export async function dispatchLarkApiRequest(
           preserveLocalDescription:
             descChanged && Boolean(saved.description.trim()) && !platformSync?.synced,
         })
+        manager.sessionViewer?.invalidateAccess()
         const refreshed = manager.store.getBot(saved.id) ?? saved
         return ok({
           ok: true,
@@ -420,6 +438,7 @@ export async function dispatchLarkApiRequest(
         }
         const existed = manager.store.deleteBot(botId)
         await manager.syncBot(botId)
+        manager.sessionViewer?.invalidateAccess()
         return ok({ ok: existed }, existed ? 200 : 404)
       }
       if (method === 'POST' && segments[2] === 'toggle') {
@@ -432,6 +451,7 @@ export async function dispatchLarkApiRequest(
         }
         const updated = manager.store.upsertBot({ ...bot, enabled: !bot.enabled })
         await manager.syncBot(updated.id)
+        manager.sessionViewer?.invalidateAccess()
         return ok({ ok: true, bot: toPublicBotView(updated) })
       }
       if (method === 'POST' && segments[2] === 'reconnect') {
@@ -532,6 +552,7 @@ export async function dispatchLarkApiRequest(
         }
         const saved = manager.store.upsertGroup({ ...body, botId, chatId })
         await manager.syncGroupWorkspace(botId, chatId)
+        manager.sessionViewer?.invalidateAccess()
         return ok({
           ok: true,
           group: saved,
@@ -540,6 +561,7 @@ export async function dispatchLarkApiRequest(
       }
       if (method === 'DELETE' && segments.length === 3) {
         const deleted = manager.store.deleteGroup(botId, chatId)
+        manager.sessionViewer?.invalidateAccess()
         return ok({ ok: deleted }, deleted ? 200 : 404)
       }
     }
@@ -755,12 +777,31 @@ export function createLarkHttpHandler(
 ): WebRoute['handler'] {
   return async (req: IncomingMessage, res: ServerResponse) => {
     const requestPath = new URL(req.url ?? '/', 'http://127.0.0.1').pathname
+    const advertisedOrigin = manager.getAdvertisedWebOrigin?.() ?? ''
     if (requestPath === LARK_SESSION_OPEN_PATH) {
-      await handleLoopbackSessionOpen(req, res, {
+      await handleSessionOpen(req, res, {
         liveOrigin: manager.getLiveWebOrigin?.() ?? '',
+        advertisedOrigin,
         connection,
         handoff: manager.sessionHandoff,
+        ...(manager.sessionViewer ? { viewer: manager.sessionViewer } : {}),
       })
+      return
+    }
+    if (requestPath === LARK_VIEW_RPC_PATH) {
+      if (!manager.sessionViewer) {
+        sendJson(res, 503, { ok: false, error: 'viewer_unavailable' })
+        return
+      }
+      await manager.sessionViewer.handleViewerRpc(req, res, { advertisedOrigin })
+      return
+    }
+    if (requestPath === LARK_VIEW_STREAM_PATH) {
+      if (!manager.sessionViewer) {
+        sendJson(res, 503, { ok: false, error: 'viewer_unavailable' })
+        return
+      }
+      await manager.sessionViewer.handleViewerStream(req, res, { advertisedOrigin })
       return
     }
 

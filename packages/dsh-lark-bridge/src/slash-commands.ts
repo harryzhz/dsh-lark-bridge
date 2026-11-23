@@ -25,6 +25,8 @@ export interface SlashCommandHost {
 export interface SlashCommandInput {
   readonly bot: LarkBotConfig
   readonly group?: LarkGroupConfig
+  readonly chatType?: 'p2p' | 'group' | string
+  readonly senderOpenId?: string
   readonly command: ParsedSlashCommand
   readonly routeKey: string
   readonly workingDir: string
@@ -32,7 +34,7 @@ export interface SlashCommandInput {
   readonly reply: (text: string) => Promise<void>
 }
 
-const HELP_TEXT = [
+const P2P_HELP_TEXT = [
   '可用命令：',
   '/status - 查看当前会话、工作区与接管链接',
   '/new - 归档当前会话并开启新会话',
@@ -42,14 +44,27 @@ const HELP_TEXT = [
   '/model <模型 ID> - 切换当前会话模型',
 ].join('\n')
 
+const GROUP_HELP_TEXT = [
+  '可用命令：',
+  '/status - 查看当前会话、工作区与会话链接',
+  '/new - 归档当前会话并开启新会话',
+  '/close - 关闭并归档当前会话',
+  '/cancel - 中断执行中的任务',
+  '（安全限制：运行时 /agent 与模型 /model 配置仅允许在 DSH 控制台或私聊中修改）',
+].join('\n')
+
+const GROUP_CONFIG_COMMAND_DENIED_TEXT =
+  '安全限制：群聊中禁止通过 /agent 或 /model 修改运行时与模型配置，请在 DSH 控制台或私聊中调整。'
+
 export async function handleSlashCommand(host: SlashCommandHost, input: SlashCommandInput): Promise<void> {
   const { bot, command, routeKey, reply } = input
+  const isGroupChat = input.chatType === 'group'
   const binding = host.store.getBinding(routeKey)
   const liveAgent = binding ? host.ctx.agents.get(brandString<SessionId>(binding.sessionId)) : undefined
 
   switch (command.name) {
     case 'help':
-      await reply(HELP_TEXT)
+      await reply(isGroupChat ? GROUP_HELP_TEXT : P2P_HELP_TEXT)
       return
     case 'new':
     case 'close': {
@@ -92,9 +107,17 @@ export async function handleSlashCommand(host: SlashCommandHost, input: SlashCom
       await reply('已发送中断信号。')
       return
     case 'agent':
+      if (isGroupChat) {
+        await reply(GROUP_CONFIG_COMMAND_DENIED_TEXT)
+        return
+      }
       await switchRuntime(host, input)
       return
     case 'model':
+      if (isGroupChat) {
+        await reply(GROUP_CONFIG_COMMAND_DENIED_TEXT)
+        return
+      }
       await switchModel(host, input, liveAgent)
       return
   }
@@ -123,7 +146,12 @@ async function switchRuntime(host: SlashCommandHost, input: SlashCommandInput): 
     await input.reply(`本群独立运行时已切换为 ${known.name}，下一条消息生效。`)
     return
   }
-  host.store.upsertBot({ ...input.bot, agentPreset: known.id, model: nextModel, reasoningEffort: '' })
+  host.store.upsertBot({
+    ...input.bot,
+    agentPreset: known.id,
+    model: nextModel || undefined,
+    reasoningEffort: undefined,
+  })
   await host.unbindRoute(input.routeKey, { archive: true })
   await input.reply(`默认运行时已切换为 ${known.name}，下一条消息生效。`)
 }

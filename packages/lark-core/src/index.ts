@@ -112,6 +112,7 @@ export {
   normalizeHHMM,
   resolveEffectiveAgentRuntime,
   resolveEffectiveCardBot,
+  resolveEffectiveGuestReadOnly,
   resolveEffectiveReactionEmoji,
   resolveEffectiveWorkingDir,
   resolveEffectiveWorkspaceName,

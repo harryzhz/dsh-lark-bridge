@@ -60,6 +60,7 @@ import { ProactiveReminderService } from './reminder-service.js'
 import { RuntimeCatalog } from './runtime-catalog.js'
 import { ScheduleNotifier, type ScheduleCreateInputLike } from './schedule-notifier.js'
 import { LoopbackSessionHandoff, isLoopbackOrigin } from './session-handoff.js'
+import { LarkSessionViewerService } from './session-viewer.js'
 import { handleSlashCommand } from './slash-commands.js'
 import type { LarkBridgeStore } from './store.js'
 import { runTurnAndCollectReply } from './turn-runner.js'
@@ -135,6 +136,7 @@ export class LarkBridgeManager {
   readonly platform: LarkPlatformManager
   readonly cliAuth: CliAuthEndpoint
   readonly sessionHandoff = new LoopbackSessionHandoff()
+  readonly sessionViewer: LarkSessionViewerService
   private readonly directoryEnricher: LarkDirectoryEnricher
   private readonly transports = new Map<string, ManagedTransport>()
   /** Live DSH agent handles keyed by `sessionId` (decoupled from route aliases). */
@@ -160,6 +162,7 @@ export class LarkBridgeManager {
     this.runtimes = new RuntimeCatalog(ctx)
     this.workspaces = new WorkspaceGrouping(ctx, store)
     this.platform = new LarkPlatformManager(config.dataDir)
+    this.sessionViewer = new LarkSessionViewerService(ctx, store)
     this.directoryEnricher = new LarkDirectoryEnricher(this.platform, () => this.store.listBots())
     this.cliAuth = ensureCliAuthEndpoint(config.dataDir, config.publicBaseUrl)
     this.schedules = new ScheduleNotifier({
@@ -190,6 +193,7 @@ export class LarkBridgeManager {
   }
 
   async start(): Promise<void> {
+    this.sessionViewer.attachToHost()
     if (this.config.autoInstallCliAndSkill !== false) {
       installLocalCliAndSkill(this.config.dataDir, this.cliAuth.endpointFile, this.ctx.logger)
     }
@@ -230,6 +234,7 @@ export class LarkBridgeManager {
   async stop(): Promise<void> {
     this.disposed = true
     this.sessionHandoff.dispose()
+    this.sessionViewer.dispose()
     this.schedules.stop()
     this.dreaming.stop()
     await this.reminders.stop()
@@ -268,18 +273,31 @@ export class LarkBridgeManager {
   }
 
   async hydrateAllowedUserProfiles(bot: LarkBotConfig): Promise<SubstituteTarget[]> {
-    if (bot.allowedUsers.length === 0) return []
+    return this.hydrateUserProfiles(bot, bot.allowedUsers, bot.allowedUserProfiles, 'allowedUserProfiles')
+  }
+
+  async hydrateAdminUserProfiles(bot: LarkBotConfig): Promise<SubstituteTarget[]> {
+    return this.hydrateUserProfiles(bot, bot.adminUsers, bot.adminUserProfiles, 'adminUserProfiles')
+  }
+
+  private async hydrateUserProfiles(
+    bot: LarkBotConfig,
+    userIds: readonly string[],
+    existingProfiles: readonly SubstituteTarget[],
+    profileField: 'allowedUserProfiles' | 'adminUserProfiles',
+  ): Promise<SubstituteTarget[]> {
+    if (userIds.length === 0) return []
     const byId = new Map<string, SubstituteTarget>()
-    for (const p of bot.allowedUserProfiles) byId.set(p.openId, p)
-    for (const t of bot.substituteMode.targets) {
-      const prev = byId.get(t.openId)
-      if (!prev || (!prev.avatarUrl && t.avatarUrl)) byId.set(t.openId, { ...prev, ...t })
+    for (const p of existingProfiles) byId.set(p.openId, p)
+    for (const p of [...bot.allowedUserProfiles, ...bot.adminUserProfiles, ...bot.substituteMode.targets]) {
+      const prev = byId.get(p.openId)
+      if (!prev || (!prev.avatarUrl && p.avatarUrl)) byId.set(p.openId, { ...prev, ...p })
     }
 
     const liveTransport = this.transports.get(bot.id)?.transport
     let mutated = false
     const result: SubstituteTarget[] = []
-    for (const openId of bot.allowedUsers) {
+    for (const openId of userIds) {
       let profile = byId.get(openId)
       if ((!profile || !profile.avatarUrl) && liveTransport) {
         const resolved = await liveTransport
@@ -324,7 +342,7 @@ export class LarkBridgeManager {
       const latestBot = this.store.getBot(bot.id) ?? bot
       this.store.upsertBot({
         ...latestBot,
-        allowedUserProfiles: result.filter((p) => p.name !== p.openId),
+        [profileField]: result.filter((p) => p.name !== p.openId),
       })
     }
     return result
@@ -623,10 +641,17 @@ export class LarkBridgeManager {
     return this.liveWebOrigin
   }
 
+  getAdvertisedWebOrigin(): string {
+    return this.resolveWebBaseUrl()
+  }
+
   sessionWebUrl(sessionId: string): string {
     const base = this.resolveWebBaseUrl()
     if (this.shouldUseLoopbackSessionHandoff(base)) {
       return this.sessionHandoff.buildUrl(base, sessionId)
+    }
+    if (!isLoopbackOrigin(base) && this.sessionViewer.canViewSession(sessionId)) {
+      return this.sessionViewer.buildViewerUrl(base, sessionId)
     }
     return `${base}/#session=${encodeURIComponent(sessionId)}`
   }
@@ -1056,7 +1081,9 @@ export class LarkBridgeManager {
     const transport: LarkBotTransport = new LarkBotTransport(bot, {
       onMessage: (msg) => this.handleInbound(bot.id, transport, msg),
       onCardAction: async (action) => {
-        const toast = await this.reminders.handleCardAction(action.actionValue)
+        const toast = await this.reminders.handleCardAction(action.actionValue, {
+          ...(action.operatorOpenId ? { operatorOpenId: action.operatorOpenId } : {}),
+        })
         return toast ? { toast } : undefined
       },
       onBotProfile: (profile) => {
@@ -1151,6 +1178,8 @@ export class LarkBridgeManager {
         {
           bot,
           ...(groupConfig ? { group: groupConfig } : {}),
+          chatType: msg.chatType,
+          ...(msg.senderOpenId ? { senderOpenId: msg.senderOpenId } : {}),
           command: decision.command,
           routeKey: decision.routeKey,
           workingDir: decision.workingDir,
@@ -1948,6 +1977,24 @@ export class LarkBridgeManager {
         ? `自动化任务进展 · ${input.scheduleTitle}`
         : `自动化任务 · ${input.scheduleTitle}`
     const cardBot = resolveEffectiveCardBot(bot, group)
+    const now = Date.now()
+    const idleMinutes = group?.idleCloseMinutes ?? bot.idleCloseMinutes
+    if (!input.isIntermediate) {
+      this.store.upsertManagedSession({
+        sessionId: input.sessionId,
+        botId: bot.id,
+        chatId: input.chatId,
+        routeKey: buildRouteKey(
+          bot.larkAppId,
+          input.chatId,
+          input.replyToMessageId || `schedule:${input.sessionId}`,
+        ),
+        trigger: 'schedule',
+        createdAtMs: now,
+        lastActivityMs: now,
+        ...(idleMinutes > 0 ? { idleCloseMs: idleMinutes * 60_000 } : {}),
+      })
+    }
     const card = buildReplyCard({
       title: cardTitle,
       template: input.isError ? 'orange' : 'blue',
@@ -1971,8 +2018,6 @@ export class LarkBridgeManager {
       const liveSession = (
         this.ctx.sessions as unknown as { get?: (id: SessionId) => Agent['session'] | undefined }
       ).get?.(brandString<SessionId>(input.sessionId))
-      const now = Date.now()
-      const idleMinutes = group?.idleCloseMinutes ?? bot.idleCloseMinutes
       const rawDir = liveSession?.header.cwd || group?.workingDir.trim() || bot.defaultWorkingDir
       const chatName = this.store.resolveChatName(bot.id, input.chatId)
       await this.replaceRouteBinding({

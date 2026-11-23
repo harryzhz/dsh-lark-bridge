@@ -251,11 +251,34 @@ describe('ProactiveReminderService one-shot lifecycle, origin auto-routing & con
     })
     expect(sentOriginCards).toHaveLength(1)
 
-    const approveToast = await reminders.handleCardAction({
+    // Missing operator or non-origin P2P user must fail closed
+    const missingOpToast = await reminders.handleCardAction({
       kind: 'lark_reminder_confirm',
       reminderId: confirmItem.id,
       decision: 'approve',
     })
+    expect(missingOpToast).toContain('无法确认操作者身份')
+    expect(store.getReminder(confirmItem.id)?.status).toBe('pending_confirm')
+
+    const strangerP2pToast = await reminders.handleCardAction(
+      {
+        kind: 'lark_reminder_confirm',
+        reminderId: confirmItem.id,
+        decision: 'approve',
+      },
+      { operatorOpenId: 'ou_other_user' },
+    )
+    expect(strangerP2pToast).toContain('仅本人或智能体管理员')
+    expect(store.getReminder(confirmItem.id)?.status).toBe('pending_confirm')
+
+    const approveToast = await reminders.handleCardAction(
+      {
+        kind: 'lark_reminder_confirm',
+        reminderId: confirmItem.id,
+        decision: 'approve',
+      },
+      { operatorOpenId: 'ou_pm_1' },
+    )
     expect(approveToast).toContain('已确认开启')
     expect(patchedCards).toHaveLength(1)
     expect(store.getReminder(confirmItem.id)?.status).toBe('scheduled')
@@ -287,10 +310,38 @@ describe('ProactiveReminderService one-shot lifecycle, origin auto-routing & con
     expect(notifyItem.status).toBe('scheduled')
     expect(sentOriginCards).toHaveLength(2)
 
-    const cancelToast = await reminders.handleCardAction({
-      kind: 'lark_reminder_cancel',
-      reminderId: notifyItem.id,
-    })
+    // Group card action fails closed when adminUsers is empty
+    const unconfiguredAdminToast = await reminders.handleCardAction(
+      {
+        kind: 'lark_reminder_cancel',
+        reminderId: notifyItem.id,
+      },
+      { operatorOpenId: 'ou_member_1' },
+    )
+    expect(unconfiguredAdminToast).toContain('未配置智能体管理员')
+    expect(store.getReminder(notifyItem.id)?.status).toBe('scheduled')
+
+    // Configure adminUsers: non-admin rejected, admin succeeds
+    const existingBot = store.getBot('dsh-agent')!
+    store.upsertBot({ ...existingBot, adminUsers: ['ou_admin_1'] })
+
+    const nonAdminToast = await reminders.handleCardAction(
+      {
+        kind: 'lark_reminder_cancel',
+        reminderId: notifyItem.id,
+      },
+      { operatorOpenId: 'ou_member_1' },
+    )
+    expect(nonAdminToast).toContain('仅智能体管理员')
+    expect(store.getReminder(notifyItem.id)?.status).toBe('scheduled')
+
+    const cancelToast = await reminders.handleCardAction(
+      {
+        kind: 'lark_reminder_cancel',
+        reminderId: notifyItem.id,
+      },
+      { operatorOpenId: 'ou_admin_1' },
+    )
     expect(cancelToast).toContain('已取消')
     expect(store.getReminder(notifyItem.id)).toMatchObject({
       status: 'archived',

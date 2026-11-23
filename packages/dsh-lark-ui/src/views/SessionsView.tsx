@@ -56,6 +56,7 @@ export function SessionsView({
   onOpen,
   onUnbind,
   onDeleteDreamSession,
+  onRotateViewerSecret,
 }: {
   bindings: readonly SessionBinding[]
   dreamSessions: readonly DreamSession[]
@@ -65,6 +66,7 @@ export function SessionsView({
   onOpen: (sessionId: string) => void
   onUnbind: (binding: SessionBinding) => void
   onDeleteDreamSession?: (session: DreamSession) => void
+  onRotateViewerSecret?: () => void
 }) {
   const [pane, setPane] = useState<Pane>('sessions')
   const [sessionFilter, setSessionFilter] = useState<SessionFilter>('all')
@@ -99,16 +101,23 @@ export function SessionsView({
           onChange={setPane}
         />
         {pane === 'sessions' ? (
-          <FilterTabs
-            label="会话类型筛选"
-            value={sessionFilter}
-            options={[
-              { value: 'all', label: '全部' },
-              { value: 'chat', label: '对话', count: bindings.length },
-              { value: 'dreaming', label: 'Dreaming', count: dreamSessions.length },
-            ]}
-            onChange={setSessionFilter}
-          />
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <FilterTabs
+              label="会话类型筛选"
+              value={sessionFilter}
+              options={[
+                { value: 'all', label: '全部' },
+                { value: 'chat', label: '对话', count: bindings.length },
+                { value: 'dreaming', label: 'Dreaming', count: dreamSessions.length },
+              ]}
+              onChange={setSessionFilter}
+            />
+            {onRotateViewerSecret && (
+              <Button size="sm" variant="ghost" onClick={onRotateViewerSecret}>
+                重置只读链接
+              </Button>
+            )}
+          </div>
         ) : (
           <SelectMenu size="sm" value={kind} options={EVENT_FILTERS} onChange={setKind} />
         )}
