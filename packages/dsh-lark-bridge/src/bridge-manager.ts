@@ -30,6 +30,7 @@ import {
   resolveEffectiveCardBot,
   resolveEffectiveWorkingDir,
   resolveEffectiveWorkspaceName,
+  slugifyBotId,
   type DiscoveredLarkChat,
   type InboundLarkMessage,
   type LarkBotConfig,
@@ -306,12 +307,15 @@ export class LarkBridgeManager {
     return result
   }
 
-  async startAutoCreateBot(rawBody: Record<string, unknown>): Promise<LarkQrJobView> {
-    const mode = rawBody.mode === 'device_flow' ? 'device_flow' : 'open_platform'
-    const name = typeof rawBody.name === 'string' ? rawBody.name.trim() : ''
-    const description = typeof rawBody.description === 'string' ? rawBody.description.trim() : ''
-    const requestedId = typeof rawBody.id === 'string' ? rawBody.id.trim() : ''
-    const workspaceName = typeof rawBody.workspaceName === 'string' ? rawBody.workspaceName.trim() : ''
+  private async resolveNewBotRuntimeDefaults(rawBody: Record<string, unknown>): Promise<{
+    readonly defaultWorkingDir: string
+    readonly workspaceName: string
+    readonly agentPreset: string
+    readonly model?: string
+    readonly reasoningEffort?: string
+  }> {
+    const workspaceName =
+      typeof rawBody.workspaceName === 'string' ? rawBody.workspaceName.trim() : ''
     const defaultWorkingDir =
       (typeof rawBody.defaultWorkingDir === 'string' && rawBody.defaultWorkingDir.trim()) || '~'
     assertExistingWorkingDirectory(defaultWorkingDir)
@@ -323,11 +327,37 @@ export class LarkBridgeManager {
       agentPreset =
         availableRuntimes.find((r) => r.isDefault)?.id ?? availableRuntimes[0]?.id ?? 'standard'
     }
-    const model = typeof rawBody.model === 'string' && rawBody.model.trim() ? rawBody.model.trim() : undefined
+    const model =
+      typeof rawBody.model === 'string' && rawBody.model.trim() ? rawBody.model.trim() : undefined
     const reasoningEffort =
       typeof rawBody.reasoningEffort === 'string' && rawBody.reasoningEffort.trim()
         ? rawBody.reasoningEffort.trim()
         : undefined
+    return {
+      defaultWorkingDir,
+      workspaceName,
+      agentPreset,
+      ...(model ? { model } : {}),
+      ...(reasoningEffort ? { reasoningEffort } : {}),
+    }
+  }
+
+  private allocateUniqueBotId(baseId: string, larkAppId: string): string {
+    let finalId = baseId
+    let suffix = 2
+    while (this.store.getBot(finalId) && this.store.getBot(finalId)?.larkAppId !== larkAppId) {
+      finalId = `${baseId}-${suffix}`
+      suffix += 1
+    }
+    return finalId
+  }
+
+  async startAutoCreateBot(rawBody: Record<string, unknown>): Promise<LarkQrJobView> {
+    const mode = rawBody.mode === 'device_flow' ? 'device_flow' : 'open_platform'
+    const name = typeof rawBody.name === 'string' ? rawBody.name.trim() : ''
+    const description = typeof rawBody.description === 'string' ? rawBody.description.trim() : ''
+    const requestedId = typeof rawBody.id === 'string' ? rawBody.id.trim() : ''
+    const defaults = await this.resolveNewBotRuntimeDefaults(rawBody)
 
     return this.platform.startAutoCreateBot(
       {
@@ -337,12 +367,7 @@ export class LarkBridgeManager {
         description,
       },
       async (created) => {
-        let finalId = created.id
-        let suffix = 2
-        while (this.store.getBot(finalId) && this.store.getBot(finalId)?.larkAppId !== created.larkAppId) {
-          finalId = `${created.id}-${suffix}`
-          suffix += 1
-        }
+        const finalId = this.allocateUniqueBotId(created.id, created.larkAppId)
         const saved = this.store.upsertBot({
           id: finalId,
           name: created.name,
@@ -350,15 +375,56 @@ export class LarkBridgeManager {
           larkAppId: created.larkAppId,
           larkAppSecret: created.larkAppSecret,
           enabled: true,
-          defaultWorkingDir,
-          workspaceName,
-          agentPreset,
-          ...(model ? { model } : {}),
-          ...(reasoningEffort ? { reasoningEffort } : {}),
+          defaultWorkingDir: defaults.defaultWorkingDir,
+          workspaceName: defaults.workspaceName,
+          agentPreset: defaults.agentPreset,
+          ...(defaults.model ? { model: defaults.model } : {}),
+          ...(defaults.reasoningEffort ? { reasoningEffort: defaults.reasoningEffort } : {}),
         })
         await this.syncBot(saved.id)
       },
     )
+  }
+
+  async importExistingOpenPlatformBot(rawBody: Record<string, unknown>): Promise<LarkBotConfig> {
+    const larkAppId = typeof rawBody.larkAppId === 'string' ? rawBody.larkAppId.trim() : ''
+    if (!larkAppId) {
+      throw new Error('请选择要接入的飞书应用')
+    }
+    const existing = this.store.listBots().find((b) => b.larkAppId === larkAppId)
+    if (existing) {
+      throw new Error(`该飞书应用已接入为智能体「${existing.name}」`)
+    }
+    const defaults = await this.resolveNewBotRuntimeDefaults(rawBody)
+    const creds = await this.platform.fetchOpenPlatformAppCredentials(larkAppId)
+    const requestedId = typeof rawBody.id === 'string' ? rawBody.id.trim() : ''
+    const requestedName = typeof rawBody.name === 'string' ? rawBody.name.trim() : ''
+    const requestedDescription =
+      typeof rawBody.description === 'string' ? rawBody.description.trim() : ''
+    const name = requestedName || creds.name || larkAppId
+    const description = requestedDescription || creds.description || ''
+    const baseId = requestedId || slugifyBotId(name, larkAppId)
+    const finalId = this.allocateUniqueBotId(baseId, creds.appId)
+
+    const saved = this.store.upsertBot({
+      id: finalId,
+      name,
+      description,
+      avatarUrl: creds.avatarUrl ?? '',
+      larkAppId: creds.appId,
+      larkAppSecret: creds.appSecret,
+      enabled: true,
+      defaultWorkingDir: defaults.defaultWorkingDir,
+      workspaceName: defaults.workspaceName,
+      agentPreset: defaults.agentPreset,
+      ...(defaults.model ? { model: defaults.model } : {}),
+      ...(defaults.reasoningEffort ? { reasoningEffort: defaults.reasoningEffort } : {}),
+    })
+    await this.syncBot(saved.id)
+    if (!saved.description.trim() || !saved.avatarUrl.trim()) {
+      await this.ensureBotProfileHydrated(saved.id)
+    }
+    return this.store.getBot(saved.id) ?? saved
   }
 
   async syncBot(

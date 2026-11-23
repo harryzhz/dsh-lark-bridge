@@ -20,6 +20,19 @@ describe('bridgeApi Desktop & Web Connection RPC transport', () => {
         if (req.path === '/fs/dirs' && req.method === 'POST') {
           return { ok: true, value: { ok: true, path: '/tmp/new-dir' } }
         }
+        if (req.path === '/auth/open-platform/apps' && req.method === 'GET') {
+          return {
+            ok: true,
+            value: {
+              ok: true,
+              authenticated: true,
+              apps: [{ appId: 'cli_demo', name: 'Demo', description: '', hasBotAbility: true, abilities: ['bot'], appStatus: 2, alreadyConnected: false }],
+            },
+          }
+        }
+        if (req.path === '/bots/import-existing' && req.method === 'POST') {
+          return { ok: true, value: { ok: true, bot: { id: 'demo', name: 'Demo', larkAppId: 'cli_demo' } } }
+        }
         return { ok: false, error: { code: 'lark-bridge/error', message: 'not_found' } }
       },
     }
@@ -32,6 +45,17 @@ describe('bridgeApi Desktop & Web Connection RPC transport', () => {
     const createdPath = await bridgeApi.createDir('/tmp', 'new-dir')
     expect(createdPath).toBe('/tmp/new-dir')
 
+    const opApps = await bridgeApi.openPlatformApps()
+    expect(opApps.authenticated).toBe(true)
+    expect(opApps.apps[0]?.appId).toBe('cli_demo')
+
+    const imported = await bridgeApi.importExistingBot({
+      larkAppId: 'cli_demo',
+      defaultWorkingDir: '~',
+      agentPreset: 'standard',
+    })
+    expect(imported.bot.name).toBe('Demo')
+
     await expect(bridgeApi.deleteBot('missing')).rejects.toThrow('not_found')
 
     expect(fetchSpy).not.toHaveBeenCalled()
@@ -41,6 +65,16 @@ describe('bridgeApi Desktop & Web Connection RPC transport', () => {
         channel: '/api',
         endpoint: 'lark-bridge-rpc',
         payload: { method: 'POST', path: '/fs/dirs', body: { parentPath: '/tmp', name: 'new-dir' } },
+      },
+      { channel: '/api', endpoint: 'lark-bridge-rpc', payload: { method: 'GET', path: '/auth/open-platform/apps' } },
+      {
+        channel: '/api',
+        endpoint: 'lark-bridge-rpc',
+        payload: {
+          method: 'POST',
+          path: '/bots/import-existing',
+          body: { larkAppId: 'cli_demo', defaultWorkingDir: '~', agentPreset: 'standard' },
+        },
       },
       { channel: '/api', endpoint: 'lark-bridge-rpc', payload: { method: 'DELETE', path: '/bots/missing' } },
     ])

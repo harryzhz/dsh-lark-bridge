@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Button,
   IconAgentPresetOutlineRegular,
@@ -32,6 +32,7 @@ import type {
   BotRecord,
   DreamRunState,
   ModelGroup,
+  OpenPlatformAppItem,
   QrJobView,
   RuntimeOption,
   SubstituteTarget,
@@ -50,6 +51,7 @@ import {
   TextArea,
   TextField,
 } from './fields.js'
+import { OpenPlatformAppPicker } from './OpenPlatformAppPicker.js'
 import {
   effectiveDefaultModel,
   leafDirectoryLabel,
@@ -157,82 +159,227 @@ function toBotConfig(record: BotRecord): BotConfig {
   }
 }
 
+function generateFallbackBotId(name: string, larkAppId: string): string {
+  const ascii = name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+  if (ascii) return ascii
+  const suffix = larkAppId
+    .toLowerCase()
+    .replace(/^cli_/, '')
+    .replace(/[^a-z0-9]+/g, '')
+    .slice(0, 6)
+  return `bot-${suffix || Date.now().toString(36).slice(-6)}`
+}
+
 export function BotConfigDialog({
   target,
+  bots,
   runtimes,
   models,
   auth,
   onClose,
   onSave,
   onAutoCreated,
+  onExistingImported,
+  onRefresh,
+  onAuthUpdated,
   onOpenAuth,
   onOpenSession,
 }: {
   target: BotRecord | 'new' | null
+  bots: readonly BotRecord[]
   runtimes: readonly RuntimeOption[]
   models: readonly ModelGroup[]
   auth: AuthStatusPayload | null
   onClose: () => void
   onSave: (config: BotConfig, existingId: string | null) => Promise<void>
   onAutoCreated: () => Promise<void>
+  onExistingImported: (botName: string) => Promise<void>
+  onRefresh: () => Promise<void>
+  onAuthUpdated: () => Promise<void>
   onOpenAuth: () => void
   onOpenSession?: (sessionId: string) => void
 }) {
-  const [section, setSection] = useState<Section>('basic')
-  const [createMode, setCreateMode] = useState<'auto' | 'manual'>('auto')
-  const [autoProtocol, setAutoProtocol] = useState<'open_platform' | 'device_flow'>('open_platform')
-  const [autoJob, setAutoJob] = useState<QrJobView | null>(null)
-  const [draft, setDraft] = useState<BotConfig | null>(null)
-  const [localDreamState, setLocalDreamState] = useState<DreamRunState | undefined>(undefined)
-  const [saving, setSaving] = useState(false)
-  const [syncingProfile, setSyncingProfile] = useState(false)
-  const [error, setError] = useState('')
-  const existingId = target && target !== 'new' ? target.id : null
-
-  useEffect(() => {
-    if (!target) return
-    setDraft(
-      target === 'new'
-        ? newBotConfig(runtimes.find((r) => r.isDefault) ?? runtimes[0], models)
-        : toBotConfig(target),
+  if (!target) return null
+  if (target === 'new') {
+    return (
+      <CreateBotDialog
+        bots={bots}
+        runtimes={runtimes}
+        models={models}
+        auth={auth}
+        onClose={onClose}
+        onSave={onSave}
+        onAutoCreated={onAutoCreated}
+        onExistingImported={onExistingImported}
+        onAuthUpdated={onAuthUpdated}
+      />
     )
-    setLocalDreamState(target !== 'new' ? target.dreamState : undefined)
-    setSection('basic')
-    setCreateMode('auto')
-    setAutoJob(null)
-    setError('')
+  }
+  return (
+    <EditBotDialog
+      target={target}
+      runtimes={runtimes}
+      models={models}
+      auth={auth}
+      onClose={onClose}
+      onSave={onSave}
+      onSynced={onRefresh}
+      onOpenAuth={onOpenAuth}
+      onOpenSession={onOpenSession}
+    />
+  )
+}
 
-    if (target !== 'new' && (!target.avatarUrl?.trim() || !target.description?.trim())) {
-      let cancelled = false
-      void bridgeApi
-        .syncBotProfile(target.id)
-        .then((res) => {
-          if (cancelled) return
-          const nextAvatar = res.profile.avatarUrl?.trim()
-          const nextDesc = res.profile.description?.trim()
-          if (!nextAvatar && !nextDesc) return
-          setDraft((prev) => {
-            if (!prev || prev.id !== target.id) return prev
-            return {
-              ...prev,
-              ...(nextAvatar && !prev.avatarUrl.trim() ? { avatarUrl: nextAvatar } : {}),
-              ...(nextDesc && !prev.description.trim() ? { description: nextDesc } : {}),
-            }
-          })
-        })
-        .catch(() => {})
-      return () => {
-        cancelled = true
+function useOpenPlatformAppsState(
+  isOpAuthenticated: boolean,
+  onAuthUpdated: () => Promise<void>,
+) {
+  const [loginJob, setLoginJob] = useState<QrJobView | null>(null)
+  const [startingLogin, setStartingLogin] = useState(false)
+  const [apps, setApps] = useState<OpenPlatformAppItem[]>([])
+  const [loaded, setLoaded] = useState(false)
+  const [loading, setLoading] = useState(false)
+  const [loadError, setLoadError] = useState('')
+  const [selectedAppId, setSelectedAppId] = useState('')
+
+  const refreshApps = useCallback(async () => {
+    setLoading(true)
+    setLoadError('')
+    try {
+      const res = await bridgeApi.openPlatformApps()
+      if (!res.authenticated) {
+        setApps([])
+        setLoaded(false)
+        setSelectedAppId('')
+        await onAuthUpdated()
+        return
       }
+      setApps(res.apps)
+      setLoaded(true)
+      setSelectedAppId((prev) =>
+        prev && res.apps.some((a) => a.appId === prev && !a.alreadyConnected) ? prev : '',
+      )
+    } catch (err) {
+      setLoadError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setLoading(false)
     }
-    return undefined
-  }, [target, runtimes, models])
+  }, [onAuthUpdated])
 
   useEffect(() => {
-    if (target && target !== 'new' && target.dreamState) {
-      setLocalDreamState(target.dreamState)
+    if (!isOpAuthenticated) {
+      setApps([])
+      setLoaded(false)
+      setSelectedAppId('')
+      return
     }
-  }, [target])
+    if (!loaded && !loading) {
+      void refreshApps()
+    }
+  }, [isOpAuthenticated, loaded, loading, refreshApps])
+
+  useEffect(() => {
+    if (!loginJob || !['waiting_scan', 'scanned', 'working'].includes(loginJob.status)) return
+    const timer = window.setInterval(async () => {
+      try {
+        const next = await bridgeApi.pollAuthJob(loginJob.jobId)
+        setLoginJob(next)
+        if (next.status === 'succeeded') {
+          await onAuthUpdated()
+          setLoginJob(null)
+          await refreshApps()
+        }
+      } catch {
+        // Ignore transient polling error.
+      }
+    }, 1500)
+    return () => window.clearInterval(timer)
+  }, [loginJob, onAuthUpdated, refreshApps])
+
+  const startLogin = useCallback(async () => {
+    setStartingLogin(true)
+    try {
+      setLoginJob(await bridgeApi.startOpenPlatformLogin())
+    } finally {
+      setStartingLogin(false)
+    }
+  }, [])
+
+  return {
+    apps,
+    loading,
+    loadError,
+    selectedAppId,
+    setSelectedAppId,
+    loginJob,
+    startingLogin,
+    refreshApps,
+    startLogin,
+  }
+}
+
+function CreateBotDialog({
+  bots,
+  runtimes,
+  models,
+  auth,
+  onClose,
+  onSave,
+  onAutoCreated,
+  onExistingImported,
+  onAuthUpdated,
+}: {
+  bots: readonly BotRecord[]
+  runtimes: readonly RuntimeOption[]
+  models: readonly ModelGroup[]
+  auth: AuthStatusPayload | null
+  onClose: () => void
+  onSave: (config: BotConfig, existingId: string | null) => Promise<void>
+  onAutoCreated: () => Promise<void>
+  onExistingImported: (botName: string) => Promise<void>
+  onAuthUpdated: () => Promise<void>
+}) {
+  const [createMode, setCreateMode] = useState<'auto' | 'existing'>('auto')
+  const [autoProtocol, setAutoProtocol] = useState<'open_platform' | 'device_flow'>('open_platform')
+  const [existingSource, setExistingSource] = useState<'open_platform' | 'manual'>('open_platform')
+  const [draft, setDraft] = useState<BotConfig>(() =>
+    newBotConfig(runtimes.find((r) => r.isDefault) ?? runtimes[0], models),
+  )
+  const runtimeTouchedRef = useRef(false)
+  const [autoJob, setAutoJob] = useState<QrJobView | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
+
+  const opAuth = auth?.openPlatform
+  const isOpAuthenticated = Boolean(opAuth?.authenticated)
+  const opState = useOpenPlatformAppsState(isOpAuthenticated, onAuthUpdated)
+  const patch = (p: Partial<BotConfig>) => setDraft((prev) => ({ ...prev, ...p }))
+  const runtime = runtimes.find((r) => r.id === draft.agentPreset)
+
+  useEffect(() => {
+    if (runtimeTouchedRef.current || runtimes.length === 0) return
+    const defaultRuntime = runtimes.find((r) => r.isDefault) ?? runtimes[0]
+    if (!defaultRuntime) return
+    setDraft((prev) => {
+      const nextModel = effectiveDefaultModel(defaultRuntime, models)
+      if (prev.agentPreset === defaultRuntime.id && (prev.model ?? '') === (nextModel ?? '')) {
+        return prev
+      }
+      return {
+        ...prev,
+        agentPreset: defaultRuntime.id,
+        model: nextModel,
+        reasoningEffort: '',
+      }
+    })
+  }, [runtimes, models])
+
+  useEffect(() => {
+    if (!auth) void onAuthUpdated()
+  }, [auth, onAuthUpdated])
 
   useEffect(() => {
     if (!autoJob || !['waiting_scan', 'scanned', 'working'].includes(autoJob.status)) return
@@ -253,22 +400,32 @@ export function BotConfigDialog({
     return () => window.clearInterval(timer)
   }, [autoJob, onAutoCreated, onClose])
 
-  if (!target || !draft) return null
-  const patch = (p: Partial<BotConfig>) => setDraft({ ...draft, ...p })
-  const runtime = runtimes.find((r) => r.id === draft.agentPreset)
+  const handleExistingSourceChange = (next: 'open_platform' | 'manual') => {
+    setExistingSource(next)
+    setError('')
+    if (next === 'manual' && opState.selectedAppId && !draft.larkAppId.trim()) {
+      const picked = opState.apps.find((a) => a.appId === opState.selectedAppId)
+      if (picked) {
+        patch({
+          name: picked.name,
+          description: picked.description,
+          larkAppId: picked.appId,
+          avatarUrl: picked.avatarUrl ?? '',
+        })
+      }
+    }
+  }
 
-  // Dedicated streamlined dialog when creating a brand-new agent in "auto" mode
-  if (!existingId && createMode === 'auto') {
-    const opAuth = auth?.openPlatform
-    const startAuto = async () => {
+  const handlePrimarySubmit = async () => {
+    setError('')
+    const norm = normalizeModelAndEffort(runtime, models, draft.model, draft.reasoningEffort)
+    if (createMode === 'auto') {
       if (!draft.name.trim() || !draft.defaultWorkingDir.trim()) {
-        setError('请填写智能体显示名称与默认工作目录')
+        setError('请填写智能体名称与工作目录')
         return
       }
       setSaving(true)
-      setError('')
       try {
-        const norm = normalizeModelAndEffort(runtime, models, draft.model, draft.reasoningEffort)
         const job = await bridgeApi.autoCreateBot({
           mode: autoProtocol,
           ...(draft.id.trim() ? { id: draft.id.trim() } : {}),
@@ -286,129 +443,351 @@ export function BotConfigDialog({
       } finally {
         setSaving(false)
       }
+      return
     }
 
-    const isJobRunning = autoJob && ['waiting_scan', 'scanned', 'working'].includes(autoJob.status)
+    if (existingSource === 'open_platform') {
+      if (!opState.selectedAppId) {
+        setError('请先从开放平台列表中选择一个已有应用')
+        return
+      }
+      if (!draft.defaultWorkingDir.trim()) {
+        setError('请填写工作目录')
+        return
+      }
+      setSaving(true)
+      try {
+        const res = await bridgeApi.importExistingBot({
+          larkAppId: opState.selectedAppId,
+          workspaceName: draft.workspaceName.trim(),
+          defaultWorkingDir: draft.defaultWorkingDir.trim(),
+          agentPreset: draft.agentPreset,
+          ...(norm.model ? { model: norm.model } : {}),
+          ...(norm.reasoningEffort ? { reasoningEffort: norm.reasoningEffort } : {}),
+        })
+        await onExistingImported(res.bot.name)
+        onClose()
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err))
+      } finally {
+        setSaving(false)
+      }
+      return
+    }
 
-    return (
-      <Modal open onClose={onClose} title="新增智能体" headless className="fb-schedule-dialog">
-        <div className="fb-schedule-dialog-head">
-          <div style={{ minWidth: 0 }}>
-            <div className="fb-schedule-dialog-title">新增飞书智能体</div>
-            <div className="fb-schedule-dialog-sub">支持一键自动创建飞书应用并开启长连接，或手动填入已有应用凭证</div>
-          </div>
-          <button type="button" className="fb-icon-btn" aria-label="关闭" onClick={onClose}>
-            <IconCloseOutlineRegular size={14} />
-          </button>
-        </div>
-
-        <div className="fb-schedule-dialog-body">
-          <div style={{ marginBottom: 10 }}>
-            <SegmentedControl
-              id="fb-bot-create-mode"
-              label="创建方式"
-              value={createMode}
-              options={[
-                { value: 'auto', label: '自动创建飞书智能体' },
-                { value: 'manual', label: '接入已有应用' },
-              ]}
-              onChange={(m) => {
-                setCreateMode(m)
-                setError('')
-              }}
-            />
-          </div>
-
-          <SettingRow
-            title="创建通道"
-            desc={
-              autoProtocol === 'open_platform'
-                ? opAuth?.authenticated && opAuth.identity
-                  ? `已登录开放平台：${opAuth.identity.userName}（${opAuth.identity.tenantName}）`
-                  : '扫码自动创建自建应用并开通权限与长连接'
-                : '通过官方 SDK 设备流注册个人智能体凭证'
-            }
-          >
-            <SelectMenu
-              value={autoProtocol}
-              options={[
-                { value: 'open_platform', label: '开放平台全自动创建（推荐）', desc: '创建企业自建应用并自动开通权限与长连接' },
-                { value: 'device_flow', label: '扫码快速注册（SDK）', desc: '通过官方设备流注册个人应用凭证' },
-              ]}
-              onChange={setAutoProtocol}
-            />
-          </SettingRow>
-
-          <SettingRow title="智能体名称">
-            <TextField value={draft.name} onChange={(name) => patch({ name })} placeholder="例如 研发协作助手" />
-          </SettingRow>
-          <SettingRow title="智能体签名">
-            <TextField value={draft.description} onChange={(description) => patch({ description })} placeholder="飞书名片简介（选填）" />
-          </SettingRow>
-          <SettingRow title="工作目录">
-            <DirectoryField
-              value={draft.defaultWorkingDir}
-              onChange={(defaultWorkingDir) => patch({ defaultWorkingDir })}
-              placeholder="~ 或 /path/to/workspace"
-            />
-          </SettingRow>
-          <SettingRow title="工作区" desc="留空默认使用工作目录末级名称">
-            <TextField
-              value={draft.workspaceName}
-              onChange={(workspaceName) => patch({ workspaceName })}
-              placeholder={leafDirectoryLabel(draft.defaultWorkingDir) || '默认使用工作目录名称'}
-            />
-          </SettingRow>
-          <AgentRuntimeFields
-            runtimeTitle="默认运行时"
-            value={{
-              agentPreset: draft.agentPreset,
-              model: draft.model ?? '',
-              reasoningEffort: draft.reasoningEffort ?? '',
-            }}
-            runtimes={runtimes}
-            models={models}
-            onChange={({ agentPreset, model, reasoningEffort }) =>
-              patch({
-                agentPreset,
-                model: model || undefined,
-                reasoningEffort: reasoningEffort || undefined,
-              })
-            }
-          />
-
-          {autoJob && (
-            <div className="fb-qr-panel" style={{ marginTop: 12 }}>
-              {autoJob.qrSvgDataUrl && <img className="fb-qr-img" src={autoJob.qrSvgDataUrl} alt="扫码创建智能体" />}
-              <div className="fb-qr-info">
-                <div style={{ fontWeight: 500 }}>自动创建进度</div>
-                <div className="fb-row-desc">{autoJob.stepMessage}</div>
-                {autoJob.verificationUrl && (
-                  <a href={autoJob.verificationUrl} target="_blank" rel="noreferrer" className="fb-row-desc" style={{ textDecoration: 'underline' }}>
-                    在浏览器中打开验证链接
-                  </a>
-                )}
-              </div>
-            </div>
-          )}
-        </div>
-
-        <div className="fb-schedule-dialog-foot">
-          {error ? <span className="fb-dialog-error">{error}</span> : null}
-          <Button variant="outline" onClick={onClose}>
-            取消
-          </Button>
-          <Button variant="primary" disabled={saving || Boolean(isJobRunning)} onClick={() => void startAuto()}>
-            {isJobRunning ? '等待完成…' : opAuth?.authenticated && autoProtocol === 'open_platform' ? '一键创建并接入' : '扫码创建并接入'}
-          </Button>
-        </div>
-      </Modal>
-    )
+    const missing =
+      !draft.name.trim() ||
+      !draft.larkAppId.trim() ||
+      !draft.larkAppSecret?.trim() ||
+      !draft.defaultWorkingDir.trim()
+    if (missing) {
+      setError('请补全显示名称、App ID、App Secret 与工作目录')
+      return
+    }
+    setSaving(true)
+    try {
+      const resolvedId = draft.id.trim() || generateFallbackBotId(draft.name, draft.larkAppId)
+      await onSave(
+        {
+          ...draft,
+          id: resolvedId,
+          model: norm.model || undefined,
+          reasoningEffort: norm.reasoningEffort || undefined,
+        },
+        null,
+      )
+      onClose()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setSaving(false)
+    }
   }
+
+  const isJobRunning = Boolean(autoJob && ['waiting_scan', 'scanned', 'working'].includes(autoJob.status))
+  const primaryDisabled =
+    saving ||
+    isJobRunning ||
+    (createMode === 'existing' && existingSource === 'open_platform' && (!isOpAuthenticated || !opState.selectedAppId))
+  const primaryLabel =
+    createMode === 'auto'
+      ? isJobRunning
+        ? '等待完成…'
+        : isOpAuthenticated && autoProtocol === 'open_platform'
+          ? '一键创建并接入'
+          : '扫码创建并接入'
+      : saving
+        ? '接入中…'
+        : existingSource === 'open_platform'
+          ? '接入所选应用'
+          : '接入智能体'
+
+  return (
+    <Modal
+      open
+      onClose={onClose}
+      title="新增智能体"
+      headless
+      className="fb-schedule-dialog fb-create-bot-dialog"
+    >
+      <div className="fb-schedule-dialog-head">
+        <div style={{ minWidth: 0 }}>
+          <div className="fb-schedule-dialog-title">新增飞书智能体</div>
+          <div className="fb-schedule-dialog-sub">
+            支持一键自动创建飞书应用，或登录开放平台直接选择已有应用接入
+          </div>
+        </div>
+        <button type="button" className="fb-icon-btn" aria-label="关闭" onClick={onClose}>
+          <IconCloseOutlineRegular size={14} />
+        </button>
+      </div>
+
+      <div className="fb-schedule-dialog-body">
+        <div style={{ marginBottom: 10 }}>
+          <SegmentedControl
+            id="fb-bot-create-mode"
+            label="创建方式"
+            value={createMode}
+            options={[
+              { value: 'auto', label: '自动创建飞书智能体' },
+              { value: 'existing', label: '接入已有应用' },
+            ]}
+            onChange={(m) => {
+              setCreateMode(m)
+              setError('')
+            }}
+          />
+        </div>
+
+        {createMode === 'auto' ? (
+          <>
+            <SettingRow
+              title="创建通道"
+              desc={
+                autoProtocol === 'open_platform'
+                  ? isOpAuthenticated && opAuth?.identity
+                    ? `已登录开放平台：${opAuth.identity.userName}（${opAuth.identity.tenantName}）`
+                    : '扫码自动创建自建应用并开通权限与长连接'
+                  : '通过官方 SDK 设备流注册个人智能体凭证'
+              }
+            >
+              <SelectMenu
+                value={autoProtocol}
+                options={[
+                  { value: 'open_platform', label: '开放平台全自动创建（推荐）', desc: '创建企业自建应用并自动开通权限与长连接' },
+                  { value: 'device_flow', label: '扫码快速注册（SDK）', desc: '通过官方设备流注册个人应用凭证' },
+                ]}
+                onChange={setAutoProtocol}
+              />
+            </SettingRow>
+            <SettingRow title="智能体名称">
+              <TextField value={draft.name} onChange={(name) => patch({ name })} placeholder="例如 研发协作助手" />
+            </SettingRow>
+            <SettingRow title="智能体签名">
+              <TextField value={draft.description} onChange={(description) => patch({ description })} placeholder="飞书名片简介（选填）" />
+            </SettingRow>
+          </>
+        ) : (
+          <>
+            <SettingRow
+              title="接入方式"
+              desc={
+                existingSource === 'open_platform'
+                  ? isOpAuthenticated && opAuth?.identity
+                    ? `已登录开放平台：${opAuth.identity.userName}（${opAuth.identity.tenantName}）`
+                    : '登录开放平台后直接从列表选择，免填基本信息与凭证'
+                  : '手动输入已有应用的 App ID、App Secret 与基本信息'
+              }
+            >
+              <SelectMenu
+                value={existingSource}
+                options={[
+                  { value: 'open_platform', label: '从开放平台选择（推荐）', desc: '登录后从已有应用列表直接选取并自动读取凭证' },
+                  { value: 'manual', label: '手动填写凭证', desc: '手动填写 App ID、App Secret 与基本信息' },
+                ]}
+                onChange={handleExistingSourceChange}
+              />
+            </SettingRow>
+
+            {existingSource === 'open_platform' ? (
+              <OpenPlatformAppPicker
+                authenticated={isOpAuthenticated}
+                apps={opState.apps}
+                bots={bots}
+                loading={opState.loading}
+                loadError={opState.loadError}
+                selectedAppId={opState.selectedAppId}
+                loginJob={opState.loginJob}
+                startingLogin={opState.startingLogin}
+                onSelect={(app) => {
+                  opState.setSelectedAppId(app.appId)
+                  setError('')
+                }}
+                onRefresh={() => void opState.refreshApps()}
+                onStartLogin={() => {
+                  setError('')
+                  void opState.startLogin().catch((err) => {
+                    setError(err instanceof Error ? err.message : String(err))
+                  })
+                }}
+              />
+            ) : (
+              <>
+                <SettingRow title="显示名称">
+                  <TextField value={draft.name} onChange={(name) => patch({ name })} placeholder="例如 DSH-Agent" />
+                </SettingRow>
+                <SettingRow title="智能体签名">
+                  <TextField value={draft.description} onChange={(description) => patch({ description })} placeholder="留空保存可从飞书自动同步" />
+                </SettingRow>
+                <SettingRow title="标识" desc="内部唯一 ID，留空自动生成">
+                  <TextField value={draft.id} onChange={(id) => patch({ id })} placeholder="dsh-agent" mono />
+                </SettingRow>
+                <SettingRow title="App ID">
+                  <TextField value={draft.larkAppId} onChange={(larkAppId) => patch({ larkAppId })} placeholder="cli_xxx" mono />
+                </SettingRow>
+                <SettingRow title="App Secret" desc="仅加密保存在本机">
+                  <TextField value={draft.larkAppSecret ?? ''} onChange={(larkAppSecret) => patch({ larkAppSecret })} secret mono />
+                </SettingRow>
+              </>
+            )}
+          </>
+        )}
+
+        <SettingRow title="工作目录">
+          <DirectoryField
+            value={draft.defaultWorkingDir}
+            onChange={(defaultWorkingDir) => patch({ defaultWorkingDir })}
+            placeholder="~ 或 /path/to/workspace"
+          />
+        </SettingRow>
+        <SettingRow title="工作区" desc="留空默认使用工作目录末级名称">
+          <TextField
+            value={draft.workspaceName}
+            onChange={(workspaceName) => patch({ workspaceName })}
+            placeholder={leafDirectoryLabel(draft.defaultWorkingDir) || '默认使用工作目录名称'}
+          />
+        </SettingRow>
+        <AgentRuntimeFields
+          runtimeTitle="默认运行时"
+          value={{
+            agentPreset: draft.agentPreset,
+            model: draft.model ?? '',
+            reasoningEffort: draft.reasoningEffort ?? '',
+          }}
+          runtimes={runtimes}
+          models={models}
+          onChange={({ agentPreset, model, reasoningEffort }) => {
+            runtimeTouchedRef.current = true
+            patch({
+              agentPreset,
+              model: model || undefined,
+              reasoningEffort: reasoningEffort || undefined,
+            })
+          }}
+        />
+
+        {createMode === 'auto' && autoJob && (
+          <div className="fb-qr-panel" style={{ marginTop: 12 }}>
+            {autoJob.qrSvgDataUrl && <img className="fb-qr-img" src={autoJob.qrSvgDataUrl} alt="扫码创建智能体" />}
+            <div className="fb-qr-info">
+              <div style={{ fontWeight: 500 }}>自动创建进度</div>
+              <div className="fb-row-desc">{autoJob.stepMessage}</div>
+              {autoJob.verificationUrl && (
+                <a href={autoJob.verificationUrl} target="_blank" rel="noreferrer" className="fb-row-desc" style={{ textDecoration: 'underline' }}>
+                  在浏览器中打开验证链接
+                </a>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div className="fb-schedule-dialog-foot">
+        {error ? <span className="fb-dialog-error">{error}</span> : null}
+        <Button variant="outline" onClick={onClose}>
+          取消
+        </Button>
+        <Button variant="primary" disabled={primaryDisabled} onClick={() => void handlePrimarySubmit()}>
+          {primaryLabel}
+        </Button>
+      </div>
+    </Modal>
+  )
+}
+
+function EditBotDialog({
+  target,
+  runtimes,
+  models,
+  auth,
+  onClose,
+  onSave,
+  onSynced,
+  onOpenAuth,
+  onOpenSession,
+}: {
+  target: BotRecord
+  runtimes: readonly RuntimeOption[]
+  models: readonly ModelGroup[]
+  auth: AuthStatusPayload | null
+  onClose: () => void
+  onSave: (config: BotConfig, existingId: string | null) => Promise<void>
+  onSynced: () => Promise<void>
+  onOpenAuth: () => void
+  onOpenSession?: (sessionId: string) => void
+}) {
+  const [section, setSection] = useState<Section>('basic')
+  const [draft, setDraft] = useState<BotConfig>(() => toBotConfig(target))
+  const [localDreamState, setLocalDreamState] = useState<DreamRunState | undefined>(target.dreamState)
+  const [saving, setSaving] = useState(false)
+  const [syncingProfile, setSyncingProfile] = useState(false)
+  const [error, setError] = useState('')
+  const existingId = target.id
+
+  useEffect(() => {
+    setDraft(toBotConfig(target))
+    setLocalDreamState(target.dreamState)
+    setSection('basic')
+    setError('')
+
+    if (!target.avatarUrl?.trim() || !target.description?.trim()) {
+      let cancelled = false
+      void bridgeApi
+        .syncBotProfile(target.id)
+        .then((res) => {
+          if (cancelled) return
+          const nextAvatar = res.profile.avatarUrl?.trim()
+          const nextDesc = res.profile.description?.trim()
+          if (!nextAvatar && !nextDesc) return
+          setDraft((prev) => {
+            if (prev.id !== target.id) return prev
+            return {
+              ...prev,
+              ...(nextAvatar && !prev.avatarUrl.trim() ? { avatarUrl: nextAvatar } : {}),
+              ...(nextDesc && !prev.description.trim() ? { description: nextDesc } : {}),
+            }
+          })
+        })
+        .catch(() => {})
+      return () => {
+        cancelled = true
+      }
+    }
+    return undefined
+  }, [target])
+
+  useEffect(() => {
+    if (target.dreamState) {
+      setLocalDreamState(target.dreamState)
+    }
+  }, [target])
+
+  const patch = (p: Partial<BotConfig>) => setDraft({ ...draft, ...p })
+  const runtime = runtimes.find((r) => r.id === draft.agentPreset)
 
   const save = async () => {
     const missing = !draft.id.trim() || !draft.name.trim() || !draft.larkAppId.trim() || !draft.defaultWorkingDir.trim()
-    if (missing || (!existingId && !draft.larkAppSecret?.trim())) {
+    if (missing) {
       setSection('basic')
       setError('请补全基本信息中的必填项')
       return
@@ -440,7 +819,6 @@ export function BotConfigDialog({
   }
 
   const syncAvatarAndProfile = async () => {
-    if (!existingId) return
     setSyncingProfile(true)
     try {
       const res = await bridgeApi.syncBotProfile(existingId)
@@ -448,7 +826,7 @@ export function BotConfigDialog({
         ...(res.profile.avatarUrl ? { avatarUrl: res.profile.avatarUrl } : {}),
         ...(res.profile.description ? { description: res.profile.description } : {}),
       })
-      await onAutoCreated()
+      await onSynced()
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
@@ -459,7 +837,7 @@ export function BotConfigDialog({
   return (
     <ConfigDialog
       open
-      title={existingId ? draft.name || existingId : '接入已有飞书应用'}
+      title={draft.name || existingId}
       sections={SECTIONS}
       active={section}
       onSectionChange={setSection}
@@ -470,34 +848,18 @@ export function BotConfigDialog({
     >
       {section === 'basic' && (
         <>
-          {!existingId && (
-            <div style={{ paddingTop: 10, paddingBottom: 4 }}>
-              <SegmentedControl
-                id="fb-bot-create-mode-manual"
-                label="创建方式"
-                value={createMode}
-                options={[
-                  { value: 'auto', label: '自动创建飞书智能体' },
-                  { value: 'manual', label: '接入已有应用' },
-                ]}
-                onChange={setCreateMode}
-              />
-            </div>
-          )}
-          {existingId && (
-            <SettingRow title="智能体头像">
-              <Avatar src={draft.avatarUrl} name={draft.name || existingId} kind="bot" />
-              <Button
-                size="sm"
-                variant="outline"
-                icon={<IconRefreshOutlineRegular size={14} />}
-                disabled={syncingProfile}
-                onClick={() => void syncAvatarAndProfile()}
-              >
-                {syncingProfile ? '同步中…' : '同步飞书信息'}
-              </Button>
-            </SettingRow>
-          )}
+          <SettingRow title="智能体头像">
+            <Avatar src={draft.avatarUrl} name={draft.name || existingId} kind="bot" />
+            <Button
+              size="sm"
+              variant="outline"
+              icon={<IconRefreshOutlineRegular size={14} />}
+              disabled={syncingProfile}
+              onClick={() => void syncAvatarAndProfile()}
+            >
+              {syncingProfile ? '同步中…' : '同步飞书信息'}
+            </Button>
+          </SettingRow>
           <SettingRow title="显示名称">
             <TextField value={draft.name} onChange={(name) => patch({ name })} placeholder="例如 DSH-Agent" />
           </SettingRow>
@@ -508,13 +870,13 @@ export function BotConfigDialog({
             <TextField value={draft.description} onChange={(description) => patch({ description })} placeholder="飞书名片简介" />
           </SettingRow>
           <SettingRow title="标识" desc="内部唯一 ID，创建后不可修改">
-            <TextField value={draft.id} onChange={(id) => patch({ id })} placeholder="dsh-agent" mono disabled={Boolean(existingId)} />
+            <TextField value={draft.id} onChange={(id) => patch({ id })} placeholder="dsh-agent" mono disabled />
           </SettingRow>
           <SettingRow title="App ID">
             <TextField value={draft.larkAppId} onChange={(larkAppId) => patch({ larkAppId })} placeholder="cli_xxx" mono />
           </SettingRow>
-          <SettingRow title="App Secret" desc={existingId ? '留空保持原密钥不变' : '仅加密保存在本机'}>
-            <TextField value={draft.larkAppSecret ?? ''} onChange={(larkAppSecret) => patch({ larkAppSecret })} placeholder={existingId ? '••••••••' : ''} secret mono />
+          <SettingRow title="App Secret" desc="留空保持原密钥不变">
+            <TextField value={draft.larkAppSecret ?? ''} onChange={(larkAppSecret) => patch({ larkAppSecret })} placeholder="••••••••" secret mono />
           </SettingRow>
           <SettingRow title="工作目录">
             <DirectoryField
@@ -529,7 +891,7 @@ export function BotConfigDialog({
               onChange={(workspaceName) => patch({ workspaceName })}
               placeholder={
                 leafDirectoryLabel(draft.defaultWorkingDir) ||
-                (target !== 'new' && !target.workspaceName && draft.defaultWorkingDir === target.defaultWorkingDir
+                (!target.workspaceName && draft.defaultWorkingDir === target.defaultWorkingDir
                   ? target.effectiveWorkspaceName
                   : '') ||
                 '默认使用工作目录名称'
@@ -610,7 +972,7 @@ export function BotConfigDialog({
           }}
           onStateUpdated={(next) => {
             setLocalDreamState(next)
-            void onAutoCreated()
+            void onSynced()
           }}
         />
       )}

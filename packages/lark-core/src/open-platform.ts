@@ -138,6 +138,28 @@ export interface AutoCreatedBotCredentials {
   readonly larkAppSecret: string
 }
 
+export interface LarkOpenPlatformAppSummary {
+  readonly appId: string
+  readonly name: string
+  readonly description: string
+  readonly avatarUrl?: string
+  readonly hasBotAbility: boolean
+  readonly abilities: readonly string[]
+  readonly appStatus: number
+  readonly version?: string
+  readonly role?: number
+  readonly updateTime?: number
+}
+
+export interface LarkOpenPlatformAppCredentials {
+  readonly appId: string
+  readonly appSecret: string
+  readonly name: string
+  readonly description: string
+  readonly avatarUrl?: string
+  readonly hasBotAbility: boolean
+}
+
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -497,12 +519,84 @@ function nextSemanticVersion(versionListPayload: Record<string, unknown>): strin
   return `${max[0]}.${max[1]}.${max[2]! + 1}`
 }
 
-function slugifyBotId(name: string): string {
+export function slugifyBotId(name: string, fallbackSuffix?: string): string {
   const ascii = name
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '')
-  return ascii || `bot-${randomUUID().slice(0, 6)}`
+  if (ascii) return ascii
+  const cleanSuffix = (fallbackSuffix ?? '')
+    .toLowerCase()
+    .replace(/^cli_/, '')
+    .replace(/[^a-z0-9]+/g, '')
+    .slice(0, 6)
+  return `bot-${cleanSuffix || randomUUID().slice(0, 6)}`
+}
+
+function extractLocalizedAppFields(base: Record<string, unknown>): {
+  readonly name?: string
+  readonly description?: string
+  readonly avatarUrl?: string
+  readonly abilities: readonly string[]
+} {
+  const primaryLang = pickStr(base, ['primaryLang']) ?? 'zh_cn'
+  const i18n = asRecord(base.i18n)
+  const zhBlock = asRecord(i18n.zh_cn)
+  const primaryBlock = asRecord(i18n[primaryLang])
+  const name =
+    pickStr(zhBlock, ['name']) ??
+    pickStr(primaryBlock, ['name']) ??
+    pickStr(base, ['name'])
+  const description =
+    pickStr(zhBlock, ['description', 'desc']) ??
+    pickStr(primaryBlock, ['description', 'desc']) ??
+    pickStr(base, ['desc', 'description'])
+  const rawAvatar = pickStr(base, ['avatarUrl', 'avatar_url', 'iconUrl', 'icon_url', 'avatar'])
+  const avatarUrl = rawAvatar && /^https?:\/\//i.test(rawAvatar) ? rawAvatar : undefined
+  const abilities = Array.isArray(base.ability)
+    ? base.ability.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+    : []
+  return {
+    ...(name ? { name } : {}),
+    ...(description ? { description } : {}),
+    ...(avatarUrl ? { avatarUrl } : {}),
+    abilities,
+  }
+}
+
+function parseOpenPlatformAppSummary(raw: unknown): LarkOpenPlatformAppSummary | undefined {
+  const rec = asRecord(raw)
+  const appId = pickStr(rec, ['appID', 'clientID', 'clientId', 'appId'])
+  if (!appId) return undefined
+  const fields = extractLocalizedAppFields(rec)
+  const appStatus =
+    typeof rec.appStatus === 'number'
+      ? rec.appStatus
+      : typeof rec.appListStatus === 'number'
+        ? rec.appListStatus
+        : 0
+  const version = pickStr(rec, ['version'])
+  const role = typeof rec.role === 'number' ? rec.role : undefined
+  const updateTime = typeof rec.updateTime === 'number' ? rec.updateTime : undefined
+  return {
+    appId,
+    name: fields.name || appId,
+    description: fields.description ?? '',
+    ...(fields.avatarUrl ? { avatarUrl: fields.avatarUrl } : {}),
+    hasBotAbility: fields.abilities.includes('bot'),
+    abilities: fields.abilities,
+    appStatus,
+    ...(version ? { version } : {}),
+    ...(role !== undefined ? { role } : {}),
+    ...(updateTime !== undefined ? { updateTime } : {}),
+  }
+}
+
+function appPriorityRank(app: LarkOpenPlatformAppSummary): number {
+  if (app.hasBotAbility && app.appStatus !== 0 && app.appStatus !== 3) return 0
+  if (app.hasBotAbility) return 1
+  if (app.appStatus !== 0 && app.appStatus !== 3) return 2
+  return 3
 }
 
 export class LarkPlatformManager {
@@ -660,28 +754,102 @@ export class LarkPlatformManager {
     if (!loaded) return undefined
     try {
       const appPayload = await loaded.client.postJson(`/developers/v1/app/${larkAppId}`, {})
-      const base = asRecord(appPayload.data)
-      const primaryLang = pickStr(base, ['primaryLang']) ?? 'zh_cn'
-      const i18n = asRecord(base.i18n)
-      const zhBlock = asRecord(i18n.zh_cn)
-      const primaryBlock = asRecord(i18n[primaryLang])
-      const name =
-        pickStr(zhBlock, ['name']) ??
-        pickStr(primaryBlock, ['name']) ??
-        pickStr(base, ['name'])
-      const description =
-        pickStr(zhBlock, ['description']) ??
-        pickStr(primaryBlock, ['description']) ??
-        pickStr(base, ['desc', 'description'])
-      const avatarUrl = pickStr(base, ['avatarUrl', 'avatar_url', 'iconUrl', 'icon_url'])
-      if (!name && !description && !avatarUrl) return undefined
+      const fields = extractLocalizedAppFields(asRecord(appPayload.data))
+      if (!fields.name && !fields.description && !fields.avatarUrl) return undefined
       return {
-        ...(name ? { name } : {}),
-        ...(description ? { description } : {}),
-        ...(avatarUrl ? { avatarUrl } : {}),
+        ...(fields.name ? { name: fields.name } : {}),
+        ...(fields.description ? { description: fields.description } : {}),
+        ...(fields.avatarUrl ? { avatarUrl: fields.avatarUrl } : {}),
       }
     } catch {
       return undefined
+    }
+  }
+
+  async listOpenPlatformApps(): Promise<{
+    readonly authenticated: boolean
+    readonly identity?: LarkOpenPlatformIdentity
+    readonly apps: readonly LarkOpenPlatformAppSummary[]
+  }> {
+    const loaded = await this.loadValidConsoleClient()
+    if (!loaded) {
+      return { authenticated: false, apps: [] }
+    }
+    const payload = await loaded.client.postJson('/developers/v1/app/list', {})
+    const data = asRecord(payload.data)
+    const rawList = Array.isArray(data.apps)
+      ? data.apps
+      : Array.isArray(data.list)
+        ? data.list
+        : Array.isArray(payload.apps)
+          ? payload.apps
+          : []
+    const dedup = new Map<string, LarkOpenPlatformAppSummary>()
+    for (const item of rawList) {
+      const parsed = parseOpenPlatformAppSummary(item)
+      if (parsed && !dedup.has(parsed.appId)) {
+        dedup.set(parsed.appId, parsed)
+      }
+    }
+    const apps = [...dedup.values()].sort((a, b) => {
+      const rankDiff = appPriorityRank(a) - appPriorityRank(b)
+      if (rankDiff !== 0) return rankDiff
+      const timeDiff = (b.updateTime ?? 0) - (a.updateTime ?? 0)
+      if (timeDiff !== 0) return timeDiff
+      return a.name.localeCompare(b.name, 'zh-CN')
+    })
+    return {
+      authenticated: true,
+      ...(loaded.client.identity ? { identity: loaded.client.identity } : {}),
+      apps,
+    }
+  }
+
+  async fetchOpenPlatformAppCredentials(larkAppId: string): Promise<LarkOpenPlatformAppCredentials> {
+    const appId = larkAppId.trim()
+    if (!appId) {
+      throw new Error('请选择要接入的飞书应用')
+    }
+    const loaded = await this.loadValidConsoleClient()
+    if (!loaded) {
+      throw new Error('尚未登录飞书开放平台，请先扫码登录')
+    }
+    const [appResult, secretResult] = await Promise.allSettled([
+      loaded.client.postJson(`/developers/v1/app/${appId}`, {}),
+      loaded.client.postJson(`/developers/v1/secret/${appId}`, {}),
+    ])
+    const base = appResult.status === 'fulfilled' ? asRecord(appResult.value.data) : {}
+    const fields = extractLocalizedAppFields(base)
+    const secretRestricted = base.secretRestricted === true
+    let appSecret: string | undefined
+    if (secretResult.status === 'fulfilled') {
+      appSecret =
+        pickStr(asRecord(secretResult.value.data), ['secret']) ??
+        pickStr(secretResult.value, ['secret'])
+    }
+    if (!appSecret) {
+      if (secretRestricted) {
+        throw new Error(
+          `该应用已开启密钥查看限制，无法自动读取 App Secret，请切换为「手动填写凭证」接入`,
+        )
+      }
+      const reason =
+        secretResult.status === 'rejected'
+          ? secretResult.reason instanceof Error
+            ? secretResult.reason.message
+            : String(secretResult.reason)
+          : ''
+      throw new Error(
+        `无法从开放平台读取应用 ${appId} 的 App Secret${reason ? `（${reason}）` : ''}，请确认应用权限或切换为「手动填写凭证」`,
+      )
+    }
+    return {
+      appId,
+      appSecret,
+      name: fields.name || appId,
+      description: fields.description ?? '',
+      ...(fields.avatarUrl ? { avatarUrl: fields.avatarUrl } : {}),
+      hasBotAbility: fields.abilities.includes('bot'),
     }
   }
 

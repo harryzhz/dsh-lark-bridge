@@ -246,6 +246,24 @@ export async function dispatchLarkApiRequest(
         manager.platform.logoutOpenPlatform()
         return ok({ ok: true })
       }
+      if (method === 'GET' && segments[1] === 'open-platform' && segments[2] === 'apps') {
+        const result = await manager.platform.listOpenPlatformApps()
+        const byAppId = new Map(manager.store.listBots().map((b) => [b.larkAppId, b]))
+        const apps = result.apps.map((app) => {
+          const existing = byAppId.get(app.appId)
+          return {
+            ...app,
+            alreadyConnected: Boolean(existing),
+            ...(existing ? { connectedBotId: existing.id, connectedBotName: existing.name } : {}),
+          }
+        })
+        return ok({
+          ok: true,
+          authenticated: result.authenticated,
+          ...(result.identity ? { identity: result.identity } : {}),
+          apps,
+        })
+      }
       if (method === 'POST' && segments[1] === 'user' && segments[2] && segments[3] === 'login') {
         const bot = manager.store.getBot(segments[2])
         if (!bot) {
@@ -319,6 +337,15 @@ export async function dispatchLarkApiRequest(
       const body = bodyRecord(request.body)
       const job = await manager.startAutoCreateBot(body)
       return ok({ ok: true, job })
+    }
+
+    if (method === 'POST' && pathname === 'bots/import-existing') {
+      if (isCliAuthenticated) {
+        return ok({ ok: false, error: 'owner_web_session_required' }, 403)
+      }
+      const body = bodyRecord(request.body)
+      const saved = await manager.importExistingOpenPlatformBot(body)
+      return ok({ ok: true, bot: toPublicBotView(saved) }, 201)
     }
 
     if (method === 'POST' && pathname === 'bots') {

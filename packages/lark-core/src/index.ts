@@ -36,8 +36,11 @@ export {
 } from './message-parser.js'
 export {
   LarkPlatformManager,
+  slugifyBotId,
   type AutoCreateBotRequest,
   type AutoCreatedBotCredentials,
+  type LarkOpenPlatformAppCredentials,
+  type LarkOpenPlatformAppSummary,
   type LarkOpenPlatformIdentity,
   type LarkOpenPlatformStatus,
   type LarkQrJobView,

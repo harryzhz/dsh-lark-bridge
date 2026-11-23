@@ -298,6 +298,37 @@ export interface OpenPlatformStatus {
   message?: string
 }
 
+export interface OpenPlatformAppItem {
+  appId: string
+  name: string
+  description: string
+  avatarUrl?: string
+  hasBotAbility: boolean
+  abilities: string[]
+  appStatus: number
+  version?: string
+  role?: number
+  updateTime?: number
+  alreadyConnected: boolean
+  connectedBotId?: string
+  connectedBotName?: string
+}
+
+export interface OpenPlatformAppsPayload {
+  authenticated: boolean
+  identity?: OpenPlatformIdentity
+  apps: OpenPlatformAppItem[]
+}
+
+export interface ImportExistingBotInput {
+  larkAppId: string
+  workspaceName?: string
+  defaultWorkingDir: string
+  agentPreset: string
+  model?: string
+  reasoningEffort?: string
+}
+
 export interface UserAuthStatus {
   botId: string
   authorized: boolean

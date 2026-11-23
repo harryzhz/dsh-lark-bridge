@@ -643,4 +643,158 @@ describe('LarkBridgeStore, RuntimeCatalog, CLI Auth & HTTP API', () => {
       }),
     ).rejects.toThrow(/内置运行时 "standard" 缺少可用的原生模型配置/)
   })
+
+  it('lists Open Platform apps with connection flags and imports existing apps without exposing secrets', async () => {
+    const dataDir = makeTempDir()
+    const validDir = makeTempDir()
+    const missingDir = join(dataDir, 'missing-workspace')
+    const store = new LarkBridgeStore(dataDir)
+    store.upsertBot({
+      id: 'existing-bot',
+      name: 'Existing Bot',
+      enabled: false,
+      larkAppId: 'cli_connected_1',
+      larkAppSecret: 'mock-secret-value',
+      defaultWorkingDir: validDir,
+    })
+
+    const fakeCtx = {
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      llm: { listProviders: () => [] },
+      on: () => () => {},
+      get: () => undefined,
+    } as unknown as Context
+    const manager = new LarkBridgeManager(
+      fakeCtx,
+      {
+        dataDir,
+        publicBaseUrl: 'http://127.0.0.1:3880',
+        idleSweepIntervalMs: 0,
+        maxAuditEvents: 50,
+        autoInstallCliAndSkill: false,
+      },
+      store,
+    )
+    vi.spyOn(manager, 'syncBot').mockResolvedValue(undefined)
+    vi.spyOn(manager, 'ensureBotProfileHydrated').mockResolvedValue(undefined)
+    vi.spyOn(manager.platform, 'listOpenPlatformApps').mockResolvedValue({
+      authenticated: true,
+      identity: {
+        userId: 'u_demo_1',
+        userName: 'Alex Chen',
+        tenantId: 't_demo',
+        tenantName: 'Acme Corp',
+      },
+      apps: [
+        {
+          appId: 'cli_connected_1',
+          name: 'Existing Bot',
+          description: 'Already linked',
+          avatarUrl: 'https://example.com/a.png',
+          hasBotAbility: true,
+          abilities: ['bot'],
+          appStatus: 2,
+        },
+        {
+          appId: 'cli_ready_2',
+          name: '研发值班助手',
+          description: '自动同步自开放平台',
+          avatarUrl: 'https://example.com/b.png',
+          hasBotAbility: true,
+          abilities: ['bot'],
+          appStatus: 2,
+        },
+      ],
+    })
+    vi.spyOn(manager.platform, 'fetchOpenPlatformAppCredentials').mockResolvedValue({
+      appId: 'cli_ready_2',
+      appSecret: 'mock-test-secret',
+      name: '研发值班助手',
+      description: '自动同步自开放平台',
+      avatarUrl: 'https://example.com/b.png',
+      hasBotAbility: true,
+    })
+
+    const admitter: ConnectionAdmitter = { admit: () => ({ peer: { principal: { kind: 'owner' } } }) }
+    const handler = createLarkHttpHandler(fakeCtx, admitter, manager)
+
+    // 1. CLI bearer token cannot list Open Platform apps or import existing apps
+    const cliList = await invokeHandler(handler, {
+      url: '/api/lark-bridge/auth/open-platform/apps',
+      headers: { authorization: `Bearer ${manager.cliAuth.token}` },
+    })
+    expect(cliList.status).toBe(403)
+    const cliImport = await invokeHandler(handler, {
+      method: 'POST',
+      url: '/api/lark-bridge/bots/import-existing',
+      headers: { authorization: `Bearer ${manager.cliAuth.token}` },
+      body: { larkAppId: 'cli_ready_2', defaultWorkingDir: validDir },
+    })
+    expect(cliImport.status).toBe(403)
+
+    // 2. Owner session receives annotated Open Platform app list
+    const listRes = await invokeHandler(handler, {
+      url: '/api/lark-bridge/auth/open-platform/apps',
+    })
+    expect(listRes.status).toBe(200)
+    expect(listRes.json.authenticated).toBe(true)
+    const apps = listRes.json.apps as Array<Record<string, unknown>>
+    expect(apps).toHaveLength(2)
+    expect(apps[0]).toMatchObject({
+      appId: 'cli_connected_1',
+      alreadyConnected: true,
+      connectedBotId: 'existing-bot',
+      connectedBotName: 'Existing Bot',
+    })
+    expect(apps[1]).toMatchObject({
+      appId: 'cli_ready_2',
+      alreadyConnected: false,
+    })
+    expect(JSON.stringify(listRes.json)).not.toContain('mock-test-secret')
+
+    // 3. Rejects invalid workingDir before calling Open Platform credentials API
+    const badDirRes = await invokeHandler(handler, {
+      method: 'POST',
+      url: '/api/lark-bridge/bots/import-existing',
+      body: { larkAppId: 'cli_ready_2', defaultWorkingDir: missingDir },
+    })
+    expect(badDirRes.status).toBe(400)
+    expect(String(badDirRes.json.error)).toContain('工作目录不存在')
+
+    // 4. Rejects already connected app
+    const dupRes = await invokeHandler(handler, {
+      method: 'POST',
+      url: '/api/lark-bridge/bots/import-existing',
+      body: { larkAppId: 'cli_connected_1', defaultWorkingDir: validDir },
+    })
+    expect(dupRes.status).toBe(400)
+    expect(String(dupRes.json.error)).toContain('已接入')
+
+    // 5. Imports new existing app without manual basic info, persists secret locally, redacts from response
+    const importedRes = await invokeHandler(handler, {
+      method: 'POST',
+      url: '/api/lark-bridge/bots/import-existing',
+      body: {
+        larkAppId: 'cli_ready_2',
+        defaultWorkingDir: validDir,
+        workspaceName: 'OpsSpace',
+        agentPreset: 'standard',
+      },
+    })
+    expect(importedRes.status).toBe(201)
+    const botView = importedRes.json.bot as Record<string, unknown>
+    expect(botView.name).toBe('研发值班助手')
+    expect(botView.description).toBe('自动同步自开放平台')
+    expect(botView.avatarUrl).toBe('https://example.com/b.png')
+    expect(botView.larkAppId).toBe('cli_ready_2')
+    expect(botView.hasSecret).toBe(true)
+    expect(botView.larkAppSecret).toBeUndefined()
+    expect(botView.id).toBe('bot-ready2')
+
+    const persisted = store.getBot('bot-ready2')
+    expect(persisted?.larkAppSecret).toBe('mock-test-secret')
+    expect(persisted?.workspaceName).toBe('OpsSpace')
+
+    await manager.stop()
+  })
 })

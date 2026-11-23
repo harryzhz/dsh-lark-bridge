@@ -231,6 +231,7 @@ function LarkBridgePage() {
 
       <BotConfigDialog
         target={editingBot}
+        bots={data.bots}
         runtimes={data.runtimes}
         models={data.models}
         auth={data.auth}
@@ -241,6 +242,12 @@ function LarkBridgePage() {
           await data.refresh()
           await data.refreshAuth()
         }}
+        onExistingImported={async (botName) => {
+          setToast({ text: `智能体「${botName}」已接入`, ok: true })
+          await data.refresh()
+        }}
+        onRefresh={data.refresh}
+        onAuthUpdated={data.refreshAuth}
         onOpenAuth={() => setAuthOpen(true)}
         onOpenSession={(sid) => openDshSession?.(sid)}
       />
