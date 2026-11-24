@@ -133,8 +133,9 @@ describe('Smart triage config, per-group overrides & protocol', () => {
     expect(effDefault.contextTtlMinutes).toBe(45)
     expect(effDefault.includeLastReply).toBe(false)
     expect(effDefault.coalesceQueuedMessages).toBe(true)
+    expect(effDefault.bypass).toEqual({ senderTypes: ['bot'], msgTypes: [], keywords: [] })
 
-    // Full per-group override (model, scope, timeout, coalescing, systemPrompt & context params)
+    // Full per-group override (model, scope, bypass, timeout, coalescing, systemPrompt & context params)
     const customGroup = LarkGroupConfigSchema.parse({
       key: 'bot-triage:oc_custom',
       botId: 'bot-triage',
@@ -144,6 +145,11 @@ describe('Smart triage config, per-group overrides & protocol', () => {
         provider: 'arkcli-agent-plan',
         model: 'doubao-seed-2.1-lite',
         scope: 'all_group',
+        bypass: {
+          senderTypes: [],
+          msgTypes: ['interactive'],
+          keywords: [' P0 ', 'CRITICAL', 'P0', '  '],
+        },
         timeoutMs: 5000,
         systemPrompt: '本群仅处理告警与发布 {{trigger_guide}}',
         recentMessageCount: 12,
@@ -159,6 +165,11 @@ describe('Smart triage config, per-group overrides & protocol', () => {
       provider: 'arkcli-agent-plan',
       model: 'doubao-seed-2.1-lite',
       scope: 'all_group',
+      bypass: {
+        senderTypes: [],
+        msgTypes: ['interactive'],
+        keywords: ['P0', 'CRITICAL'],
+      },
       timeoutMs: 5000,
       systemPrompt: '本群仅处理告警与发布 {{trigger_guide}}',
       recentMessageCount: 12,
@@ -218,12 +229,18 @@ describe('Smart triage config, per-group overrides & protocol', () => {
     expect(resolveEffectiveRouterConfig(offBot, customGroup).enabled).toBe(true)
   })
 
-  it('enforces passive_only vs all_group scope boundaries and excludes p2p', () => {
+  it('enforces passive_only, active_thread_only, and all_group scope boundaries and excludes p2p', () => {
     const passiveCfg = {
       source: 'bot' as const,
       ...DEFAULT_BOT_ROUTER_CONFIG,
       enabled: true,
       scope: 'passive_only' as const,
+    }
+    const activeThreadOnlyCfg = {
+      source: 'bot' as const,
+      ...DEFAULT_BOT_ROUTER_CONFIG,
+      enabled: true,
+      scope: 'active_thread_only' as const,
     }
     const allGroupCfg = {
       source: 'bot' as const,
@@ -238,40 +255,112 @@ describe('Smart triage config, per-group overrides & protocol', () => {
     expect(shouldRunTriage(makeDecision({ trigger: 'listener' }), passiveCfg)).toBe(true)
     expect(shouldRunTriage(makeDecision({ trigger: 'active-thread' }), passiveCfg)).toBe(true)
 
+    expect(shouldRunTriage(makeDecision({ trigger: 'p2p' }), activeThreadOnlyCfg)).toBe(false)
+    expect(shouldRunTriage(makeDecision({ trigger: 'mention' }), activeThreadOnlyCfg)).toBe(false)
+    expect(shouldRunTriage(makeDecision({ trigger: 'substitute' }), activeThreadOnlyCfg)).toBe(false)
+    expect(shouldRunTriage(makeDecision({ trigger: 'listener' }), activeThreadOnlyCfg)).toBe(false)
+    expect(shouldRunTriage(makeDecision({ trigger: 'active-thread' }), activeThreadOnlyCfg)).toBe(
+      true,
+    )
+
     expect(shouldRunTriage(makeDecision({ trigger: 'mention' }), allGroupCfg)).toBe(true)
     expect(shouldRunTriage(makeDecision({ trigger: 'substitute' }), allGroupCfg)).toBe(true)
   })
 
-  it('bypasses triage ONLY for non-text rich media (images/files/media/merge_forward) and never bypasses long text or code blocks', () => {
+  it('bypasses triage for built-in rich media and declarative bypass rules (senderTypes / msgTypes / keywords)', () => {
+    const emptyBypass = { senderTypes: [], msgTypes: [], keywords: [] }
     expect(
-      shouldFastBypassTriage(makeMsg({ imageKeys: ['img_1'] }), makeDecision({ trigger: 'mention' })).bypass,
+      shouldFastBypassTriage(
+        makeMsg({ imageKeys: ['img_1'] }),
+        makeDecision({ trigger: 'mention' }),
+        emptyBypass,
+      ).bypass,
     ).toBe(true)
     expect(
-      shouldFastBypassTriage(makeMsg({ msgType: 'file' }), makeDecision({ trigger: 'listener' })).bypass,
+      shouldFastBypassTriage(
+        makeMsg({ msgType: 'file' }),
+        makeDecision({ trigger: 'listener' }),
+        emptyBypass,
+      ).bypass,
     ).toBe(true)
     expect(
-      shouldFastBypassTriage(makeMsg({ msgType: 'media' }), makeDecision({ trigger: 'mention' })).bypass,
+      shouldFastBypassTriage(
+        makeMsg({ msgType: 'media' }),
+        makeDecision({ trigger: 'mention' }),
+        emptyBypass,
+      ).bypass,
     ).toBe(true)
     expect(
-      shouldFastBypassTriage(makeMsg({ msgType: 'merge_forward' }), makeDecision({ trigger: 'mention' })).bypass,
+      shouldFastBypassTriage(
+        makeMsg({ msgType: 'merge_forward' }),
+        makeDecision({ trigger: 'mention' }),
+        emptyBypass,
+      ).bypass,
     ).toBe(true)
     // Long text and fenced code blocks are NO LONGER bypassed
     expect(
       shouldFastBypassTriage(
         makeMsg(),
         makeDecision({ trigger: 'mention', userText: '看下报错：\n```ts\nthrow new Error()\n```' }),
+        DEFAULT_BOT_ROUTER_CONFIG.bypass,
       ).bypass,
     ).toBe(false)
     expect(
       shouldFastBypassTriage(
         makeMsg({ msgType: 'text' }),
         makeDecision({ trigger: 'mention', userText: 'A'.repeat(2500) }),
+        DEFAULT_BOT_ROUTER_CONFIG.bypass,
       ).bypass,
     ).toBe(false)
     expect(
       shouldFastBypassTriage(
-        makeMsg({ msgType: 'interactive' }),
+        makeMsg({ msgType: 'interactive', senderType: 'user' }),
         makeDecision({ trigger: 'listener', userText: 'A'.repeat(1200) }),
+        DEFAULT_BOT_ROUTER_CONFIG.bypass,
+      ).bypass,
+    ).toBe(false)
+
+    // Default bypass: senderTypes=['bot'] routes bot/app alerts directly to main runtime
+    const botHit = shouldFastBypassTriage(
+      makeMsg({ senderType: 'bot', msgType: 'interactive' }),
+      makeDecision({ trigger: 'listener', userText: '[P1] API 延迟飙升' }),
+      DEFAULT_BOT_ROUTER_CONFIG.bypass,
+    )
+    expect(botHit.bypass).toBe(true)
+    expect(botHit.reason).toContain('应用/机器人')
+
+    // Clearing senderTypes lets bot messages go through triage
+    expect(
+      shouldFastBypassTriage(
+        makeMsg({ senderType: 'bot', msgType: 'text' }),
+        makeDecision({ trigger: 'listener', userText: '日常构建完成' }),
+        emptyBypass,
+      ).bypass,
+    ).toBe(false)
+
+    // msgTypes bypass
+    const cardHit = shouldFastBypassTriage(
+      makeMsg({ senderType: 'user', msgType: 'interactive' }),
+      makeDecision({ trigger: 'listener', userText: '卡片通知' }),
+      { senderTypes: [], msgTypes: ['interactive'], keywords: [] },
+    )
+    expect(cardHit.bypass).toBe(true)
+    expect(cardHit.reason).toContain('interactive')
+
+    // Case-insensitive keyword bypass
+    const kwHit = shouldFastBypassTriage(
+      makeMsg({ senderType: 'user', msgType: 'text' }),
+      makeDecision({ trigger: 'listener', userText: '线上 critical 接口超时了' }),
+      { senderTypes: [], msgTypes: [], keywords: ['P0', 'CRITICAL'] },
+    )
+    expect(kwHit.bypass).toBe(true)
+    expect(kwHit.reason).toContain('CRITICAL')
+
+    expect(
+      shouldFastBypassTriage(
+        makeMsg({ senderType: 'user', msgType: 'text' }),
+        makeDecision({ trigger: 'listener', userText: '中午吃啥' }),
+        { senderTypes: [], msgTypes: [], keywords: ['P0', 'CRITICAL'] },
       ).bypass,
     ).toBe(false)
   })

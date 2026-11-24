@@ -7,6 +7,8 @@ import type {
   ListenerSenderType,
   ListenerTemplate,
   ReminderCreationMode,
+  RouterBypassConfig,
+  RouterBypassMsgType,
   RouterScopeMode,
   ScheduleDeliveryMode,
   ScheduleNotifyOn,
@@ -101,11 +103,36 @@ export const ROUTER_SCOPE_MODES: readonly Choice<RouterScopeMode>[] = [
     desc: '显式 @ 智能体直达主运行时，仅对主动监听与活跃话题续聊做分流',
   },
   {
+    value: 'active_thread_only',
+    label: '仅活跃话题续聊',
+    desc: '主动监听首消息与显式 @ 直达主运行时，仅对活跃话题续聊做分流',
+  },
+  {
     value: 'all_group',
     label: '全部群消息',
     desc: '包含显式 @ 在内的全部群聊消息均先经轻量模型分流（私聊除外）',
   },
 ]
+
+export const ROUTER_BYPASS_MSG_TYPES: readonly Choice<RouterBypassMsgType>[] = [
+  { value: 'interactive', label: '卡片' },
+  { value: 'text', label: '文本' },
+  { value: 'post', label: '富文本' },
+]
+
+export const DEFAULT_ROUTER_BYPASS: RouterBypassConfig = {
+  senderTypes: ['bot'],
+  msgTypes: [],
+  keywords: [],
+}
+
+export function cloneRouterBypass(bypass?: Partial<RouterBypassConfig>): RouterBypassConfig {
+  return {
+    senderTypes: bypass?.senderTypes ? [...bypass.senderTypes] : [...DEFAULT_ROUTER_BYPASS.senderTypes],
+    msgTypes: bypass?.msgTypes ? [...bypass.msgTypes] : [...DEFAULT_ROUTER_BYPASS.msgTypes],
+    keywords: bypass?.keywords ? [...bypass.keywords] : [...DEFAULT_ROUTER_BYPASS.keywords],
+  }
+}
 
 export const FALLBACK_TRIAGE_DEFAULTS: TriageDefaultsPayload = {
   toolName: 'route_message',

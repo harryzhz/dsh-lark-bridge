@@ -134,8 +134,35 @@ export const DEFAULT_BOT_PROACTIVE_CONFIG: z.output<typeof BotProactiveConfigSch
   branchPrefix: 'agent/',
 }
 
-export const RouterScopeModeSchema = z.enum(['passive_only', 'all_group'])
+export const ListenerSenderTypeSchema = z.enum(['user', 'bot'])
+export const RouterScopeModeSchema = z.enum(['passive_only', 'active_thread_only', 'all_group'])
 export const GroupRouterModeSchema = z.enum(['inherit', 'override', 'off'])
+export const RouterBypassMsgTypeSchema = z.enum(['interactive', 'text', 'post'])
+
+export const RouterBypassConfigSchema = z.object({
+  senderTypes: z.array(ListenerSenderTypeSchema).default(['bot']),
+  msgTypes: z.array(RouterBypassMsgTypeSchema).default([]),
+  keywords: z
+    .array(z.string())
+    .default([])
+    .transform((items) => {
+      const seen = new Set<string>()
+      const out: string[] = []
+      for (const raw of items) {
+        const trimmed = raw.trim()
+        if (!trimmed || seen.has(trimmed)) continue
+        seen.add(trimmed)
+        out.push(trimmed)
+      }
+      return out
+    }),
+})
+
+export const DEFAULT_ROUTER_BYPASS_CONFIG: z.output<typeof RouterBypassConfigSchema> = {
+  senderTypes: ['bot'],
+  msgTypes: [],
+  keywords: [],
+}
 
 function migrateLegacyRouterConfig(input: unknown): unknown {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return input
@@ -156,6 +183,7 @@ export const BotRouterConfigSchema = z.preprocess(
     provider: z.string().default(''),
     model: z.string().default(''),
     scope: RouterScopeModeSchema.default('passive_only'),
+    bypass: RouterBypassConfigSchema.default(DEFAULT_ROUTER_BYPASS_CONFIG),
     timeoutMs: z.number().int().min(1000).max(15000).default(4000),
     systemPrompt: z.string().default(''),
     recentMessageCount: z.number().int().min(0).max(50).default(6),
@@ -170,6 +198,11 @@ export const DEFAULT_BOT_ROUTER_CONFIG: z.output<typeof BotRouterConfigSchema> =
   provider: '',
   model: '',
   scope: 'passive_only',
+  bypass: {
+    senderTypes: [...DEFAULT_ROUTER_BYPASS_CONFIG.senderTypes],
+    msgTypes: [],
+    keywords: [],
+  },
   timeoutMs: 4000,
   systemPrompt: '',
   recentMessageCount: 6,
@@ -185,6 +218,7 @@ export const GroupRouterConfigSchema = z.preprocess(
     provider: z.string().default(''),
     model: z.string().default(''),
     scope: RouterScopeModeSchema.default('passive_only'),
+    bypass: RouterBypassConfigSchema.default(DEFAULT_ROUTER_BYPASS_CONFIG),
     timeoutMs: z.number().int().min(1000).max(15000).default(4000),
     systemPrompt: z.string().default(''),
     recentMessageCount: z.number().int().min(0).max(50).default(6),
@@ -199,6 +233,11 @@ export const DEFAULT_GROUP_ROUTER_CONFIG: z.output<typeof GroupRouterConfigSchem
   provider: '',
   model: '',
   scope: 'passive_only',
+  bypass: {
+    senderTypes: [...DEFAULT_ROUTER_BYPASS_CONFIG.senderTypes],
+    msgTypes: [],
+    keywords: [],
+  },
   timeoutMs: 4000,
   systemPrompt: '',
   recentMessageCount: 6,
@@ -243,7 +282,6 @@ export const GroupReplyModeSchema = z.enum(['new-topic', 'reply', 'chat'])
 export const GroupSessionModeSchema = z.enum(['thread', 'per_message', 'chat'])
 export const MentionTriggerModeSchema = z.enum(['mention_and_active_thread', 'mention_only'])
 export const ListenerMsgTypeSchema = z.enum(['text', 'post', 'interactive', 'image', 'merge_forward'])
-export const ListenerSenderTypeSchema = z.enum(['user', 'bot'])
 
 function migrateLegacyWorkspaceField(input: unknown): unknown {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return input
@@ -571,6 +609,8 @@ export type BotDreamingConfig = z.output<typeof BotDreamingConfigSchema>
 export type BotProactiveConfig = z.output<typeof BotProactiveConfigSchema>
 export type RouterScopeMode = z.infer<typeof RouterScopeModeSchema>
 export type GroupRouterMode = z.infer<typeof GroupRouterModeSchema>
+export type RouterBypassMsgType = z.infer<typeof RouterBypassMsgTypeSchema>
+export type RouterBypassConfig = z.output<typeof RouterBypassConfigSchema>
 export type BotRouterConfig = z.output<typeof BotRouterConfigSchema>
 export type GroupRouterConfig = z.output<typeof GroupRouterConfigSchema>
 export type BotExperimentalConfig = z.output<typeof BotExperimentalConfigSchema>
@@ -919,6 +959,7 @@ export interface EffectiveRouterConfig {
   readonly provider: string
   readonly model: string
   readonly scope: RouterScopeMode
+  readonly bypass: RouterBypassConfig
   readonly timeoutMs: number
   readonly systemPrompt: string
   readonly recentMessageCount: number
@@ -940,6 +981,7 @@ export function resolveEffectiveRouterConfig(
       provider: base.provider.trim(),
       model: base.model.trim(),
       scope: base.scope,
+      bypass: base.bypass,
       timeoutMs: base.timeoutMs,
       systemPrompt: base.systemPrompt.trim(),
       recentMessageCount: base.recentMessageCount,
@@ -955,6 +997,7 @@ export function resolveEffectiveRouterConfig(
       provider: base.provider.trim(),
       model: base.model.trim(),
       scope: base.scope,
+      bypass: base.bypass,
       timeoutMs: base.timeoutMs,
       systemPrompt: '',
       recentMessageCount: base.recentMessageCount,
@@ -973,6 +1016,7 @@ export function resolveEffectiveRouterConfig(
     provider,
     model,
     scope: groupRouter.scope,
+    bypass: groupRouter.bypass,
     timeoutMs: groupRouter.timeoutMs,
     systemPrompt: groupRouter.systemPrompt.trim(),
     recentMessageCount: groupRouter.recentMessageCount,

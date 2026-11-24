@@ -12,6 +12,8 @@ import {
 import { bridgeApi } from '../api.js'
 import {
   BINARY_SWITCH_MODES,
+  cloneRouterBypass,
+  DEFAULT_ROUTER_BYPASS,
   INTERMEDIATE_MESSAGE_MODES,
   LISTENER_SCOPES,
   MSG_TYPES,
@@ -70,6 +72,7 @@ const DEFAULT_GROUP_ROUTER: GroupRouterConfig = {
   provider: '',
   model: '',
   scope: 'passive_only',
+  bypass: cloneRouterBypass(DEFAULT_ROUTER_BYPASS),
   timeoutMs: 4000,
   systemPrompt: '',
   recentMessageCount: 6,
@@ -389,6 +392,7 @@ export function GroupConfigDialog({
             const currentRouter: GroupRouterConfig = {
               ...DEFAULT_GROUP_ROUTER,
               ...(draft.router ?? {}),
+              bypass: cloneRouterBypass(draft.router?.bypass),
             }
             const botRouterModelLabel = bot?.router?.model
               ? resolveNativeModelLabel(bot.router.provider, bot.router.model, models)
@@ -422,6 +426,7 @@ export function GroupConfigDialog({
                             provider: currentRouter.provider || base?.provider || '',
                             model: currentRouter.model || base?.model || '',
                             scope: base?.scope ?? currentRouter.scope,
+                            bypass: cloneRouterBypass(base?.bypass ?? currentRouter.bypass),
                             timeoutMs: base?.timeoutMs ?? currentRouter.timeoutMs,
                             systemPrompt: currentRouter.systemPrompt || base?.systemPrompt || '',
                             recentMessageCount:
