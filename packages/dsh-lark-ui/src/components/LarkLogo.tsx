@@ -1,26 +1,40 @@
+const HEX_CORE_RING_PATH =
+  'M11 2.38V4.83L5.29 8.13V10.65H3.17V6.9Z M3.17 13.35H5.29V15.88L11 19.17V21.62L3.17 17.1Z M13 2.38L20.83 6.9V17.1L13 21.62V19.17L18.71 15.88V8.13L13 4.83Z'
+const HEX_CORE_CENTER_PATH = 'M12 8.45L15.07 10.22V13.78L12 15.55L8.93 13.78V10.22Z'
+
 /**
- * Left-facing (`↖`) geometric paper-plane icon for the DSH sidebar.
- * Symmetric along the upper-left diagonal (`2.1, 2.1` → `8.5, 8.5`) with rounded
- * wing tips and `currentColor` 1px-class strokes matching sibling DSH icons.
+ * Monochrome Hex Terminal Core icon for the DSH sidebar menu.
+ * Matches the split-hexagon + inner-core brand mark in `icon.svg`, optically
+ * tuned for 16px monochrome rendering via `currentColor` across light/dark themes.
  */
 export function LarkSidebarIcon({ size = 16, className }: { size?: number; className?: string }) {
   return (
     <svg
       width={size}
       height={size}
-      viewBox="0 0 16 16"
+      viewBox="0 0 24 24"
       fill="none"
-      stroke="currentColor"
-      strokeWidth={1.08}
-      strokeLinecap="round"
-      strokeLinejoin="round"
       className={className}
       style={{ display: 'block', flexShrink: 0 }}
       aria-hidden="true"
     >
-      <path d="M2.28 2.02L13.92 6.08C14.32 6.22 14.35 6.77 13.97 6.96L8.72 9.52L6.16 14.77C5.97 15.15 5.42 15.12 5.28 14.72L1.82 2.48C1.71 2.11 1.92 1.89 2.28 2.02Z" transform="translate(0.35, -0.35) scale(0.95)" />
-      <path d="M2.25 2.05L8.62 9.42" transform="translate(0.35, -0.35) scale(0.95)" />
+      <path d={HEX_CORE_RING_PATH} fill="currentColor" />
+      <path d={HEX_CORE_CENTER_PATH} fill="currentColor" />
     </svg>
+  )
+}
+
+/**
+ * Animated monochrome Hex Terminal Core emblem rendered before the main page title.
+ * Gently flips horizontally around the Y-axis and restores, matching the monochrome DSH palette.
+ */
+export function LarkTitleIcon({ size = 24, className }: { size?: number; className?: string }) {
+  return (
+    <span className={className ? `fb-title-icon ${className}` : 'fb-title-icon'} aria-hidden="true">
+      <span className="fb-title-icon-glyph">
+        <LarkSidebarIcon size={size} />
+      </span>
+    </span>
   )
 }
 

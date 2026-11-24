@@ -14,7 +14,7 @@ import { BotConfigDialog } from './components/BotConfigDialog.js'
 import { ConfirmDialog, type ConfirmRequest } from './components/ConfirmDialog.js'
 import { GroupConfigDialog } from './components/GroupConfigDialog.js'
 import { LarkAuthDialog } from './components/LarkAuthDialog.js'
-import { LarkSidebarIcon, RobotTabIcon, ShieldAuthIcon } from './components/LarkLogo.js'
+import { LarkSidebarIcon, LarkTitleIcon, RobotTabIcon, ShieldAuthIcon } from './components/LarkLogo.js'
 import { ReminderEditDialog } from './components/ReminderEditDialog.js'
 import { ScheduleConfigDialog } from './components/ScheduleConfigDialog.js'
 import { installSessionModelFilter } from './session-model-filter.js'
@@ -111,7 +111,10 @@ function LarkBridgePage() {
     <div className="fb-page">
       <div className="fb-container">
         <header className="fb-header">
-          <h1 className="fb-title">飞书桥接</h1>
+          <h1 className="fb-title">
+            <LarkTitleIcon size={24} />
+            <span>飞书桥接</span>
+          </h1>
           <div className="fb-actions">
             <Button
               variant="outline"
