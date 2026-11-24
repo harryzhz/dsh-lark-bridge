@@ -442,8 +442,8 @@ export async function dispatchLarkApiRequest(
         return ok({ ok: false, error: 'owner_web_session_required' }, 403)
       }
       const body = bodyRecord(request.body)
-      const saved = await manager.importExistingOpenPlatformBot(body)
-      return ok({ ok: true, bot: toPublicBotView(saved) }, 201)
+      const { bot: saved, eventSync } = await manager.importExistingOpenPlatformBot(body)
+      return ok({ ok: true, bot: toPublicBotView(saved), ...(eventSync ? { eventSync } : {}) }, 201)
     }
 
     if (method === 'POST' && pathname === 'bots') {

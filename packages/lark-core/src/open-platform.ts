@@ -161,6 +161,15 @@ export interface LarkOpenPlatformAppCredentials {
   readonly hasBotAbility: boolean
 }
 
+export interface LarkBaselineEventSyncResult {
+  readonly synced: boolean
+  readonly skipped?: boolean
+  readonly addedEvents: readonly string[]
+  readonly addedCallbacks: readonly string[]
+  readonly version?: string
+  readonly message?: string
+}
+
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -1018,6 +1027,178 @@ export class LarkPlatformManager {
     } catch (err) {
       return {
         synced: false,
+        message: err instanceof Error ? err.message : String(err),
+      }
+    }
+  }
+
+  /**
+   * Idempotently ensures an existing Open Platform app subscribes to all baseline
+   * long-connection events (including message receive & recall) and card callback,
+   * creating and publishing a patch version only when changes are actually needed.
+   */
+  async syncAppBaselineEvents(larkAppId: string): Promise<LarkBaselineEventSyncResult> {
+    const appId = larkAppId.trim()
+    if (!appId) {
+      return {
+        synced: false,
+        addedEvents: [],
+        addedCallbacks: [],
+        message: '缺少有效的飞书 App ID',
+      }
+    }
+    const loaded = await this.loadValidConsoleClient()
+    if (!loaded) {
+      return {
+        synced: false,
+        addedEvents: [],
+        addedCallbacks: [],
+        message: '未登录飞书开放平台，无法自动补齐事件订阅',
+      }
+    }
+    const { client } = loaded
+    const addedEvents: string[] = []
+    const addedCallbacks: string[] = []
+    try {
+      const eventPayload = await client.postJson(`/developers/v1/event/${appId}`, {})
+      const eventData = asRecord(eventPayload.data)
+      const currentEventMode =
+        typeof eventData.eventMode === 'number' ? eventData.eventMode : undefined
+      const existingEvents = new Set<string>()
+      for (const list of [eventData.events, eventData.appEvents]) {
+        if (!Array.isArray(list)) continue
+        for (const item of list) {
+          if (typeof item === 'string' && item.trim()) existingEvents.add(item.trim())
+        }
+      }
+      const missingEvents = BASELINE_APP_EVENTS.filter((ev) => !existingEvents.has(ev))
+      const needsEventModeSwitch = currentEventMode !== LONG_CONNECTION_EVENT_MODE
+
+      let missingCallbacks: string[] = []
+      let needsCallbackModeSwitch = false
+      try {
+        const callbackPayload = await client.postJson(`/developers/v1/callback/${appId}`, {})
+        const callbackData = asRecord(callbackPayload.data)
+        const currentCallbackMode =
+          typeof callbackData.callbackMode === 'number' ? callbackData.callbackMode : undefined
+        const existingCallbacks = new Set<string>()
+        for (const list of [callbackData.callbacks, callbackData.appCallbacks]) {
+          if (!Array.isArray(list)) continue
+          for (const item of list) {
+            if (typeof item === 'string' && item.trim()) existingCallbacks.add(item.trim())
+          }
+        }
+        missingCallbacks = BASELINE_CALLBACKS.filter((cb) => !existingCallbacks.has(cb))
+        needsCallbackModeSwitch = currentCallbackMode !== LONG_CONNECTION_EVENT_MODE
+      } catch {
+        // Callback inspection is optional; proceed with event sync regardless.
+      }
+
+      if (
+        missingEvents.length === 0 &&
+        !needsEventModeSwitch &&
+        missingCallbacks.length === 0 &&
+        !needsCallbackModeSwitch
+      ) {
+        return {
+          synced: true,
+          skipped: true,
+          addedEvents: [],
+          addedCallbacks: [],
+        }
+      }
+
+      if (missingEvents.length > 0 || needsEventModeSwitch) {
+        await client.postJson(`/developers/v1/event/update/${appId}`, {
+          clientId: appId,
+          operation: 'add',
+          events: [],
+          appEvents: missingEvents.length > 0 ? missingEvents : BASELINE_APP_EVENTS,
+          userEvents: [],
+          eventMode: LONG_CONNECTION_EVENT_MODE,
+        })
+        addedEvents.push(...missingEvents)
+      }
+
+      if (missingCallbacks.length > 0 || needsCallbackModeSwitch) {
+        try {
+          await client.postJson(`/developers/v1/callback/update/${appId}`, {
+            clientId: appId,
+            operation: 'add',
+            callbacks: missingCallbacks.length > 0 ? missingCallbacks : BASELINE_CALLBACKS,
+            callbackMode: LONG_CONNECTION_EVENT_MODE,
+          })
+          addedCallbacks.push(...missingCallbacks)
+        } catch {
+          // Best-effort callback sync; do not fail baseline event completion.
+        }
+      }
+
+      const visPayload = await client.postJson(`/developers/v1/visible/online/${appId}`, {})
+      const visData = asRecord(visPayload.data)
+      const whiteList = normalizeVisibleSuggest(visData.whiteList ?? visData) ?? {
+        departments: [],
+        members: client.identity?.userId ? [client.identity.userId] : [],
+        groups: [],
+        isAll: 0,
+      }
+      const blackList = normalizeVisibleSuggest(visData.blackList) ?? {
+        departments: [],
+        members: [],
+        groups: [],
+        isAll: 0,
+      }
+
+      const versionsPayload = await client.postJson(`/developers/v1/app_version/list/${appId}`, {})
+      const versions = Array.isArray(asRecord(versionsPayload.data).versions)
+        ? (asRecord(versionsPayload.data).versions as unknown[])
+        : []
+      const draftVersion = versions
+        .map(asRecord)
+        .find((v) => v.versionStatus === 0 && pickStr(v, ['versionId', 'version_id', 'id']))
+      let versionId = draftVersion ? pickStr(draftVersion, ['versionId', 'version_id', 'id']) : undefined
+      let appVersion = draftVersion ? pickStr(draftVersion, ['appVersion']) : undefined
+
+      if (!versionId) {
+        appVersion = nextSemanticVersion(versionsPayload)
+        const created = await client.postJson(`/developers/v1/app_version/create/${appId}`, {
+          appVersion,
+          mobileDefaultAbility: 'bot',
+          pcDefaultAbility: 'bot',
+          changeLog: 'Sync baseline events from DSH Lark Bridge',
+          remark: 'Sync baseline events from DSH Lark Bridge',
+          visibleSuggest: whiteList,
+          blackVisibleSuggest: blackList,
+        })
+        versionId =
+          pickStr(asRecord(created.data), ['versionId', 'version_id', 'id']) ??
+          pickStr(created, ['versionId'])
+      }
+
+      if (!versionId) {
+        return {
+          synced: false,
+          addedEvents,
+          addedCallbacks,
+          message: '已更新事件配置，但未能创建可发布的应用版本，请在开放平台手动发布',
+        }
+      }
+
+      await client.postJson(`/developers/v1/publish/commit/${appId}/${versionId}`, {
+        clientId: appId,
+      })
+
+      return {
+        synced: true,
+        addedEvents,
+        addedCallbacks,
+        ...(appVersion ? { version: appVersion } : {}),
+      }
+    } catch (err) {
+      return {
+        synced: false,
+        addedEvents,
+        addedCallbacks,
         message: err instanceof Error ? err.message : String(err),
       }
     }

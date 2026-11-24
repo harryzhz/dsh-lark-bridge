@@ -286,8 +286,21 @@ function LarkBridgePage() {
           await data.refresh()
           await data.refreshAuth()
         }}
-        onExistingImported={async (botName) => {
-          setToast({ text: `智能体「${botName}」已接入`, ok: true })
+        onExistingImported={async (botName, eventSync) => {
+          let text = `智能体「${botName}」已接入`
+          if (eventSync) {
+            if (eventSync.synced && eventSync.skipped) {
+              text = `智能体「${botName}」已接入（基线事件已齐全）`
+            } else if (eventSync.synced) {
+              const ver = eventSync.version ? `并发布 v${eventSync.version}` : ''
+              const added =
+                eventSync.addedEvents.length > 0 ? `新增 ${eventSync.addedEvents.length} 项事件` : '已同步长连接配置'
+              text = `智能体「${botName}」已接入，${added}${ver}`
+            } else {
+              text = `智能体「${botName}」已接入，但事件补齐未完成${eventSync.message ? `：${eventSync.message}` : ''}`
+            }
+          }
+          setToast({ text, ok: !eventSync || eventSync.synced })
           await data.refresh()
         }}
         onRefresh={data.refresh}

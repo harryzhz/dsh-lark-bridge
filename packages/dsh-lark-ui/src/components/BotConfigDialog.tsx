@@ -28,6 +28,7 @@ import {
 } from '../presets.js'
 import type {
   AuthStatusPayload,
+  BaselineEventSyncResult,
   BotConfig,
   BotDreamingConfig,
   BotProactiveConfig,
@@ -237,7 +238,7 @@ export function BotConfigDialog({
   onClose: () => void
   onSave: (config: BotConfig, existingId: string | null) => Promise<void>
   onAutoCreated: () => Promise<void>
-  onExistingImported: (botName: string) => Promise<void>
+  onExistingImported: (botName: string, eventSync?: BaselineEventSyncResult) => Promise<void>
   onRefresh: () => Promise<void>
   onProfilesChanged?: () => Promise<void>
   onAuthUpdated: () => Promise<void>
@@ -385,13 +386,14 @@ function CreateBotDialog({
   onClose: () => void
   onSave: (config: BotConfig, existingId: string | null) => Promise<void>
   onAutoCreated: () => Promise<void>
-  onExistingImported: (botName: string) => Promise<void>
+  onExistingImported: (botName: string, eventSync?: BaselineEventSyncResult) => Promise<void>
   onProfilesChanged?: () => Promise<void>
   onAuthUpdated: () => Promise<void>
 }) {
   const [createMode, setCreateMode] = useState<'auto' | 'existing'>('auto')
   const [autoProtocol, setAutoProtocol] = useState<'open_platform' | 'device_flow'>('open_platform')
   const [existingSource, setExistingSource] = useState<'open_platform' | 'manual'>('open_platform')
+  const [syncBaselineEvents, setSyncBaselineEvents] = useState(false)
   const [draft, setDraft] = useState<BotConfig>(() =>
     newBotConfig(runtimes.find((r) => r.isDefault) ?? runtimes[0], models),
   )
@@ -519,8 +521,9 @@ function CreateBotDialog({
           ...(draft.runtimeProfileId?.trim() ? { runtimeProfileId: draft.runtimeProfileId.trim() } : {}),
           ...(norm.model ? { model: norm.model } : {}),
           ...(norm.reasoningEffort ? { reasoningEffort: norm.reasoningEffort } : {}),
+          ...(syncBaselineEvents ? { syncBaselineEvents: true } : {}),
         })
-        await onExistingImported(res.bot.name)
+        await onExistingImported(res.bot.name, res.eventSync)
         onClose()
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err))
@@ -698,27 +701,41 @@ function CreateBotDialog({
             </SettingRow>
 
             {existingSource === 'open_platform' ? (
-              <OpenPlatformAppPicker
-                authenticated={isOpAuthenticated}
-                apps={opState.apps}
-                bots={bots}
-                loading={opState.loading}
-                loadError={opState.loadError}
-                selectedAppId={opState.selectedAppId}
-                loginJob={opState.loginJob}
-                startingLogin={opState.startingLogin}
-                onSelect={(app) => {
-                  opState.setSelectedAppId(app.appId)
-                  setError('')
-                }}
-                onRefresh={() => void opState.refreshApps()}
-                onStartLogin={() => {
-                  setError('')
-                  void opState.startLogin().catch((err) => {
-                    setError(err instanceof Error ? err.message : String(err))
-                  })
-                }}
-              />
+              <>
+                <OpenPlatformAppPicker
+                  authenticated={isOpAuthenticated}
+                  apps={opState.apps}
+                  bots={bots}
+                  loading={opState.loading}
+                  loadError={opState.loadError}
+                  selectedAppId={opState.selectedAppId}
+                  loginJob={opState.loginJob}
+                  startingLogin={opState.startingLogin}
+                  onSelect={(app) => {
+                    opState.setSelectedAppId(app.appId)
+                    setError('')
+                  }}
+                  onRefresh={() => void opState.refreshApps()}
+                  onStartLogin={() => {
+                    setError('')
+                    void opState.startLogin().catch((err) => {
+                      setError(err instanceof Error ? err.message : String(err))
+                    })
+                  }}
+                />
+                {isOpAuthenticated ? (
+                  <SettingRow
+                    title="补齐基线事件订阅"
+                    desc="导入时自动补订收发与撤回消息等长连接事件并发布新版本"
+                  >
+                    <Switch
+                      label="补齐基线事件订阅"
+                      checked={syncBaselineEvents}
+                      onChange={setSyncBaselineEvents}
+                    />
+                  </SettingRow>
+                ) : null}
+              </>
             ) : (
               <>
                 <SettingRow title="显示名称">

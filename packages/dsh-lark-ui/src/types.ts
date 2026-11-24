@@ -477,6 +477,15 @@ export interface OpenPlatformAppsPayload {
   apps: OpenPlatformAppItem[]
 }
 
+export interface BaselineEventSyncResult {
+  synced: boolean
+  skipped?: boolean
+  addedEvents: string[]
+  addedCallbacks: string[]
+  version?: string
+  message?: string
+}
+
 export interface ImportExistingBotInput {
   larkAppId: string
   workspaceName?: string
@@ -485,6 +494,7 @@ export interface ImportExistingBotInput {
   runtimeProfileId?: string
   model?: string
   reasoningEffort?: string
+  syncBaselineEvents?: boolean
 }
 
 export interface UserAuthStatus {

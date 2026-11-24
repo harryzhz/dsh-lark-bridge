@@ -794,6 +794,45 @@ describe('LarkBridgeStore, RuntimeCatalog, CLI Auth & HTTP API', () => {
     const persisted = store.getBot('bot-ready2')
     expect(persisted?.larkAppSecret).toBe('mock-test-secret')
     expect(persisted?.workspaceName).toBe('OpsSpace')
+    expect(importedRes.json.eventSync).toBeUndefined()
+
+    // 6. Optional baseline event sync during existing app import
+    const syncSpy = vi.spyOn(manager.platform, 'syncAppBaselineEvents').mockResolvedValue({
+      synced: true,
+      addedEvents: ['im.message.recalled_v1'],
+      addedCallbacks: [],
+      version: '1.0.5',
+    })
+    vi.spyOn(manager.platform, 'fetchOpenPlatformAppCredentials').mockResolvedValueOnce({
+      appId: 'cli_ready_3',
+      appSecret: 'mock-test-secret-3',
+      name: '自动补齐助手',
+      description: '测试补齐事件',
+      hasBotAbility: true,
+    })
+
+    const syncedImportRes = await invokeHandler(handler, {
+      method: 'POST',
+      url: '/api/lark-bridge/bots/import-existing',
+      body: {
+        larkAppId: 'cli_ready_3',
+        defaultWorkingDir: validDir,
+        workspaceName: 'OpsSpace',
+        agentPreset: 'standard',
+        syncBaselineEvents: true,
+      },
+    })
+    expect(syncedImportRes.status).toBe(201)
+    expect(syncSpy).toHaveBeenCalledWith('cli_ready_3')
+    expect(syncedImportRes.json.eventSync).toEqual({
+      synced: true,
+      addedEvents: ['im.message.recalled_v1'],
+      addedCallbacks: [],
+      version: '1.0.5',
+    })
+    expect(
+      store.listEvents(20).some((e) => e.kind === 'lifecycle' && e.summary.includes('已补齐基线事件')),
+    ).toBe(true)
 
     await manager.stop()
   })
