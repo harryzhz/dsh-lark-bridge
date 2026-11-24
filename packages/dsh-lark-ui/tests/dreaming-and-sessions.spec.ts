@@ -79,6 +79,21 @@ describe('Dreaming status presentation & unified SessionsView merging', () => {
 
     const err = buildDreamStatusPresentation(succeeded, '网络连接超时', false)
     expect(err).toMatchObject({ dot: 'error', title: '运行异常', detail: '网络连接超时', isError: true })
+
+    const structured = buildDreamStatusPresentation(
+      {
+        botId: 'bot-1',
+        status: 'succeeded',
+        lastDreamAtMs: Date.now(),
+        lastProcessedCount: 6,
+        lastSummary: '已整理 6 个会话（新增 2 · 纠偏 1） · - **发布红线**：统一检查 `P95` 延迟。',
+        processedSessionIds: ['s1'],
+      },
+      '',
+      false,
+    )
+    expect(structured?.title).toContain('已整理 6 个会话 · 新增 2 · 纠偏 1')
+    expect(structured?.detail).toBe('发布红线：统一检查 P95 延迟。')
   })
 
   it('merges chat bindings and Dreaming sessions in reverse chronological order and respects filters', () => {
