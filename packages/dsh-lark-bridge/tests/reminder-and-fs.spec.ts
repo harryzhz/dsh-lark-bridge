@@ -540,6 +540,225 @@ describe('ProactiveReminderService one-shot lifecycle, origin auto-routing & con
 
     await reminders.stop()
   })
+
+  it('enforces prompt length cap, reminder chain depth/TTL/backoff circuit breaker, and same-thread duplicate guard', async () => {
+    const dataDir = makeTempDir()
+    const workDir = makeTempDir()
+    const store = new LarkBridgeStore(dataDir)
+
+    store.upsertBot({
+      id: 'guard-bot',
+      name: 'GuardBot',
+      enabled: true,
+      larkAppId: 'cli_guard',
+      larkAppSecret: 'sec_guard',
+      defaultWorkingDir: workDir,
+    })
+    store.upsertGroup({
+      botId: 'guard-bot',
+      chatId: 'oc_ops',
+      chatName: '告警群',
+      enabled: true,
+    })
+
+    const submittedPrompts: string[] = []
+    let turnHandler: (sessionId: string) => Promise<string> = async () => REMINDER_SILENT_SENTINEL
+
+    const fakeCtx = {
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      agents: {
+        create: vi.fn(async ({ sessionId, setup }: { sessionId: string; setup?: (c: unknown, a: unknown) => void }) => {
+          const agent = { session: { id: sessionId, header: { cwd: workDir, agentPreset: 'codex' } } }
+          setup?.({}, agent)
+          return { agent, dispose: vi.fn().mockResolvedValue(undefined) }
+        }),
+      },
+      get: () => undefined,
+    } as unknown as Context
+
+    const reminders = new ProactiveReminderService({
+      ctx: fakeCtx,
+      store,
+      runtimes: new RuntimeCatalog(fakeCtx),
+      workspaces: {
+        attachSession: vi.fn().mockResolvedValue(undefined),
+        archiveSession: vi.fn().mockResolvedValue(true),
+      } as unknown as WorkspaceGrouping,
+      runTurn: vi.fn(async (agent, content) => {
+        submittedPrompts.push(content.map((b) => ('text' in b ? b.text : '')).join('\n'))
+        return turnHandler(String(agent.session.id))
+      }),
+      sendOriginCard: vi.fn().mockResolvedValue({}),
+      patchOriginCard: vi.fn().mockResolvedValue(undefined),
+      deliverReminderOutput: vi.fn().mockResolvedValue({ messageId: 'om_out_guard' }),
+    })
+
+    const baseNow = Date.parse('2026-11-24T02:00:00.000Z')
+
+    // 1. Oversized prompt (> 2400 chars) is rejected immediately
+    await expect(
+      reminders.create(
+        {
+          botId: 'guard-bot',
+          chatId: 'oc_ops',
+          replyToMessageId: 'om_root_guard',
+          title: '超长提醒测试',
+          prompt: 'x'.repeat(2401),
+          afterSeconds: 1800,
+        },
+        baseNow,
+      ),
+    ).rejects.toThrow('提醒指令过长')
+
+    // 2. Root reminder created normally (depth 0)
+    const root = await reminders.create(
+      {
+        botId: 'guard-bot',
+        chatId: 'oc_ops',
+        replyToMessageId: 'om_root_guard',
+        title: '核查同步任务',
+        prompt: '核查同步任务是否完成',
+        afterSeconds: 1800,
+      },
+      baseNow,
+    )
+    expect(root.chainDepth).toBeUndefined()
+
+    // 3. Duplicate active reminder on the exact same thread is rejected
+    await expect(
+      reminders.create(
+        {
+          botId: 'guard-bot',
+          chatId: 'oc_ops',
+          replyToMessageId: 'om_root_guard',
+          title: '重复的同步核查',
+          prompt: '重复核查',
+          afterSeconds: 1800,
+        },
+        baseNow + 10_000,
+      ),
+    ).rejects.toThrow('当前话题已存在待触发提醒')
+
+    // 4. Chain hop 1: backoff < 30 min rejected; >= 30 min succeeds and inherits rootReminderId
+    let hop1Id = ''
+    turnHandler = async (sid) => {
+      await expect(
+        reminders.create(
+          {
+            sessionId: sid,
+            botId: 'guard-bot',
+            chatId: 'oc_ops',
+            replyToMessageId: 'om_root_guard',
+            title: '核查同步任务',
+            prompt: '过密续查',
+            afterSeconds: 300,
+          },
+          baseNow + 1800_000,
+        ),
+      ).rejects.toThrow('指数退避保护')
+
+      const hop1 = await reminders.create(
+        {
+          sessionId: sid,
+          botId: 'guard-bot',
+          chatId: 'oc_ops',
+          replyToMessageId: 'om_root_guard',
+          title: '核查同步任务',
+          prompt: '第 1 次续查',
+          afterSeconds: 1800,
+        },
+        baseNow + 1800_000,
+      )
+      hop1Id = hop1.id
+      expect(hop1.rootReminderId).toBe(root.id)
+      expect(hop1.parentReminderId).toBe(root.id)
+      expect(hop1.chainDepth).toBe(1)
+      return REMINDER_SILENT_SENTINEL
+    }
+    await reminders.runNow(root.id, baseNow + 1800_000)
+
+    // 5. Hop 2 (after 60 min) -> Hop 3 (after 120 min) -> Hop 4 MUST be blocked by maxChainDepth=3!
+    let hop2Id = ''
+    turnHandler = async (sid) => {
+      const hop2 = await reminders.create(
+        {
+          sessionId: sid,
+          botId: 'guard-bot',
+          chatId: 'oc_ops',
+          replyToMessageId: 'om_root_guard',
+          title: '核查同步任务',
+          prompt: '第 2 次续查',
+          afterSeconds: 3600,
+        },
+        baseNow + 3600_000,
+      )
+      hop2Id = hop2.id
+      expect(hop2.chainDepth).toBe(2)
+      return REMINDER_SILENT_SENTINEL
+    }
+    await reminders.runNow(hop1Id, baseNow + 3600_000)
+
+    let hop3Id = ''
+    turnHandler = async (sid) => {
+      // Exceeding 6h total chain window is also blocked
+      await expect(
+        reminders.create(
+          {
+            sessionId: sid,
+            botId: 'guard-bot',
+            chatId: 'oc_ops',
+            replyToMessageId: 'om_root_guard',
+            title: '核查同步任务',
+            prompt: '超窗续查',
+            afterSeconds: 5 * 3600,
+          },
+          baseNow + 7200_000,
+        ),
+      ).rejects.toThrow('最长自动续查窗口')
+
+      const hop3 = await reminders.create(
+        {
+          sessionId: sid,
+          botId: 'guard-bot',
+          chatId: 'oc_ops',
+          replyToMessageId: 'om_root_guard',
+          title: '核查同步任务',
+          prompt: '第 3 次最终续查',
+          afterSeconds: 7200,
+        },
+        baseNow + 7200_000,
+      )
+      hop3Id = hop3.id
+      expect(hop3.chainDepth).toBe(3)
+      return REMINDER_SILENT_SENTINEL
+    }
+    await reminders.runNow(hop2Id, baseNow + 7200_000)
+
+    turnHandler = async (sid) => {
+      // Depth 4 MUST fail closed!
+      await expect(
+        reminders.create(
+          {
+            sessionId: sid,
+            botId: 'guard-bot',
+            chatId: 'oc_ops',
+            replyToMessageId: 'om_root_guard',
+            title: '核查同步任务',
+            prompt: '第 4 次续查（应被拒绝）',
+            afterSeconds: 7200,
+          },
+          baseNow + 14400_000,
+        ),
+      ).rejects.toThrow('链式续查上限')
+      return REMINDER_SILENT_SENTINEL
+    }
+    await reminders.runNow(hop3Id, baseNow + 14400_000)
+    // Prompt injected on depth=3 explicitly warns agent not to re-chain
+    expect(submittedPrompts[submittedPrompts.length - 1]).toContain('本轮为链末次核查')
+    expect(submittedPrompts[submittedPrompts.length - 1]).toContain('lark-bridge silence')
+
+    await reminders.stop()
+  })
 })
 
 describe('Local directory picker HTTP API & lark-bridge worktree CLI', () => {
