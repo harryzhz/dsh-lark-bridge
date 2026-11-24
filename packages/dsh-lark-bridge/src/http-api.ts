@@ -9,6 +9,7 @@ import {
   createHostSubdirectory,
 } from './fs-browser.js'
 import type { CreateReminderInput, UpdateReminderInput } from './reminder-service.js'
+import { dispatchMemoryApiRequest } from './http-memory-routes.js'
 import type { RuntimeProfileInput } from './runtime-catalog.js'
 import type { ScheduleCreateInputLike } from './schedule-notifier.js'
 import {
@@ -325,6 +326,19 @@ export async function dispatchLarkApiRequest(
       }
     }
 
+    // ── Bridge Memory (Runtime-Agnostic Long-Term Memory) ────────────────
+    if (segments[0] === 'memory') {
+      const handled = await dispatchMemoryApiRequest(manager, {
+        method,
+        segments,
+        url,
+        body: request.body,
+        isCliAuthenticated,
+        principalKind,
+      })
+      if (handled) return handled
+    }
+
     // ── Listener templates ────────────────────────────────────────────────
     if (pathname === 'listener-templates') {
       if (method === 'GET') {
@@ -345,6 +359,7 @@ export async function dispatchLarkApiRequest(
         }),
       )
       const statuses = new Map(manager.listBotStatuses().map((s) => [s.botId, s]))
+      const memoryCounts = manager.memory?.countActiveByBot?.() ?? new Map<string, number>()
       const bots = await Promise.all(
         manager.store.listBots().map(async (bot) => {
           const allowedUserProfiles =
@@ -367,6 +382,7 @@ export async function dispatchLarkApiRequest(
                 ? manager.store.resolveBotWorkspaceName(refreshed)
                 : resolveEffectiveWorkspaceName(refreshed),
             configuredGroupCount: manager.store.listGroups(refreshed.id).length,
+            activeMemoryCount: memoryCounts.get(refreshed.id) ?? 0,
             status: statuses.get(refreshed.id),
             ...(dreamState ? { dreamState } : {}),
           }

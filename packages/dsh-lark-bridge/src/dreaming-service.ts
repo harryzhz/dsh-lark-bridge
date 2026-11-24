@@ -9,12 +9,15 @@ import { appendPluginRecord, type Session, type SessionEvent, type SessionId } f
 import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
 import {
   composeDreamExecutionPrompt,
+  detectDreamingMemoryWriteFailure,
   expandWorkingDir,
   extractPureUserIntent,
   normalizeReplyText,
   resolveEffectiveWorkingDir,
   resolveEffectiveWorkspaceName,
+  type LarkMemoryMutationStats,
 } from '@dsh-lark/lark-core'
+import type { BridgeMemoryService } from './memory-service.js'
 import type { RuntimeCatalog } from './runtime-catalog.js'
 import type { LarkBridgeStore } from './store.js'
 import {
@@ -36,9 +39,20 @@ export interface DreamingHost {
   readonly ctx: Context
   readonly dataDir: string
   readonly store: LarkBridgeStore
+  readonly memory?: BridgeMemoryService
   readonly runtimes: RuntimeCatalog
   readonly workspaces: WorkspaceGrouping
   runTurn(agent: Agent, content: ContentBlock[]): Promise<string>
+}
+
+function formatMemoryStatsBadge(stats?: LarkMemoryMutationStats): string {
+  if (!stats) return ''
+  const parts: string[] = []
+  if (stats.created > 0) parts.push(`新增 ${stats.created}`)
+  if (stats.updated > 0) parts.push(`更新 ${stats.updated}`)
+  if (stats.superseded > 0) parts.push(`纠偏 ${stats.superseded}`)
+  if (stats.archived > 0) parts.push(`归档 ${stats.archived}`)
+  return parts.join(' · ')
 }
 
 function formatDateKey(now: Date): string {
@@ -259,9 +273,12 @@ export class DreamingService {
         : resolveEffectiveWorkspaceName(bot)
     const sessionId = brandString<SessionId>(`session-${randomUUID()}`)
     let createdSession = false
+    const mutationTracker = this.host.memory?.beginMutationTracker(bot.id)
 
     try {
       const digestPath = this.writeTranscriptDigest(bot.id, dateKey, prepared.selected)
+      const memoryMarkdownPath = this.host.memory?.ensureMarkdownMirror(bot.id, now.getTime())
+      const activeMemoryCount = this.host.memory?.countActiveForBot(bot.id) ?? 0
       const prompt = composeDreamExecutionPrompt({
         botId: bot.id,
         botName: bot.name,
@@ -271,6 +288,7 @@ export class DreamingService {
           : {}),
         currentDateIso: dateKey,
         transcriptDigestPath: digestPath,
+        ...(memoryMarkdownPath ? { memoryMarkdownPath, activeMemoryCount } : {}),
         sessionCount: prepared.selected.length,
         config: cfg,
         proactive: bot.experimental.proactive,
@@ -362,19 +380,34 @@ export class DreamingService {
 
       const finishedMs = Date.now()
       const durationMs = finishedMs - startedMs
+      const memoryStats = mutationTracker?.snapshot()
+      const totalMutations = mutationTracker?.totalMutations() ?? 0
+      const normalizedReply = replyText.replace(/\s+/g, ' ').trim()
+
+      if (totalMutations === 0) {
+        const writeFailure = detectDreamingMemoryWriteFailure(normalizedReply)
+        if (writeFailure) {
+          throw new Error(`记忆写入未完成：${writeFailure}`)
+        }
+      }
+
       const newlyProcessed = [
         ...prepared.consumedSessionIds,
         ...prepared.skippedNoiseSessionIds,
       ].filter((id) => !processedSet.has(id))
       const nextProcessed = [...prev.processedSessionIds, ...newlyProcessed]
-      const normalizedReply = replyText.replace(/\s+/g, ' ').trim()
       const cleanNote =
         normalizedReply.length > MAX_DREAM_NOTE_CHARS
           ? `${normalizedReply.slice(0, MAX_DREAM_NOTE_CHARS).trimEnd()}…`
           : normalizedReply
-      const summaryNote = cleanNote
-        ? `已整理 ${prepared.selected.length} 个会话 · ${cleanNote}`
+      const outcome: 'memory_updated' | 'no_change' =
+        totalMutations > 0 ? 'memory_updated' : 'no_change'
+      const statsBadge = formatMemoryStatsBadge(memoryStats)
+      const mutationDescriptor = statsBadge || (memoryStats ? '无新增记忆' : '')
+      const headerLabel = mutationDescriptor
+        ? `已整理 ${prepared.selected.length} 个会话（${mutationDescriptor}）`
         : `已整理 ${prepared.selected.length} 个会话`
+      const summaryNote = cleanNote ? `${headerLabel} · ${cleanNote}` : headerLabel
 
       this.host.store.upsertDreamSession?.({
         sessionId,
@@ -386,6 +419,8 @@ export class DreamingService {
         ...(bot.runtimeProfileId ? { runtimeProfileId: bot.runtimeProfileId } : {}),
         ...(launch.model ?? bot.model ? { model: launch.model ?? bot.model } : {}),
         status: 'succeeded',
+        outcome,
+        ...(memoryStats ? { memoryStats } : {}),
         dateKey,
         processedCount: prepared.selected.length,
         ...(cleanNote ? { summary: cleanNote } : {}),
@@ -410,12 +445,13 @@ export class DreamingService {
         sessionId,
         durationMs,
         kind: 'lifecycle',
-        summary: `Dreaming 完成：已整理 ${prepared.selected.length} 个会话`,
+        summary: `Dreaming 完成：${headerLabel}`,
       })
       return updated
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       const finishedMs = Date.now()
+      const memoryStats = mutationTracker?.snapshot()
       this.host.ctx.logger.error(`[lark-bridge] dreaming failed for "${bot.name}": ${msg}`)
       if (createdSession) {
         await this.host.workspaces.archiveSession(sessionId).catch(() => {})
@@ -430,6 +466,8 @@ export class DreamingService {
           ...(bot.runtimeProfileId ? { runtimeProfileId: bot.runtimeProfileId } : {}),
           ...(bot.model ? { model: bot.model } : {}),
           status: 'failed',
+          outcome: 'failed',
+          ...(memoryStats ? { memoryStats } : {}),
           dateKey,
           processedCount: prepared.selected.length,
           summary: msg,
@@ -453,6 +491,7 @@ export class DreamingService {
       })
       return failed
     } finally {
+      mutationTracker?.dispose()
       this.runningBots.delete(botId)
     }
   }

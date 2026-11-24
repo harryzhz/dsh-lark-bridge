@@ -17,6 +17,12 @@ const HELP = `lark-bridge — DSH 飞书桥接辅助 CLI（零密钥暴露，自
   lark-bridge silence [--reason <原因>] [--session <id>]
   lark-bridge history [--bot <botId>] [--chat <chatId>] [--thread <rootOrThreadId|none>] [--limit <n>]
   lark-bridge message <messageId> [--bot <botId>] [--download-dir <dir>] [--no-download] [--raw]
+  lark-bridge memory list [--bot <botId>] [--scope bot|chat|workspace] [--scope-id <id>] [--type feedback|user|project|reference] [--status active|superseded|archived|all] [--limit <n>]
+  lark-bridge memory search <query> [--bot <botId>] [--scope bot|chat|workspace] [--type feedback|user|project|reference] [--status active|superseded|archived|all] [--limit <n>]
+  lark-bridge memory get <memoryId>
+  lark-bridge memory upsert --type <feedback|user|project|reference> --title <标题> (--content <正文> | --content-file <路径>) [--bot <botId>] [--scope bot|chat|workspace] [--scope-id <id>] [--tags a,b] [--confidence high|medium] [--supersedes <oldId>] [--reason <原因>] [--pin]
+  lark-bridge memory supersede <memoryId> --reason <原因> [--type <type>] [--title <标题> (--content <正文> | --content-file <路径>)] [--scope bot|chat|workspace] [--scope-id <id>] [--tags a,b] [--pin]
+  lark-bridge memory forget <memoryId> [--reason <原因>]
   lark-bridge reminder list [--status active|archived|all]
   lark-bridge reminder create --title <标题> (--at "<YYYY-MM-DD HH:mm|ISO>" | --after <秒>) (--prompt <文本> | --prompt-file <路径>) [--reason <原因>] [--urgency normal|high] [--mention <openId[:姓名]>] [--bot <botId>] [--chat <chatId>] [--user <openId>] [--reply-to <messageId>] [--mode thread|chat|p2p] [--cwd <目录>] [--worktree <路径> --branch <分支> [--pr <链接>]]
   lark-bridge reminder update <reminderId> [--title <标题>] [--at "<YYYY-MM-DD HH:mm|ISO>"] [--prompt <文本> | --prompt-file <路径>] [--reason <原因>]
@@ -69,6 +75,7 @@ const BOOL_FLAGS = new Set([
   'redact',
   'to-json',
   'json',
+  'pin',
 ])
 
 function parseCliArgs(argv) {
@@ -319,6 +326,117 @@ function handleWorktreeCommand(positionals, flags) {
   }
 
   throw new Error(`未知的 worktree 子命令 "${sub}"（支持 create | list）`)
+}
+
+async function handleMemoryCommand(endpoint, positionals, flags, sessionId) {
+  const sub = positionals[1] ?? 'list'
+
+  if (sub === 'list' || sub === 'search') {
+    const params = new URLSearchParams()
+    if (sessionId) params.set('sessionId', sessionId)
+    if (flags.bot) params.set('botId', String(flags.bot))
+    if (flags.scope) params.set('scope', String(flags.scope))
+    if (flags['scope-id']) params.set('scopeId', String(flags['scope-id']))
+    if (flags.type) params.set('type', String(flags.type))
+    if (flags.status) params.set('status', String(flags.status))
+    if (flags.limit) params.set('limit', String(flags.limit))
+    if (sub === 'search') {
+      const q = positionals.slice(2).join(' ').trim() || String(flags.query || flags.q || '').trim()
+      if (!q) throw new Error('用法：lark-bridge memory search "<关键词>" [--bot <botId>]')
+      params.set('q', q)
+    } else if (flags.query || flags.q) {
+      params.set('q', String(flags.query || flags.q).trim())
+    }
+    printJson(await apiRequest(endpoint, 'GET', `/memory?${params.toString()}`))
+    return
+  }
+
+  if (sub === 'get') {
+    const memoryId = positionals[2]
+    if (!memoryId) throw new Error('用法：lark-bridge memory get <memoryId>')
+    printJson(await apiRequest(endpoint, 'GET', `/memory/${encodeURIComponent(memoryId)}`))
+    return
+  }
+
+  if (sub === 'upsert') {
+    const type = String(flags.type || '').trim()
+    const title = String(flags.title || '').trim()
+    const content = flags['content-file']
+      ? readFileSync(resolve(String(flags['content-file'])), 'utf8').trim()
+      : flags.content
+        ? String(flags.content).trim()
+        : (await readPipedStdin()).trim()
+    if (!type || !title || !content) {
+      throw new Error(
+        '用法：lark-bridge memory upsert --type <feedback|user|project|reference> --title <标题> (--content <正文> | --content-file <路径>)',
+      )
+    }
+    const payload = {
+      ...(sessionId ? { sessionId } : {}),
+      ...(flags.bot ? { botId: String(flags.bot) } : {}),
+      ...(flags.scope ? { scope: String(flags.scope) } : {}),
+      ...(flags['scope-id'] ? { scopeId: String(flags['scope-id']) } : {}),
+      ...(flags.tags ? { tags: String(flags.tags) } : {}),
+      ...(flags.confidence ? { confidence: String(flags.confidence) } : {}),
+      ...(flags.supersedes ? { supersedesId: String(flags.supersedes) } : {}),
+      ...(flags.reason ? { supersedeReason: String(flags.reason) } : {}),
+      ...(flags.pin ? { pinned: true } : {}),
+      type,
+      title,
+      content,
+    }
+    printJson(await apiRequest(endpoint, 'POST', '/memory', payload))
+    return
+  }
+
+  if (sub === 'supersede') {
+    const memoryId = positionals[2]
+    const reason = String(flags.reason || '').trim()
+    if (!memoryId || !reason) {
+      throw new Error(
+        '用法：lark-bridge memory supersede <memoryId> --reason <原因> [--type <type> --title <标题> --content <正文>]',
+      )
+    }
+    const content = flags['content-file']
+      ? readFileSync(resolve(String(flags['content-file'])), 'utf8').trim()
+      : flags.content
+        ? String(flags.content).trim()
+        : undefined
+    const payload = {
+      ...(sessionId ? { sessionId } : {}),
+      reason,
+      ...(flags.type ? { type: String(flags.type) } : {}),
+      ...(flags.title ? { title: String(flags.title) } : {}),
+      ...(content ? { content } : {}),
+      ...(flags.scope ? { scope: String(flags.scope) } : {}),
+      ...(flags['scope-id'] ? { scopeId: String(flags['scope-id']) } : {}),
+      ...(flags.tags ? { tags: String(flags.tags) } : {}),
+      ...(flags.confidence ? { confidence: String(flags.confidence) } : {}),
+      ...(flags.pin ? { pinned: true } : {}),
+    }
+    printJson(
+      await apiRequest(endpoint, 'POST', `/memory/${encodeURIComponent(memoryId)}/supersede`, payload),
+    )
+    return
+  }
+
+  if (sub === 'forget' || sub === 'archive') {
+    const memoryId = positionals[2]
+    if (!memoryId) throw new Error('用法：lark-bridge memory forget <memoryId> [--reason <原因>]')
+    const params = new URLSearchParams()
+    if (flags.reason) params.set('reason', String(flags.reason))
+    const qs = params.toString()
+    printJson(
+      await apiRequest(
+        endpoint,
+        'DELETE',
+        `/memory/${encodeURIComponent(memoryId)}${qs ? `?${qs}` : ''}`,
+      ),
+    )
+    return
+  }
+
+  throw new Error(`未知的 memory 子命令 "${sub}"（支持 list | search | get | upsert | supersede | forget）`)
 }
 
 async function handleReminderCommand(endpoint, positionals, flags, sessionId) {
@@ -726,6 +844,11 @@ async function main() {
       delete msg.downloaded
     }
     printJson({ ok: true, message: msg })
+    return
+  }
+
+  if (cmd === 'memory') {
+    await handleMemoryCommand(endpoint, positionals, flags, sessionId)
     return
   }
 

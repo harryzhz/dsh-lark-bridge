@@ -27,6 +27,7 @@ import {
   type SendLarkReplyResult,
 } from '@dsh-lark/lark-core'
 import type { BotConnectionPool } from './bot-connection-pool.js'
+import type { BridgeMemoryService } from './memory-service.js'
 import type { RuntimeCatalog } from './runtime-catalog.js'
 import type { AcquiredAgent, AgentDecision, SessionCoordinator } from './session-coordinator.js'
 import type { SessionTitleGuard } from './session-title-guard.js'
@@ -68,6 +69,7 @@ export interface InboundPipelineHost {
   readonly runtimes: RuntimeCatalog
   readonly connections: BotConnectionPool
   readonly sessions: SessionCoordinator
+  readonly memory?: BridgeMemoryService
   readonly triage?: LlmTriageService
   readonly titleGuard: SessionTitleGuard
   readonly shutdownSignal: AbortSignal
@@ -1152,6 +1154,16 @@ export class InboundPipeline {
         config: bot.experimental.proactive,
       })
       if (proactiveReminder) reminders.push(proactiveReminder)
+
+      const memoryReminder = this.host.memory?.composeFirstTurnReminder(
+        {
+          botId: bot.id,
+          chatId: primary.msg.chatId,
+          workingDir: effectiveDecision.workingDir,
+        },
+        { includeWhenEmpty: Boolean(bot.experimental.dreaming.enabled) },
+      )
+      if (memoryReminder) reminders.push(memoryReminder)
     }
 
     const handoffTurns = items.flatMap((i) => i.handoffTurns ?? [])

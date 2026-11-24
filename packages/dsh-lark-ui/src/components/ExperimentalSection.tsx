@@ -75,12 +75,14 @@ export function buildDreamStatusPresentation(
   }
 
   if (dreamState.status === 'succeeded') {
-    const countMatch = /^已整理\s+(\d+)\s+个会话(?:\s*·\s*)?([\s\S]*)$/.exec(rawSummary)
+    const countMatch = /^已整理\s+(\d+)\s+个会话(?:（([^）]+)）)?(?:\s*·\s*)?([\s\S]*)$/.exec(rawSummary)
     const count = dreamState.lastProcessedCount ?? (countMatch ? Number(countMatch[1]) : undefined)
-    const detail = (countMatch ? (countMatch[2] ?? '') : rawSummary).trim()
+    const mutationTag = countMatch?.[2]?.trim() || ''
+    const detail = (countMatch ? (countMatch[3] ?? '') : rawSummary).trim()
     const titleParts = [
       timeLabel ? `最近整理 ${timeLabel}` : '最近整理已完成',
       count !== undefined ? `已整理 ${count} 个会话` : null,
+      mutationTag || null,
     ].filter(Boolean)
     return {
       dot: 'done',
@@ -96,14 +98,18 @@ export function ExperimentalSection({
   botId,
   experimental,
   dreamState,
+  activeMemoryCount,
   onChange,
+  onOpenMemory,
   onOpenSession,
   onStateUpdated,
 }: {
   botId: string | null
   experimental: BotExperimentalConfig
   dreamState?: DreamRunState | undefined
+  activeMemoryCount?: number | undefined
   onChange: (next: BotExperimentalConfig) => void
+  onOpenMemory?: (() => void) | undefined
   onOpenSession?: ((sessionId: string) => void) | undefined
   onStateUpdated?: ((next: DreamRunState) => void) | undefined
 }) {
@@ -135,14 +141,19 @@ export function ExperimentalSection({
 
   return (
     <>
-      <GroupTitle>Dreaming 记忆整理</GroupTitle>
+      <GroupTitle>Dreaming 与长期记忆</GroupTitle>
       <div className="fb-dream-card">
         <div className="fb-dream-head">
           <div className="fb-dream-desc">
-            到达整理时间且新增会话达到阈值后，自动汇总近期增量对话摘要并结合代码库变更唤醒智能体，调用其自身长期记忆机制提炼关键认知、合并重复项并清理纠偏过期内容。
+            基于跨运行时 Bridge Memory 持久库（渐进披露首轮注入 + 双时态纠偏）。到达整理时间且有效新增会话达到阈值后，自动盘点增量对话并结合活跃代码库变更沉淀长期认知、纠偏与归档过期项。
           </div>
           {botId && (
             <div className="fb-dream-actions">
+              {onOpenMemory && (
+                <Button size="sm" variant="outline" onClick={onOpenMemory}>
+                  {`记忆库 (${activeMemoryCount ?? 0})`}
+                </Button>
+              )}
               <Button
                 size="sm"
                 variant="outline"

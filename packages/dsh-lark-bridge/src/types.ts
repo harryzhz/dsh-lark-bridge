@@ -2,6 +2,7 @@ import type {
   GroupReplyMode,
   LarkBotStatus,
   LarkGroupConfig,
+  LarkMemoryMutationStats,
   ListenerTemplate,
   TriageAction,
   TriagePromptVariable,
@@ -132,6 +133,8 @@ export interface LarkDreamSession {
   readonly runtimeProfileId?: string
   readonly model?: string
   readonly status: 'running' | 'succeeded' | 'failed'
+  readonly outcome?: 'memory_updated' | 'no_change' | 'failed'
+  readonly memoryStats?: LarkMemoryMutationStats
   readonly dateKey: string
   readonly processedCount: number
   readonly summary?: string
