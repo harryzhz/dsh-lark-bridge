@@ -13,6 +13,7 @@ import {
   decideLarkRouting,
   isSilentReplySentinel,
   normalizeReplyText,
+  replaceMentionKeysWithNames,
   resolveEffectiveCardBot,
   resolveEffectiveRouterConfig,
   shouldFastBypassTriage,
@@ -25,6 +26,7 @@ import {
   type LarkGroupConfig,
   type RouterHandoffTurn,
   type SendLarkReplyResult,
+  type TriageHistoryEntry,
 } from '@dsh-lark/lark-core'
 import type { BotConnectionPool } from './bot-connection-pool.js'
 import type { MemoryService } from './memory-service.js'
@@ -34,11 +36,17 @@ import type { SessionTitleGuard } from './session-title-guard.js'
 import { handleSlashCommand } from './slash-commands.js'
 import type { LarkBridgeStore } from './store.js'
 import type { LlmTriageService } from './triage-service.js'
+import {
+  canAutoResumePendingTurn,
+  composeRestartRecoveryReminder,
+  inspectPersistedTurnCompletion,
+} from './turn-recovery.js'
 import { TurnAbortedError, runTurnAndCollectReply } from './turn-runner.js'
-import type { LarkPendingTurn } from './types.js'
+import type { ActiveTurnSummary, LarkPendingTurn, PendingTurnStatus } from './types.js'
 
-const SHUTDOWN_TURN_CLEANUP_TIMEOUT_MS = 5_000
+const SHUTDOWN_TURN_CLEANUP_TIMEOUT_MS = 2_000
 const STALE_PENDING_TURN_MAX_AGE_MS = 24 * 60 * 60_000
+const TRIAGE_HISTORY_BACKFILL_TIMEOUT_MS = 1_200
 const UNEXPECTED_SILENT_SENTINEL_FALLBACK = '抱歉，当前消息不在我的职责范围内或暂无法直接回复。'
 
 export interface ActiveTurnRecord {
@@ -55,8 +63,13 @@ export interface ActiveTurnRecord {
   readonly reactionId?: string
   readonly startedAtMs: number
   readonly transport: LarkBotTransport
+  readonly inboundMsg?: InboundLarkMessage
+  readonly senderName?: string
+  handoffTurns?: readonly RouterHandoffTurn[]
   sessionId?: string
   intermediateSentCount: number
+  recoveryAttempts: number
+  status: PendingTurnStatus
   silencedByControl: boolean
   silenceReason?: string
   settled: boolean
@@ -74,7 +87,19 @@ export interface InboundPipelineHost {
   readonly titleGuard: SessionTitleGuard
   readonly shutdownSignal: AbortSignal
   readonly isDisposed: () => boolean
+  readonly isDraining?: () => boolean
+  readonly onActivityChange?: () => void
   readonly sessionWebUrl: (sessionId: string) => string
+}
+
+interface RecoveryRunContext {
+  readonly pendingTurnId: string
+  readonly existingReactionId?: string
+  readonly previousSessionId?: string
+  readonly recoveryAttempts: number
+  readonly previousIntermediateSentCount: number
+  readonly handoffTurns?: readonly RouterHandoffTurn[]
+  readonly startedAtMs: number
 }
 
 interface QueuedWorkerTurnItem {
@@ -85,6 +110,7 @@ interface QueuedWorkerTurnItem {
   readonly senderName?: string
   readonly handoffTurns?: readonly RouterHandoffTurn[]
   readonly triageNote?: string
+  readonly recoveryReminder?: string
 }
 
 function createTraceId(): string {
@@ -99,9 +125,44 @@ function createTraceId(): string {
 export class InboundPipeline {
   private readonly dedup = new MessageDeduplicator()
   private readonly activeTurns = new Map<string, ActiveTurnRecord>()
+  private readonly recoveringTurnIds = new Set<string>()
+  private readonly recoveryTasks = new Set<Promise<void>>()
 
   constructor(private readonly host: InboundPipelineHost) {
     this.dedup.hydrate(host.store.listSeenMessages?.() ?? [])
+  }
+
+  getActiveCount(): number {
+    let active = 0
+    for (const turn of this.activeTurns.values()) {
+      if (!turn.settled) active += 1
+    }
+    return active + this.recoveringTurnIds.size
+  }
+
+  listActiveTurnSummaries(): ActiveTurnSummary[] {
+    const out: ActiveTurnSummary[] = []
+    for (const turn of this.activeTurns.values()) {
+      if (turn.settled) continue
+      out.push({
+        id: turn.id,
+        botId: turn.botId,
+        chatId: turn.chatId,
+        ...(turn.chatName ? { chatName: turn.chatName } : {}),
+        messageId: turn.messageId,
+        routeKey: turn.routeKey,
+        ...(turn.sessionId ? { sessionId: turn.sessionId } : {}),
+        trigger: turn.trigger,
+        startedAtMs: turn.startedAtMs,
+      })
+    }
+    return out.sort((a, b) => a.startedAtMs - b.startedAtMs)
+  }
+
+  async waitForRecoveries(): Promise<void> {
+    while (this.recoveryTasks.size > 0) {
+      await Promise.allSettled([...this.recoveryTasks])
+    }
   }
 
   /**
@@ -132,7 +193,7 @@ export class InboundPipeline {
     transport: LarkBotTransport,
     msg: InboundLarkMessage,
   ): Promise<void> {
-    if (this.host.isDisposed()) return
+    if (this.host.isDisposed() || this.host.isDraining?.()) return
     if (!this.host.connections.isActiveTransport(botId, transport)) return
     const bot = this.host.store.getBot(botId)
     if (!bot) return
@@ -145,34 +206,17 @@ export class InboundPipeline {
       msg.chatType === 'group' ? this.host.store.getGroup(bot.id, msg.chatId) : undefined
     const knownChatName =
       msg.chatType === 'group' ? this.host.store.resolveChatName(bot.id, msg.chatId) : undefined
-    const rawDecision = decideLarkRouting(bot, msg, {
-      groupConfig,
-      ...(knownChatName ? { chatName: knownChatName } : {}),
-      hasActiveSessionForRoute: (routeKey) => Boolean(this.host.store.getBinding(routeKey)),
-      hasEphemeralRouterThread: (routeKey) =>
-        Boolean(this.host.triage?.context.hasEphemeralThread(routeKey)),
-      getRouteTrigger: (routeKey) =>
-        this.host.store.getBinding(routeKey)?.trigger ??
-        this.host.triage?.context.getEphemeralThreadTrigger(routeKey),
-      hasRouteReplied: (routeKey) => {
-        const binding = this.host.store.getBinding(routeKey)
-        if (binding) return binding.hasReplied !== false
-        if (this.host.triage?.context.hasEphemeralThread(routeKey)) return true
-        return true
-      },
-    })
-    const decision =
-      rawDecision.action !== 'ignore'
-        ? {
-            ...rawDecision,
-            workspaceName:
-              msg.chatType === 'group'
-                ? this.host.store.resolveGroupWorkspaceName(bot, groupConfig, knownChatName)
-                : this.host.store.resolveBotWorkspaceName(bot),
-          }
-        : rawDecision
+    const decision = this.resolveDecisionForMessage(bot, msg, groupConfig, knownChatName)
 
     if (decision.action === 'ignore') {
+      if (
+        msg.chatType === 'group' &&
+        decision.reason !== 'bot_disabled' &&
+        decision.reason !== 'self_message' &&
+        decision.reason !== 'group_disabled'
+      ) {
+        this.recordIgnoredGroupContext(bot, transport, msg, groupConfig)
+      }
       if (decision.reason !== 'no_matching_rule' && decision.reason !== 'self_message') {
         this.host.store.recordMetric({ botId: bot.id, chatId: msg.chatId, kind: 'ignored' })
         this.host.store.recordEvent({
@@ -237,15 +281,112 @@ export class InboundPipeline {
     await this.runAgentTurn(bot, transport, msg, decision, groupConfig, traceId)
   }
 
+  private resolveDecisionForMessage(
+    bot: LarkBotConfig,
+    msg: InboundLarkMessage,
+    groupConfig: LarkGroupConfig | undefined,
+    knownChatName: string | undefined,
+  ) {
+    const rawDecision = decideLarkRouting(bot, msg, {
+      groupConfig,
+      ...(knownChatName ? { chatName: knownChatName } : {}),
+      hasActiveSessionForRoute: (routeKey) => Boolean(this.host.store.getBinding(routeKey)),
+      hasEphemeralRouterThread: (routeKey) =>
+        Boolean(this.host.triage?.context.hasEphemeralThread(routeKey)),
+      getRouteTrigger: (routeKey) =>
+        this.host.store.getBinding(routeKey)?.trigger ??
+        this.host.triage?.context.getEphemeralThreadTrigger(routeKey),
+      hasRouteReplied: (routeKey) => {
+        const binding = this.host.store.getBinding(routeKey)
+        if (binding) return binding.hasReplied !== false
+        if (this.host.triage?.context.hasEphemeralThread(routeKey)) return true
+        return true
+      },
+    })
+    return rawDecision.action !== 'ignore'
+      ? {
+          ...rawDecision,
+          workspaceName:
+            msg.chatType === 'group'
+              ? this.host.store.resolveGroupWorkspaceName(bot, groupConfig, knownChatName)
+              : this.host.store.resolveBotWorkspaceName(bot),
+        }
+      : rawDecision
+  }
+
+  private recordIgnoredGroupContext(
+    bot: LarkBotConfig,
+    transport: LarkBotTransport,
+    msg: InboundLarkMessage,
+    groupConfig: LarkGroupConfig | undefined,
+  ): void {
+    if (!this.host.triage) return
+    const routerConfig = resolveEffectiveRouterConfig(bot, groupConfig)
+    if (!routerConfig.enabled) return
+
+    const text =
+      replaceMentionKeysWithNames(msg.text, msg.mentions).trim() ||
+      (msg.imageKeys.length > 0 ? '[图片消息]' : `[${msg.msgType}]`)
+    if (!text) return
+
+    const chatScopeKey = `chat:${bot.id}:${msg.chatId}`
+    let threadRouteKey: string | undefined
+    const scopeId = msg.rootId ?? msg.threadId
+    if (scopeId) {
+      const candidate = buildRouteKey(bot.larkAppId, msg.chatId, scopeId)
+      if (
+        this.host.store.getBinding(candidate) ||
+        this.host.triage.context.hasEphemeralThread(candidate)
+      ) {
+        threadRouteKey = candidate
+      }
+    }
+
+    const cachedName =
+      typeof transport.getCachedUserName === 'function'
+        ? transport.getCachedUserName(msg.senderOpenId)
+        : undefined
+    const timestampMs = msg.createTimeMs || Date.now()
+    this.host.triage.context.recordChatMessage(
+      chatScopeKey,
+      {
+        role: 'user',
+        ...(cachedName ? { senderName: cachedName } : {}),
+        text,
+        timestampMs,
+        messageId: msg.messageId,
+      },
+      { ...(threadRouteKey ? { routeKey: threadRouteKey } : {}), now: timestampMs },
+    )
+
+    if (!cachedName && msg.senderType === 'user' && msg.senderOpenId) {
+      void this.resolveSenderName(transport, msg).then((resolvedName) => {
+        if (!resolvedName || this.host.isDisposed()) return
+        this.host.triage?.context.recordChatMessage(
+          chatScopeKey,
+          {
+            role: 'user',
+            senderName: resolvedName,
+            text,
+            timestampMs,
+            messageId: msg.messageId,
+          },
+          { ...(threadRouteKey ? { routeKey: threadRouteKey } : {}), now: timestampMs },
+        )
+      })
+    }
+  }
+
   async recoverStalePendingTurns(botId?: string, nowMs = Date.now()): Promise<number> {
     const stale = this.host.store.listPendingTurns().filter((item) => {
       if (botId && item.botId !== botId) return false
-      return !this.activeTurns.has(item.id)
+      return !this.activeTurns.has(item.id) && !this.recoveringTurnIds.has(item.id)
     })
     if (stale.length === 0) return 0
 
     let recovered = 0
     for (const item of stale) {
+      if (this.activeTurns.has(item.id) || this.recoveringTurnIds.has(item.id)) continue
       const transport = this.host.connections.getTransport(item.botId)
       if (!transport) {
         const bot = this.host.store.getBot(item.botId)
@@ -267,35 +408,160 @@ export class InboundPipeline {
         continue
       }
 
-      this.host.store.deletePendingTurn(item.id)
-      await this.deliverInterruptedTurnCleanup({
-        transport,
-        turn: item,
-        intermediateSentCount: 0,
-        auditSummary: '本轮执行因服务重启中断',
-        replyText: '本轮执行因服务重启中断，可重新回复继续。',
-      })
-      recovered += 1
+      this.recoveringTurnIds.add(item.id)
+      this.host.onActivityChange?.()
+      let handedOffToAsyncTask = false
+      try {
+        const bot = this.host.store.getBot(item.botId)
+        const groupConfig =
+          item.inboundMsg?.chatType === 'group'
+            ? this.host.store.getGroup(item.botId, item.chatId)
+            : this.host.store.getGroup(item.botId, item.chatId)
+
+        // 1. Check whether the interrupted session actually finished its turn right before shutdown.
+        if (item.sessionId) {
+          const inspection = await inspectPersistedTurnCompletion(
+            this.host.ctx,
+            item.sessionId,
+            item.messageId,
+          )
+          if (inspection.state === 'completed') {
+            this.host.store.deletePendingTurn(item.id)
+            await this.deliverRecoveredCompletedTurn({
+              bot,
+              transport,
+              turn: item,
+              groupConfig,
+              replyText: inspection.replyText,
+              silencedByTool: inspection.silencedByTool,
+            })
+            recovered += 1
+            continue
+          }
+        }
+
+        // 2. Automatically resume eligible in-flight turns within the recovery window & retry budget.
+        if (bot?.enabled && canAutoResumePendingTurn(item, nowMs)) {
+          const replayMsg = item.inboundMsg!
+          const knownChatName =
+            item.chatName ||
+            (replayMsg.chatType === 'group'
+              ? this.host.store.resolveChatName(bot.id, replayMsg.chatId)
+              : undefined)
+          const decision = this.resolveDecisionForMessage(bot, replayMsg, groupConfig, knownChatName)
+          if (decision.action === 'agent') {
+            const nextAttempt = (item.recoveryAttempts ?? 0) + 1
+            const traceId = item.traceId || createTraceId()
+            this.host.store.upsertPendingTurn({
+              ...item,
+              status: 'recovering',
+              recoveryAttempts: nextAttempt,
+              updatedAtMs: nowMs,
+            })
+            this.host.store.recordEvent({
+              botId: bot.id,
+              chatId: item.chatId,
+              ...(knownChatName ? { chatName: knownChatName } : {}),
+              routeKey: decision.routeKey,
+              ...(item.sessionId ? { sessionId: item.sessionId } : {}),
+              traceId,
+              kind: 'lifecycle',
+              summary: `服务重启后自动恢复处理中消息（第 ${nextAttempt} 次恢复）`,
+            })
+
+            const task = this.runAgentTurn(bot, transport, replayMsg, decision, groupConfig, traceId, {
+              pendingTurnId: item.id,
+              ...(item.reactionId ? { existingReactionId: item.reactionId } : {}),
+              ...(item.sessionId ? { previousSessionId: item.sessionId } : {}),
+              recoveryAttempts: nextAttempt,
+              previousIntermediateSentCount: item.intermediateSentCount ?? 0,
+              ...(item.handoffTurns ? { handoffTurns: item.handoffTurns } : {}),
+              startedAtMs: item.startedAtMs,
+            })
+              .catch((err) => {
+                this.host.ctx.logger.warn(
+                  `[lark-bridge][bot=${bot.id}][msg=${item.messageId}] auto-resume failed: ${err instanceof Error ? err.message : String(err)}`,
+                )
+              })
+              .finally(() => {
+                this.recoveringTurnIds.delete(item.id)
+                this.recoveryTasks.delete(task)
+                this.host.onActivityChange?.()
+              })
+            this.recoveryTasks.add(task)
+            handedOffToAsyncTask = true
+            recovered += 1
+            continue
+          }
+        }
+
+        // 3. Non-recoverable (legacy row without payload, expired window, retries exhausted, or disabled):
+        //    clean up stale reaction and notify interactive turns.
+        this.host.store.deletePendingTurn(item.id)
+        await this.deliverInterruptedTurnCleanup({
+          transport,
+          turn: item,
+          intermediateSentCount: item.intermediateSentCount ?? 0,
+          auditSummary: '本轮执行因服务重启中断',
+          replyText: '本轮执行因服务重启中断，可重新回复继续。',
+        })
+        recovered += 1
+      } finally {
+        if (!handedOffToAsyncTask) {
+          this.recoveringTurnIds.delete(item.id)
+          this.host.onActivityChange?.()
+        }
+      }
     }
     return recovered
   }
 
-  async cleanupActiveTurnsOnShutdown(): Promise<void> {
-    const claimed: ActiveTurnRecord[] = []
+  /**
+   * Preserves recoverable in-flight turns in SQLite (`status: 'interrupted'`) with their
+   * Feishu reaction intact so the next process resumes them seamlessly without error spam.
+   * Only non-recoverable turns (missing payload or retries already exhausted) are cleaned up
+   * and reported as interrupted.
+   */
+  async suspendActiveTurnsForShutdown(): Promise<void> {
+    const nowMs = Date.now()
+    const recoverable: ActiveTurnRecord[] = []
+    const nonRecoverable: ActiveTurnRecord[] = []
+
     for (const record of this.activeTurns.values()) {
       if (record.settled) continue
       record.settled = true
       record.reactionRemoved = true
-      claimed.push(record)
+      if (canAutoResumePendingTurn(record, nowMs)) {
+        recoverable.push(record)
+      } else {
+        nonRecoverable.push(record)
+      }
     }
     this.activeTurns.clear()
-    for (const record of claimed) {
+    this.host.onActivityChange?.()
+
+    for (const record of recoverable) {
+      record.status = 'interrupted'
+      this.persistActiveTurn(record, { force: true })
+      this.host.store.recordEvent({
+        botId: record.botId,
+        chatId: record.chatId,
+        ...(record.chatName ? { chatName: record.chatName } : {}),
+        routeKey: record.routeKey,
+        ...(record.sessionId ? { sessionId: record.sessionId } : {}),
+        traceId: record.traceId,
+        kind: 'lifecycle',
+        summary: '服务重载或停机，已保存处理中任务待重启自动恢复',
+      })
+    }
+
+    if (nonRecoverable.length === 0) return
+    for (const record of nonRecoverable) {
       this.host.store.deletePendingTurn(record.id)
     }
-    if (claimed.length === 0) return
 
     const work = Promise.all(
-      claimed.map((record) =>
+      nonRecoverable.map((record) =>
         this.deliverInterruptedTurnCleanup({
           transport: record.transport,
           turn: record,
@@ -318,6 +584,82 @@ export class InboundPipeline {
     }
   }
 
+  async cleanupActiveTurnsOnShutdown(): Promise<void> {
+    await this.suspendActiveTurnsForShutdown()
+  }
+
+  private async deliverRecoveredCompletedTurn(input: {
+    readonly bot: LarkBotConfig | undefined
+    readonly transport: LarkBotTransport
+    readonly turn: LarkPendingTurn
+    readonly groupConfig: LarkGroupConfig | undefined
+    readonly replyText: string
+    readonly silencedByTool: boolean
+  }): Promise<void> {
+    const { bot, transport, turn, groupConfig, replyText, silencedByTool } = input
+    const normalized = silencedByTool
+      ? ''
+      : normalizeReplyText(replyText, { allowSilentSentinel: true })
+    const isSilent = turn.allowSilentEmptyReply && (silencedByTool || !normalized)
+    if (turn.reactionId) {
+      await transport.removeReaction(turn.messageId, turn.reactionId).catch(() => {})
+    }
+    if (isSilent) {
+      this.host.store.recordMetric({ botId: turn.botId, chatId: turn.chatId, kind: 'silent_skip' })
+      this.host.store.recordEvent({
+        botId: turn.botId,
+        chatId: turn.chatId,
+        ...(turn.chatName ? { chatName: turn.chatName } : {}),
+        routeKey: turn.routeKey,
+        ...(turn.sessionId ? { sessionId: turn.sessionId } : {}),
+        ...(turn.traceId ? { traceId: turn.traceId } : {}),
+        kind: 'silent_skip',
+        summary: '服务重启后检测到原回合已静默完成',
+      })
+      return
+    }
+
+    const text = normalized || '（已完成，无文本输出）'
+    const useCard = bot
+      ? resolveEffectiveCardBot(bot, groupConfig).useInteractiveCard
+      : false
+    const card =
+      useCard && bot && turn.sessionId
+        ? buildReplyCard({
+            markdown: text,
+            bot: resolveEffectiveCardBot(bot, groupConfig),
+            sessionUrl: this.host.sessionWebUrl(turn.sessionId),
+          })
+        : undefined
+    await transport
+      .sendReply({
+        chatId: turn.chatId,
+        replyToMessageId: turn.messageId,
+        replyMode: turn.replyMode,
+        ...(card ? { card } : { text }),
+      })
+      .catch(() => {})
+    this.host.store.markBindingReplied(turn.routeKey)
+    this.host.store.recordMetric({
+      botId: turn.botId,
+      chatId: turn.chatId,
+      ...(turn.chatName ? { chatName: turn.chatName } : {}),
+      kind: 'replied',
+      latencyMs: Date.now() - turn.startedAtMs,
+    })
+    this.host.store.recordEvent({
+      botId: turn.botId,
+      chatId: turn.chatId,
+      ...(turn.chatName ? { chatName: turn.chatName } : {}),
+      routeKey: turn.routeKey,
+      ...(turn.sessionId ? { sessionId: turn.sessionId } : {}),
+      ...(turn.traceId ? { traceId: turn.traceId } : {}),
+      durationMs: Date.now() - turn.startedAtMs,
+      kind: 'reply',
+      summary: `服务重启后检测到原回合已完成，已补发回复（${text.length} 字）`,
+    })
+  }
+
   private async runAgentTurn(
     bot: LarkBotConfig,
     transport: LarkBotTransport,
@@ -325,25 +667,28 @@ export class InboundPipeline {
     decision: AgentDecision,
     groupConfig: LarkGroupConfig | undefined,
     traceId: string,
+    recovery?: RecoveryRunContext,
   ): Promise<void> {
-    const startedMs = Date.now()
+    const startedMs = recovery?.startedAtMs ?? Date.now()
     const resolvedChatName =
       decision.chatName || this.host.store.resolveChatName(bot.id, msg.chatId)
     const chatName = resolvedChatName ? { chatName: resolvedChatName } : {}
-    this.host.store.recordMetric({
-      botId: bot.id,
-      chatId: msg.chatId,
-      ...chatName,
-      kind: 'inbound',
-      now: startedMs,
-    })
-    if (decision.trigger === 'listener') {
+    if (!recovery) {
       this.host.store.recordMetric({
         botId: bot.id,
         chatId: msg.chatId,
-        kind: 'listener',
+        ...chatName,
+        kind: 'inbound',
         now: startedMs,
       })
+      if (decision.trigger === 'listener') {
+        this.host.store.recordMetric({
+          botId: bot.id,
+          chatId: msg.chatId,
+          kind: 'listener',
+          now: startedMs,
+        })
+      }
     }
 
     const routerConfig = resolveEffectiveRouterConfig(bot, groupConfig)
@@ -352,7 +697,7 @@ export class InboundPipeline {
     let triageNote: string | undefined
     let triageSessionId: string | undefined
 
-    if (this.host.triage && shouldRunTriage(decision, routerConfig)) {
+    if (!recovery && this.host.triage && shouldRunTriage(decision, routerConfig)) {
       const triageOutcome = await this.evaluateAndHandleTriage({
         bot,
         transport,
@@ -369,23 +714,29 @@ export class InboundPipeline {
       if (triageOutcome.handled || this.host.isDisposed()) return
       triageNote = triageOutcome.triageNote
       triageSessionId = triageOutcome.triageSessionId
-    } else if (this.host.triage && msg.chatType === 'group') {
+    } else if (!recovery && this.host.triage && msg.chatType === 'group') {
       this.host.triage.context.recordInboundMessage(chatScopeKey, decision.routeKey, {
         role: 'user',
         ...(senderName ? { senderName } : {}),
         text: decision.userText,
         timestampMs: startedMs,
+        messageId: msg.messageId,
       })
     }
 
     const reaction = decision.receivedReactionEmoji
-    const reactionId = reaction ? await transport.addReaction(msg.messageId, reaction) : undefined
+    const reactionId = recovery?.existingReactionId
+      ? recovery.existingReactionId
+      : reaction
+        ? await transport.addReaction(msg.messageId, reaction)
+        : undefined
     if (this.host.isDisposed()) {
-      if (reactionId) await transport.removeReaction(msg.messageId, reactionId)
+      if (!recovery && reactionId) await transport.removeReaction(msg.messageId, reactionId)
       return
     }
 
     const activeTurn = this.registerActiveTurn({
+      ...(recovery ? { id: recovery.pendingTurnId } : {}),
       traceId,
       botId: bot.id,
       chatId: msg.chatId,
@@ -398,6 +749,11 @@ export class InboundPipeline {
       ...(reactionId ? { reactionId } : {}),
       startedAtMs: startedMs,
       transport,
+      inboundMsg: msg,
+      ...(senderName ? { senderName } : {}),
+      ...(recovery?.handoffTurns ? { handoffTurns: recovery.handoffTurns } : {}),
+      intermediateSentCount: recovery?.previousIntermediateSentCount ?? 0,
+      recoveryAttempts: recovery?.recoveryAttempts ?? 0,
     })
 
     let trackedSessionId: string | undefined
@@ -414,6 +770,7 @@ export class InboundPipeline {
         activeTurn,
         traceId,
         ...(senderName ? { senderName } : {}),
+        ...(recovery?.handoffTurns ? { handoffTurns: recovery.handoffTurns } : {}),
         ...(triageNote ? { triageNote } : {}),
       },
     ]
@@ -423,10 +780,6 @@ export class InboundPipeline {
       acquiredRef = acquired
       trackedSessionId = acquired.sessionId
       activeTurn.sessionId = trackedSessionId
-      this.persistActiveTurn(activeTurn)
-      if (triageSessionId) {
-        this.host.store.linkTriageHandoffSession?.(triageSessionId, acquired.sessionId)
-      }
 
       const handoff = this.host.triage?.context.consumeEphemeralHandoff(decision.routeKey)
       if (handoff && decision.sessionMode === 'thread') {
@@ -434,14 +787,36 @@ export class InboundPipeline {
           this.host.store.bindRouteAlias(decision.routeKey, aliasKey)
         }
       }
+      const effectiveHandoffTurns =
+        handoff?.turns.length ? handoff.turns : recovery?.handoffTurns
+      if (effectiveHandoffTurns && effectiveHandoffTurns.length > 0) {
+        activeTurn.handoffTurns = effectiveHandoffTurns
+      }
+      this.persistActiveTurn(activeTurn)
+      if (triageSessionId) {
+        this.host.store.linkTriageHandoffSession?.(triageSessionId, acquired.sessionId)
+      }
+
+      const recoveryReminder =
+        recovery &&
+        recovery.previousSessionId &&
+        acquired.sessionId === recovery.previousSessionId &&
+        !acquired.isNew
+          ? composeRestartRecoveryReminder({
+              attempt: recovery.recoveryAttempts,
+              intermediateSentCount: recovery.previousIntermediateSentCount,
+            })
+          : undefined
+
       const selfItem: QueuedWorkerTurnItem = {
         msg,
         decision,
         activeTurn,
         traceId,
         ...(senderName ? { senderName } : {}),
-        ...(handoff?.turns.length ? { handoffTurns: handoff.turns } : {}),
+        ...(effectiveHandoffTurns?.length ? { handoffTurns: effectiveHandoffTurns } : {}),
         ...(triageNote ? { triageNote } : {}),
+        ...(recoveryReminder ? { recoveryReminder } : {}),
       }
       batchItems = [selfItem]
 
@@ -470,7 +845,11 @@ export class InboundPipeline {
       if (slot.role === 'aborted') {
         batchItems = slot.orphanedItems
         for (const orphaned of slot.orphanedItems) {
-          this.claimActiveTurn(orphaned.activeTurn)
+          if (this.host.isDisposed() && canAutoResumePendingTurn(orphaned.activeTurn)) {
+            this.suspendSingleTurnForRestart(orphaned.activeTurn)
+          } else {
+            this.claimActiveTurn(orphaned.activeTurn)
+          }
         }
         shouldDisposeEphemeral = acquired.disposeAfter
         return
@@ -502,6 +881,7 @@ export class InboundPipeline {
 
       const inboundBaseSummary = `${effectiveDecision.listenerName ? `监听「${effectiveDecision.listenerName}」` : effectiveDecision.trigger} → ${effectiveDecision.agentPreset} · ${effectiveDecision.workspaceName}`
       const inboundTags = [
+        ...(recovery ? [`重启自动恢复 #${recovery.recoveryAttempts}`] : []),
         ...(triageNote ? [triageNote] : []),
         ...(batchSize > 1 ? [`合并 ${batchSize} 条排队消息`] : []),
       ]
@@ -548,6 +928,7 @@ export class InboundPipeline {
                 )
                 if (sent) {
                   latestItem.activeTurn.intermediateSentCount += 1
+                  this.persistActiveTurn(latestItem.activeTurn)
                   this.host.store.markBindingReplied(effectiveDecision.routeKey)
                 }
               },
@@ -715,7 +1096,9 @@ export class InboundPipeline {
         )
       }
       if (hasFinalText && latestItem.msg.chatType === 'group') {
-        this.host.triage?.context.recordWorkerReply(effectiveDecision.routeKey, normalizedReply)
+        this.host.triage?.context.recordWorkerReply(effectiveDecision.routeKey, normalizedReply, Date.now(), {
+          chatScopeKey: `chat:${bot.id}:${latestItem.msg.chatId}`,
+        })
       }
       this.host.store.markBindingReplied(effectiveDecision.routeKey)
       this.host.store.recordMetric({
@@ -801,6 +1184,43 @@ export class InboundPipeline {
         dispose = true
         archive = isSilentFailedListener
       }
+    }
+
+    const isRestartAbort =
+      err instanceof TurnAbortedError && (err.kind === 'disposed' || err.kind === 'interrupted')
+    if (isRestartAbort) {
+      const nonRecoverableItems: QueuedWorkerTurnItem[] = []
+      const nowMs = Date.now()
+      for (const item of batchItems) {
+        if (item.activeTurn.settled) continue
+        if (canAutoResumePendingTurn(item.activeTurn, nowMs)) {
+          this.suspendSingleTurnForRestart(item.activeTurn)
+        } else {
+          nonRecoverableItems.push(item)
+        }
+      }
+      if (nonRecoverableItems.length === 0) {
+        return { dispose: false, archive: false }
+      }
+      // Fall through to interrupt-cleanup only for non-recoverable turns.
+      for (const item of nonRecoverableItems) {
+        this.claimActiveTurn(item.activeTurn)
+        item.activeTurn.reactionRemoved = true
+        if (item.activeTurn !== targetTurn && item.activeTurn.reactionId) {
+          await transport
+            .removeReaction(item.msg.messageId, item.activeTurn.reactionId)
+            .catch(() => {})
+        }
+      }
+      const fallbackTurn = nonRecoverableItems[nonRecoverableItems.length - 1]!.activeTurn
+      await this.deliverInterruptedTurnCleanup({
+        transport,
+        turn: fallbackTurn,
+        intermediateSentCount: totalIntermediate,
+        auditSummary: err.message,
+        replyText: `${err.message}，可重新回复继续。`,
+      })
+      return { dispose, archive }
     }
 
     let anyClaimed = false
@@ -894,9 +1314,19 @@ export class InboundPipeline {
         ...(senderName ? { senderName } : {}),
         text: decision.userText,
         timestampMs: startedMs,
+        messageId: msg.messageId,
       })
       return { handled: false, ...(bypass.reason ? { triageNote: bypass.reason } : {}) }
     }
+
+    await this.hydrateTriageContextIfNeeded({
+      bot,
+      transport,
+      msg,
+      decision,
+      routerConfig,
+      chatScopeKey,
+    })
 
     const existingBinding = this.host.store.getBinding(decision.routeKey)
     const hasActiveWorker = Boolean(existingBinding)
@@ -923,6 +1353,7 @@ export class InboundPipeline {
       ...(senderName ? { senderName } : {}),
       text: decision.userText,
       timestampMs: startedMs,
+      messageId: msg.messageId,
     })
 
     if (this.host.isDisposed()) return { handled: true }
@@ -956,11 +1387,19 @@ export class InboundPipeline {
           const aliasRouteKeys = this.collectReplyAliasKeys(bot, msg, decision, sent)
           this.host.triage!.context.recordEphemeralQuickReply({
             routeKey: decision.routeKey,
+            chatScopeKey,
             aliasRouteKeys,
             trigger: decision.trigger,
             ...(senderName ? { senderName } : {}),
             userText: decision.userText,
             routerReply: replyText,
+          })
+        } else {
+          this.host.triage!.context.recordChatMessage(chatScopeKey, {
+            role: 'router',
+            text: replyText,
+            timestampMs: Date.now(),
+            ...(sent?.messageId ? { messageId: sent.messageId } : {}),
           })
         }
         const latencyMs = Date.now() - startedMs
@@ -1025,27 +1464,132 @@ export class InboundPipeline {
     return undefined
   }
 
+  private async hydrateTriageContextIfNeeded(input: {
+    readonly bot: LarkBotConfig
+    readonly transport: LarkBotTransport
+    readonly msg: InboundLarkMessage
+    readonly decision: AgentDecision
+    readonly routerConfig: EffectiveRouterConfig
+    readonly chatScopeKey: string
+  }): Promise<void> {
+    const triage = this.host.triage
+    if (!triage || input.routerConfig.recentMessageCount <= 0) return
+    if (typeof input.transport.listMessages !== 'function') return
+
+    const ttlMs = input.routerConfig.contextTtlMinutes * 60_000
+    const maxCount = input.routerConfig.recentMessageCount
+    const botOpenId = input.transport.state?.botOpenId ?? input.msg.botOpenId
+    const threadAnchor = input.msg.threadId ?? input.msg.rootId
+    const targetScopeKey = threadAnchor ? input.decision.routeKey : input.chatScopeKey
+
+    if (triage.context.hasHydratedScope(targetScopeKey)) return
+    const existing = triage.context.getRecentMessages(
+      threadAnchor ? input.decision.routeKey : '',
+      threadAnchor ? '' : input.chatScopeKey,
+      { ttlMs, maxCount },
+    )
+    if (existing.length >= maxCount) {
+      triage.context.markScopeHydrated(targetScopeKey)
+      return
+    }
+
+    const fetchWithTimeout = async () => {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      try {
+        return await Promise.race([
+          input.transport.listMessages({
+            chatId: input.msg.chatId,
+            ...(threadAnchor ? { threadId: threadAnchor } : {}),
+            limit: Math.min(maxCount + 4, 20),
+          }),
+          new Promise<undefined>((resolve) => {
+            timer = setTimeout(() => resolve(undefined), TRIAGE_HISTORY_BACKFILL_TIMEOUT_MS)
+            timer.unref?.()
+          }),
+        ])
+      } catch {
+        return undefined
+      } finally {
+        if (timer) clearTimeout(timer)
+      }
+    }
+
+    const fetched = await fetchWithTimeout()
+    triage.context.markScopeHydrated(targetScopeKey)
+    if (!fetched || fetched.length === 0) return
+
+    const nowMs = Date.now()
+    const entries: TriageHistoryEntry[] = []
+    for (const item of fetched) {
+      if (!item.messageId || item.messageId === input.msg.messageId) continue
+      const text = item.text?.trim()
+      if (!text) continue
+      const ts = item.createTimeMs || nowMs
+      if (nowMs - ts > 24 * 60 * 60_000) continue
+      const isSelfBot =
+        item.senderType === 'bot' &&
+        Boolean(
+          (botOpenId && item.senderOpenId === botOpenId) ||
+            item.senderOpenId === input.bot.larkAppId,
+        )
+      entries.push({
+        role: isSelfBot ? 'worker' : 'user',
+        ...(!isSelfBot && item.senderName ? { senderName: item.senderName } : {}),
+        text,
+        timestampMs: ts,
+        messageId: item.messageId,
+      })
+    }
+    if (entries.length > 0) {
+      triage.context.hydrateScopeHistory(targetScopeKey, entries, nowMs)
+    }
+  }
+
+  private suspendSingleTurnForRestart(record: ActiveTurnRecord): void {
+    if (record.settled) return
+    record.settled = true
+    record.reactionRemoved = true
+    record.status = 'interrupted'
+    this.activeTurns.delete(record.id)
+    this.persistActiveTurn(record, { force: true })
+    this.host.store.recordEvent({
+      botId: record.botId,
+      chatId: record.chatId,
+      ...(record.chatName ? { chatName: record.chatName } : {}),
+      routeKey: record.routeKey,
+      ...(record.sessionId ? { sessionId: record.sessionId } : {}),
+      traceId: record.traceId,
+      kind: 'lifecycle',
+      summary: '服务重载或停机，已保存处理中任务待重启自动恢复',
+    })
+    this.host.onActivityChange?.()
+  }
+
   private registerActiveTurn(
     input: Omit<
       ActiveTurnRecord,
-      'id' | 'intermediateSentCount' | 'silencedByControl' | 'settled' | 'reactionRemoved'
-    >,
+      'id' | 'silencedByControl' | 'settled' | 'reactionRemoved' | 'status'
+    > & { readonly id?: string },
   ): ActiveTurnRecord {
     const record: ActiveTurnRecord = {
-      id: randomUUID(),
       ...input,
-      intermediateSentCount: 0,
+      id: input.id || randomUUID(),
+      status: 'running',
       silencedByControl: false,
       settled: false,
       reactionRemoved: false,
     }
     this.activeTurns.set(record.id, record)
     this.persistActiveTurn(record)
+    this.host.onActivityChange?.()
     return record
   }
 
-  private persistActiveTurn(record: ActiveTurnRecord): void {
-    if (record.settled || this.host.isDisposed()) return
+  private persistActiveTurn(
+    record: ActiveTurnRecord,
+    options: { readonly force?: boolean } = {},
+  ): void {
+    if (!options.force && (record.settled || this.host.isDisposed())) return
     this.host.store.upsertPendingTurn({
       id: record.id,
       botId: record.botId,
@@ -1060,6 +1604,15 @@ export class InboundPipeline {
       ...(record.sessionId ? { sessionId: record.sessionId } : {}),
       ...(record.traceId ? { traceId: record.traceId } : {}),
       startedAtMs: record.startedAtMs,
+      status: record.status,
+      ...(record.inboundMsg ? { inboundMsg: record.inboundMsg } : {}),
+      ...(record.senderName ? { senderName: record.senderName } : {}),
+      intermediateSentCount: record.intermediateSentCount,
+      recoveryAttempts: record.recoveryAttempts,
+      ...(record.handoffTurns && record.handoffTurns.length > 0
+        ? { handoffTurns: record.handoffTurns }
+        : {}),
+      updatedAtMs: Date.now(),
     })
   }
 
@@ -1068,6 +1621,7 @@ export class InboundPipeline {
     record.settled = true
     this.activeTurns.delete(record.id)
     this.host.store.deletePendingTurn(record.id)
+    this.host.onActivityChange?.()
     return true
   }
 
@@ -1169,6 +1723,10 @@ export class InboundPipeline {
     const handoffTurns = items.flatMap((i) => i.handoffTurns ?? [])
     const handoffReminder = composeRouterHandoffReminder(handoffTurns)
     if (handoffReminder) reminders.push(handoffReminder)
+
+    for (const item of items) {
+      if (item.recoveryReminder) reminders.push(item.recoveryReminder)
+    }
 
     reminders.push(
       composeLarkContextReminder({

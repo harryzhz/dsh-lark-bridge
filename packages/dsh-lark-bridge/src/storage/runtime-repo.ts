@@ -811,34 +811,74 @@ export class RuntimeRepo {
       session_id: string | null
       trace_id: string | null
       started_at_ms: number
+      status: string | null
+      inbound_msg_json: string | null
+      sender_name: string | null
+      intermediate_sent_count: number | null
+      recovery_attempts: number | null
+      handoff_turns_json: string | null
+      updated_at_ms: number | null
     }>
-    return rows.map((row) => ({
-      id: row.id,
-      botId: row.bot_id,
-      chatId: row.chat_id,
-      ...(row.chat_name ? { chatName: row.chat_name } : {}),
-      messageId: row.message_id,
-      routeKey: row.route_key,
-      replyMode:
-        row.reply_mode === 'chat' || row.reply_mode === 'reply' || row.reply_mode === 'new-topic'
-          ? row.reply_mode
-          : 'new-topic',
-      trigger: row.trigger,
-      allowSilentEmptyReply: row.allow_silent_empty_reply === 1,
-      ...(row.reaction_id ? { reactionId: row.reaction_id } : {}),
-      ...(row.session_id ? { sessionId: row.session_id } : {}),
-      ...(row.trace_id ? { traceId: row.trace_id } : {}),
-      startedAtMs: Number(row.started_at_ms),
-    }))
+    return rows.map((row) => {
+      let inboundMsg: LarkPendingTurn['inboundMsg']
+      if (row.inbound_msg_json) {
+        try {
+          inboundMsg = JSON.parse(row.inbound_msg_json) as LarkPendingTurn['inboundMsg']
+        } catch {
+          inboundMsg = undefined
+        }
+      }
+      let handoffTurns: LarkPendingTurn['handoffTurns']
+      if (row.handoff_turns_json) {
+        try {
+          const parsed = JSON.parse(row.handoff_turns_json)
+          if (Array.isArray(parsed)) handoffTurns = parsed as LarkPendingTurn['handoffTurns']
+        } catch {
+          handoffTurns = undefined
+        }
+      }
+      const status =
+        row.status === 'interrupted' || row.status === 'recovering' || row.status === 'running'
+          ? row.status
+          : 'running'
+      return {
+        id: row.id,
+        botId: row.bot_id,
+        chatId: row.chat_id,
+        ...(row.chat_name ? { chatName: row.chat_name } : {}),
+        messageId: row.message_id,
+        routeKey: row.route_key,
+        replyMode:
+          row.reply_mode === 'chat' || row.reply_mode === 'reply' || row.reply_mode === 'new-topic'
+            ? row.reply_mode
+            : 'new-topic',
+        trigger: row.trigger,
+        allowSilentEmptyReply: row.allow_silent_empty_reply === 1,
+        ...(row.reaction_id ? { reactionId: row.reaction_id } : {}),
+        ...(row.session_id ? { sessionId: row.session_id } : {}),
+        ...(row.trace_id ? { traceId: row.trace_id } : {}),
+        startedAtMs: Number(row.started_at_ms),
+        status,
+        ...(inboundMsg ? { inboundMsg } : {}),
+        ...(row.sender_name ? { senderName: row.sender_name } : {}),
+        ...(row.intermediate_sent_count ? { intermediateSentCount: Number(row.intermediate_sent_count) } : {}),
+        ...(row.recovery_attempts ? { recoveryAttempts: Number(row.recovery_attempts) } : {}),
+        ...(handoffTurns && handoffTurns.length > 0 ? { handoffTurns } : {}),
+        ...(row.updated_at_ms !== null ? { updatedAtMs: Number(row.updated_at_ms) } : {}),
+      }
+    })
   }
 
   upsertPendingTurn(turn: LarkPendingTurn): LarkPendingTurn {
+    const updatedAtMs = turn.updatedAtMs ?? Date.now()
     this.db
       .prepare(
         `INSERT INTO pending_turns (
            id, bot_id, chat_id, chat_name, message_id, route_key, reply_mode,
-           trigger, allow_silent_empty_reply, reaction_id, session_id, trace_id, started_at_ms
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           trigger, allow_silent_empty_reply, reaction_id, session_id, trace_id, started_at_ms,
+           status, inbound_msg_json, sender_name, intermediate_sent_count, recovery_attempts,
+           handoff_turns_json, updated_at_ms
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            bot_id = excluded.bot_id,
            chat_id = excluded.chat_id,
@@ -851,7 +891,14 @@ export class RuntimeRepo {
            reaction_id = excluded.reaction_id,
            session_id = excluded.session_id,
            trace_id = excluded.trace_id,
-           started_at_ms = excluded.started_at_ms`,
+           started_at_ms = excluded.started_at_ms,
+           status = excluded.status,
+           inbound_msg_json = excluded.inbound_msg_json,
+           sender_name = excluded.sender_name,
+           intermediate_sent_count = excluded.intermediate_sent_count,
+           recovery_attempts = excluded.recovery_attempts,
+           handoff_turns_json = excluded.handoff_turns_json,
+           updated_at_ms = excluded.updated_at_ms`,
       )
       .run(
         turn.id,
@@ -867,8 +914,15 @@ export class RuntimeRepo {
         turn.sessionId ?? null,
         turn.traceId ?? null,
         turn.startedAtMs,
+        turn.status ?? 'running',
+        turn.inboundMsg ? JSON.stringify(turn.inboundMsg) : null,
+        turn.senderName ?? null,
+        turn.intermediateSentCount ?? 0,
+        turn.recoveryAttempts ?? 0,
+        turn.handoffTurns && turn.handoffTurns.length > 0 ? JSON.stringify(turn.handoffTurns) : null,
+        updatedAtMs,
       )
-    return turn
+    return { ...turn, updatedAtMs }
   }
 
   deletePendingTurn(id: string): boolean {
@@ -876,9 +930,89 @@ export class RuntimeRepo {
     return Number(res.changes) > 0
   }
 
-  // ── Internals ───────────────────────────────────────────────────────────
+  // ── Smart Triage Context Persistence ────────────────────────────────────
 
-  private resolvePrimaryRouteKey(routeKey: string): string {
+  loadTriageContextScopes(minUpdatedAtMs = 0): Array<{
+    readonly scopeKey: string
+    readonly kind: 'history' | 'worker_reply' | 'ephemeral_thread'
+    readonly payloadJson: string
+    readonly updatedAtMs: number
+  }> {
+    const rows = this.db
+      .prepare(
+        `SELECT scope_key, kind, payload_json, updated_at_ms
+         FROM triage_context_scopes
+         WHERE updated_at_ms >= ?
+         ORDER BY updated_at_ms ASC`,
+      )
+      .all(minUpdatedAtMs) as Array<{
+      scope_key: string
+      kind: string
+      payload_json: string
+      updated_at_ms: number
+    }>
+    const out: Array<{
+      readonly scopeKey: string
+      readonly kind: 'history' | 'worker_reply' | 'ephemeral_thread'
+      readonly payloadJson: string
+      readonly updatedAtMs: number
+    }> = []
+    for (const row of rows) {
+      if (
+        row.kind !== 'history' &&
+        row.kind !== 'worker_reply' &&
+        row.kind !== 'ephemeral_thread'
+      ) {
+        continue
+      }
+      out.push({
+        scopeKey: row.scope_key,
+        kind: row.kind,
+        payloadJson: row.payload_json,
+        updatedAtMs: Number(row.updated_at_ms),
+      })
+    }
+    return out
+  }
+
+  upsertTriageContextScope(
+    scopeKey: string,
+    kind: 'history' | 'worker_reply' | 'ephemeral_thread',
+    payloadJson: string,
+    updatedAtMs: number,
+  ): void {
+    if (!scopeKey) return
+    this.db
+      .prepare(
+        `INSERT INTO triage_context_scopes (scope_key, kind, payload_json, updated_at_ms)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(scope_key, kind) DO UPDATE SET
+           payload_json = excluded.payload_json,
+           updated_at_ms = excluded.updated_at_ms`,
+      )
+      .run(scopeKey, kind, payloadJson, updatedAtMs)
+  }
+
+  deleteTriageContextScope(
+    scopeKey: string,
+    kind?: 'history' | 'worker_reply' | 'ephemeral_thread',
+  ): number {
+    const res = kind
+      ? this.db
+          .prepare('DELETE FROM triage_context_scopes WHERE scope_key = ? AND kind = ?')
+          .run(scopeKey, kind)
+      : this.db.prepare('DELETE FROM triage_context_scopes WHERE scope_key = ?').run(scopeKey)
+    return Number(res.changes)
+  }
+
+  pruneTriageContextScopes(cutoffMs: number): number {
+    const res = this.db
+      .prepare('DELETE FROM triage_context_scopes WHERE updated_at_ms < ?')
+      .run(cutoffMs)
+    return Number(res.changes)
+  }
+
+  resolvePrimaryRouteKey(routeKey: string): string {
     const direct = this.db
       .prepare('SELECT 1 FROM session_bindings WHERE route_key = ?')
       .get(routeKey)
@@ -888,6 +1022,8 @@ export class RuntimeRepo {
       .get(routeKey) as { primary_route_key?: string } | undefined
     return alias?.primary_route_key ?? routeKey
   }
+
+  // ── Internals ───────────────────────────────────────────────────────────
 
   private listAliasesForPrimary(primaryRouteKey: string): string[] {
     const rows = this.db

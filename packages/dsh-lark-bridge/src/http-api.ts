@@ -3,6 +3,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
 import { resolveEffectiveWorkspaceName, toPublicBotView } from '@dsh-lark/lark-core'
 import type { AgentCliSendInput, LarkBridgeManager } from './bridge-manager.js'
+import { OPERATOR_TOKEN_HEADER } from './cli-support.js'
 import {
   assertExistingWorkingDirectory,
   browseHostDirectories,
@@ -34,6 +35,7 @@ export interface LarkApiRequest {
   readonly path: string
   readonly body?: unknown
   readonly isCliAuthenticated: boolean
+  readonly isOperatorAuthenticated?: boolean
   readonly principalKind: string
   readonly signal?: AbortSignal
 }
@@ -110,17 +112,52 @@ export async function dispatchLarkApiRequest(
   const url = new URL(rawPath, 'http://127.0.0.1')
   const pathname = url.pathname.replace(/^\/api\/lark-bridge\/?/, '').replace(/^\/+/, '')
   const segments = pathname ? pathname.split('/').map(decodeURIComponent) : []
-  const { isCliAuthenticated, principalKind } = request
+  const { isCliAuthenticated, isOperatorAuthenticated, principalKind } = request
 
   try {
     if (method === 'GET' && (pathname === '' || pathname === 'health')) {
+      const lifecycle = manager.getLifecycleStatus?.()
       return ok({
         ok: true,
         principal: principalKind,
         botCount: manager.store.listBots().length,
         groupCount: manager.store.listGroups().length,
         activeBindings: manager.store.listBindings().length,
+        ...(lifecycle ? { phase: lifecycle.phase, draining: lifecycle.draining } : {}),
       })
+    }
+
+    // ── Graceful lifecycle / drain control plane ─────────────────────────
+    if (segments[0] === 'lifecycle') {
+      if (method === 'GET' && segments[1] === 'status') {
+        return ok({ ok: true, ...manager.getLifecycleStatus() })
+      }
+      const canOperateLifecycle =
+        (principalKind === 'owner' && !isCliAuthenticated) || Boolean(isOperatorAuthenticated)
+      if (method === 'POST' && segments[1] === 'drain') {
+        if (!canOperateLifecycle) {
+          return ok({ ok: false, error: 'owner_or_operator_required' }, 403)
+        }
+        const body = bodyRecord(request.body)
+        const reason = typeof body.reason === 'string' ? body.reason.trim() : undefined
+        const wait = body.wait === true
+        const timeoutMs =
+          typeof body.timeoutMs === 'number' && Number.isFinite(body.timeoutMs)
+            ? body.timeoutMs
+            : undefined
+        let status = await manager.beginDrain({ ...(reason ? { reason } : {}) })
+        if (wait && !status.drained) {
+          status = await manager.waitForDrain(timeoutMs, request.signal)
+        }
+        return ok({ ok: true, ...status })
+      }
+      if (method === 'POST' && segments[1] === 'resume-intake') {
+        if (!canOperateLifecycle) {
+          return ok({ ok: false, error: 'owner_or_operator_required' }, 403)
+        }
+        const status = await manager.cancelDrain()
+        return ok({ ok: true, ...status })
+      }
     }
 
     if (method === 'GET' && (pathname === 'cockpit' || pathname === 'overview')) {
@@ -980,11 +1017,16 @@ export function createLarkHttpHandler(
 
     const authHeader =
       typeof req.headers.authorization === 'string' ? req.headers.authorization : undefined
+    const operatorHeader =
+      typeof req.headers[OPERATOR_TOKEN_HEADER] === 'string'
+        ? req.headers[OPERATOR_TOKEN_HEADER]
+        : undefined
     const isCliAuthenticated = Boolean(manager.cliAuth?.verify(authHeader))
+    const isOperatorAuthenticated = Boolean(manager.operatorAuth?.verify(operatorHeader))
 
     let principalKind = 'owner'
-    if (isCliAuthenticated) {
-      principalKind = 'cli'
+    if (isCliAuthenticated || isOperatorAuthenticated) {
+      principalKind = isOperatorAuthenticated ? 'operator' : 'cli'
     } else {
       const admission = connection.admit(req)
       if ('rejection' in admission) {
@@ -998,7 +1040,7 @@ export function createLarkHttpHandler(
       principalKind = admittedPeer?.principal?.kind ?? 'owner'
     }
 
-    if (!isSameOriginMutationAllowed(req, isCliAuthenticated)) {
+    if (!isSameOriginMutationAllowed(req, isCliAuthenticated || isOperatorAuthenticated)) {
       sendJson(res, 403, { ok: false, error: 'cross_origin_forbidden' })
       return
     }
@@ -1024,6 +1066,7 @@ export function createLarkHttpHandler(
       path: rawUrl,
       body,
       isCliAuthenticated,
+      isOperatorAuthenticated,
       principalKind,
     })
     sendJson(res, response.status, response.payload)

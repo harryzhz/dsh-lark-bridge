@@ -73,6 +73,26 @@ export class BotConnectionPool {
     this.transports.clear()
   }
 
+  /**
+   * Stops inbound WSClient delivery across all bots while retaining transport
+   * entries and REST clients so in-flight turns can finish replying during drain.
+   */
+  async pauseAllInbound(): Promise<void> {
+    await Promise.all(
+      [...this.transports.values()].map((m) =>
+        (typeof m.transport.pauseInbound === 'function'
+          ? m.transport.pauseInbound()
+          : m.transport.stop()
+        ).catch(() => {}),
+      ),
+    )
+  }
+
+  /** Resumes inbound WSClient delivery for enabled bots after a cancelled drain. */
+  async resumeAllInbound(): Promise<void> {
+    await this.startAllEnabled()
+  }
+
   getTransport(botId: string): LarkBotTransport | undefined {
     return this.transports.get(botId)?.transport
   }

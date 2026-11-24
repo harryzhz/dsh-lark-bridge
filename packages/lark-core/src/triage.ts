@@ -31,6 +31,7 @@ export interface TriageHistoryEntry {
   readonly senderName?: string
   readonly text: string
   readonly timestampMs: number
+  readonly messageId?: string
 }
 
 export interface TriagePromptInput {

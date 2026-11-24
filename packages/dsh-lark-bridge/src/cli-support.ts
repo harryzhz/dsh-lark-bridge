@@ -19,6 +19,50 @@ export interface CliAuthEndpoint {
   updateBaseUrl(nextPublicBaseUrl: string): void
 }
 
+export interface OperatorAuthToken {
+  readonly tokenFile: string
+  readonly token: string
+  verify(candidateHeaderOrToken: string | undefined): boolean
+}
+
+export const OPERATOR_TOKEN_FILENAME = 'operator-token'
+export const OPERATOR_TOKEN_HEADER = 'x-lark-bridge-operator'
+
+/**
+ * Separate host-operator secret (`0600`) for maintenance operations like graceful
+ * drain/resume-intake. Kept strictly out of `cli-endpoint.json` and Agent environment
+ * variables so sandboxed/session-scoped Agent CLI calls cannot drain the bridge.
+ */
+export function ensureOperatorAuth(dataDir: string): OperatorAuthToken {
+  const tokenFile = join(dataDir, OPERATOR_TOKEN_FILENAME)
+  let token = ''
+  if (existsSync(tokenFile)) {
+    try {
+      const existing = readFileSync(tokenFile, 'utf8').trim()
+      if (existing.length >= 32) token = existing
+    } catch {
+      // Regenerate below.
+    }
+  }
+  if (!token) {
+    token = randomBytes(32).toString('hex')
+    atomicWrite(tokenFile, `${token}\n`, 0o600)
+  }
+  const tokenBuf = Buffer.from(token, 'utf8')
+  return {
+    tokenFile,
+    token,
+    verify(candidate: string | undefined): boolean {
+      if (!candidate) return false
+      const trimmed = candidate.replace(/^Bearer\s+/i, '').trim()
+      if (!trimmed) return false
+      const candBuf = Buffer.from(trimmed, 'utf8')
+      if (candBuf.length !== tokenBuf.length) return false
+      return timingSafeEqual(candBuf, tokenBuf)
+    },
+  }
+}
+
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
 function atomicWrite(filePath: string, content: string, mode?: number): void {

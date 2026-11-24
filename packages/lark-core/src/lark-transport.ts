@@ -542,6 +542,23 @@ export class LarkBotTransport {
     this.callbacks.onStatusChange?.()
   }
 
+  /**
+   * Stops inbound WebSocket event delivery while keeping the REST client and
+   * cached bot identity intact so in-flight turns can finish replying during drain.
+   */
+  async pauseInbound(): Promise<void> {
+    await this.stop()
+  }
+
+  /** Zero-network-cost lookup of a cached Feishu user display name. */
+  getCachedUserName(openId: string | undefined, now = Date.now()): string | undefined {
+    const key = openId?.trim()
+    if (!key) return undefined
+    const cached = this.userCache.get(key)
+    if (!cached || now - cached.cachedAtMs >= USER_DETAIL_TTL_MS) return undefined
+    return cached.name && cached.name !== key ? cached.name : undefined
+  }
+
   async fetchBotProfile(): Promise<LarkBotProfile> {
     const res = (await this.client.request({
       method: 'GET',

@@ -1610,7 +1610,8 @@ describe('LarkBridgeManager prompt injection, title hygiene & auto-archiving', (
     const stopAudit = store.listEvents().find((e) => e.kind === 'error' && e.summary.includes('手动停止'))
     expect(stopAudit?.sessionId).toBeTruthy()
 
-    // 2. Reproduce HMR LIFO unload while a turn is in-flight -> fiber effects dispose first, then manager.stop()
+    // 2. Reproduce HMR LIFO unload while a turn is in-flight -> preserves checkpoint & reaction
+    //    instead of spamming an error reply, then auto-resumes seamlessly after restart.
     turnBehavior = 'hang'
     removedReactions.length = 0
     sentReplies.length = 0
@@ -1644,18 +1645,25 @@ describe('LarkBridgeManager prompt injection, title hygiene & auto-archiving', (
     await manager.stop()
     await inFlightPromise
 
-    expect(removedReactions).toEqual([{ messageId: 'om_hmr_1', reactionId: 'react_3' }])
-    expect(sentReplies).toHaveLength(1)
-    expect(sentReplies[0]!.text).toContain('服务重载或停机已中断')
-    expect(store.listPendingTurns()).toHaveLength(0)
-    const hmrAudit = store
+    // Reaction stays on the message, no premature error spam, pending_turns holds interrupted checkpoint.
+    expect(removedReactions).toEqual([])
+    expect(sentReplies).toHaveLength(0)
+    const suspendedPending = store.listPendingTurns()
+    expect(suspendedPending).toHaveLength(1)
+    expect(suspendedPending[0]?.status).toBe('interrupted')
+    expect(suspendedPending[0]?.sessionId).toBe(hmrSessionId)
+    expect(suspendedPending[0]?.reactionId).toBe('react_3')
+    const hmrLifecycleAudit = store
       .listEvents()
-      .find((e) => e.kind === 'error' && e.sessionId === hmrSessionId)
-    expect(hmrAudit?.summary).toContain('服务重载或停机已中断')
+      .find((e) => e.kind === 'lifecycle' && e.sessionId === hmrSessionId)
+    expect(hmrLifecycleAudit?.summary).toContain('待重启自动恢复')
     expect(createdCount).toBe(3)
 
-    // 3. Crash/SIGKILL recovery: persisted pendingTurns survive restart; recoverStalePendingTurns cleans both reactions
-    //    but only notifies the interactive turn (not the silent listener).
+    // 3. Restart & recovery:
+    //    - `om_hmr_1` (with persisted inboundMsg within recovery budget) auto-resumes on the same session,
+    //      delivers the actual reply, and removes `react_3` without adding a duplicate reaction.
+    //    - Legacy/non-recoverable rows (without `inboundMsg`) still clean up reactions and notify only
+    //      interactive turns (never spamming silent listeners).
     store.upsertPendingTurn({
       id: 'pt-interactive',
       botId: 'ops-bot',
@@ -1686,8 +1694,9 @@ describe('LarkBridgeManager prompt injection, title hygiene & auto-archiving', (
     })
 
     const reloadedStore = new LarkBridgeStore(dir)
-    expect(reloadedStore.listPendingTurns()).toHaveLength(2)
+    expect(reloadedStore.listPendingTurns()).toHaveLength(3)
 
+    turnBehavior = 'complete'
     const recoveredManager = new LarkBridgeManager(
       fakeCtx,
       {
@@ -1701,6 +1710,7 @@ describe('LarkBridgeManager prompt injection, title hygiene & auto-archiving', (
     )
     removedReactions.length = 0
     sentReplies.length = 0
+    fakeTransport.addReaction.mockClear()
     ;(
       recoveredManager as unknown as {
         transports: Map<string, { config: unknown; transport: unknown }>
@@ -1708,15 +1718,26 @@ describe('LarkBridgeManager prompt injection, title hygiene & auto-archiving', (
     ).transports.set('ops-bot', { config: reloadedStore.getBot('ops-bot'), transport: fakeTransport })
 
     const recoveredCount = await recoveredManager.recoverStalePendingTurns()
-    expect(recoveredCount).toBe(2)
+    await recoveredManager.inbound.waitForRecoveries()
+    expect(recoveredCount).toBe(3)
     expect(reloadedStore.listPendingTurns()).toHaveLength(0)
-    expect(removedReactions).toEqual([
-      { messageId: 'om_crash_interactive', reactionId: 'react_crash_1' },
-      { messageId: 'om_crash_listener', reactionId: 'react_crash_2' },
-    ])
-    expect(sentReplies).toHaveLength(1)
-    expect(sentReplies[0]!.replyToMessageId).toBe('om_crash_interactive')
-    expect(sentReplies[0]!.text).toContain('服务重启中断')
+    // Auto-resumed turn reused `react_3` without adding a second reaction.
+    expect(fakeTransport.addReaction).not.toHaveBeenCalled()
+    expect(removedReactions).toEqual(
+      expect.arrayContaining([
+        { messageId: 'om_hmr_1', reactionId: 'react_3' },
+        { messageId: 'om_crash_interactive', reactionId: 'react_crash_1' },
+        { messageId: 'om_crash_listener', reactionId: 'react_crash_2' },
+      ]),
+    )
+    expect(removedReactions).toHaveLength(3)
+    // Interactive reply delivered for auto-resumed `om_hmr_1`, interrupt notice for legacy `om_crash_interactive`,
+    // and zero spam for silent listener `om_crash_listener`.
+    expect(sentReplies).toHaveLength(2)
+    const resumedReply = sentReplies.find((r) => r.replyToMessageId === 'om_hmr_1')
+    expect(JSON.stringify(resumedReply?.card ?? resumedReply?.text)).toContain('配置一切正常。')
+    const legacyReply = sentReplies.find((r) => r.replyToMessageId === 'om_crash_interactive')
+    expect(legacyReply?.text).toContain('服务重启中断')
     expect(
       reloadedStore.listEvents().some((e) => e.sessionId === 'session-crash-1' && e.kind === 'error'),
     ).toBe(true)

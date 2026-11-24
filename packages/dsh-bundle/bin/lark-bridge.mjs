@@ -41,6 +41,9 @@ const HELP = `lark-bridge — DSH 飞书桥接辅助 CLI（零密钥暴露，自
   lark-bridge db export [--data-dir <目录>] [--out <输出路径>] [--redact]
   lark-bridge db rollback --from <backup.json> [--to-json] [--data-dir <目录>] [--force]
   lark-bridge db compact [--data-dir <目录>] [--force]
+  lark-bridge lifecycle status
+  lark-bridge lifecycle drain [--wait] [--timeout <秒>] [--reason <原因>]
+  lark-bridge lifecycle resume-intake
   lark-bridge doctor [--data-dir <目录>] [--json]
 
 send 选项:
@@ -76,6 +79,8 @@ const BOOL_FLAGS = new Set([
   'to-json',
   'json',
   'pin',
+  'wait',
+  'allow-in-session',
 ])
 
 function parseCliArgs(argv) {
@@ -181,13 +186,14 @@ function loadEndpointConfig() {
   }
 }
 
-async function apiRequest(endpoint, method, path, body) {
+async function apiRequest(endpoint, method, path, body, extraHeaders) {
   const res = await fetch(`${endpoint.apiBaseUrl}${path}`, {
     method,
     headers: {
       authorization: `Bearer ${endpoint.token}`,
       accept: 'application/json',
       ...(body !== undefined ? { 'content-type': 'application/json' } : {}),
+      ...(extraHeaders || {}),
     },
     ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
   })
@@ -196,6 +202,19 @@ async function apiRequest(endpoint, method, path, body) {
     throw new Error(data.error || `HTTP ${res.status}`)
   }
   return data
+}
+
+function loadOperatorToken(flags) {
+  const dataDir = resolveDataDir(flags['data-dir'])
+  const tokenFile = join(dataDir, 'operator-token')
+  if (!existsSync(tokenFile)) {
+    throw new Error(`未找到本机运维凭证 (${tokenFile})，请确认 dsh-lark-bridge 服务已启动。`)
+  }
+  const token = readFileSync(tokenFile, 'utf8').trim()
+  if (token.length < 32) {
+    throw new Error(`本机运维凭证无效：${tokenFile}`)
+  }
+  return token
 }
 
 async function readPipedStdin() {
@@ -637,6 +656,48 @@ async function main() {
   const endpoint = loadEndpointConfig()
   const sessionId = String(flags.session || process.env.DSH_SESSION_ID || '').trim() || undefined
   const qSession = sessionId ? `sessionId=${encodeURIComponent(sessionId)}` : ''
+
+  if (cmd === 'lifecycle') {
+    const sub = positionals[1] || 'status'
+    if (sub === 'status') {
+      printJson(await apiRequest(endpoint, 'GET', '/lifecycle/status'))
+      return
+    }
+    if (sub === 'drain' || sub === 'resume-intake') {
+      if (process.env.DSH_SESSION_ID && !flags['allow-in-session']) {
+        throw new Error(
+          '拒绝在 Agent 会话内直接变更桥接排空状态；请在宿主机运维终端执行（或在明确需要时传 --allow-in-session）。',
+        )
+      }
+      const operatorToken = loadOperatorToken(flags)
+      const headers = { 'x-lark-bridge-operator': operatorToken }
+      if (sub === 'drain') {
+        const timeoutSec = flags.timeout !== undefined ? Number(flags.timeout) : 120
+        const timeoutMs = Number.isFinite(timeoutSec) ? Math.max(0, timeoutSec * 1000) : 120_000
+        const result = await apiRequest(
+          endpoint,
+          'POST',
+          '/lifecycle/drain',
+          {
+            wait: Boolean(flags.wait),
+            timeoutMs,
+            ...(flags.reason ? { reason: String(flags.reason) } : {}),
+          },
+          headers,
+        )
+        printJson(result)
+        if (flags.wait && !result.drained) {
+          process.exitCode = 2
+        }
+        return
+      }
+      printJson(await apiRequest(endpoint, 'POST', '/lifecycle/resume-intake', {}, headers))
+      return
+    }
+    throw new Error(
+      '用法：lark-bridge lifecycle status | drain [--wait] [--timeout <秒>] [--reason <原因>] | resume-intake',
+    )
+  }
 
   if (cmd === 'context') {
     printJson(await apiRequest(endpoint, 'GET', `/agent/context${qSession ? `?${qSession}` : ''}`))
