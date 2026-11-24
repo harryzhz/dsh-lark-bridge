@@ -230,7 +230,7 @@ export function ExperimentalSection({
       </SettingRow>
 
       {dreaming.enabled && (
-        <NestedSettings>
+        <>
           <SettingRow title="整理时间" desc="每日定时执行的本地时间（HH:MM）">
             <TextField
               value={dreaming.scheduleTime}
@@ -266,7 +266,7 @@ export function ExperimentalSection({
               onChange={(cleanupAndCorrect) => patchDreaming({ cleanupAndCorrect })}
             />
           </SettingRow>
-        </NestedSettings>
+        </>
       )}
 
       <GroupTitle>主动工作</GroupTitle>

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { Button, IconCloseOutlineRegular, Modal, Switch } from '@deepseek-ai/dsh-client-ui-primitives'
 import { SCHEDULE_DELIVERY_MODES, SCHEDULE_NOTIFY_ON, type Choice } from '../presets.js'
 import type { BotRecord, GroupView, ScheduleBinding, ScheduleTarget, ScheduleView } from '../types.js'
-import { ChipToggles, NestedSettings, ScheduleAutomationHint, SelectMenu, SettingRow } from './fields.js'
+import { ChipToggles, ScheduleAutomationHint, SelectMenu, SettingRow } from './fields.js'
 
 function encodeTarget(t: ScheduleTarget): string {
   return `${t.botId}\t${t.chatId}`
@@ -136,7 +136,7 @@ export function ScheduleConfigDialog({
         </SettingRow>
 
         {draft.enabled && (
-          <NestedSettings>
+          <>
             <SettingRow
               title="通知群聊"
               desc={originHint ? `未勾选时默认回传至「${originHint.chatName}」` : undefined}
@@ -189,7 +189,7 @@ export function ScheduleConfigDialog({
                 }
               />
             </SettingRow>
-          </NestedSettings>
+          </>
         )}
       </div>
 
