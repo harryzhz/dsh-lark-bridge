@@ -11,7 +11,62 @@ export const MAX_REMINDER_CHAIN_DEPTH = 3
 export const MAX_REMINDER_CHAIN_WINDOW_MS = 6 * 60 * 60_000
 export const MAX_REMINDER_PROMPT_CHARS = 2400
 export const MIN_CHAINED_REMINDER_BACKOFF_SECONDS: readonly number[] = [1800, 3600, 7200]
+export const MAX_REMINDER_RESTART_RETRIES = 1
+export const STALE_REMINDER_RETRY_WINDOW_MS = 2 * 60 * 60_000
+export const RESTART_RETRY_DELAY_MS = 15_000
 const MAX_SIBLING_REMINDERS_IN_PROMPT = 10
+
+export const ReminderUrgencySchema = z.enum(['normal', 'high'])
+export type ReminderUrgency = z.infer<typeof ReminderUrgencySchema>
+
+function parseHHMMToMinutes(hhmm: string): number | undefined {
+  const m = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(hhmm.trim())
+  if (!m) return undefined
+  return Number(m[1]) * 60 + Number(m[2])
+}
+
+/**
+ * Defers a `normal` urgency reminder that falls inside the bot's configured local
+ * Quiet Hours window (`[start, end)`) to the window's end time. `high` urgency
+ * reminders always bypass Quiet Hours so real P0 alerts are never delayed.
+ */
+export function applyQuietHoursDeferral(
+  targetIso: string,
+  config: Pick<BotProactiveConfig, 'quietHoursEnabled' | 'quietHoursStart' | 'quietHoursEnd'>,
+  urgency: ReminderUrgency = 'normal',
+): { readonly scheduledAt: string; readonly deferredFrom?: string } {
+  if (!config.quietHoursEnabled || urgency === 'high') {
+    return { scheduledAt: targetIso }
+  }
+  const startMins = parseHHMMToMinutes(config.quietHoursStart)
+  const endMins = parseHHMMToMinutes(config.quietHoursEnd)
+  if (startMins === undefined || endMins === undefined || startMins === endMins) {
+    return { scheduledAt: targetIso }
+  }
+  const target = new Date(targetIso)
+  if (!Number.isFinite(target.getTime())) return { scheduledAt: targetIso }
+
+  const curMins = target.getHours() * 60 + target.getMinutes()
+  const overnight = startMins > endMins
+  const inQuietWindow = overnight
+    ? curMins >= startMins || curMins < endMins
+    : curMins >= startMins && curMins < endMins
+  if (!inQuietWindow) {
+    return { scheduledAt: targetIso }
+  }
+
+  const endHour = Math.floor(endMins / 60)
+  const endMinute = endMins % 60
+  const deferred = new Date(target.getTime())
+  if (overnight && curMins >= startMins) {
+    deferred.setDate(deferred.getDate() + 1)
+  }
+  deferred.setHours(endHour, endMinute, 0, 0)
+  return {
+    scheduledAt: deferred.toISOString(),
+    deferredFrom: targetIso,
+  }
+}
 
 export const LarkReminderStatusSchema = z.enum([
   'pending_confirm',
@@ -68,6 +123,9 @@ export const LarkReminderItemSchema = z.object({
   confirmMessageId: z.string().optional(),
   lastSessionId: z.string().optional(),
   resultSummary: z.string().optional(),
+  urgency: ReminderUrgencySchema.optional(),
+  retryCount: z.number().int().nonnegative().optional(),
+  deferredFromScheduledAt: z.string().optional(),
   rootReminderId: z.string().optional(),
   parentReminderId: z.string().optional(),
   chainDepth: z.number().int().nonnegative().optional(),
@@ -120,6 +178,9 @@ export function composeProactiveSessionReminder(
         : config.reminderCreationMode === 'notify'
           ? '当前为 `notify` 模式：执行命令后自动附带可取消提示卡，正文中无需重复说明。'
           : '当前为 `silent` 模式：后台静默生效，正文中无需专门播报“已创建提醒”。'
+    const quietRule = config.quietHoursEnabled
+      ? `夜间免打扰已开启（${config.quietHoursStart}–${config.quietHoursEnd}）：普通提醒将自动顺延至结束时刻，仅确属线上 P0 紧急止损复查时才显式传 \`--urgency high\`。`
+      : '若属线上 P0 紧急止损复查可显式标注 `--urgency high`。'
     lines.push(
       '1. **一次性跟进提醒（`lark-bridge reminder`）**：',
       '   - 触发场景（仅在存在明确时间锚点或待闭环责任时创建）：',
@@ -129,7 +190,7 @@ export function composeProactiveSessionReminder(
       '     d) **多节点里程碑跟进**：跨天交付事项（如“周五前完成迁移”），可拆分前置进度核查（如周三上午，正常则静默）与截止兜底核查（周五下午）；',
       '     e) **非工作时段错峰交付**：夜间或节假日自动排查产出非紧急优化方案/PR 时，创建下一工作日上午（如 `10:00`）提醒推送给负责人。',
       '   - 不创建边界：纯技术问答、无时间锚点与责任人的泛泛讨论、或已有周期性 `schedule` 覆盖的例行任务；创建前先用 `lark-bridge reminder list` 避免重复。单次提醒仅用于有限跟进（系统硬限制单链最多续查 3 次且总跨度 ≤ 6 小时、单条指令 ≤ 2400 字），禁止用于无限小时级轮询。',
-      `   - 模式说明：自动继承当前会话投递路径；${modeRule}`,
+      `   - 模式说明：自动继承当前会话投递路径；${modeRule} ${quietRule}`,
       '   - 命令示例：',
       '     - 按时间点核查：`lark-bridge reminder create --title "核查 16:00 发版结果" --at "<YYYY-MM-DD HH:mm>" --mention "<open_id>:<姓名>" --prompt "运行 lark-bridge history --limit 20 并检查部署状态：已完成或群内已同步延期则调用 lark-bridge silence --reason \\"已闭环\\" 静默；未完成且无说明则简短提醒负责人"`',
       '     - 按相对延时复查：`lark-bridge reminder create --title "复查降级恢复情况" --after 1800 --prompt "检查近 30 分钟错误率与群内通报：指标已恢复且无遗留开关则调用 lark-bridge silence --reason \\"指标已恢复\\" 静默；异常持续则同步数据提醒值班人"`',

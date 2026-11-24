@@ -281,6 +281,11 @@ sequenceDiagram
 | `chat`（群内直发） | 群主消息流发结果卡片，返回 `sent.messageId = om_card_1` | `cli_demo:oc_team:om_card_1 → S_job`（若有 `sent.threadId` 同步挂别名） | 成员直接回复该卡片即可复用 `S_job` 上下文追问 |
 | `thread`（发回原话题） | 对来源 `replyToMessageId = om_orig_1` 调用 `reply_in_thread: true` | `replaceRouteBinding` 更新 `cli_demo:oc_team:om_orig_1 → S_job`（若替换了旧绑定且无在途回合，安全释放旧句柄） | 在原话题继续回复即衔接最新巡检/提醒结论 |
 
+> **提醒可靠性与防雪崩机制**：
+> - **链条护栏**：同一跟进链限制深度 ≤ 3、总 TTL ≤ 6h、连续续期采用递增退避（30 / 60 / 120 分钟）、提示词 ≤ 2400 字符，且同线程同提示去重合并。
+> - **非阻塞并发与重启补跑**：到期队列按上限 3 并发派发，互不阻塞；若服务重启时存在 2 小时内中断的 `running` 提醒，自动重排补跑 1 次（`retryCount` 记录补跑次数），超次后归档为 `error`。
+> - **夜间免打扰（Quiet Hours）**：Bot 启用夜间免打扰后，普通优先级（`normal`）提醒若落入静默时段会自动顺延至免打扰结束时刻（记录 `deferredFromScheduledAt`）；高优提醒（`--urgency high`）允许穿透免打扰按时触发。
+
 ---
 
 ### 场景 8：混合 `replyMode` 下的引用链升级为话题（自动别名同步）

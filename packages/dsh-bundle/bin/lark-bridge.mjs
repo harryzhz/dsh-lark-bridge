@@ -18,7 +18,7 @@ const HELP = `lark-bridge — DSH 飞书桥接辅助 CLI（零密钥暴露，自
   lark-bridge history [--bot <botId>] [--chat <chatId>] [--thread <rootOrThreadId|none>] [--limit <n>]
   lark-bridge message <messageId> [--bot <botId>] [--download-dir <dir>] [--no-download] [--raw]
   lark-bridge reminder list [--status active|archived|all]
-  lark-bridge reminder create --title <标题> (--at "<YYYY-MM-DD HH:mm|ISO>" | --after <秒>) (--prompt <文本> | --prompt-file <路径>) [--reason <原因>] [--mention <openId[:姓名]>] [--bot <botId>] [--chat <chatId>] [--user <openId>] [--reply-to <messageId>] [--mode thread|chat|p2p] [--cwd <目录>] [--worktree <路径> --branch <分支> [--pr <链接>]]
+  lark-bridge reminder create --title <标题> (--at "<YYYY-MM-DD HH:mm|ISO>" | --after <秒>) (--prompt <文本> | --prompt-file <路径>) [--reason <原因>] [--urgency normal|high] [--mention <openId[:姓名]>] [--bot <botId>] [--chat <chatId>] [--user <openId>] [--reply-to <messageId>] [--mode thread|chat|p2p] [--cwd <目录>] [--worktree <路径> --branch <分支> [--pr <链接>]]
   lark-bridge reminder update <reminderId> [--title <标题>] [--at "<YYYY-MM-DD HH:mm|ISO>"] [--prompt <文本> | --prompt-file <路径>] [--reason <原因>]
   lark-bridge reminder cancel <reminderId>
   lark-bridge reminder run <reminderId>
@@ -364,6 +364,7 @@ async function handleReminderCommand(endpoint, positionals, flags, sessionId) {
       ...(flags.mode ? { deliveryMode: String(flags.mode) } : {}),
       ...(flags.cwd ? { workingDir: resolve(String(flags.cwd)) } : {}),
       ...(flags.reason ? { reason: String(flags.reason).trim() } : {}),
+      ...(flags.urgency ? { urgency: String(flags.urgency).trim() } : {}),
       ...(flags.at ? { at: String(flags.at).trim() } : {}),
       ...(flags.after !== undefined ? { afterSeconds: Number(flags.after) } : {}),
       ...(mentions.length > 0 ? { mentions } : {}),

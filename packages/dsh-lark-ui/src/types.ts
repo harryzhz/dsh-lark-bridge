@@ -42,6 +42,9 @@ export interface BotDreamingConfig {
 export interface BotProactiveConfig {
   remindersEnabled: boolean
   reminderCreationMode: ReminderCreationMode
+  quietHoursEnabled?: boolean
+  quietHoursStart?: string
+  quietHoursEnd?: string
   autoCodeEnabled: boolean
   branchPrefix: string
 }
@@ -197,6 +200,10 @@ export interface ReminderItem {
   confirmMessageId?: string
   lastSessionId?: string
   resultSummary?: string
+  urgency?: 'normal' | 'high'
+  retryCount?: number
+  deferredFromScheduledAt?: string
+  chainDepth?: number
   createdAtMs: number
   updatedAtMs: number
   archivedAtMs?: number
