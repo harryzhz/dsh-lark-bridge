@@ -1437,4 +1437,223 @@ describe('decideLarkRouting, <user_message> format, memberOverrides & title inte
     expect(dedup2.claim('cli:m3', 85_000)).toBe(false)
     expect(dedup2.claim('cli:m4', 85_000)).toBe(false)
   })
+
+  it('ignores peer bot replies and bare @other mentions in mention-originated active threads while preserving bot-enabled listener threads', () => {
+    const bot = createBot({
+      groupReplyMode: 'new-topic',
+      groupSessionMode: 'thread',
+      mentionTriggerMode: 'mention_and_active_thread',
+    })
+    const group = LarkGroupConfigSchema.parse({
+      key: 'dsh-bot:oc_multi_bot',
+      botId: 'dsh-bot',
+      chatId: 'oc_multi_bot',
+      enabled: true,
+    })
+
+    // 1. Bare @PeerBot poke without body text must not wake up this bot's active thread
+    expect(
+      decideLarkRouting(
+        bot,
+        createMessage({
+          chatId: 'oc_multi_bot',
+          messageId: 'om_poke_peer',
+          rootId: 'om_root_1',
+          threadId: 'omt_topic_1',
+          senderOpenId: 'ou_member_1',
+          senderType: 'user',
+          text: '@_user_1',
+          mentions: [{ key: '@_user_1', openId: 'ou_peer_bot', name: 'PeerBot' }],
+        }),
+        {
+          groupConfig: group,
+          hasActiveSessionForRoute: () => true,
+          getRouteTrigger: () => 'mention',
+          hasRouteReplied: () => true,
+        },
+      ),
+    ).toEqual({ action: 'ignore', reason: 'no_matching_rule' })
+
+    // 2. Peer bot reply card inside a mention-originated active thread must be ignored (no multi-bot ping-pong)
+    expect(
+      decideLarkRouting(
+        bot,
+        createMessage({
+          chatId: 'oc_multi_bot',
+          messageId: 'om_peer_bot_reply',
+          rootId: 'om_root_1',
+          threadId: 'omt_topic_1',
+          senderOpenId: 'ou_peer_bot',
+          senderType: 'bot',
+          msgType: 'interactive',
+          text: '请升级至最新版本客户端，以查看内容',
+        }),
+        {
+          groupConfig: group,
+          hasActiveSessionForRoute: () => true,
+          getRouteTrigger: () => 'mention',
+          hasRouteReplied: () => true,
+        },
+      ),
+    ).toEqual({ action: 'ignore', reason: 'no_matching_rule' })
+
+    // 3. Human follow-up referencing a colleague WITH substantive text still continues active-thread
+    expect(
+      decideLarkRouting(
+        bot,
+        createMessage({
+          chatId: 'oc_multi_bot',
+          messageId: 'om_human_with_ref',
+          rootId: 'om_root_1',
+          threadId: 'omt_topic_1',
+          senderOpenId: 'ou_member_1',
+          senderType: 'user',
+          text: '按 @_user_1 说的超时改成 5s',
+          mentions: [{ key: '@_user_1', openId: 'ou_colleague', name: 'Sam' }],
+        }),
+        {
+          groupConfig: group,
+          hasActiveSessionForRoute: () => true,
+          getRouteTrigger: () => 'mention',
+          hasRouteReplied: () => true,
+        },
+      ),
+    ).toMatchObject({
+      action: 'agent',
+      trigger: 'active-thread',
+      userText: '按 @Sam 说的超时改成 5s',
+    })
+
+    // 4. Bot-enabled alert listener thread still accepts follow-up updates from the alert bot
+    const alertGroup = LarkGroupConfigSchema.parse({
+      key: 'dsh-bot:oc_alert_thread',
+      botId: 'dsh-bot',
+      chatId: 'oc_alert_thread',
+      enabled: true,
+      listener: {
+        enabled: true,
+        name: '告警跟进',
+        prompt: '跟进告警恢复状态',
+        senderTypes: ['user', 'bot'],
+      },
+    })
+    expect(
+      decideLarkRouting(
+        bot,
+        createMessage({
+          chatId: 'oc_alert_thread',
+          messageId: 'om_alert_resolved',
+          rootId: 'om_alert_root',
+          threadId: 'omt_alert_1',
+          senderOpenId: 'ou_alert_bot',
+          senderType: 'bot',
+          msgType: 'interactive',
+          text: '[RESOLVED] 核心接口错误率已恢复正常',
+        }),
+        {
+          groupConfig: alertGroup,
+          hasActiveSessionForRoute: () => true,
+          getRouteTrigger: () => 'listener',
+          hasRouteReplied: () => true,
+        },
+      ),
+    ).toMatchObject({
+      action: 'agent',
+      trigger: 'active-thread',
+      allowSilentEmptyReply: true,
+    })
+
+    // 5. Peer bot reply & bare @PeerBot poke inside a mention-originated active thread must NOT fall through
+    //    to a `scope: 'all'` passive listener (even when that listener allows bot senders)
+    const botWithSub = createBot({
+      groupSessionMode: 'thread',
+      mentionTriggerMode: 'mention_and_active_thread',
+      substituteMode: {
+        enabled: true,
+        targets: [{ openId: 'ou_owner', name: 'Alex Chen' }],
+      },
+    })
+    const allScopeListenerGroup = LarkGroupConfigSchema.parse({
+      key: 'dsh-bot:oc_all_listener',
+      botId: 'dsh-bot',
+      chatId: 'oc_all_listener',
+      enabled: true,
+      listener: {
+        enabled: true,
+        name: '全量旁听',
+        prompt: '必要时介入',
+        scope: 'all',
+        senderTypes: ['user', 'bot'],
+      },
+    })
+    expect(
+      decideLarkRouting(
+        botWithSub,
+        createMessage({
+          chatId: 'oc_all_listener',
+          messageId: 'om_peer_bot_card_in_mention_thread',
+          rootId: 'om_root_1',
+          threadId: 'omt_topic_1',
+          senderOpenId: 'ou_peer_bot',
+          senderType: 'bot',
+          msgType: 'interactive',
+          text: '请升级至最新版本客户端，以查看内容',
+        }),
+        {
+          groupConfig: allScopeListenerGroup,
+          hasActiveSessionForRoute: () => true,
+          getRouteTrigger: () => 'mention',
+          hasRouteReplied: () => true,
+        },
+      ),
+    ).toEqual({ action: 'ignore', reason: 'no_matching_rule' })
+
+    expect(
+      decideLarkRouting(
+        botWithSub,
+        createMessage({
+          chatId: 'oc_all_listener',
+          messageId: 'om_bare_peer_poke_in_listener_group',
+          rootId: 'om_root_1',
+          threadId: 'omt_topic_1',
+          senderOpenId: 'ou_member_1',
+          senderType: 'user',
+          text: '@_user_1',
+          mentions: [{ key: '@_user_1', openId: 'ou_peer_bot', name: 'PeerBot' }],
+        }),
+        {
+          groupConfig: allScopeListenerGroup,
+          hasActiveSessionForRoute: () => true,
+          getRouteTrigger: () => 'mention',
+          hasRouteReplied: () => true,
+        },
+      ),
+    ).toEqual({ action: 'ignore', reason: 'no_matching_rule' })
+
+    // 6. Bare @SubstituteTarget poke in an active thread still routes to substitute mode
+    expect(
+      decideLarkRouting(
+        botWithSub,
+        createMessage({
+          chatId: 'oc_all_listener',
+          messageId: 'om_bare_sub_poke',
+          rootId: 'om_root_1',
+          threadId: 'omt_topic_1',
+          senderOpenId: 'ou_member_1',
+          senderType: 'user',
+          text: '@_user_1',
+          mentions: [{ key: '@_user_1', openId: 'ou_owner', name: 'Alex Chen' }],
+        }),
+        {
+          groupConfig: allScopeListenerGroup,
+          hasActiveSessionForRoute: () => true,
+          getRouteTrigger: () => 'mention',
+          hasRouteReplied: () => true,
+        },
+      ),
+    ).toMatchObject({
+      action: 'agent',
+      trigger: 'substitute',
+    })
+  })
 })

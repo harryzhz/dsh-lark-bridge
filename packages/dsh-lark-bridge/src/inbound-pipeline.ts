@@ -11,6 +11,7 @@ import {
   composeRouterHandoffReminder,
   composeTurnPrompt,
   decideLarkRouting,
+  isGroupEnabled,
   isLarkMessageRecalledError,
   isSilentReplySentinel,
   normalizeReplyText,
@@ -59,8 +60,37 @@ const RECALLED_MESSAGE_TTL_MS = 10 * 60_000
 const MAX_RECALLED_MESSAGES = 2_000
 const UNEXPECTED_SILENT_SENTINEL_FALLBACK = '抱歉，当前消息不在我的职责范围内或暂无法直接回复。'
 
+type DisableCancelScope = 'group' | 'bot'
+
 function createRecalledAbortError(): TurnAbortedError {
   return new TurnAbortedError('recalled', '原消息已撤回，已取消当前轮次并停止执行')
+}
+
+function createDisabledAbortError(scope: DisableCancelScope): TurnAbortedError {
+  return new TurnAbortedError(
+    'disabled',
+    scope === 'bot'
+      ? '智能体已停用，已取消当前轮次并停止执行'
+      : '群聊响应开关已关闭，已取消当前轮次并停止执行',
+  )
+}
+
+function disabledCancelSummary(scope: DisableCancelScope, suffix: string): string {
+  return `${scope === 'bot' ? '智能体已停用' : '群聊响应开关已关闭'}，${suffix}`
+}
+
+function canSilenceTurnByControl(
+  turn: Pick<ActiveTurnRecord, 'allowSilentEmptyReply' | 'trigger'>,
+): boolean {
+  return turn.allowSilentEmptyReply || turn.trigger === 'active-thread'
+}
+
+interface InflightCancelEntry {
+  readonly botId: string
+  readonly chatId: string
+  readonly chatType: string
+  readonly messageId: string
+  readonly controller: AbortController
 }
 
 function linkAbortSignals(signals: readonly (AbortSignal | undefined)[]): {
@@ -131,6 +161,7 @@ export interface ActiveTurnRecord {
   silencedByControl: boolean
   silenceReason?: string
   cancelledByRecall: boolean
+  cancelledByDisable?: DisableCancelScope
   settled: boolean
   reactionRemoved: boolean
 }
@@ -188,7 +219,7 @@ export class InboundPipeline {
   private readonly dedup = new MessageDeduplicator()
   private readonly activeTurns = new Map<string, ActiveTurnRecord>()
   private readonly recalledMessages = new Map<string, number>()
-  private readonly inflightControllers = new Map<string, Set<AbortController>>()
+  private readonly inflightCancels = new Set<InflightCancelEntry>()
   private readonly recoveringTurnIds = new Set<string>()
   private readonly recoveryTasks = new Set<Promise<void>>()
 
@@ -244,16 +275,22 @@ export class InboundPipeline {
   ): { readonly matched: boolean; readonly turnId?: string; readonly allowSilent: boolean } {
     const sid = sessionId.trim()
     if (!sid) return { matched: false, allowSilent: false }
+    const matching: ActiveTurnRecord[] = []
     for (const turn of this.activeTurns.values()) {
       if (turn.settled || turn.sessionId !== sid) continue
-      if (!turn.allowSilentEmptyReply) {
-        return { matched: true, turnId: turn.id, allowSilent: false }
-      }
-      turn.silencedByControl = true
-      if (reason?.trim()) turn.silenceReason = reason.trim()
-      return { matched: true, turnId: turn.id, allowSilent: true }
+      matching.push(turn)
     }
-    return { matched: false, allowSilent: false }
+    if (matching.length === 0) return { matched: false, allowSilent: false }
+    const first = matching[0]!
+    if (matching.some((turn) => !canSilenceTurnByControl(turn))) {
+      return { matched: true, turnId: first.id, allowSilent: false }
+    }
+    const trimmedReason = reason?.trim()
+    for (const turn of matching) {
+      turn.silencedByControl = true
+      if (trimmedReason) turn.silenceReason = trimmedReason
+    }
+    return { matched: true, turnId: first.id, allowSilent: true }
   }
 
   private recallKey(botId: string, messageId: string): string {
@@ -295,24 +332,102 @@ export class InboundPipeline {
 
   private trackInflightController(
     botId: string,
+    chatId: string,
+    chatType: string,
     messageId: string,
     controller: AbortController,
   ): () => void {
-    const key = this.recallKey(botId, messageId)
-    let set = this.inflightControllers.get(key)
-    if (!set) {
-      set = new Set<AbortController>()
-      this.inflightControllers.set(key, set)
-    }
-    set.add(controller)
+    const entry: InflightCancelEntry = { botId, chatId, chatType, messageId, controller }
+    this.inflightCancels.add(entry)
     return () => {
-      const current = this.inflightControllers.get(key)
-      if (!current) return
-      current.delete(controller)
-      if (current.size === 0) {
-        this.inflightControllers.delete(key)
+      this.inflightCancels.delete(entry)
+    }
+  }
+
+  private getDisabledScope(
+    botId: string,
+    chatType: string,
+    chatId: string,
+  ): DisableCancelScope | undefined {
+    const currentBot = this.host.store.getBot(botId)
+    if (!currentBot || !currentBot.enabled) return 'bot'
+    if (chatType === 'group') {
+      const currentGroup = this.host.store.getGroup(botId, chatId)
+      if (!isGroupEnabled(currentBot, currentGroup)) return 'group'
+    }
+    return undefined
+  }
+
+  /**
+   * Immediately cancels any in-flight triage, queued turn, running Agent turn, or
+   * pending recovery turn whose bot or group has just been disabled in configuration.
+   */
+  cancelDisabledTurns(botId: string, chatId?: string): number {
+    if (this.host.isDisposed()) return 0
+    const normalizedBotId = botId.trim()
+    const normalizedChatId = chatId?.trim() || undefined
+    if (!normalizedBotId) return 0
+
+    let cancelled = 0
+    const abortedControllers = new Set<AbortController>()
+
+    for (const turn of this.activeTurns.values()) {
+      if (turn.settled || turn.botId !== normalizedBotId) continue
+      if (normalizedChatId && turn.chatId !== normalizedChatId) continue
+      const chatType = turn.inboundMsg?.chatType ?? (turn.trigger === 'p2p' ? 'p2p' : 'group')
+      const scope = this.getDisabledScope(turn.botId, chatType, turn.chatId)
+      if (!scope) continue
+      turn.cancelledByDisable = scope
+      cancelled += 1
+      if (turn.cancelController && !turn.cancelController.signal.aborted) {
+        abortedControllers.add(turn.cancelController)
+        turn.cancelController.abort(createDisabledAbortError(scope))
       }
     }
+
+    for (const entry of [...this.inflightCancels]) {
+      if (entry.botId !== normalizedBotId) continue
+      if (normalizedChatId && entry.chatId !== normalizedChatId) continue
+      if (abortedControllers.has(entry.controller) || entry.controller.signal.aborted) continue
+      const scope = this.getDisabledScope(entry.botId, entry.chatType, entry.chatId)
+      if (!scope) continue
+      cancelled += 1
+      abortedControllers.add(entry.controller)
+      entry.controller.abort(createDisabledAbortError(scope))
+    }
+
+    const activeTurnIds = new Set(this.activeTurns.keys())
+    const transport = this.host.connections.getTransport(normalizedBotId)
+    for (const pending of this.host.store.listPendingTurns()) {
+      if (pending.botId !== normalizedBotId) continue
+      if (normalizedChatId && pending.chatId !== normalizedChatId) continue
+      if (activeTurnIds.has(pending.id)) continue
+      const chatType = pending.inboundMsg?.chatType ?? (pending.trigger === 'p2p' ? 'p2p' : 'group')
+      const scope = this.getDisabledScope(pending.botId, chatType, pending.chatId)
+      if (!scope) continue
+      cancelled += 1
+      this.host.store.deletePendingTurn(pending.id)
+      if (pending.reactionId && transport) {
+        void transport.removeReaction(pending.messageId, pending.reactionId).catch(() => {})
+      }
+      this.host.store.recordEvent({
+        botId: pending.botId,
+        chatId: pending.chatId,
+        ...(pending.chatName ? { chatName: pending.chatName } : {}),
+        routeKey: pending.routeKey,
+        ...(pending.sessionId ? { sessionId: pending.sessionId } : {}),
+        ...(pending.traceId ? { traceId: pending.traceId } : {}),
+        kind: 'lifecycle',
+        summary: disabledCancelSummary(scope, '已取消待恢复轮次'),
+      })
+    }
+
+    if (cancelled > 0) {
+      this.host.ctx.logger.info(
+        `[lark-bridge][bot=${normalizedBotId}]${normalizedChatId ? `[chat=${normalizedChatId}]` : ''} scope disabled; cancelled ${cancelled} in-flight/queued turn(s)`,
+      )
+    }
+    return cancelled
   }
 
   /**
@@ -337,8 +452,6 @@ export class InboundPipeline {
     if (!firstSeen) return
 
     const reason = createRecalledAbortError()
-    const key = this.recallKey(botId, messageId)
-    const controllers = this.inflightControllers.get(key)
     let matchedAny = false
 
     for (const turn of this.activeTurns.values()) {
@@ -351,12 +464,11 @@ export class InboundPipeline {
       }
     }
 
-    if (controllers) {
-      for (const ctrl of [...controllers]) {
-        matchedAny = true
-        if (!ctrl.signal.aborted) {
-          ctrl.abort(reason)
-        }
+    for (const entry of [...this.inflightCancels]) {
+      if (entry.botId !== botId || entry.messageId !== messageId) continue
+      matchedAny = true
+      if (!entry.controller.signal.aborted) {
+        entry.controller.abort(reason)
       }
     }
 
@@ -635,6 +747,27 @@ export class InboundPipeline {
           item.inboundMsg?.chatType === 'group'
             ? this.host.store.getGroup(item.botId, item.chatId)
             : this.host.store.getGroup(item.botId, item.chatId)
+        const pendingChatType =
+          item.inboundMsg?.chatType ?? (item.trigger === 'p2p' ? 'p2p' : 'group')
+        const disabledScope = this.getDisabledScope(item.botId, pendingChatType, item.chatId)
+        if (disabledScope) {
+          this.host.store.deletePendingTurn(item.id)
+          if (item.reactionId) {
+            await transport.removeReaction(item.messageId, item.reactionId).catch(() => {})
+          }
+          this.host.store.recordEvent({
+            botId: item.botId,
+            chatId: item.chatId,
+            ...(item.chatName ? { chatName: item.chatName } : {}),
+            routeKey: item.routeKey,
+            ...(item.sessionId ? { sessionId: item.sessionId } : {}),
+            ...(item.traceId ? { traceId: item.traceId } : {}),
+            kind: 'lifecycle',
+            summary: disabledCancelSummary(disabledScope, '已跳过重启恢复'),
+          })
+          recovered += 1
+          continue
+        }
 
         // 1. Check whether the interrupted session actually finished its turn right before shutdown.
         if (item.sessionId) {
@@ -828,10 +961,11 @@ export class InboundPipeline {
     readonly silencedByTool: boolean
   }): Promise<void> {
     const { bot, transport, turn, groupConfig, replyText, silencedByTool } = input
-    const normalized = silencedByTool
+    const effectiveSilencedByTool = silencedByTool && canSilenceTurnByControl(turn)
+    const normalized = effectiveSilencedByTool
       ? ''
       : normalizeReplyText(replyText, { allowSilentSentinel: true })
-    const isSilent = turn.allowSilentEmptyReply && (silencedByTool || !normalized)
+    const isSilent = effectiveSilencedByTool || (turn.allowSilentEmptyReply && !normalized)
     if (turn.reactionId) {
       await transport.removeReaction(turn.messageId, turn.reactionId).catch(() => {})
     }
@@ -926,12 +1060,17 @@ export class InboundPipeline {
     const msgCancelController = new AbortController()
     const untrackInflight = this.trackInflightController(
       bot.id,
+      msg.chatId,
+      msg.chatType,
       msg.messageId,
       msgCancelController,
     )
+    const getSelfDisabledScope = (): DisableCancelScope | undefined =>
+      this.getDisabledScope(bot.id, msg.chatType, msg.chatId)
     const isSelfRecalled = () =>
-      msgCancelController.signal.aborted || this.isMessageRecalled(bot.id, msg.messageId)
-    const recordPreTurnRecall = (summary: string) => {
+      this.isMessageRecalled(bot.id, msg.messageId) ||
+      (msgCancelController.signal.aborted && !this.isSignalDisabled(msgCancelController.signal))
+    const recordPreTurnCancel = (summary: string) => {
       this.host.store.recordEvent({
         botId: bot.id,
         chatId: msg.chatId,
@@ -944,14 +1083,24 @@ export class InboundPipeline {
     }
 
     try {
+      const preDisabled = getSelfDisabledScope()
+      if (preDisabled) {
+        recordPreTurnCancel(disabledCancelSummary(preDisabled, '已取消当前轮次并停止执行'))
+        return
+      }
       if (isSelfRecalled()) {
-        recordPreTurnRecall('原消息已撤回，已取消当前轮次并停止执行')
+        recordPreTurnCancel('原消息已撤回，已取消当前轮次并停止执行')
         return
       }
 
       const senderName = await this.resolveSenderName(transport, msg)
+      const postSenderDisabled = getSelfDisabledScope()
+      if (postSenderDisabled) {
+        recordPreTurnCancel(disabledCancelSummary(postSenderDisabled, '已取消当前轮次并停止执行'))
+        return
+      }
       if (isSelfRecalled()) {
-        recordPreTurnRecall('原消息已撤回，已取消当前轮次并停止执行')
+        recordPreTurnCancel('原消息已撤回，已取消当前轮次并停止执行')
         return
       }
 
@@ -975,8 +1124,13 @@ export class InboundPipeline {
           cancelSignal: msgCancelController.signal,
         })
         if (triageOutcome.handled || this.host.isDisposed()) return
+        const postTriageDisabled = getSelfDisabledScope()
+        if (postTriageDisabled) {
+          recordPreTurnCancel(disabledCancelSummary(postTriageDisabled, '已取消当前轮次并停止执行'))
+          return
+        }
         if (isSelfRecalled()) {
-          recordPreTurnRecall('原消息已撤回，已取消当前轮次并停止执行')
+          recordPreTurnCancel('原消息已撤回，已取消当前轮次并停止执行')
           return
         }
         triageNote = triageOutcome.triageNote
@@ -991,8 +1145,13 @@ export class InboundPipeline {
         })
       }
 
+      const preReactionDisabled = getSelfDisabledScope()
+      if (preReactionDisabled) {
+        recordPreTurnCancel(disabledCancelSummary(preReactionDisabled, '已取消当前轮次并停止执行'))
+        return
+      }
       if (isSelfRecalled()) {
-        recordPreTurnRecall('原消息已撤回，已取消当前轮次并停止执行')
+        recordPreTurnCancel('原消息已撤回，已取消当前轮次并停止执行')
         return
       }
 
@@ -1006,8 +1165,16 @@ export class InboundPipeline {
         if (!recovery && reactionId) await transport.removeReaction(msg.messageId, reactionId)
         return
       }
+      const postReactionDisabled = getSelfDisabledScope()
+      if (postReactionDisabled) {
+        if (!recovery && reactionId) {
+          await transport.removeReaction(msg.messageId, reactionId).catch(() => {})
+        }
+        recordPreTurnCancel(disabledCancelSummary(postReactionDisabled, '已取消当前轮次并停止执行'))
+        return
+      }
       if (isSelfRecalled()) {
-        recordPreTurnRecall('原消息已撤回，已取消当前轮次并停止执行')
+        recordPreTurnCancel('原消息已撤回，已取消当前轮次并停止执行')
         return
       }
 
@@ -1060,6 +1227,17 @@ export class InboundPipeline {
         trackedSessionId = acquired.sessionId
         activeTurn.sessionId = trackedSessionId
 
+        const postAcquireDisabled = activeTurn.cancelledByDisable ?? getSelfDisabledScope()
+        if (postAcquireDisabled) {
+          this.settleDisabledTurn(
+            activeTurn,
+            postAcquireDisabled,
+            disabledCancelSummary(postAcquireDisabled, '已取消当前轮次并停止执行'),
+          )
+          shouldDisposeEphemeral = Boolean(acquired.disposeAfter || acquired.isNew)
+          shouldArchiveEphemeral = shouldDisposeEphemeral
+          return
+        }
         if (isSelfRecalled() || activeTurn.cancelledByRecall) {
           this.settleRecalledTurn(activeTurn, '原消息已撤回，已取消当前轮次并停止执行')
           shouldDisposeEphemeral = Boolean(acquired.disposeAfter || acquired.isNew)
@@ -1121,6 +1299,8 @@ export class InboundPipeline {
           isAborted: () =>
             activeTurn.settled ||
             activeTurn.cancelledByRecall ||
+            Boolean(activeTurn.cancelledByDisable) ||
+            Boolean(getSelfDisabledScope()) ||
             isSelfRecalled() ||
             this.host.isDisposed(),
           onLeaderRegistered: () => {
@@ -1137,10 +1317,18 @@ export class InboundPipeline {
         if (slot.role === 'aborted') {
           batchItems = slot.orphanedItems
           const abortNowMs = Date.now()
-          let anyRecalled = false
+          let anyCancelled = false
           for (const orphaned of slot.orphanedItems) {
-            if (this.isTurnRecalled(bot.id, orphaned)) {
-              anyRecalled = true
+            const disabledScope = this.getTurnDisabledScope(bot.id, orphaned)
+            if (disabledScope) {
+              anyCancelled = true
+              this.settleDisabledTurn(
+                orphaned.activeTurn,
+                disabledScope,
+                disabledCancelSummary(disabledScope, '已取消排队轮次'),
+              )
+            } else if (this.isTurnRecalled(bot.id, orphaned)) {
+              anyCancelled = true
               this.settleRecalledTurn(orphaned.activeTurn, '原消息已撤回，已取消排队轮次')
             } else if (
               this.host.isDisposed() &&
@@ -1154,15 +1342,22 @@ export class InboundPipeline {
           const currentBinding = this.host.store.getBinding(decision.routeKey)
           shouldDisposeEphemeral = Boolean(
             acquired.disposeAfter ||
-              (anyRecalled && acquired.isNew && currentBinding?.hasReplied === false),
+              (anyCancelled && acquired.isNew && currentBinding?.hasReplied === false),
           )
-          shouldArchiveEphemeral = Boolean(anyRecalled && shouldDisposeEphemeral)
+          shouldArchiveEphemeral = Boolean(anyCancelled && shouldDisposeEphemeral)
           return
         }
 
         if (slot.abandonedItems && slot.abandonedItems.length > 0) {
           for (const abandoned of slot.abandonedItems) {
-            if (this.isTurnRecalled(bot.id, abandoned)) {
+            const disabledScope = this.getTurnDisabledScope(bot.id, abandoned)
+            if (disabledScope) {
+              this.settleDisabledTurn(
+                abandoned.activeTurn,
+                disabledScope,
+                disabledCancelSummary(disabledScope, '已从合并队列移除'),
+              )
+            } else if (this.isTurnRecalled(bot.id, abandoned)) {
               this.settleRecalledTurn(abandoned.activeTurn, '原消息已撤回，已从合并队列移除')
             } else {
               this.claimActiveTurn(abandoned.activeTurn)
@@ -1173,6 +1368,11 @@ export class InboundPipeline {
         releaseTurnSlot = slot.release
         finishBatch = slot.finishBatch
         batchItems = slot.items
+
+        const preExecDisabled = this.getBatchDisabledScope(bot.id, batchItems)
+        if (preExecDisabled) {
+          throw createDisabledAbortError(preExecDisabled)
+        }
 
         const latestItem = batchItems[batchItems.length - 1] ?? selfItem
         const batchSize = batchItems.length
@@ -1222,6 +1422,10 @@ export class InboundPipeline {
           acquired.isNew,
           resolvedChatName,
         )
+        const postPromptDisabled = this.getBatchDisabledScope(bot.id, batchItems)
+        if (postPromptDisabled) {
+          throw createDisabledAbortError(postPromptDisabled)
+        }
         if (batchItems.some((i) => this.isTurnRecalled(bot.id, i))) {
           throw createRecalledAbortError()
         }
@@ -1232,8 +1436,10 @@ export class InboundPipeline {
 
         const linkedCancel = linkAbortSignals(batchItems.map((i) => i.cancelController.signal))
         const isSilenced = () => batchItems.some((i) => i.activeTurn.silencedByControl)
-        const isBatchRecalled = () =>
-          linkedCancel.signal.aborted || batchItems.some((i) => this.isTurnRecalled(bot.id, i))
+        const isBatchCancelled = () =>
+          linkedCancel.signal.aborted ||
+          Boolean(this.getBatchDisabledScope(bot.id, batchItems)) ||
+          batchItems.some((i) => this.isTurnRecalled(bot.id, i))
         let replyText: string
         try {
           replyText = await runTurnAndCollectReply(this.host.ctx, acquired.agent, content, {
@@ -1247,7 +1453,7 @@ export class InboundPipeline {
             ...(effectiveDecision.sendIntermediateMessages
               ? {
                   onIntermediate: async (stepText) => {
-                    if (isSilenced() || isBatchRecalled()) return
+                    if (isSilenced() || isBatchCancelled()) return
                     const sent = await this.deliverIntermediateReply(
                       bot,
                       transport,
@@ -1361,6 +1567,26 @@ export class InboundPipeline {
       return { dispose: acquired.disposeAfter, archive: false }
     }
 
+    const disabledScope = this.getBatchDisabledScope(bot.id, batchItems)
+    if (disabledScope) {
+      this.host.store.recordEvent({
+        botId: bot.id,
+        chatId: latestItem.msg.chatId,
+        ...chatName,
+        routeKey: effectiveDecision.routeKey,
+        sessionId: acquired.sessionId,
+        traceId: latestItem.traceId,
+        durationMs: Date.now() - startedMs,
+        kind: 'lifecycle',
+        summary: disabledCancelSummary(disabledScope, '已取消当前轮次并跳过回复'),
+      })
+      const currentBinding = this.host.store.getBinding(effectiveDecision.routeKey)
+      const dispose = Boolean(
+        acquired.disposeAfter || (acquired.isNew && currentBinding?.hasReplied === false),
+      )
+      return { dispose, archive: dispose }
+    }
+
     if (batchItems.some((item) => this.isTurnRecalled(bot.id, item))) {
       for (const item of batchItems) {
         if (this.isTurnRecalled(bot.id, item)) {
@@ -1414,8 +1640,7 @@ export class InboundPipeline {
         })
     const hasFinalText = normalizedReply.length > 0
     const isSilentSkip =
-      effectiveDecision.allowSilentEmptyReply &&
-      (Boolean(silencedItem) || !hasFinalText) &&
+      (Boolean(silencedItem) || (effectiveDecision.allowSilentEmptyReply && !hasFinalText)) &&
       intermediateSentCount === 0
 
     if (isSilentSkip) {
@@ -1619,6 +1844,45 @@ export class InboundPipeline {
       return { dispose, archive }
     }
 
+    const disabledScope =
+      this.getBatchDisabledScope(bot.id, batchItems) ??
+      (err instanceof TurnAbortedError && err.kind === 'disabled'
+        ? this.getDisabledScope(bot.id, targetMsg.chatType, targetMsg.chatId) ?? 'group'
+        : undefined)
+    const isDisabledAbort =
+      (err instanceof TurnAbortedError && err.kind === 'disabled') || Boolean(disabledScope)
+    if (isDisabledAbort) {
+      let anyDisabledClaimed = false
+      for (const item of batchItems) {
+        if (this.claimActiveTurn(item.activeTurn)) {
+          anyDisabledClaimed = true
+        }
+      }
+      if (anyDisabledClaimed) {
+        this.host.store.recordEvent({
+          botId: bot.id,
+          chatId: targetMsg.chatId,
+          ...chatName,
+          routeKey: targetDecision.routeKey,
+          ...(trackedSessionId ? { sessionId: trackedSessionId } : {}),
+          traceId: targetTurn.traceId,
+          durationMs: Date.now() - targetTurn.startedAtMs,
+          kind: 'lifecycle',
+          summary: disabledCancelSummary(
+            disabledScope ?? 'group',
+            '已取消当前轮次并停止执行',
+          ),
+        })
+      }
+      if (acquiredRef) {
+        if (acquiredRef.disposeAfter || (acquiredRef.isNew && totalIntermediate === 0)) {
+          dispose = true
+          archive = true
+        }
+      }
+      return { dispose, archive }
+    }
+
     const isRecalledAbort =
       (err instanceof TurnAbortedError && err.kind === 'recalled') ||
       batchItems.some((item) => this.isTurnRecalled(bot.id, item))
@@ -1742,11 +2006,26 @@ export class InboundPipeline {
       cancelSignal,
     } = input
     const chatName = resolvedChatName ? { chatName: resolvedChatName } : {}
+    const getDisabledScope = () => this.getDisabledScope(bot.id, msg.chatType, msg.chatId)
     const isRecalled = () =>
-      Boolean(cancelSignal?.aborted) || this.isMessageRecalled(bot.id, msg.messageId)
+      this.isMessageRecalled(bot.id, msg.messageId) ||
+      (Boolean(cancelSignal?.aborted) && !this.isSignalDisabled(cancelSignal))
 
     const bypass = shouldFastBypassTriage(msg, decision, routerConfig.bypass)
     if (bypass.bypass) {
+      const bypassDisabled = getDisabledScope()
+      if (bypassDisabled) {
+        this.host.store.recordEvent({
+          botId: bot.id,
+          chatId: msg.chatId,
+          ...chatName,
+          routeKey: decision.routeKey,
+          traceId,
+          kind: 'lifecycle',
+          summary: disabledCancelSummary(bypassDisabled, '已取消当前轮次并停止执行'),
+        })
+        return { handled: true }
+      }
       if (isRecalled()) {
         this.host.store.recordEvent({
           botId: bot.id,
@@ -1787,6 +2066,19 @@ export class InboundPipeline {
       chatScopeKey,
     })
 
+    const preTriageDisabled = getDisabledScope()
+    if (preTriageDisabled) {
+      this.host.store.recordEvent({
+        botId: bot.id,
+        chatId: msg.chatId,
+        ...chatName,
+        routeKey: decision.routeKey,
+        traceId,
+        kind: 'lifecycle',
+        summary: disabledCancelSummary(preTriageDisabled, '已取消分流并停止执行'),
+      })
+      return { handled: true }
+    }
     if (isRecalled()) {
       this.host.store.recordEvent({
         botId: bot.id,
@@ -1826,6 +2118,21 @@ export class InboundPipeline {
       linkedTriageSignal.dispose()
     }
 
+    const postTriageDisabled = getDisabledScope()
+    if (postTriageDisabled) {
+      this.host.store.recordEvent({
+        botId: bot.id,
+        chatId: msg.chatId,
+        ...chatName,
+        routeKey: decision.routeKey,
+        ...(result.triageSessionId ? { sessionId: result.triageSessionId } : {}),
+        traceId,
+        durationMs: result.durationMs,
+        kind: 'lifecycle',
+        summary: disabledCancelSummary(postTriageDisabled, '已取消分流并停止执行'),
+      })
+      return { handled: true }
+    }
     if (isRecalled()) {
       this.host.store.recordEvent({
         botId: bot.id,
@@ -2069,12 +2376,67 @@ export class InboundPipeline {
     }
   }
 
-  private isTurnRecalled(botId: string, item: Pick<QueuedWorkerTurnItem, 'msg' | 'activeTurn' | 'cancelController'>): boolean {
-    return (
-      item.activeTurn.cancelledByRecall ||
-      item.cancelController.signal.aborted ||
-      this.isMessageRecalled(botId, item.msg.messageId)
+  private isSignalDisabled(signal?: AbortSignal): boolean {
+    return Boolean(
+      signal?.aborted &&
+        signal.reason instanceof TurnAbortedError &&
+        signal.reason.kind === 'disabled',
     )
+  }
+
+  private getTurnDisabledScope(
+    botId: string,
+    item: Pick<QueuedWorkerTurnItem, 'msg' | 'activeTurn'>,
+  ): DisableCancelScope | undefined {
+    return (
+      item.activeTurn.cancelledByDisable ??
+      this.getDisabledScope(botId, item.msg.chatType, item.msg.chatId)
+    )
+  }
+
+  private getBatchDisabledScope(
+    botId: string,
+    items: readonly Pick<QueuedWorkerTurnItem, 'msg' | 'activeTurn'>[],
+  ): DisableCancelScope | undefined {
+    for (const item of items) {
+      const scope = this.getTurnDisabledScope(botId, item)
+      if (scope) return scope
+    }
+    return undefined
+  }
+
+  private isTurnRecalled(
+    botId: string,
+    item: Pick<QueuedWorkerTurnItem, 'msg' | 'activeTurn' | 'cancelController'>,
+  ): boolean {
+    if (item.activeTurn.cancelledByRecall || this.isMessageRecalled(botId, item.msg.messageId)) {
+      return true
+    }
+    return (
+      item.cancelController.signal.aborted &&
+      !item.activeTurn.cancelledByDisable &&
+      !this.isSignalDisabled(item.cancelController.signal)
+    )
+  }
+
+  private settleDisabledTurn(
+    record: ActiveTurnRecord,
+    scope: DisableCancelScope,
+    summary: string,
+  ): void {
+    record.cancelledByDisable = scope
+    if (!this.claimActiveTurn(record)) return
+    this.host.store.recordEvent({
+      botId: record.botId,
+      chatId: record.chatId,
+      ...(record.chatName ? { chatName: record.chatName } : {}),
+      routeKey: record.routeKey,
+      ...(record.sessionId ? { sessionId: record.sessionId } : {}),
+      traceId: record.traceId,
+      durationMs: Date.now() - record.startedAtMs,
+      kind: 'lifecycle',
+      summary,
+    })
   }
 
   private settleRecalledTurn(record: ActiveTurnRecord, summary: string): void {

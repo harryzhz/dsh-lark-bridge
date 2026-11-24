@@ -633,6 +633,7 @@ export async function dispatchLarkApiRequest(
           }
         }
         const saved = manager.store.upsertGroup({ ...body, botId, chatId })
+        manager.cancelDisabledTurns?.(botId, chatId)
         await manager.syncGroupWorkspace(botId, chatId)
         manager.sessionViewer?.invalidateAccess()
         return ok({
@@ -643,6 +644,7 @@ export async function dispatchLarkApiRequest(
       }
       if (method === 'DELETE' && segments.length === 3) {
         const deleted = manager.store.deleteGroup(botId, chatId)
+        manager.cancelDisabledTurns?.(botId, chatId)
         manager.sessionViewer?.invalidateAccess()
         return ok({ ok: deleted }, deleted ? 200 : 404)
       }

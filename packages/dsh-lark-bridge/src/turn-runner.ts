@@ -7,6 +7,7 @@ import { hasVisibleText, trimInvisibleText } from '@dsh-lark/lark-core'
 export type TurnAbortKind =
   | 'disposed'
   | 'recalled'
+  | 'disabled'
   | 'user'
   | 'parent'
   | 'hook'

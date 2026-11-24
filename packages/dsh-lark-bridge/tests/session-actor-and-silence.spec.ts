@@ -325,6 +325,129 @@ describe('SessionActor invariants, structured silence control & SessionTitleGuar
     store.close()
   })
 
+  it('allows explicit `POST /agent/silence` on unmentioned active-thread followups while still rejecting it on explicit @mention turns', async () => {
+    const dir = makeTempDir()
+    const store = new LarkBridgeStore(dir)
+    const runtime = createMockRuntimeCtx()
+    const manager = new LarkBridgeManager(
+      runtime.ctx,
+      {
+        dataDir: dir,
+        publicBaseUrl: 'http://127.0.0.1:3880',
+        idleSweepIntervalMs: 0,
+        maxAuditEvents: 200,
+        autoInstallCliAndSkill: false,
+      },
+      store,
+    )
+
+    store.upsertBot({
+      id: 'bot-thread-silence',
+      name: 'ThreadBot',
+      larkAppId: 'cli_thread_1',
+      larkAppSecret: 'mock-secret-value',
+      defaultWorkingDir: dir,
+      agentPreset: 'standard',
+      receivedReactionEmoji: 'NONE',
+    })
+    store.upsertGroup({
+      botId: 'bot-thread-silence',
+      chatId: 'oc_thread_chat',
+      chatName: '研发话题群',
+      enabled: true,
+    })
+
+    const sendReply = vi.fn().mockResolvedValue({ messageId: 'om_thread_reply_1' })
+    const fakeTransport = {
+      state: { botOpenId: 'ou_bot_thread', connected: true },
+      addReaction: vi.fn().mockResolvedValue(undefined),
+      removeReaction: vi.fn().mockResolvedValue(undefined),
+      sendReply,
+    } as unknown as LarkBotTransport
+
+    // 1. Explicit @mention turn must reject `lark-bridge silence`
+    let sessionId = ''
+    const mentionEntered = new Promise<void>((resolve) => {
+      runtime.setOnTurnStarted((sid) => {
+        sessionId = sid
+        resolve()
+      })
+    })
+    const mentionPromise = manager.inbound.handleInbound('bot-thread-silence', fakeTransport, {
+      botId: 'bot-thread-silence',
+      larkAppId: 'cli_thread_1',
+      botOpenId: 'ou_bot_thread',
+      messageId: 'om_root_mention',
+      chatId: 'oc_thread_chat',
+      chatType: 'group',
+      msgType: 'text',
+      senderOpenId: 'ou_user_1',
+      senderType: 'user',
+      text: '@ThreadBot 帮我看下架构',
+      rawContent: '{"text":"@ThreadBot 帮我看下架构"}',
+      mentions: [{ key: '@_user_1', openId: 'ou_bot_thread', name: 'ThreadBot' }],
+      imageKeys: [],
+      createTimeMs: Date.now(),
+    })
+    await mentionEntered
+
+    const deniedRes = await dispatchLarkApiRequest(runtime.ctx, manager, {
+      method: 'POST',
+      path: '/api/lark-bridge/agent/silence',
+      body: { sessionId, reason: '不应允许显式提及静默' },
+      isCliAuthenticated: true,
+      principalKind: 'cli',
+    })
+    expect(deniedRes.status).toBe(200)
+    expect((deniedRes.payload as { silenced: boolean }).silenced).toBe(false)
+
+    runtime.finishCurrentTurn('架构分析已完成')
+    await mentionPromise
+    expect(sendReply).toHaveBeenCalledTimes(1)
+
+    // 2. Subsequent unmentioned active-thread message CAN explicitly invoke `lark-bridge silence`
+    const followupEntered = new Promise<void>((resolve) => {
+      runtime.setOnTurnStarted(() => resolve())
+    })
+    const followupPromise = manager.inbound.handleInbound('bot-thread-silence', fakeTransport, {
+      botId: 'bot-thread-silence',
+      larkAppId: 'cli_thread_1',
+      botOpenId: 'ou_bot_thread',
+      messageId: 'om_thread_chatter',
+      rootId: 'om_root_mention',
+      threadId: 'omt_thread_1',
+      chatId: 'oc_thread_chat',
+      chatType: 'group',
+      msgType: 'text',
+      senderOpenId: 'ou_user_2',
+      senderType: 'user',
+      text: '收到，那我跟 Sam 线下对齐一下',
+      rawContent: '{"text":"收到，那我跟 Sam 线下对齐一下"}',
+      mentions: [],
+      imageKeys: [],
+      createTimeMs: Date.now(),
+    })
+    await followupEntered
+
+    const allowedRes = await dispatchLarkApiRequest(runtime.ctx, manager, {
+      method: 'POST',
+      path: '/api/lark-bridge/agent/silence',
+      body: { sessionId, reason: '同事间旁白，无需插话' },
+      isCliAuthenticated: true,
+      principalKind: 'cli',
+    })
+    expect(allowedRes.status).toBe(200)
+    expect((allowedRes.payload as { silenced: boolean }).silenced).toBe(true)
+
+    runtime.finishCurrentTurn('已静默跳过')
+    await followupPromise
+    expect(sendReply).toHaveBeenCalledTimes(1)
+    expect(store.listEvents(10).some((e) => e.kind === 'silent_skip')).toBe(true)
+
+    await manager.stop()
+    store.close()
+  })
+
   it('degrades SessionTitleGuard gracefully when DSH host changes sessionTitle internals', () => {
     const dir = makeTempDir()
     const store = new LarkBridgeStore(dir)

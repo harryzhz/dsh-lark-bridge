@@ -73,6 +73,7 @@ export {
   composeSystemReminder,
   composeTurnPrompt,
   decideLarkRouting,
+  isGroupEnabled,
   isListenerSenderEnabled,
   type LarkConversationContextInput,
   type ScheduleContextReminderInput,
