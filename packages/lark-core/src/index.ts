@@ -91,8 +91,13 @@ export {
   MAX_REMINDER_CHAIN_DEPTH,
   MAX_REMINDER_CHAIN_WINDOW_MS,
   MAX_REMINDER_PROMPT_CHARS,
+  MAX_REMINDER_RESTART_RETRIES,
   MIN_CHAINED_REMINDER_BACKOFF_SECONDS,
   REMINDER_SILENT_SENTINEL,
+  RESTART_RETRY_DELAY_MS,
+  ReminderUrgencySchema,
+  STALE_REMINDER_RETRY_WINDOW_MS,
+  applyQuietHoursDeferral,
   composeProactiveSessionReminder,
   composeReminderTriggerPrompt,
   extractReminderTriggerOutput,
@@ -104,6 +109,7 @@ export {
   type LarkReminderWorktreeMeta,
   type ProactiveSessionReminderInput,
   type ReminderTriggerPromptInput,
+  type ReminderUrgency,
 } from './proactive.js'
 export {
   DEFAULT_TRIAGE_SYSTEM_PROMPT,

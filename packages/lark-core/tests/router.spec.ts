@@ -757,6 +757,9 @@ describe('decideLarkRouting, <user_message> format, memberOverrides & title inte
     expect(defaultBot.experimental.proactive).toEqual({
       remindersEnabled: false,
       reminderCreationMode: 'silent',
+      quietHoursEnabled: false,
+      quietHoursStart: '23:00',
+      quietHoursEnd: '09:00',
       autoCodeEnabled: false,
       branchPrefix: 'agent/',
     })

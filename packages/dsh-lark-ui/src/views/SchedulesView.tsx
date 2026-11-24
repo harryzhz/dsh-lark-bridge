@@ -245,6 +245,7 @@ function RemindersList({
               <div className="fb-item-title">
                 <span>{item.title}</span>
                 <Tag tone={badge.tone}>{badge.label}</Tag>
+                {item.urgency === 'high' && <Tag tone="warning">高优</Tag>}
                 <Tag tone="quiet">{formatReminderOrigin(item)}</Tag>
                 {item.worktree && <Tag tone="info">{`分支 · ${item.worktree.branch}`}</Tag>}
               </div>
@@ -252,6 +253,10 @@ function RemindersList({
                 {[
                   item.origin.botName ? `智能体「${item.origin.botName}」` : null,
                   `计划触发 ${formatIsoTime(item.scheduledAt)}`,
+                  item.deferredFromScheduledAt
+                    ? `免打扰顺延自 ${formatIsoTime(item.deferredFromScheduledAt)}`
+                    : null,
+                  item.retryCount && item.retryCount > 0 ? `重启补跑 #${item.retryCount}` : null,
                   mentionText,
                   item.resultSummary || item.reason || null,
                 ]

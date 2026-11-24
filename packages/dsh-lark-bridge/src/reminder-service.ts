@@ -14,7 +14,11 @@ import {
   MAX_REMINDER_CHAIN_DEPTH,
   MAX_REMINDER_CHAIN_WINDOW_MS,
   MAX_REMINDER_PROMPT_CHARS,
+  MAX_REMINDER_RESTART_RETRIES,
   MIN_CHAINED_REMINDER_BACKOFF_SECONDS,
+  RESTART_RETRY_DELAY_MS,
+  STALE_REMINDER_RETRY_WINDOW_MS,
+  applyQuietHoursDeferral,
   buildReminderConfirmCard,
   buildReminderNoticeCard,
   buildReminderStatusCard,
@@ -31,6 +35,7 @@ import {
   type LarkReminderOrigin,
   type LarkReminderWorktreeMeta,
   type ReminderCreationMode,
+  type ReminderUrgency,
 } from '@dsh-lark/lark-core'
 import { assertExistingWorkingDirectory } from './fs-browser.js'
 import type { RuntimeCatalog } from './runtime-catalog.js'
@@ -39,6 +44,7 @@ import { LARK_ORIGIN_RECORD_TYPE, type LarkOriginRecord } from './types.js'
 import type { WorkspaceGrouping } from './workspace-grouping.js'
 
 const SWEEP_INTERVAL_MS = 30_000
+const MAX_CONCURRENT_REMINDERS = 3
 
 export interface CreateReminderInput {
   readonly sessionId?: string
@@ -57,6 +63,7 @@ export interface CreateReminderInput {
   readonly mentions?: readonly LarkReminderMention[]
   readonly worktree?: LarkReminderWorktreeMeta
   readonly creationMode?: ReminderCreationMode
+  readonly urgency?: ReminderUrgency
 }
 
 export interface UpdateReminderInput {
@@ -202,8 +209,11 @@ export class ProactiveReminderService {
   }
 
   /**
-   * Transitions any reminder left in `running` from a prior process restart/crash
-   * into `archived` (`error`) while preserving or backfilling its `lastSessionId`.
+   * Recovers reminders left in `running` from a prior process restart/crash:
+   * - Within the retry budget (`retryCount < MAX_REMINDER_RESTART_RETRIES`) and
+   *   freshness window (`<= STALE_REMINDER_RETRY_WINDOW_MS`), automatically requeues
+   *   as `scheduled` after a short startup delay instead of silently dropping the check.
+   * - Otherwise transitions into `archived` (`error`) while preserving/backfilling `lastSessionId`.
    */
   async recoverStaleRunningReminders(nowMs = Date.now()): Promise<number> {
     const stale = this.host.store
@@ -213,6 +223,32 @@ export class ProactiveReminderService {
 
     for (const item of stale) {
       const sessionId = item.lastSessionId || (await this.findSessionIdForReminder(item.id))
+      const priorRetries = item.retryCount ?? 0
+      const scheduledMs = Date.parse(item.scheduledAt)
+      const withinWindow =
+        Number.isFinite(scheduledMs) && nowMs - scheduledMs <= STALE_REMINDER_RETRY_WINDOW_MS
+
+      if (priorRetries < MAX_REMINDER_RESTART_RETRIES && withinWindow) {
+        const retryAt = new Date(nowMs + RESTART_RETRY_DELAY_MS).toISOString()
+        this.host.store.upsertReminder({
+          ...item,
+          status: 'scheduled',
+          scheduledAt: retryAt,
+          retryCount: priorRetries + 1,
+          ...(sessionId ? { lastSessionId: sessionId } : {}),
+          resultSummary: `执行因服务重启中断，已自动重新排队补跑（第 ${priorRetries + 1} 次重试）`,
+          updatedAtMs: nowMs,
+        })
+        this.host.store.recordEvent({
+          botId: item.origin.botId,
+          ...(item.origin.chatId ? { chatId: item.origin.chatId } : {}),
+          ...(sessionId ? { sessionId } : {}),
+          kind: 'lifecycle',
+          summary: `提醒事项「${item.title}」因服务重启中断，已自动重新排队补跑`,
+        })
+        continue
+      }
+
       this.host.store.upsertReminder({
         ...item,
         status: 'archived',
@@ -244,10 +280,18 @@ export class ProactiveReminderService {
       )
     }
 
-    const scheduledAt = parseReminderTargetIso(input, nowMs)
+    const rawScheduledAt = parseReminderTargetIso(input, nowMs)
     const origin = await this.resolveOrigin(input)
     const bot = this.host.store.getBot(origin.botId)
     if (!bot) throw new Error(`未找到智能体 "${origin.botId}"`)
+
+    const urgency: ReminderUrgency = input.urgency === 'high' ? 'high' : 'normal'
+    const quietAdjusted = applyQuietHoursDeferral(
+      rawScheduledAt,
+      bot.experimental.proactive,
+      urgency,
+    )
+    const scheduledAt = quietAdjusted.scheduledAt
 
     const chainMeta = this.validateReminderChainAndDedup({
       sourceSessionId: input.sessionId?.trim() || undefined,
@@ -275,6 +319,8 @@ export class ProactiveReminderService {
       ...(validatedWorkingDir ? { workingDir: validatedWorkingDir } : {}),
       mentions: input.mentions ?? [],
       ...(input.worktree ? { worktree: input.worktree } : {}),
+      ...(urgency === 'high' ? { urgency } : {}),
+      ...(quietAdjusted.deferredFrom ? { deferredFromScheduledAt: quietAdjusted.deferredFrom } : {}),
       ...(chainMeta
         ? {
             rootReminderId: chainMeta.rootReminderId,
@@ -307,11 +353,14 @@ export class ProactiveReminderService {
       this.rearmNextDueTimer()
     }
 
+    const deferSuffix = quietAdjusted.deferredFrom
+      ? `，命中夜间免打扰顺延自 ${formatFriendlyLocalTime(quietAdjusted.deferredFrom)}`
+      : ''
     this.host.store.recordEvent({
       botId: bot.id,
       ...(origin.chatId ? { chatId: origin.chatId } : {}),
       kind: 'lifecycle',
-      summary: `${mode === 'confirm' ? '待确认提醒事项' : '创建提醒事项'}「${title}」（${timeStr}）`,
+      summary: `${mode === 'confirm' ? '待确认提醒事项' : '创建提醒事项'}「${title}」（${timeStr}${deferSuffix}）`,
     })
     return item
   }
@@ -465,15 +514,32 @@ export class ProactiveReminderService {
 
   async tick(nowMs = Date.now()): Promise<void> {
     if (this.disposed) return
-    const active = this.host.store.listReminders('active')
-    for (const item of active) {
-      if (item.status !== 'scheduled') continue
-      if (this.runningIds.has(item.id)) continue
-      if (Date.parse(item.scheduledAt) <= nowMs) {
+    const due = this.host.store
+      .listReminders('active')
+      .filter(
+        (item) =>
+          item.status === 'scheduled' &&
+          !this.runningIds.has(item.id) &&
+          Date.parse(item.scheduledAt) <= nowMs,
+      )
+      .sort((a, b) => Date.parse(a.scheduledAt) - Date.parse(b.scheduledAt))
+
+    const slots = Math.max(0, MAX_CONCURRENT_REMINDERS - this.runningIds.size)
+    const batch = due.slice(0, slots)
+
+    // Launch due reminders concurrently up to MAX_CONCURRENT_REMINDERS without blocking
+    // `rearmNextDueTimer` or stalling sibling due reminders behind a multi-minute turn.
+    await Promise.all(
+      batch.map(async (item) => {
         const { completion } = await this.startReminderExecution(item, nowMs)
-        await completion
-      }
-    }
+        void completion.finally(() => {
+          if (!this.disposed) {
+            void this.tick(Math.max(Date.now(), nowMs))
+          }
+        })
+      }),
+    )
+
     this.rearmNextDueTimer(nowMs)
   }
 
@@ -764,6 +830,11 @@ export class ProactiveReminderService {
       })
       return archived
     } catch (err) {
+      // During graceful service shutdown, leave the reminder in `running` so the restarted
+      // process can recover and retry it automatically via `recoverStaleRunningReminders()`.
+      if (this.disposed) {
+        return this.host.store.getReminder(item.id) ?? item
+      }
       const msg = err instanceof Error ? err.message : String(err)
       const finishedMs = Date.now()
       const failed = this.host.store.upsertReminder({

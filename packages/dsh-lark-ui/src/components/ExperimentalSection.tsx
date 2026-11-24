@@ -262,6 +262,42 @@ export function ExperimentalSection({
               onChange={(reminderCreationMode) => patchProactive({ reminderCreationMode })}
             />
           </SettingRow>
+          <SettingRow
+            title="夜间免打扰"
+            desc="非紧急提醒落在静默时段时自动顺延至结束时刻"
+          >
+            <Switch
+              label="夜间免打扰"
+              checked={Boolean(proactive.quietHoursEnabled)}
+              onChange={(quietHoursEnabled) =>
+                patchProactive({
+                  quietHoursEnabled,
+                  ...(proactive.quietHoursStart ? {} : { quietHoursStart: '23:00' }),
+                  ...(proactive.quietHoursEnd ? {} : { quietHoursEnd: '09:00' }),
+                })
+              }
+            />
+          </SettingRow>
+          {proactive.quietHoursEnabled && (
+            <NestedSettings>
+              <SettingRow title="开始时间" desc="本地时间（HH:MM）">
+                <TextField
+                  value={proactive.quietHoursStart || '23:00'}
+                  onChange={(quietHoursStart) => patchProactive({ quietHoursStart })}
+                  placeholder="23:00"
+                  mono
+                />
+              </SettingRow>
+              <SettingRow title="结束时间" desc="本地时间（HH:MM）">
+                <TextField
+                  value={proactive.quietHoursEnd || '09:00'}
+                  onChange={(quietHoursEnd) => patchProactive({ quietHoursEnd })}
+                  placeholder="09:00"
+                  mono
+                />
+              </SettingRow>
+            </NestedSettings>
+          )}
         </NestedSettings>
       )}
 

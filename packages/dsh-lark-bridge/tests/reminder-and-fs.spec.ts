@@ -441,7 +441,8 @@ describe('ProactiveReminderService one-shot lifecycle, origin auto-routing & con
       deliverReminderOutput: vi.fn().mockResolvedValue({ messageId: 'om_out_1' }),
     })
 
-    // 1. Stale running reminder from prior restart (missing lastSessionId) is recovered & backfilled
+    // 1. Stale running reminder from prior restart (within freshness window & retryCount=0)
+    //    is automatically requeued once with backfilled lastSessionId instead of being dropped!
     store.upsertReminder({
       id: 'rem-stale-1',
       title: '被重启中断的提醒',
@@ -466,8 +467,20 @@ describe('ProactiveReminderService one-shot lifecycle, origin auto-routing & con
     const recoveredCount = await reminders.recoverStaleRunningReminders()
     expect(recoveredCount).toBe(1)
     expect(store.getReminder('rem-stale-1')).toMatchObject({
+      status: 'scheduled',
+      retryCount: 1,
+      lastSessionId: staleSid,
+    })
+
+    // Second interruption after retry budget is exhausted archives as error
+    const requeued = store.getReminder('rem-stale-1')!
+    store.upsertReminder({ ...requeued, status: 'running' })
+    const secondRecovered = await reminders.recoverStaleRunningReminders()
+    expect(secondRecovered).toBe(1)
+    expect(store.getReminder('rem-stale-1')).toMatchObject({
       status: 'archived',
       resolution: 'error',
+      retryCount: 1,
       lastSessionId: staleSid,
       resultSummary: '执行因服务重启中断，已归档',
     })
@@ -756,6 +769,154 @@ describe('ProactiveReminderService one-shot lifecycle, origin auto-routing & con
     // Prompt injected on depth=3 explicitly warns agent not to re-chain
     expect(submittedPrompts[submittedPrompts.length - 1]).toContain('本轮为链末次核查')
     expect(submittedPrompts[submittedPrompts.length - 1]).toContain('lark-bridge silence')
+
+    await reminders.stop()
+  })
+
+  it('dispatches multiple due reminders concurrently in tick() up to concurrency cap and defers normal reminders during Quiet Hours while allowing high urgency', async () => {
+    const dataDir = makeTempDir()
+    const workDir = makeTempDir()
+    const store = new LarkBridgeStore(dataDir)
+
+    store.upsertBot({
+      id: 'quiet-bot',
+      name: 'QuietBot',
+      enabled: true,
+      larkAppId: 'cli_quiet',
+      larkAppSecret: 'sec_quiet',
+      defaultWorkingDir: workDir,
+      experimental: {
+        dreaming: { enabled: false },
+        proactive: {
+          remindersEnabled: true,
+          reminderCreationMode: 'silent',
+          quietHoursEnabled: true,
+          quietHoursStart: '23:00',
+          quietHoursEnd: '09:00',
+          autoCodeEnabled: false,
+          branchPrefix: 'agent/',
+        },
+      },
+    })
+    store.upsertGroup({
+      botId: 'quiet-bot',
+      chatId: 'oc_ops',
+      chatName: '值班群',
+      enabled: true,
+    })
+
+    const activeResolvers: Array<(reply: string) => void> = []
+    let maxConcurrentSeen = 0
+    let currentConcurrent = 0
+
+    const fakeCtx = {
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      agents: {
+        create: vi.fn(async ({ sessionId, setup }: { sessionId: string; setup?: (c: unknown, a: unknown) => void }) => {
+          const agent = { session: { id: sessionId, header: { cwd: workDir, agentPreset: 'codex' } } }
+          setup?.({}, agent)
+          return { agent, dispose: vi.fn().mockResolvedValue(undefined) }
+        }),
+      },
+      get: () => undefined,
+    } as unknown as Context
+
+    const reminders = new ProactiveReminderService({
+      ctx: fakeCtx,
+      store,
+      runtimes: new RuntimeCatalog(fakeCtx),
+      workspaces: {
+        attachSession: vi.fn().mockResolvedValue(undefined),
+        archiveSession: vi.fn().mockResolvedValue(true),
+      } as unknown as WorkspaceGrouping,
+      runTurn: vi.fn(async () => {
+        currentConcurrent += 1
+        maxConcurrentSeen = Math.max(maxConcurrentSeen, currentConcurrent)
+        try {
+          return await new Promise<string>((resolve) => {
+            activeResolvers.push(resolve)
+          })
+        } finally {
+          currentConcurrent -= 1
+        }
+      }),
+      sendOriginCard: vi.fn().mockResolvedValue({}),
+      patchOriginCard: vi.fn().mockResolvedValue(undefined),
+      deliverReminderOutput: vi.fn().mockResolvedValue({ messageId: 'om_quiet_out' }),
+    })
+
+    // 1. Quiet Hours: normal reminder scheduled at local 01:30 defers to 09:00 same day; high urgency stays at 01:30!
+    const nightNow = new Date(2026, 10, 24, 1, 0, 0).getTime()
+    const normalNight = await reminders.create(
+      {
+        botId: 'quiet-bot',
+        chatId: 'oc_ops',
+        replyToMessageId: 'om_night_normal',
+        title: '常规任务核查',
+        prompt: '核查常规任务状态',
+        afterSeconds: 1800,
+      },
+      nightNow,
+    )
+    const deferredDate = new Date(normalNight.scheduledAt)
+    expect(deferredDate.getHours()).toBe(9)
+    expect(deferredDate.getMinutes()).toBe(0)
+    expect(normalNight.deferredFromScheduledAt).toBe(new Date(nightNow + 1800_000).toISOString())
+
+    const highNight = await reminders.create(
+      {
+        botId: 'quiet-bot',
+        chatId: 'oc_ops',
+        replyToMessageId: 'om_night_high',
+        title: 'P0 止损复查',
+        prompt: '核查 P0 止损指标',
+        urgency: 'high',
+        afterSeconds: 1800,
+      },
+      nightNow,
+    )
+    expect(highNight.urgency).toBe('high')
+    expect(highNight.deferredFromScheduledAt).toBeUndefined()
+    expect(new Date(highNight.scheduledAt).getHours()).toBe(1)
+
+    await reminders.cancel(normalNight.id)
+    await reminders.cancel(highNight.id)
+
+    // 2. Concurrent tick(): create 4 due reminders (all daytime); tick() launches 3 concurrently without blocking, then drains #4 when slot frees!
+    const dayNow = new Date(2026, 10, 24, 14, 0, 0).getTime()
+    const dueIds: string[] = []
+    for (let i = 0; i < 4; i += 1) {
+      const r = await reminders.create(
+        {
+          botId: 'quiet-bot',
+          chatId: 'oc_ops',
+          replyToMessageId: `om_conc_${i}`,
+          title: `并发核查 ${i}`,
+          prompt: `检查事项 ${i}`,
+          afterSeconds: 60,
+        },
+        dayNow,
+      )
+      dueIds.push(r.id)
+    }
+
+    // tick() resolves immediately while all 3 launched turns are still in flight!
+    await reminders.tick(dayNow + 120_000)
+    await vi.waitFor(() => expect(activeResolvers).toHaveLength(3))
+    expect(maxConcurrentSeen).toBe(3)
+    expect(store.getReminder(dueIds[3]!)?.status).toBe('scheduled')
+
+    // Complete 1 turn -> 4th reminder automatically drains into the freed slot!
+    activeResolvers.shift()!(REMINDER_SILENT_SENTINEL)
+    await vi.waitFor(() => expect(store.getReminder(dueIds[3]!)?.status).toBe('running'))
+    while (activeResolvers.length > 0) {
+      activeResolvers.shift()!(REMINDER_SILENT_SENTINEL)
+    }
+    await vi.waitFor(() => {
+      for (const id of dueIds) {
+        expect(store.getReminder(id)?.status).toBe('archived')
+      }
+    })
 
     await reminders.stop()
   })
