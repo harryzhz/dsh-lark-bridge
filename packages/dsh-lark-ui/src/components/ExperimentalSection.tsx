@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import {
   Button,
-  IconNewChatOutlineRegular,
+  IconChevronRightOutlineRegular,
   IconPlayOutlineRegular,
   StateDot,
   Switch,
@@ -33,6 +33,15 @@ export interface DreamStatusPresentation {
   readonly isError?: boolean
 }
 
+function cleanSummaryDetail(raw: string): string {
+  return raw
+    .replace(/\*\*(.*?)\*\*/g, '$1')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/(?:^|\s)-\s+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
 export function buildDreamStatusPresentation(
   dreamState: DreamRunState | undefined,
   runError: string,
@@ -54,7 +63,7 @@ export function buildDreamStatusPresentation(
   const rawSummary = dreamState.lastSummary?.trim() ?? ''
 
   if (dreamState.status === 'failed') {
-    const detail = rawSummary.replace(/^整理失败[：:]\s*/, '').trim()
+    const detail = cleanSummaryDetail(rawSummary.replace(/^整理失败[：:]\s*/, ''))
     return {
       dot: 'error',
       title: timeLabel ? `最近整理失败 · ${timeLabel}` : '最近整理失败',
@@ -70,7 +79,7 @@ export function buildDreamStatusPresentation(
       title: dreamState.lastCheckedDateKey
         ? `上次检查 ${dreamState.lastCheckedDateKey}`
         : '上次检查已跳过',
-      detail: rawSummary,
+      detail: cleanSummaryDetail(rawSummary),
     }
   }
 
@@ -78,7 +87,7 @@ export function buildDreamStatusPresentation(
     const countMatch = /^已整理\s+(\d+)\s+个会话(?:（([^）]+)）)?(?:\s*·\s*)?([\s\S]*)$/.exec(rawSummary)
     const count = dreamState.lastProcessedCount ?? (countMatch ? Number(countMatch[1]) : undefined)
     const mutationTag = countMatch?.[2]?.trim() || ''
-    const detail = (countMatch ? (countMatch[3] ?? '') : rawSummary).trim()
+    const detail = cleanSummaryDetail(countMatch ? (countMatch[3] ?? '') : rawSummary)
     const titleParts = [
       timeLabel ? `最近整理 ${timeLabel}` : '最近整理已完成',
       count !== undefined ? `已整理 ${count} 个会话` : null,
@@ -91,7 +100,7 @@ export function buildDreamStatusPresentation(
     }
   }
 
-  return rawSummary ? { dot: 'idle', title: rawSummary } : null
+  return rawSummary ? { dot: 'idle', title: cleanSummaryDetail(rawSummary) } : null
 }
 
 export function ExperimentalSection({
@@ -145,15 +154,10 @@ export function ExperimentalSection({
       <div className="fb-dream-card">
         <div className="fb-dream-head">
           <div className="fb-dream-desc">
-            基于跨运行时 Bridge Memory 持久库（渐进披露首轮注入 + 双时态纠偏）。到达整理时间且有效新增会话达到阈值后，自动盘点增量对话并结合活跃代码库变更沉淀长期认知、纠偏与归档过期项。
+            定期回顾增量对话与代码变更，沉淀长期记忆并纠偏过期结论。
           </div>
           {botId && (
             <div className="fb-dream-actions">
-              {onOpenMemory && (
-                <Button size="sm" variant="outline" onClick={onOpenMemory}>
-                  {`记忆库 (${activeMemoryCount ?? 0})`}
-                </Button>
-              )}
               <Button
                 size="sm"
                 variant="outline"
@@ -163,16 +167,6 @@ export function ExperimentalSection({
               >
                 {isRunning ? '整理中…' : '立即整理'}
               </Button>
-              {dreamState?.lastSessionId && onOpenSession && (
-                <Button
-                  size="sm"
-                  variant="outline"
-                  icon={<IconNewChatOutlineRegular size={14} />}
-                  onClick={() => onOpenSession(dreamState.lastSessionId!)}
-                >
-                  查看会话
-                </Button>
-              )}
             </div>
           )}
         </div>
@@ -182,11 +176,23 @@ export function ExperimentalSection({
               <StateDot state={statusView.dot} />
             </span>
             <div className="fb-dream-status-body">
-              <div
-                className="fb-dream-status-title fb-num"
-                data-error={statusView.isError ? '' : undefined}
-              >
-                {statusView.title}
+              <div className="fb-dream-status-head">
+                <div
+                  className="fb-dream-status-title fb-num"
+                  data-error={statusView.isError ? '' : undefined}
+                >
+                  {statusView.title}
+                </div>
+                {dreamState?.lastSessionId && onOpenSession && (
+                  <button
+                    type="button"
+                    className="fb-dream-inline-link"
+                    onClick={() => onOpenSession(dreamState.lastSessionId!)}
+                  >
+                    <span>查看会话</span>
+                    <IconChevronRightOutlineRegular size={13} />
+                  </button>
+                )}
               </div>
               {statusView.detail && (
                 <div className="fb-dream-status-note" title={statusView.detail}>
@@ -197,6 +203,23 @@ export function ExperimentalSection({
           </div>
         )}
       </div>
+
+      {botId && onOpenMemory && (
+        <SettingRow
+          title="长期记忆库"
+          desc="跨会话持久化，新会话首轮按需召回"
+        >
+          <button
+            type="button"
+            className="fb-drill-btn"
+            aria-label={`打开长期记忆库（当前 ${activeMemoryCount ?? 0} 条）`}
+            onClick={onOpenMemory}
+          >
+            <span className="fb-drill-count fb-num">{`${activeMemoryCount ?? 0} 条`}</span>
+            <IconChevronRightOutlineRegular size={14} />
+          </button>
+        </SettingRow>
+      )}
 
       <SettingRow title="启用 Dreaming">
         <Switch
