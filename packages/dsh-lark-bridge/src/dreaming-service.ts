@@ -11,6 +11,8 @@ import {
   composeDreamExecutionPrompt,
   expandWorkingDir,
   extractPureUserIntent,
+  normalizeReplyText,
+  resolveEffectiveWorkingDir,
   resolveEffectiveWorkspaceName,
 } from '@dsh-lark/lark-core'
 import type { RuntimeCatalog } from './runtime-catalog.js'
@@ -24,7 +26,9 @@ import type { WorkspaceGrouping } from './workspace-grouping.js'
 
 const TICK_INTERVAL_MS = 60_000
 const MAX_SESSIONS_PER_DREAM = 20
-const MAX_EVENTS_PER_SESSION = 120
+const MAX_SCAN_CANDIDATES_PER_DREAM = 120
+const READ_EVENTS_PAGE_SIZE = 200
+const MAX_EVENTS_PER_SESSION = 2000
 const MAX_TRANSCRIPT_CHARS_PER_SESSION = 2800
 const MAX_DREAM_NOTE_CHARS = 160
 
@@ -50,9 +54,61 @@ function parseMinutesOfDay(hhmm: string): number | undefined {
   return Number(match[1]) * 60 + Number(match[2])
 }
 
-function summarizeSessionEvents(events: readonly SessionEvent[]): string {
+interface SessionDigestEntry {
+  readonly markdown: string
+  readonly hasSubstantiveAgentReply: boolean
+  readonly fingerprint: string
+}
+
+interface PreparedDigestItem {
+  readonly session: LarkManagedSession
+  readonly digest: SessionDigestEntry
+  readonly workingDir?: string
+  readonly duplicateCount: number
+}
+
+interface PreparedDreamBatch {
+  readonly selected: readonly PreparedDigestItem[]
+  readonly consumedSessionIds: readonly string[]
+  readonly skippedNoiseSessionIds: readonly string[]
+  readonly activeWorkingDirs: readonly string[]
+}
+
+function normalizeFingerprint(raw: string): string {
+  return raw
+    .replace(/\b\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?\b/g, '<ts>')
+    .replace(/\b\d+(\.\d+)?\b/g, '<n>')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 120)
+}
+
+function triggerPriorityTier(trigger?: string): number {
+  if (
+    trigger === 'p2p' ||
+    trigger === 'mention' ||
+    trigger === 'active-thread' ||
+    trigger === 'substitute'
+  ) {
+    return 0
+  }
+  return 1
+}
+
+function summarizeSessionEvents(events: readonly SessionEvent[]): SessionDigestEntry {
   const lines: string[] = []
+  let firstUserText = ''
+  let usedSilenceCli = false
+  let substantiveAgentCount = 0
+
   for (const ev of events) {
+    if (ev.type === 'tool/call') {
+      const args = (ev.data as { arguments?: unknown }).arguments
+      if (typeof args === 'string' && args.includes('lark-bridge silence')) {
+        usedSilenceCli = true
+      }
+      continue
+    }
     if (ev.type === 'user/message') {
       const blocks = (ev.data as { content?: ReadonlyArray<{ type?: string; text?: string }> }).content ?? []
       const raw = blocks
@@ -61,6 +117,7 @@ function summarizeSessionEvents(events: readonly SessionEvent[]): string {
         .join('\n')
       const clean = extractPureUserIntent(raw)
       if (clean && clean !== '[空消息]') {
+        if (!firstUserText) firstUserText = clean
         lines.push(`- **User**: ${clean.slice(0, 500)}`)
       }
       continue
@@ -73,20 +130,28 @@ function summarizeSessionEvents(events: readonly SessionEvent[]): string {
       if (msgData.interrupted) continue
       const content = msgData.message?.content ?? []
       if (content.some((b) => b.type === 'tool-call')) continue
-      const text = content
+      const rawText = content
         .filter((b) => b.type === 'text' && typeof b.text === 'string')
         .map((b) => b.text!.trim())
         .filter(Boolean)
         .join('\n')
-      if (text) {
-        lines.push(`- **Agent**: ${text.slice(0, 700)}`)
+      const cleanAgentText = normalizeReplyText(rawText, { allowSilentSentinel: true })
+      if (cleanAgentText) {
+        substantiveAgentCount += 1
+        lines.push(`- **Agent**: ${cleanAgentText.slice(0, 700)}`)
       }
     }
   }
   const joined = lines.join('\n')
-  return joined.length > MAX_TRANSCRIPT_CHARS_PER_SESSION
-    ? `${joined.slice(0, MAX_TRANSCRIPT_CHARS_PER_SESSION)}\n  …`
-    : joined
+  const markdown =
+    joined.length > MAX_TRANSCRIPT_CHARS_PER_SESSION
+      ? `${joined.slice(0, MAX_TRANSCRIPT_CHARS_PER_SESSION)}\n  …`
+      : joined
+  return {
+    markdown,
+    hasSubstantiveAgentReply: !usedSilenceCli && substantiveAgentCount > 0,
+    fingerprint: firstUserText ? normalizeFingerprint(firstUserText) : '',
+  }
 }
 
 /**
@@ -158,14 +223,23 @@ export class DreamingService {
     const processedSet = new Set(prev.processedSessionIds)
 
     const candidateSessions = this.collectNewSessions(botId, processedSet)
-    if (!options.force && candidateSessions.length < cfg.minNewSessions) {
-      const skippedSummary = `增量会话 ${candidateSessions.length} 个（未达阈值 ${cfg.minNewSessions}），已静默跳过`
+    const prepared = await this.prepareTranscriptBatch(bot, candidateSessions)
+    if (!options.force && prepared.selected.length < cfg.minNewSessions) {
+      const mergedProcessed =
+        prepared.skippedNoiseSessionIds.length > 0
+          ? [
+              ...prev.processedSessionIds,
+              ...prepared.skippedNoiseSessionIds.filter((id) => !processedSet.has(id)),
+            ]
+          : prev.processedSessionIds
+      const skippedSummary = `有效增量会话 ${prepared.selected.length} 个（未达阈值 ${cfg.minNewSessions}），已静默跳过`
       return this.host.store.upsertDreamState({
         ...prev,
         status: 'skipped',
         lastCheckedDateKey: dateKey,
         lastProcessedCount: 0,
         lastSummary: skippedSummary,
+        processedSessionIds: mergedProcessed,
       })
     }
 
@@ -178,7 +252,6 @@ export class DreamingService {
     })
 
     const startedMs = Date.now()
-    const batch = candidateSessions.slice(0, MAX_SESSIONS_PER_DREAM)
     const workingDir = expandWorkingDir(bot.defaultWorkingDir) || bot.defaultWorkingDir
     const workspaceName =
       typeof this.host.store.resolveBotWorkspaceName === 'function'
@@ -188,14 +261,17 @@ export class DreamingService {
     let createdSession = false
 
     try {
-      const digestPath = await this.writeTranscriptDigest(bot.id, dateKey, batch)
+      const digestPath = this.writeTranscriptDigest(bot.id, dateKey, prepared.selected)
       const prompt = composeDreamExecutionPrompt({
         botId: bot.id,
         botName: bot.name,
         workingDir,
+        ...(prepared.activeWorkingDirs.length > 0
+          ? { activeWorkingDirs: prepared.activeWorkingDirs }
+          : {}),
         currentDateIso: dateKey,
         transcriptDigestPath: digestPath,
-        sessionCount: batch.length,
+        sessionCount: prepared.selected.length,
         config: cfg,
         proactive: bot.experimental.proactive,
       })
@@ -261,7 +337,7 @@ export class DreamingService {
         ...(launch.model ?? bot.model ? { model: launch.model ?? bot.model } : {}),
         status: 'running',
         dateKey,
-        processedCount: batch.length,
+        processedCount: prepared.selected.length,
         summary: '正在盘点增量会话与代码库并整理记忆…',
         createdAtMs: startedMs,
         lastActivityMs: startedMs,
@@ -286,18 +362,19 @@ export class DreamingService {
 
       const finishedMs = Date.now()
       const durationMs = finishedMs - startedMs
-      const nextProcessed = [
-        ...prev.processedSessionIds,
-        ...batch.map((s) => s.sessionId).filter((id) => !processedSet.has(id)),
-      ]
+      const newlyProcessed = [
+        ...prepared.consumedSessionIds,
+        ...prepared.skippedNoiseSessionIds,
+      ].filter((id) => !processedSet.has(id))
+      const nextProcessed = [...prev.processedSessionIds, ...newlyProcessed]
       const normalizedReply = replyText.replace(/\s+/g, ' ').trim()
       const cleanNote =
         normalizedReply.length > MAX_DREAM_NOTE_CHARS
           ? `${normalizedReply.slice(0, MAX_DREAM_NOTE_CHARS).trimEnd()}…`
           : normalizedReply
       const summaryNote = cleanNote
-        ? `已整理 ${batch.length} 个会话 · ${cleanNote}`
-        : `已整理 ${batch.length} 个会话`
+        ? `已整理 ${prepared.selected.length} 个会话 · ${cleanNote}`
+        : `已整理 ${prepared.selected.length} 个会话`
 
       this.host.store.upsertDreamSession?.({
         sessionId,
@@ -310,7 +387,7 @@ export class DreamingService {
         ...(launch.model ?? bot.model ? { model: launch.model ?? bot.model } : {}),
         status: 'succeeded',
         dateKey,
-        processedCount: batch.length,
+        processedCount: prepared.selected.length,
         ...(cleanNote ? { summary: cleanNote } : {}),
         createdAtMs: startedMs,
         lastActivityMs: finishedMs,
@@ -323,7 +400,7 @@ export class DreamingService {
         lastDreamAtMs: now.getTime(),
         lastCheckedDateKey: dateKey,
         lastSessionId: sessionId,
-        lastProcessedCount: batch.length,
+        lastProcessedCount: prepared.selected.length,
         lastSummary: summaryNote,
         processedSessionIds: nextProcessed,
       })
@@ -333,7 +410,7 @@ export class DreamingService {
         sessionId,
         durationMs,
         kind: 'lifecycle',
-        summary: `Dreaming 完成：已整理 ${batch.length} 个会话`,
+        summary: `Dreaming 完成：已整理 ${prepared.selected.length} 个会话`,
       })
       return updated
     } catch (err) {
@@ -354,7 +431,7 @@ export class DreamingService {
           ...(bot.model ? { model: bot.model } : {}),
           status: 'failed',
           dateKey,
-          processedCount: batch.length,
+          processedCount: prepared.selected.length,
           summary: msg,
           createdAtMs: startedMs,
           lastActivityMs: finishedMs,
@@ -393,18 +470,89 @@ export class DreamingService {
           ms.trigger !== 'reminder' &&
           ms.chatId !== 'dream:internal',
       )
+      .sort((a, b) => {
+        const tierDiff = triggerPriorityTier(a.trigger) - triggerPriorityTier(b.trigger)
+        if (tierDiff !== 0) return tierDiff
+        return a.lastActivityMs - b.lastActivityMs
+      })
   }
 
-  private async writeTranscriptDigest(
+  private async prepareTranscriptBatch(
+    bot: NonNullable<ReturnType<LarkBridgeStore['getBot']>>,
+    candidates: readonly LarkManagedSession[],
+  ): Promise<PreparedDreamBatch> {
+    const persistence = this.host.ctx.get('sessionPersistence') as SessionPersistence | undefined
+    const liveSessionsSvc = this.host.ctx.sessions as unknown as
+      | { get?: (id: SessionId) => Session | undefined }
+      | undefined
+
+    const selected: PreparedDigestItem[] = []
+    const consumedSessionIds: string[] = []
+    const skippedNoiseSessionIds: string[] = []
+    const activeWorkingDirSet = new Set<string>()
+    const listenerFingerprintIndex = new Map<string, number>()
+
+    const scanLimit = Math.min(candidates.length, MAX_SCAN_CANDIDATES_PER_DREAM)
+    for (let i = 0; i < scanLimit && selected.length < MAX_SESSIONS_PER_DREAM; i += 1) {
+      const ms = candidates[i]!
+      const { events, cwd } = await this.readSessionEvents(ms.sessionId, liveSessionsSvc, persistence)
+      const digest = summarizeSessionEvents(events)
+
+      if (!digest.markdown || (ms.trigger === 'listener' && !digest.hasSubstantiveAgentReply)) {
+        skippedNoiseSessionIds.push(ms.sessionId)
+        continue
+      }
+
+      const group = ms.chatId ? this.host.store.getGroup(bot.id, ms.chatId) : undefined
+      const effectiveDir =
+        (cwd ? expandWorkingDir(cwd) || cwd : '') ||
+        resolveEffectiveWorkingDir(bot, group)
+      if (effectiveDir) activeWorkingDirSet.add(effectiveDir)
+
+      consumedSessionIds.push(ms.sessionId)
+
+      if (ms.trigger === 'listener' && digest.fingerprint) {
+        const dedupKey = `${ms.chatId}::${digest.fingerprint}`
+        const existingIdx = listenerFingerprintIndex.get(dedupKey)
+        if (existingIdx !== undefined) {
+          const prevItem = selected[existingIdx]!
+          selected[existingIdx] = {
+            session: ms,
+            digest,
+            ...(effectiveDir ? { workingDir: effectiveDir } : {}),
+            duplicateCount: prevItem.duplicateCount + 1,
+          }
+          continue
+        }
+        listenerFingerprintIndex.set(dedupKey, selected.length)
+      }
+
+      selected.push({
+        session: ms,
+        digest,
+        ...(effectiveDir ? { workingDir: effectiveDir } : {}),
+        duplicateCount: 1,
+      })
+    }
+
+    return {
+      selected,
+      consumedSessionIds,
+      skippedNoiseSessionIds,
+      activeWorkingDirs: [...activeWorkingDirSet],
+    }
+  }
+
+  private writeTranscriptDigest(
     botId: string,
     dateKey: string,
-    sessions: readonly LarkManagedSession[],
-  ): Promise<string> {
+    items: readonly PreparedDigestItem[],
+  ): string {
     const dreamDir = join(this.host.dataDir, 'dreaming', botId)
     mkdirSync(dreamDir, { recursive: true, mode: 0o700 })
     const digestPath = join(dreamDir, 'recent-transcripts.md')
 
-    if (sessions.length === 0) {
+    if (items.length === 0) {
       writeFileSync(
         digestPath,
         `# Dreaming Transcript Digest (${dateKey})\n\n（本次为手动触发，暂无未处理的新增会话记录；请结合当前代码库核查并清理你自身记忆中的过期内容。）\n`,
@@ -414,24 +562,15 @@ export class DreamingService {
     }
 
     const sections: string[] = [`# Dreaming Transcript Digest (${dateKey})\n`]
-    const persistence = this.host.ctx.get('sessionPersistence') as SessionPersistence | undefined
-    const liveSessionsSvc = this.host.ctx.sessions as unknown as
-      | { get?: (id: SessionId) => Session | undefined }
-      | undefined
-
-    for (const ms of sessions) {
-      const events = await this.readSessionEvents(ms.sessionId, liveSessionsSvc, persistence)
-      const summary = summarizeSessionEvents(events)
-      if (!summary) continue
+    for (const item of items) {
+      const ms = item.session
       const chatLabel = this.host.store.resolveChatName(ms.botId, ms.chatId) || ms.chatId
       const dateStr = new Date(ms.lastActivityMs).toISOString().slice(0, 16).replace('T', ' ')
+      const dupSuffix =
+        item.duplicateCount > 1 ? ` · 同主题重复 ${item.duplicateCount} 次已折叠` : ''
       sections.push(
-        `## Session ${ms.sessionId} · chat_id=${ms.chatId} (${chatLabel}) · ${dateStr}\n\n${summary}\n`,
+        `## Session ${ms.sessionId} · chat_id=${ms.chatId} (${chatLabel}) · ${dateStr}${dupSuffix}\n\n${item.digest.markdown}\n`,
       )
-    }
-
-    if (sections.length === 1) {
-      sections.push('（近期会话均为空或纯命令交互，无可提炼正文。）\n')
     }
 
     writeFileSync(digestPath, sections.join('\n'), 'utf8')
@@ -442,24 +581,44 @@ export class DreamingService {
     sessionId: string,
     liveSessionsSvc: { get?: (id: SessionId) => Session | undefined } | undefined,
     persistence: SessionPersistence | undefined,
-  ): Promise<readonly SessionEvent[]> {
+  ): Promise<{ readonly events: readonly SessionEvent[]; readonly cwd?: string }> {
     const sid = brandString<SessionId>(sessionId)
     const live = liveSessionsSvc?.get?.(sid)
     if (live && typeof live.snapshotEvents === 'function') {
       const snap = live.snapshotEvents()
-      if (snap.length > 0) return snap.slice(-MAX_EVENTS_PER_SESSION)
+      const liveCwd = (live as { header?: { cwd?: string } }).header?.cwd
+      if (snap.length > 0) {
+        return {
+          events: snap.slice(-MAX_EVENTS_PER_SESSION),
+          ...(liveCwd ? { cwd: liveCwd } : {}),
+        }
+      }
     }
-    if (!persistence) return []
+    if (!persistence) return { events: [] }
     try {
       const handle = await persistence.open(sid, 'read')
       try {
-        const res = await handle.read(0, MAX_EVENTS_PER_SESSION)
-        return res.events
+        const allEvents: SessionEvent[] = []
+        let offset = 0
+        while (allEvents.length < MAX_EVENTS_PER_SESSION) {
+          const remaining = MAX_EVENTS_PER_SESSION - allEvents.length
+          const pageSize = Math.min(READ_EVENTS_PAGE_SIZE, remaining)
+          const res = await handle.read(offset, pageSize)
+          if (!res.events || res.events.length === 0) break
+          allEvents.push(...res.events)
+          offset += res.events.length
+          if (res.events.length < pageSize) break
+        }
+        const persistedCwd = handle.header?.cwd
+        return {
+          events: allEvents,
+          ...(persistedCwd ? { cwd: persistedCwd } : {}),
+        }
       } finally {
         await handle.close().catch(() => {})
       }
     } catch {
-      return []
+      return { events: [] }
     }
   }
 }

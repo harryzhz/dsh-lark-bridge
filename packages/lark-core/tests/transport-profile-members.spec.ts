@@ -334,4 +334,125 @@ describe('LarkBotTransport profile description sync & member/bot avatar resoluti
       wsCloseSpy.mockRestore()
     }
   })
+
+  it('caps listMessages page_size to <= 50 and paginates via page_token when filtering non-thread om_* roots or fetching > 50 items', async () => {
+    const transport = new LarkBotTransport(createBot(), { onMessage: () => {} })
+    const internalClient = (
+      transport as unknown as {
+        client: {
+          im: {
+            message: {
+              get: ReturnType<typeof vi.fn>
+              list: ReturnType<typeof vi.fn>
+            }
+          }
+        }
+      }
+    ).client
+
+    // Non-thread message (no thread_id) -> falls back to chat list filtering by filterRootMessageId
+    internalClient.im.message.get = vi.fn().mockResolvedValue({
+      data: { items: [{ message_id: 'om_root_1' }] },
+    })
+
+    const observedPageSizes: number[] = []
+    internalClient.im.message.list = vi.fn(
+      async ({ params }: { params: { page_size: number; page_token?: string } }) => {
+        observedPageSizes.push(params.page_size)
+        expect(params.page_size).toBeLessThanOrEqual(50)
+        if (!params.page_token) {
+          return {
+            data: {
+              has_more: true,
+              page_token: 'tok_page_2',
+              items: [
+                {
+                  message_id: 'om_unrelated',
+                  chat_id: 'oc_demo',
+                  msg_type: 'text',
+                  body: { content: '{"text":"unrelated"}' },
+                  sender: { id: 'ou_other', sender_type: 'user' },
+                  create_time: '2000',
+                },
+                {
+                  message_id: 'om_reply_1',
+                  root_id: 'om_root_1',
+                  chat_id: 'oc_demo',
+                  msg_type: 'text',
+                  body: { content: '{"text":"second reply"}' },
+                  sender: { id: 'ou_user_1', sender_type: 'user' },
+                  create_time: '1900',
+                },
+              ],
+            },
+          }
+        }
+        return {
+          data: {
+            has_more: false,
+            items: [
+              {
+                message_id: 'om_root_1',
+                chat_id: 'oc_demo',
+                msg_type: 'text',
+                body: { content: '{"text":"initial root"}' },
+                sender: { id: 'ou_user_1', sender_type: 'user' },
+                create_time: '1000',
+              },
+            ],
+          },
+        }
+      },
+    )
+
+    const threadMsgs = await transport.listMessages({
+      chatId: 'oc_demo',
+      threadId: 'om_root_1',
+      limit: 30,
+    })
+    expect(observedPageSizes).toEqual([50, 50])
+    expect(threadMsgs.map((m) => m.messageId)).toEqual(['om_root_1', 'om_reply_1'])
+
+    // Unfiltered request with limit=75 must split into 50 + 25 pages
+    observedPageSizes.length = 0
+    internalClient.im.message.list = vi.fn(
+      async ({ params }: { params: { page_size: number; page_token?: string } }) => {
+        observedPageSizes.push(params.page_size)
+        expect(params.page_size).toBeLessThanOrEqual(50)
+        if (!params.page_token) {
+          return {
+            data: {
+              has_more: true,
+              page_token: 'tok_2',
+              items: Array.from({ length: 50 }, (_, idx) => ({
+                message_id: `om_p1_${idx}`,
+                chat_id: 'oc_demo',
+                msg_type: 'text',
+                body: { content: `{"text":"msg ${idx}"}` },
+                sender: { id: 'ou_user_1', sender_type: 'user' },
+                create_time: String(3000 - idx),
+              })),
+            },
+          }
+        }
+        return {
+          data: {
+            has_more: false,
+            items: Array.from({ length: 25 }, (_, idx) => ({
+              message_id: `om_p2_${idx}`,
+              chat_id: 'oc_demo',
+              msg_type: 'text',
+              body: { content: `{"text":"older ${idx}"}` },
+              sender: { id: 'ou_user_1', sender_type: 'user' },
+              create_time: String(2000 - idx),
+            })),
+          },
+        }
+      },
+    )
+
+    const chatMsgs = await transport.listMessages({ chatId: 'oc_demo', limit: 75 })
+    expect(observedPageSizes).toEqual([50, 25])
+    expect(chatMsgs).toHaveLength(75)
+  })
 })

@@ -11,6 +11,10 @@ import {
 } from '@deepseek-ai/dsh-session'
 import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
 import {
+  MAX_REMINDER_CHAIN_DEPTH,
+  MAX_REMINDER_CHAIN_WINDOW_MS,
+  MAX_REMINDER_PROMPT_CHARS,
+  MIN_CHAINED_REMINDER_BACKOFF_SECONDS,
   buildReminderConfirmCard,
   buildReminderNoticeCard,
   buildReminderStatusCard,
@@ -142,7 +146,10 @@ export class ProactiveReminderService {
   private nextDueTimer: ReturnType<typeof setTimeout> | null = null
   private readonly runningIds = new Set<string>()
   private readonly sessionHandles = new Map<string, AgentHandle>()
-  private readonly activeReminderSessions = new Map<string, { silenced: boolean; reason?: string }>()
+  private readonly activeReminderSessions = new Map<
+    string,
+    { reminderId: string; silenced: boolean; reason?: string }
+  >()
   private disposed = false
 
   constructor(private readonly host: ReminderServiceHost) {}
@@ -231,11 +238,23 @@ export class ProactiveReminderService {
     const title = input.title.trim()
     const prompt = input.prompt.trim()
     if (!title || !prompt) throw new Error('提醒事项标题（title）与指令（prompt）不能为空')
+    if (prompt.length > MAX_REMINDER_PROMPT_CHARS) {
+      throw new Error(
+        `提醒指令过长（${prompt.length} 字，上限 ${MAX_REMINDER_PROMPT_CHARS} 字），请精简为核查目标与判断条件，勿粘贴完整历史日志`,
+      )
+    }
 
     const scheduledAt = parseReminderTargetIso(input, nowMs)
     const origin = await this.resolveOrigin(input)
     const bot = this.host.store.getBot(origin.botId)
     if (!bot) throw new Error(`未找到智能体 "${origin.botId}"`)
+
+    const chainMeta = this.validateReminderChainAndDedup({
+      sourceSessionId: input.sessionId?.trim() || undefined,
+      origin,
+      scheduledAt,
+      nowMs,
+    })
 
     const mode: ReminderCreationMode =
       input.creationMode ?? bot.experimental.proactive.reminderCreationMode ?? 'silent'
@@ -256,6 +275,14 @@ export class ProactiveReminderService {
       ...(validatedWorkingDir ? { workingDir: validatedWorkingDir } : {}),
       mentions: input.mentions ?? [],
       ...(input.worktree ? { worktree: input.worktree } : {}),
+      ...(chainMeta
+        ? {
+            rootReminderId: chainMeta.rootReminderId,
+            parentReminderId: chainMeta.parentReminderId,
+            chainDepth: chainMeta.chainDepth,
+            chainStartedAtMs: chainMeta.chainStartedAtMs,
+          }
+        : {}),
       createdAtMs: nowMs,
       updatedAtMs: nowMs,
     })
@@ -293,6 +320,11 @@ export class ProactiveReminderService {
     const existing = this.host.store.getReminder(id)
     if (!existing) throw new Error('未找到该提醒事项')
     if (existing.status === 'running') throw new Error('提醒事项正在执行中，无法修改')
+    if (patch.prompt !== undefined && patch.prompt.trim().length > MAX_REMINDER_PROMPT_CHARS) {
+      throw new Error(
+        `提醒指令过长（${patch.prompt.trim().length} 字，上限 ${MAX_REMINDER_PROMPT_CHARS} 字），请精简后重试`,
+      )
+    }
 
     const nextScheduledAt = patch.at
       ? parseReminderTargetIso({ at: patch.at }, nowMs)
@@ -657,7 +689,10 @@ export class ProactiveReminderService {
     readonly startedMs: number
   }): Promise<LarkReminderItem> {
     const { item, bot, handle, sessionId, prompt, startedMs } = input
-    const controlState: { silenced: boolean; reason?: string } = { silenced: false }
+    const controlState: { reminderId: string; silenced: boolean; reason?: string } = {
+      reminderId: item.id,
+      silenced: false,
+    }
     this.activeReminderSessions.set(sessionId, controlState)
     try {
       const replyText = await this.host.runTurn(handle.agent, [{ type: 'text', text: prompt }])
@@ -752,6 +787,96 @@ export class ProactiveReminderService {
       this.activeReminderSessions.delete(sessionId)
       this.runningIds.delete(item.id)
     }
+  }
+
+  private validateReminderChainAndDedup(input: {
+    readonly sourceSessionId?: string
+    readonly origin: LarkReminderOrigin
+    readonly scheduledAt: string
+    readonly nowMs: number
+  }):
+    | {
+        readonly rootReminderId: string
+        readonly parentReminderId: string
+        readonly chainDepth: number
+        readonly chainStartedAtMs: number
+      }
+    | undefined {
+    const { sourceSessionId, origin, scheduledAt, nowMs } = input
+    let parent: LarkReminderItem | undefined
+    if (sourceSessionId) {
+      const activeId = this.activeReminderSessions.get(sourceSessionId)?.reminderId
+      parent = activeId
+        ? this.host.store.getReminder(activeId)
+        : this.host.store.listReminders('all').find((r) => r.lastSessionId === sourceSessionId)
+    }
+
+    let chainMeta:
+      | {
+          readonly rootReminderId: string
+          readonly parentReminderId: string
+          readonly chainDepth: number
+          readonly chainStartedAtMs: number
+        }
+      | undefined
+
+    if (parent) {
+      const nextDepth = (parent.chainDepth ?? 0) + 1
+      const rootReminderId = parent.rootReminderId ?? parent.id
+      const chainStartedAtMs = parent.chainStartedAtMs ?? parent.createdAtMs
+
+      if (nextDepth > MAX_REMINDER_CHAIN_DEPTH) {
+        throw new Error(
+          `已达到单次提醒链式续查上限（最多 ${MAX_REMINDER_CHAIN_DEPTH} 次续查），禁止继续自动轮询；若事项仍未闭环请直接提醒负责人处理，或改用周期性任务（lark-bridge schedule）`,
+        )
+      }
+
+      const scheduledMs = Date.parse(scheduledAt)
+      if (scheduledMs - chainStartedAtMs > MAX_REMINDER_CHAIN_WINDOW_MS) {
+        const hours = Math.round(MAX_REMINDER_CHAIN_WINDOW_MS / 3_600_000)
+        throw new Error(
+          `该提醒链已超过最长自动续查窗口（${hours} 小时），禁止继续自动续查；请直接向负责人同步现状并由人工决定后续动作`,
+        )
+      }
+
+      const minBackoffSec =
+        MIN_CHAINED_REMINDER_BACKOFF_SECONDS[
+          Math.min(nextDepth - 1, MIN_CHAINED_REMINDER_BACKOFF_SECONDS.length - 1)
+        ] ?? 1800
+      if (scheduledMs - nowMs < minBackoffSec * 1000 - 5_000) {
+        const minMins = Math.round(minBackoffSec / 60)
+        throw new Error(
+          `第 ${nextDepth} 次链式续查间隔不得短于 ${minMins} 分钟（指数退避保护），请拉大复查间隔或直接向负责人汇报`,
+        )
+      }
+
+      chainMeta = {
+        rootReminderId,
+        parentReminderId: parent.id,
+        chainDepth: nextDepth,
+        chainStartedAtMs,
+      }
+    }
+
+    if (origin.chatType === 'group' && origin.chatId && origin.replyToMessageId) {
+      const duplicate = this.host.store
+        .listReminders('active')
+        .find(
+          (r) =>
+            (r.status === 'scheduled' || r.status === 'pending_confirm') &&
+            r.id !== parent?.id &&
+            r.origin.botId === origin.botId &&
+            r.origin.chatId === origin.chatId &&
+            r.origin.replyToMessageId === origin.replyToMessageId,
+        )
+      if (duplicate) {
+        throw new Error(
+          `当前话题已存在待触发提醒 ${duplicate.id}「${duplicate.title}」（${formatFriendlyLocalTime(duplicate.scheduledAt)}），请使用 lark-bridge reminder update ${duplicate.id} 更新或先取消原提醒，禁止重复创建`,
+        )
+      }
+    }
+
+    return chainMeta
   }
 
   private async resolveOrigin(input: CreateReminderInput): Promise<LarkReminderOrigin> {

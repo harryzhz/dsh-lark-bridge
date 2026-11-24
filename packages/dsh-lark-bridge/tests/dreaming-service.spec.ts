@@ -381,4 +381,218 @@ describe('DreamingService dual-gate scheduling, product dataDir isolation & nati
       summary: '执行因服务重启中断',
     })
   })
+
+  it('paginates persisted sessions past 120 events, filters silent listener noise, folds duplicate alerts, prioritizes mentions FIFO, and scopes activeWorkingDirs', async () => {
+    const dataDir = makeTempDir()
+    const parentDir = makeTempDir()
+    const subRepoDir = join(parentDir, 'service-a')
+    const store = new LarkBridgeStore(dataDir)
+
+    store.upsertBot({
+      id: 'ops-bot',
+      name: 'OpsBot',
+      enabled: true,
+      larkAppId: 'cli_ops',
+      larkAppSecret: 'sec_ops',
+      defaultWorkingDir: parentDir,
+      experimental: {
+        dreaming: {
+          enabled: true,
+          scheduleTime: '02:00',
+          minNewSessions: 2,
+          scopes: ['踩坑与排障经验'],
+          cleanupAndCorrect: true,
+        },
+      },
+    })
+    store.upsertGroup({
+      botId: 'ops-bot',
+      chatId: 'oc_alert',
+      chatName: '服务告警群',
+      enabled: true,
+      workingDir: subRepoDir,
+    })
+
+    // Build a persisted 260-event session where the first 250 events are tool calls and the final reply is at event #259!
+    const longEvents: SessionEvent[] = [
+      {
+        type: 'user/message',
+        data: { content: [{ type: 'text', text: '<user_message>\n检查超时根因\n</user_message>' }] },
+      } as unknown as SessionEvent,
+      ...Array.from({ length: 250 }, (_, idx) => ({
+        type: 'assistant/message',
+        data: {
+          message: {
+            content: [{ type: 'tool-call', id: `tc_${idx}`, name: 'bash', arguments: '{}' }],
+          },
+        },
+      })) as unknown as SessionEvent[],
+      {
+        type: 'assistant/message',
+        data: {
+          message: {
+            content: [{ type: 'text', text: '根因已定位：连接池耗尽导致尾部 P99 抖动。' }],
+          },
+        },
+      } as unknown as SessionEvent,
+    ]
+
+    const persistedLogs = new Map<string, { cwd: string; events: SessionEvent[] }>([
+      ['sess-long-mention', { cwd: subRepoDir, events: longEvents }],
+      [
+        'sess-silent-listener',
+        {
+          cwd: subRepoDir,
+          events: [
+            {
+              type: 'user/message',
+              data: { content: [{ type: 'text', text: '<user_message>\n收到辛苦了\n</user_message>' }] },
+            } as unknown as SessionEvent,
+            {
+              type: 'tool/call',
+              data: { name: 'bash', arguments: '{"command":"lark-bridge silence --reason \\"闲聊\\""}' },
+            } as unknown as SessionEvent,
+            {
+              type: 'assistant/message',
+              data: { message: { content: [{ type: 'text', text: '<no_reply/>' }] } },
+            } as unknown as SessionEvent,
+          ],
+        },
+      ],
+      [
+        'sess-alert-1',
+        {
+          cwd: subRepoDir,
+          events: [
+            {
+              type: 'user/message',
+              data: { content: [{ type: 'text', text: '<user_message>\n[warning] CronJob failed 2026-11-23 17:40 val: 2\n</user_message>' }] },
+            } as unknown as SessionEvent,
+            {
+              type: 'assistant/message',
+              data: { message: { content: [{ type: 'text', text: '已核查定时任务重试状态。' }] } },
+            } as unknown as SessionEvent,
+          ],
+        },
+      ],
+      [
+        'sess-alert-2',
+        {
+          cwd: subRepoDir,
+          events: [
+            {
+              type: 'user/message',
+              data: { content: [{ type: 'text', text: '<user_message>\n[warning] CronJob failed 2026-11-23 17:50 val: 3\n</user_message>' }] },
+            } as unknown as SessionEvent,
+            {
+              type: 'assistant/message',
+              data: { message: { content: [{ type: 'text', text: '任务持续失败，建议值班介入。' }] } },
+            } as unknown as SessionEvent,
+          ],
+        },
+      ],
+    ])
+
+    // Insert sessions with newer listener noise and older high-value mention
+    store.upsertManagedSession({
+      sessionId: 'sess-long-mention',
+      botId: 'ops-bot',
+      chatId: 'oc_alert',
+      trigger: 'mention',
+      createdAtMs: 1000,
+      lastActivityMs: 1000,
+    })
+    store.upsertManagedSession({
+      sessionId: 'sess-alert-1',
+      botId: 'ops-bot',
+      chatId: 'oc_alert',
+      trigger: 'listener',
+      createdAtMs: 2000,
+      lastActivityMs: 2000,
+    })
+    store.upsertManagedSession({
+      sessionId: 'sess-alert-2',
+      botId: 'ops-bot',
+      chatId: 'oc_alert',
+      trigger: 'listener',
+      createdAtMs: 3000,
+      lastActivityMs: 3000,
+    })
+    store.upsertManagedSession({
+      sessionId: 'sess-silent-listener',
+      botId: 'ops-bot',
+      chatId: 'oc_alert',
+      trigger: 'listener',
+      createdAtMs: 4000,
+      lastActivityMs: 4000,
+    })
+
+    const runPrompts: string[] = []
+    const fakeCtx = {
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      sessions: { get: () => undefined },
+      agents: {
+        create: vi.fn(async ({ sessionId, setup }: { sessionId: string; setup?: (c: unknown, a: unknown) => void }) => {
+          const agent = { session: { id: sessionId, header: { cwd: parentDir, agentPreset: 'codex' } } }
+          setup?.({}, agent)
+          return { agent, dispose: vi.fn().mockResolvedValue(undefined) }
+        }),
+      },
+      get: (key: string) => {
+        if (key === 'sessionPersistence') {
+          return {
+            open: async (sid: string) => {
+              const rec = persistedLogs.get(String(sid))
+              if (!rec) throw new Error('not found')
+              return {
+                header: { cwd: rec.cwd },
+                read: async (offset = 0, limit = 200) => ({
+                  events: rec.events.slice(offset, offset + limit),
+                }),
+                close: async () => {},
+              }
+            },
+          }
+        }
+        return undefined
+      },
+    } as unknown as Context
+
+    const dreaming = new DreamingService({
+      ctx: fakeCtx,
+      dataDir,
+      store,
+      runtimes: new RuntimeCatalog(fakeCtx),
+      workspaces: {
+        attachSession: vi.fn().mockResolvedValue(undefined),
+        archiveSession: vi.fn().mockResolvedValue(true),
+      } as unknown as WorkspaceGrouping,
+      runTurn: vi.fn(async (_agent, content) => {
+        runPrompts.push(content.map((b) => ('text' in b ? b.text : '')).join('\n'))
+        return '已完成记忆整理'
+      }),
+    })
+
+    const res = await dreaming.runForBot('ops-bot', { force: false, now: new Date(2026, 10, 24, 2, 5, 0) })
+    expect(res.status).toBe('succeeded')
+    // 1 mention + 1 folded alert group = 2 substantive digest entries (silent listener filtered out!)
+    expect(res.lastProcessedCount).toBe(2)
+    // All 4 sessions (including silent listener and folded duplicate) are retired in watermark
+    expect(res.processedSessionIds).toEqual(
+      expect.arrayContaining(['sess-long-mention', 'sess-alert-1', 'sess-alert-2', 'sess-silent-listener']),
+    )
+
+    const digest = readFileSync(join(dataDir, 'dreaming', 'ops-bot', 'recent-transcripts.md'), 'utf8')
+    // Tail reply past event #120 MUST be preserved!
+    expect(digest).toContain('根因已定位：连接池耗尽导致尾部 P99 抖动')
+    // Silent listener chatter MUST be excluded from digest
+    expect(digest).not.toContain('收到辛苦了')
+    // Duplicate alert MUST be folded with count annotation, and mention comes first
+    expect(digest).toContain('同主题重复 2 次已折叠')
+    expect(digest.indexOf('sess-long-mention')).toBeLessThan(digest.indexOf('sess-alert-2'))
+
+    // Prompt directs git inspection specifically to active subRepoDir instead of blindly scanning parentDir
+    expect(runPrompts[0]).toContain(subRepoDir)
+    expect(runPrompts[0]).toContain('勿盲目遍历无关仓库')
+  })
 })

@@ -7,6 +7,10 @@ import {
 } from './types.js'
 
 export const REMINDER_SILENT_SENTINEL = '<no_reminder_needed/>'
+export const MAX_REMINDER_CHAIN_DEPTH = 3
+export const MAX_REMINDER_CHAIN_WINDOW_MS = 6 * 60 * 60_000
+export const MAX_REMINDER_PROMPT_CHARS = 2400
+export const MIN_CHAINED_REMINDER_BACKOFF_SECONDS: readonly number[] = [1800, 3600, 7200]
 const MAX_SIBLING_REMINDERS_IN_PROMPT = 10
 
 export const LarkReminderStatusSchema = z.enum([
@@ -64,6 +68,10 @@ export const LarkReminderItemSchema = z.object({
   confirmMessageId: z.string().optional(),
   lastSessionId: z.string().optional(),
   resultSummary: z.string().optional(),
+  rootReminderId: z.string().optional(),
+  parentReminderId: z.string().optional(),
+  chainDepth: z.number().int().nonnegative().optional(),
+  chainStartedAtMs: z.number().optional(),
   createdAtMs: z.number(),
   updatedAtMs: z.number(),
   archivedAtMs: z.number().optional(),
@@ -120,11 +128,11 @@ export function composeProactiveSessionReminder(
       '     c) **待审与外部依赖催办**：PR/MR 待评审、跨团队接口确认或问题单超过合理等待窗口未响应时，创建跟进提醒（已合入/已回复则静默，仍挂起则提醒对应人员）；',
       '     d) **多节点里程碑跟进**：跨天交付事项（如“周五前完成迁移”），可拆分前置进度核查（如周三上午，正常则静默）与截止兜底核查（周五下午）；',
       '     e) **非工作时段错峰交付**：夜间或节假日自动排查产出非紧急优化方案/PR 时，创建下一工作日上午（如 `10:00`）提醒推送给负责人。',
-      '   - 不创建边界：纯技术问答、无时间锚点与责任人的泛泛讨论、或已有周期性 `schedule` 覆盖的例行任务；创建前先用 `lark-bridge reminder list` 避免重复。',
+      '   - 不创建边界：纯技术问答、无时间锚点与责任人的泛泛讨论、或已有周期性 `schedule` 覆盖的例行任务；创建前先用 `lark-bridge reminder list` 避免重复。单次提醒仅用于有限跟进（系统硬限制单链最多续查 3 次且总跨度 ≤ 6 小时、单条指令 ≤ 2400 字），禁止用于无限小时级轮询。',
       `   - 模式说明：自动继承当前会话投递路径；${modeRule}`,
       '   - 命令示例：',
-      '     - 按时间点核查：`lark-bridge reminder create --title "核查 16:00 发版结果" --at "<YYYY-MM-DD HH:mm>" --mention "<open_id>:<姓名>" --prompt "运行 lark-bridge history --limit 20 并检查部署状态：已完成或群内已同步延期则输出 <no_reminder_needed/>；未完成且无说明则简短提醒负责人"`',
-      '     - 按相对延时复查：`lark-bridge reminder create --title "复查降级恢复情况" --after 1800 --prompt "检查近 30 分钟错误率与群内通报：指标已恢复且无遗留开关则输出 <no_reminder_needed/>；异常持续则同步数据提醒值班人"`',
+      '     - 按时间点核查：`lark-bridge reminder create --title "核查 16:00 发版结果" --at "<YYYY-MM-DD HH:mm>" --mention "<open_id>:<姓名>" --prompt "运行 lark-bridge history --limit 20 并检查部署状态：已完成或群内已同步延期则调用 lark-bridge silence --reason \\"已闭环\\" 静默；未完成且无说明则简短提醒负责人"`',
+      '     - 按相对延时复查：`lark-bridge reminder create --title "复查降级恢复情况" --after 1800 --prompt "检查近 30 分钟错误率与群内通报：指标已恢复且无遗留开关则调用 lark-bridge silence --reason \\"指标已恢复\\" 静默；异常持续则同步数据提醒值班人"`',
     )
   }
 
@@ -191,6 +199,17 @@ export function composeReminderTriggerPrompt(input: ReminderTriggerPromptInput):
     )
   }
 
+  const currentDepth = item.chainDepth ?? 0
+  if (currentDepth >= MAX_REMINDER_CHAIN_DEPTH) {
+    innerLines.push(
+      `- 链式续查额度：${currentDepth}/${MAX_REMINDER_CHAIN_DEPTH}（**本轮为链末次核查，系统已禁止继续创建续查提醒**；若事项仍未闭环请直接提醒负责人处理，或建议改用周期性 \`lark-bridge schedule\`）`,
+    )
+  } else {
+    innerLines.push(
+      `- 链式续查额度：${currentDepth}/${MAX_REMINDER_CHAIN_DEPTH}（严禁将单次提醒用作无限轮询；若确需继续观察且未超上限，须拉大间隔且仅写增量要点，勿复制长段历史日志）`,
+    )
+  }
+
   const outputGuideline =
     item.origin.chatType === 'group'
       ? '  3. 若需提醒或提审，直接输出简洁的简体中文 Markdown 正文（@ 群成员用 `<at id="ou_xxx">姓名</at>`；未给出 `open_id` 时先运行 `lark-bridge members --query <姓名>` 按需查询本群真实 ID，禁止编造或跨应用混用；勿用 `lark-bridge send` 重复发送正文）。'
@@ -199,7 +218,7 @@ export function composeReminderTriggerPrompt(input: ReminderTriggerPromptInput):
   innerLines.push(
     '- 执行准则：',
     '  1. 先按下方指令核查最新事实（如 `lark-bridge history` 查看群内最新消息、检查仓库提交/分支/PR 或部署状态）。',
-    `  2. 若事项已完成、进度正常或无需干预，仅输出 \`${REMINDER_SILENT_SENTINEL}\`。`,
+    `  2. 若事项已完成、进度正常或无需干预，优先运行 \`lark-bridge silence --reason "<简短原因>"\`（或仅输出 \`${REMINDER_SILENT_SENTINEL}\`）静默归档。`,
     outputGuideline,
     '</reminder_trigger>',
   )

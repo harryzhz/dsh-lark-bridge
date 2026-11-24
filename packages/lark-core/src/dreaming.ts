@@ -9,6 +9,7 @@ export interface DreamExecutionPromptInput {
   readonly botId: string
   readonly botName: string
   readonly workingDir: string
+  readonly activeWorkingDirs?: readonly string[]
   readonly currentDateIso: string
   readonly transcriptDigestPath: string
   readonly sessionCount: number
@@ -61,13 +62,25 @@ export function composeDreamExecutionPrompt(input: DreamExecutionPromptInput): s
     }
   }
 
+  const activeDirs = Array.from(
+    new Set(
+      (input.activeWorkingDirs ?? [])
+        .map((d) => expandWorkingDir(d) || d.trim())
+        .filter(Boolean),
+    ),
+  )
+  const inspectDirLine =
+    activeDirs.length > 0
+      ? `- 仅定向只读巡检本次增量会话涉及的工作目录（${activeDirs.map((d) => `\`${d}\``).join('、')}）近期变更（如 \`git status -s\`、\`git log -n 20 --oneline\`）与核心文档，勿盲目遍历无关仓库。`
+      : `- 只读巡检工作目录 \`${absWorkingDir}\` 近期变更（如 \`git status -s\`、\`git log -n 20 --oneline\`）与核心文档。`
+
   const dreamSection = [
     `<dream_job agent="${escapeXmlAttr(input.botName)}" date="${escapeXmlAttr(currentDateIso)}" sessions="${input.sessionCount}">`,
     '执行离线 **Dreaming（长期记忆沉淀、清理与纠偏）**：',
     '',
     '### 1. 读取增量上下文',
     `- 读取 ${input.sessionCount} 个增量会话摘要：\`${input.transcriptDigestPath}\`。`,
-    `- 只读巡检工作目录 \`${absWorkingDir}\` 近期变更（如 \`git status -s\`、\`git log -n 20 --oneline\`）与核心文档。`,
+    inspectDirLine,
     '',
     '### 2. 更新内置 Memory',
     scopeBlock,

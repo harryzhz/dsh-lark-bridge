@@ -1230,29 +1230,44 @@ export class LarkBotTransport {
       }
     }
 
-    const fetchSize = filterRootMessageId ? Math.min(100, limit * 3) : Math.min(50, limit)
-    const res = await this.client.im.message.list({
-      params: {
-        container_id_type: containerIdType,
-        container_id: containerId,
-        sort_type: 'ByCreateTimeDesc',
-        page_size: fetchSize,
-      },
-    })
-
-    const rawItems = [...(res.data?.items ?? [])]
+    const maxPageSize = 50
+    const maxPages = filterRootMessageId ? 4 : Math.ceil(limit / maxPageSize)
     const mapped: LarkHistoryMessage[] = []
-    for (const raw of rawItems) {
-      const item = raw as Record<string, unknown>
-      if (Boolean(item.deleted)) continue
-      const messageId = typeof item.message_id === 'string' ? item.message_id : ''
-      if (!messageId) continue
-      const rootId = typeof item.root_id === 'string' && item.root_id ? item.root_id : undefined
-      if (filterRootMessageId && messageId !== filterRootMessageId && rootId !== filterRootMessageId) {
-        continue
+    let pageToken: string | undefined
+
+    for (let page = 0; page < maxPages && mapped.length < limit; page += 1) {
+      const remaining = limit - mapped.length
+      const pageSize = filterRootMessageId
+        ? maxPageSize
+        : Math.min(maxPageSize, remaining)
+      const res = await this.client.im.message.list({
+        params: {
+          container_id_type: containerIdType,
+          container_id: containerId,
+          sort_type: 'ByCreateTimeDesc',
+          page_size: pageSize,
+          ...(pageToken ? { page_token: pageToken } : {}),
+        },
+      })
+
+      const rawItems = [...(res.data?.items ?? [])]
+      for (const raw of rawItems) {
+        const item = raw as Record<string, unknown>
+        if (Boolean(item.deleted)) continue
+        const messageId = typeof item.message_id === 'string' ? item.message_id : ''
+        if (!messageId) continue
+        const rootId = typeof item.root_id === 'string' && item.root_id ? item.root_id : undefined
+        if (filterRootMessageId && messageId !== filterRootMessageId && rootId !== filterRootMessageId) {
+          continue
+        }
+        mapped.push(await this.formatApiMessageItem(item))
+        if (mapped.length >= limit) break
       }
-      mapped.push(await this.formatApiMessageItem(item))
-      if (mapped.length >= limit) break
+
+      const hasMore = Boolean(res.data?.has_more)
+      const nextToken = typeof res.data?.page_token === 'string' ? res.data.page_token.trim() : ''
+      if (!hasMore || !nextToken) break
+      pageToken = nextToken
     }
 
     return mapped.reverse()
