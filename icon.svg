@@ -1,11 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
-  <defs>
-    <linearGradient id="lark-bg" x1="8" y1="8" x2="56" y2="56" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#3370FF" />
-      <stop offset="100%" stop-color="#00D6B9" />
-    </linearGradient>
-  </defs>
-  <rect width="64" height="64" rx="16" fill="url(#lark-bg)" />
-  <path d="M15.4 15.4C15.0 15.8 14.92 16.45 15.15 17.1L26.05 48.7C26.5 50.0 28.3 50.1 28.92 48.85L35.2 35.2L35.6 34.8L16.2 15.4Z" fill="#FFFFFF" fill-opacity="0.72" />
-  <path d="M15.4 15.4C15.8 15.0 16.45 14.92 17.1 15.15L48.7 26.05C50.0 26.5 50.1 28.3 48.85 28.92L35.2 35.2L15.4 15.4Z" fill="#FFFFFF" />
+  <rect width="64" height="64" rx="16" fill="#F6F2EA" />
+  <rect x="0.5" y="0.5" width="63" height="63" rx="15.5" stroke="#141518" stroke-opacity="0.08" />
+  <path d="M30.25 12.01V17.84L18.87 24.42V29.67H13.81V21.5Z M13.81 34.33H18.87V39.58L30.25 46.16V51.99L13.81 42.5Z M33.75 12.01L50.19 21.5V42.5L33.75 51.99V46.16L45.13 39.58V24.42L33.75 17.84Z" fill="#141518" />
+  <path d="M32 24.71L38.31 28.35V35.65L32 39.29L25.69 35.65V28.35Z" fill="#D96B43" />
 </svg>

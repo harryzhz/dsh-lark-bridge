@@ -27,6 +27,30 @@ const CSS = `
 /* Header & monochrome DSH icon tab bar */
 .fb-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 36px; margin-bottom: 14px; }
 .fb-title { display: flex; align-items: center; gap: 8px; margin: 0; font-size: 20px; line-height: 28px; font-weight: 500; }
+.fb-title-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  perspective: 140px;
+}
+.fb-title-icon-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transform-origin: center;
+  transform-style: preserve-3d;
+  will-change: transform;
+  animation: fb-title-icon-flip 5.6s cubic-bezier(0.42, 0, 0.22, 1) infinite;
+}
+@keyframes fb-title-icon-flip {
+  0%, 10% { transform: rotateY(0deg); }
+  24%, 32% { transform: rotateY(180deg); }
+  46%, 100% { transform: rotateY(0deg); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .fb-title-icon-glyph { animation: none; }
+}
 .fb-actions { display: flex; align-items: center; gap: 8px; flex: none; }
 .fb-tabs {
   display: flex;
