@@ -10,6 +10,7 @@
   ```bash
   pnpm build && pnpm typecheck && pnpm test && pnpm run check:privacy
   ```
+- **交付前端到端真实验证**：通过构建与单测后、向用户交付前，必须在本地运行的 DSH 环境中完成真实端到端验证——（1）在**真实浏览器**检查改动涉及的配置页、弹窗、UI 布局与交互/跳转链路，确认无界面 Bug 与控制台报错；（2）改动涉及消息处理、运行时或配置项时，在**真实飞书测试群**实测功能闭环与配置项是否真实生效（严禁向非测试业务群发测试消息；详见 [docs/guidelines/development.md](./docs/guidelines/development.md#2-交付前端到端真实验证规范)）。若受环境限制无法完成其中某项，须显式说明未验证边界，不得以单测替代端到端实测。
 
 ## 核心红线（每次必守）
 
@@ -24,7 +25,7 @@
 
 | 涉及场景 | 文档 | 内容摘要 |
 | --- | --- | --- |
-| 新建 worktree / 提 PR / 验证发版 / 隐私自检 | [docs/guidelines/development.md](./docs/guidelines/development.md) | Worktree + 分支 + PR 标准流程、Commit 约定、常用脚本与脱敏自检清单 |
+| 新建 worktree / 提 PR / 端到端验证 / 隐私自检 | [docs/guidelines/development.md](./docs/guidelines/development.md) | Worktree + 分支 + PR 标准流程、交付前端到端真实验证规范、Commit 约定与脱敏自检清单 |
 | 修改前端界面、弹窗、表单或样式（**必读**） | [docs/guidelines/ui.md](./docs/guidelines/ui.md) | 设计令牌、控件右对齐规范、原位子视图与防双层遮罩、级联子配置与标签流样式 |
 | 改动包分层 / 鉴权路由 / Desktop 接管 / 目录边界 | [docs/architecture/overview.md](./docs/architecture/overview.md) | 六大模块分层、能力驱动边界、产物目录、HTTP/RPC 与 Electron Desktop 约束 |
 | 改动消息路由、话题复用、代答/监听或自动归档 | [docs/architecture/session-management.md](./docs/architecture/session-management.md) | 五级入站路由、多路由别名索引、`SessionActor` 状态机与典型配置场景 |
