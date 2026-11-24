@@ -4,13 +4,13 @@
 
 ## 开发工作流（默认规则）
 
-- **Worktree + 分支 + PR**：新需求或修复默认基于最新 `origin/main` 在 `.worktrees/<slug>` 新建独立 worktree 与功能分支（如 `feat/<slug>`、`fix/<slug>`、`docs/<slug>`）开发，**禁止直接在 `main` 分支提交**（除非用户明确要求）。完成后推送分支并向 `main` 发起 GitHub PR，合入后清理 worktree 与已合并分支（详见 [docs/guidelines/development.md](./docs/guidelines/development.md)）。
+- **Worktree + 分支 + PR**：新需求或修复默认基于最新 `origin/main` 在 `.worktrees/<slug>` 新建独立 worktree 与功能分支（如 `feat/<slug>`、`fix/<slug>`、`docs/<slug>`）开发，**禁止直接在 `main` 分支提交**（除非用户明确要求）。完成后推送分支并向 `main` 发起 GitHub PR；验证与 CI 通过后自动合入 `main`、清理 worktree 与已合并分支并按需优雅重启服务（详见 [docs/guidelines/development.md](./docs/guidelines/development.md)）。
 - **产物目录边界**：本仓库研发临时产物放本仓库 `.local/`（已 gitignore）；产品运行产物放 `$DSH_HOME/lark-bridge/`、`<workingDir>/.dsh-lark-bridge/` 与 `<workingDir>/.worktrees/`，**严禁将产品运行产物写入目标工作区的 `.local/`**。
 - **合并前门禁**：提交与发起 PR 前必须全部通过：
   ```bash
   pnpm build && pnpm typecheck && pnpm test && pnpm run check:privacy
   ```
-- **交付前端到端真实验证**：通过构建与单测后、向用户交付前，必须在本地运行的 DSH 环境中完成真实端到端验证——（1）在**真实浏览器**检查改动涉及的配置页、弹窗、UI 布局与交互/跳转链路，确认无界面 Bug 与控制台报错；（2）改动涉及消息处理、运行时或配置项时，在**真实飞书测试群**实测功能闭环与配置项是否真实生效（严禁向非测试业务群发测试消息；详见 [docs/guidelines/development.md](./docs/guidelines/development.md#2-交付前端到端真实验证规范)）。若受环境限制无法完成其中某项，须显式说明未验证边界，不得以单测替代端到端实测。
+- **端到端真实验证与自动合入重启**：除纯文档修改外，全量门禁与 PR CI 通过后须在本地运行的 DSH 环境中自动完成真实端到端验证——（1）**飞书端到端实测**：当任务由飞书端发起时默认在当前触发任务所在的飞书群/话题实测，或当用户显式提供了验收群时在提供的群实测（**严禁将任何真实群名称、群 ID 或消息 ID 写入文档、代码、测试或 PR**；未从飞书发起且未指定验收群时须先向用户确认，严禁向非测试业务群发消息）；（2）**真实浏览器验证**：使用真实浏览器访问本地 DSH Web 检查页面渲染、核心交互、配置保存回显、跳转链路与控制台零报错。**上述验证与 CI 全部通过后，无需等待二次确认，直接自动将 PR 合入 `main`、拉取主干重新构建并执行优雅排空重启**（详见 [docs/guidelines/development.md](./docs/guidelines/development.md#2-交付前端到端真实验证与自动合入重启规范)）；任一环节失败则中止合入与重启并回报问题，受环境限制无法完成某项时须显式说明未验证边界，不得以单测替代实测。
 
 ## 核心红线（每次必守）
 
