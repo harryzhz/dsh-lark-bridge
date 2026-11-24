@@ -17,6 +17,7 @@ import type {
   LarkMessageDetail,
   LarkResourceRef,
   LarkUserSearchHit,
+  RecalledLarkMessageEvent,
 } from './types.js'
 
 export interface CardActionEvent {
@@ -65,6 +66,7 @@ export interface TransportDiagnosticsSnapshot {
 
 export interface LarkTransportCallbacks {
   readonly onMessage: (message: InboundLarkMessage) => Promise<void> | void
+  readonly onMessageRecalled?: (event: RecalledLarkMessageEvent) => Promise<void> | void
   readonly onCardAction?: (
     action: CardActionEvent,
   ) => Promise<{ toast?: string } | void> | { toast?: string } | void
@@ -464,6 +466,26 @@ export class LarkBotTransport {
           this.lastError = err instanceof Error ? err.message : String(err)
           this.log('error', `card.action.trigger handler failed: ${this.lastError}`)
           return { toast: { type: 'error', content: '操作处理失败' } }
+        }
+      },
+      'im.message.recalled_v1': (data: unknown) => {
+        if (epoch !== this.lifecycleEpoch) return
+        const t0 = performance.now()
+        this.lastEventAtMs = Date.now()
+        try {
+          const parsed = this.normalizeRecalledEvent(data)
+          if (!parsed || !this.callbacks.onMessageRecalled) return
+          void Promise.resolve()
+            .then(() => this.callbacks.onMessageRecalled?.(parsed))
+            .catch((err) => {
+              this.lastError = err instanceof Error ? err.message : String(err)
+              this.log('error', `im.message.recalled_v1 handler failed: ${this.lastError}`)
+            })
+        } catch (err) {
+          this.lastError = err instanceof Error ? err.message : String(err)
+          this.log('error', `im.message.recalled_v1 normalize failed: ${this.lastError}`)
+        } finally {
+          this.recordAckLatency(performance.now() - t0)
         }
       },
       'im.message.reaction.created_v1': () => {},
@@ -1495,6 +1517,34 @@ export class LarkBotTransport {
       mentions,
       imageKeys: parsedContent.imageKeys,
       createTimeMs: Number.isFinite(createTimeRaw) && createTimeRaw > 0 ? createTimeRaw : Date.now(),
+    }
+  }
+
+  private normalizeRecalledEvent(raw: unknown): RecalledLarkMessageEvent | undefined {
+    const root = raw as Record<string, unknown>
+    const messageId = typeof root?.message_id === 'string' ? root.message_id.trim() : ''
+    const chatId = typeof root?.chat_id === 'string' ? root.chat_id.trim() : ''
+    if (!messageId || !chatId) return undefined
+
+    const eventId = typeof root.event_id === 'string' && root.event_id.trim() ? root.event_id.trim() : undefined
+    const recallType =
+      typeof root.recall_type === 'string' && root.recall_type.trim() ? root.recall_type.trim() : undefined
+    const rawRecallTime = Number(root.recall_time)
+    const recallTimeMs =
+      Number.isFinite(rawRecallTime) && rawRecallTime > 0
+        ? rawRecallTime < 1e12
+          ? Math.round(rawRecallTime * 1000)
+          : Math.round(rawRecallTime)
+        : undefined
+
+    return {
+      botId: this.bot.id,
+      larkAppId: this.bot.larkAppId,
+      ...(eventId ? { eventId } : {}),
+      messageId,
+      chatId,
+      ...(recallTimeMs ? { recallTimeMs } : {}),
+      ...(recallType ? { recallType } : {}),
     }
   }
 

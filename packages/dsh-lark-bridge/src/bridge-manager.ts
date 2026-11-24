@@ -137,6 +137,8 @@ export class LarkBridgeManager {
       isDisposed: () => this.disposed,
       onInboundMessage: (botId, transport, msg) =>
         this.inbound.handleInbound(botId, transport, msg),
+      onMessageRecalled: (botId, transport, event) =>
+        this.inbound.handleMessageRecalled(botId, transport, event),
       onCardAction: async (action) => {
         const toast = await this.reminders.handleCardAction(action.actionValue, {
           ...(action.operatorOpenId ? { operatorOpenId: action.operatorOpenId } : {}),

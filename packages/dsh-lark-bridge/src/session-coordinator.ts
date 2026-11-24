@@ -29,9 +29,18 @@ export type CoalescedTurnSlot<T> =
       readonly finishBatch: () => void
     }
 
+interface WaitingBatchEntry<T> {
+  readonly item: T
+  readonly itemSignal?: AbortSignal
+  readonly isAborted: () => boolean
+  removed?: boolean
+}
+
 interface WaitingBatch<T> {
-  readonly items: T[]
-  readonly followerResolvers: Array<() => void>
+  readonly entries: WaitingBatchEntry<T>[]
+  readonly followerResolvers: Array<(outcome: 'follower' | 'aborted') => void>
+  readonly abortController: AbortController
+  readonly checkEmpty: () => void
 }
 
 export interface AcquiredAgent {
@@ -77,8 +86,9 @@ export class SessionActor {
     const batch = this.waitingBatch
     this.waitingBatch = null
     if (!batch) return
+    batch.abortController.abort()
     while (batch.followerResolvers.length > 0) {
-      batch.followerResolvers.shift()?.()
+      batch.followerResolvers.shift()?.('follower')
     }
   }
 
@@ -88,12 +98,16 @@ export class SessionActor {
    * - Busy session (`state === 'running'`) with `coalesce: true`: the first waiting caller creates
    *   a pending batch; subsequent callers arriving before that batch starts merge into it as
    *   followers and settle once the leader completes the combined turn.
+   * - Optional `itemSignal` cancels only the individual queued item without dropping healthy peers
+   *   in the same coalesced batch; once all entries in a waiting batch are aborted, the leader wakes
+   *   and exits immediately.
    */
   async acquireCoalescedTurnSlot<T>(
     item: T,
     options: {
       readonly coalesce: boolean
       readonly signal: AbortSignal
+      readonly itemSignal?: AbortSignal
       readonly isAborted: () => boolean
       readonly onLeaderRegistered?: () => void
     },
@@ -103,48 +117,120 @@ export class SessionActor {
     | {
         readonly role: 'leader'
         readonly items: readonly T[]
+        readonly abandonedItems?: readonly T[]
         readonly release: () => void
         readonly finishBatch: () => void
       }
   > {
-    if (this.isTerminated || options.signal.aborted || options.isAborted()) {
+    if (
+      this.isTerminated ||
+      options.signal.aborted ||
+      options.itemSignal?.aborted ||
+      options.isAborted()
+    ) {
       return { role: 'aborted', orphanedItems: [item] }
     }
 
     if (options.coalesce && this.state === 'running' && this.waitingBatch) {
       const batch = this.waitingBatch as WaitingBatch<T>
-      batch.items.push(item)
-      await new Promise<void>((resolve) => {
+      const entry: WaitingBatchEntry<T> = {
+        item,
+        ...(options.itemSignal ? { itemSignal: options.itemSignal } : {}),
+        isAborted: options.isAborted,
+      }
+      batch.entries.push(entry)
+      const outcome = await new Promise<'follower' | 'aborted'>((resolve) => {
         let settled = false
-        const done = () => {
+        const done = (result: 'follower' | 'aborted') => {
           if (settled) return
           settled = true
-          options.signal.removeEventListener('abort', onAbort)
-          resolve()
+          options.signal.removeEventListener('abort', onGlobalAbort)
+          options.itemSignal?.removeEventListener('abort', onItemAbort)
+          resolve(result)
         }
-        const onAbort = () => {
-          const idx = batch.items.indexOf(item)
-          if (idx >= 0) batch.items.splice(idx, 1)
-          done()
+        const onGlobalAbort = () => {
+          entry.removed = true
+          batch.checkEmpty()
+          done('follower')
         }
-        if (options.signal.aborted || options.isAborted() || this.isTerminated) {
-          onAbort()
+        const onItemAbort = () => {
+          entry.removed = true
+          batch.checkEmpty()
+          done('aborted')
+        }
+        if (options.itemSignal?.aborted || options.isAborted()) {
+          onItemAbort()
           return
         }
-        options.signal.addEventListener('abort', onAbort, { once: true })
+        if (options.signal.aborted || this.isTerminated) {
+          onGlobalAbort()
+          return
+        }
+        options.signal.addEventListener('abort', onGlobalAbort, { once: true })
+        options.itemSignal?.addEventListener('abort', onItemAbort, { once: true })
         batch.followerResolvers.push(done)
       })
+      if (outcome === 'aborted') {
+        return { role: 'aborted', orphanedItems: [item] }
+      }
       return { role: 'follower' }
     }
 
+    const leaderEntry: WaitingBatchEntry<T> = {
+      item,
+      ...(options.itemSignal ? { itemSignal: options.itemSignal } : {}),
+      isAborted: options.isAborted,
+    }
+    const batchController = new AbortController()
     let ownedBatch: WaitingBatch<T> | undefined
+    const isEntryAlive = (e: WaitingBatchEntry<T>) =>
+      !e.removed && !e.itemSignal?.aborted && !e.isAborted()
+    const checkBatchEmpty = () => {
+      if (batchController.signal.aborted) return
+      const entries = ownedBatch ? ownedBatch.entries : [leaderEntry]
+      if (!entries.some(isEntryAlive)) {
+        batchController.abort()
+      }
+    }
+
     if (options.coalesce && this.state === 'running') {
-      ownedBatch = { items: [item], followerResolvers: [] }
+      ownedBatch = {
+        entries: [leaderEntry],
+        followerResolvers: [],
+        abortController: batchController,
+        checkEmpty: checkBatchEmpty,
+      }
       this.waitingBatch = ownedBatch as WaitingBatch<unknown>
     }
+
+    const onGlobalAbort = () => {
+      if (!batchController.signal.aborted) batchController.abort()
+    }
+    const onLeaderItemAbort = () => {
+      leaderEntry.removed = true
+      checkBatchEmpty()
+    }
+    options.signal.addEventListener('abort', onGlobalAbort, { once: true })
+    options.itemSignal?.addEventListener('abort', onLeaderItemAbort, { once: true })
+    if (options.signal.aborted) onGlobalAbort()
+    if (options.itemSignal?.aborted) onLeaderItemAbort()
+
     options.onLeaderRegistered?.()
 
-    const release = await this.acquireTurnSlot(options.signal, options.isAborted)
+    let release: (() => void) | undefined
+    try {
+      release = await this.acquireTurnSlot(
+        batchController.signal,
+        () =>
+          options.signal.aborted ||
+          this.isTerminated ||
+          !(ownedBatch ? ownedBatch.entries : [leaderEntry]).some(isEntryAlive),
+      )
+    } finally {
+      options.signal.removeEventListener('abort', onGlobalAbort)
+      options.itemSignal?.removeEventListener('abort', onLeaderItemAbort)
+    }
+
     if (ownedBatch && this.waitingBatch === (ownedBatch as WaitingBatch<unknown>)) {
       this.waitingBatch = null
     }
@@ -152,19 +238,34 @@ export class SessionActor {
     const finishBatch = () => {
       if (!ownedBatch) return
       while (ownedBatch.followerResolvers.length > 0) {
-        ownedBatch.followerResolvers.shift()?.()
+        ownedBatch.followerResolvers.shift()?.('follower')
       }
     }
 
-    if (!release) {
-      const orphanedItems = ownedBatch ? [...ownedBatch.items] : [item]
+    const allEntries = ownedBatch ? ownedBatch.entries : [leaderEntry]
+    const survivingItems: T[] = []
+    const abandonedItems: T[] = []
+    for (const entry of allEntries) {
+      if (isEntryAlive(entry)) {
+        survivingItems.push(entry.item)
+      } else {
+        abandonedItems.push(entry.item)
+      }
+    }
+
+    if (!release || survivingItems.length === 0) {
+      release?.()
       finishBatch()
-      return { role: 'aborted', orphanedItems }
+      return {
+        role: 'aborted',
+        orphanedItems: allEntries.map((e) => e.item),
+      }
     }
 
     return {
       role: 'leader',
-      items: ownedBatch ? [...ownedBatch.items] : [item],
+      items: survivingItems,
+      ...(abandonedItems.length > 0 ? { abandonedItems } : {}),
       release,
       finishBatch,
     }
@@ -290,6 +391,7 @@ export class SessionCoordinator {
     options: {
       readonly coalesce: boolean
       readonly signal: AbortSignal
+      readonly itemSignal?: AbortSignal
       readonly isAborted: () => boolean
       readonly onLeaderRegistered?: () => void
     },
@@ -299,6 +401,7 @@ export class SessionCoordinator {
     | {
         readonly role: 'leader'
         readonly items: readonly T[]
+        readonly abandonedItems?: readonly T[]
         readonly release: () => void
         readonly finishBatch: () => void
       }

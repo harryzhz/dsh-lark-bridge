@@ -726,6 +726,16 @@ export interface InboundLarkMessage {
   readonly createTimeMs: number
 }
 
+export interface RecalledLarkMessageEvent {
+  readonly botId: string
+  readonly larkAppId: string
+  readonly eventId?: string
+  readonly messageId: string
+  readonly chatId: string
+  readonly recallTimeMs?: number
+  readonly recallType?: string
+}
+
 export interface ParsedSlashCommand {
   readonly name: 'new' | 'close' | 'cancel' | 'status' | 'model' | 'agent' | 'help'
   readonly args: string
