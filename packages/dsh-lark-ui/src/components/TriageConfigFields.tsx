@@ -234,7 +234,7 @@ function TriagePromptSection({
 
   return (
     <>
-      <GroupTitle>Prompt 配置</GroupTitle>
+      <GroupTitle>分流 Prompt</GroupTitle>
       <SettingRow
         title="System Prompt"
         desc="完整可自定义，点击下方变量标签在光标处插入占位符"
@@ -318,8 +318,9 @@ function TriagePromptSection({
 }
 
 /**
- * Shared smart-triage configuration fields reused across Bot settings and Group overrides,
- * split into Basic and Prompt subgroups inside `<NestedSettings>`.
+ * Shared smart-triage configuration fields reused across Bot settings and Group overrides.
+ * Basic fields render flat directly under the group's toggle/mode row, followed by the
+ * "分流 Prompt" subgroup.
  */
 export function TriageConfigFields({
   value,
@@ -359,9 +360,8 @@ export function TriageConfigFields({
 
   return (
     <>
-      <GroupTitle>基本配置</GroupTitle>
       {nativeGroups.length === 0 && (
-        <div className="fb-banner" data-tone="warn" style={{ margin: '4px 0 6px' }}>
+        <div className="fb-banner" data-tone="warn" style={{ margin: '12px 0 4px' }}>
           <div className="fb-row-desc" style={{ minWidth: 0, flex: 1 }}>
             当前未检测到可用的 DSH 原生或自定义模型，请先在 DSH「设置 → 模型」配置至少一个轻量模型；未就绪期间消息将自动直通主运行时。
           </div>

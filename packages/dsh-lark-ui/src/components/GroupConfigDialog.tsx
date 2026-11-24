@@ -358,32 +358,30 @@ export function GroupConfigDialog({
           </SettingRow>
 
           {runtimeMode === 'override' && (
-            <NestedSettings>
-              <AgentRuntimeFields
-                value={{
-                  agentPreset: overridePreset,
-                  runtimeProfileId: draft.runtimeProfileId ?? '',
-                  model: draft.model,
-                  reasoningEffort: draft.reasoningEffort,
-                }}
-                runtimes={runtimes}
-                models={models}
-                profileRevision={profileRevision}
-                onProfilesChanged={onProfilesChanged}
-                onManageProfiles={(rt, pid) =>
-                  setProfileView({ runtimeId: rt.id, ...(pid ? { initialProfileId: pid } : {}) })
-                }
-                onChange={({ agentPreset, runtimeProfileId, model, reasoningEffort }) =>
-                  patch({
-                    runtimeMode: 'override',
-                    agentPreset,
-                    runtimeProfileId: runtimeProfileId?.trim() ?? '',
-                    model,
-                    reasoningEffort,
-                  })
-                }
-              />
-            </NestedSettings>
+            <AgentRuntimeFields
+              value={{
+                agentPreset: overridePreset,
+                runtimeProfileId: draft.runtimeProfileId ?? '',
+                model: draft.model,
+                reasoningEffort: draft.reasoningEffort,
+              }}
+              runtimes={runtimes}
+              models={models}
+              profileRevision={profileRevision}
+              onProfilesChanged={onProfilesChanged}
+              onManageProfiles={(rt, pid) =>
+                setProfileView({ runtimeId: rt.id, ...(pid ? { initialProfileId: pid } : {}) })
+              }
+              onChange={({ agentPreset, runtimeProfileId, model, reasoningEffort }) =>
+                patch({
+                  runtimeMode: 'override',
+                  agentPreset,
+                  runtimeProfileId: runtimeProfileId?.trim() ?? '',
+                  model,
+                  reasoningEffort,
+                })
+              }
+            />
           )}
 
           <GroupTitle>智能分流</GroupTitle>
@@ -443,18 +441,16 @@ export function GroupConfigDialog({
                   />
                 </SettingRow>
                 {currentRouter.mode === 'override' && (
-                  <NestedSettings>
-                    <TriageConfigFields
-                      value={currentRouter}
-                      runtimes={runtimes}
-                      models={models}
-                      triageDefaults={triageDefaults}
-                      emptyModelLabel={emptyGroupModelLabel}
-                      onChange={(next) =>
-                        patch({ router: { ...currentRouter, mode: 'override', ...next } })
-                      }
-                    />
-                  </NestedSettings>
+                  <TriageConfigFields
+                    value={currentRouter}
+                    runtimes={runtimes}
+                    models={models}
+                    triageDefaults={triageDefaults}
+                    emptyModelLabel={emptyGroupModelLabel}
+                    onChange={(next) =>
+                      patch({ router: { ...currentRouter, mode: 'override', ...next } })
+                    }
+                  />
                 )}
               </>
             )
@@ -534,11 +530,11 @@ function ListenerSection({
 
   return (
     <>
-      <SettingRow title="主动监听" desc="无需 @，自动判断群消息是否需要回复">
-        <Switch label="主动监听" checked={rule.enabled} onChange={(enabled) => patch({ enabled })} />
+      <SettingRow title="启用主动监听" desc="无需 @，自动判断群消息是否需要回复">
+        <Switch label="启用主动监听" checked={rule.enabled} onChange={(enabled) => patch({ enabled })} />
       </SettingRow>
       {rule.enabled && (
-        <NestedSettings>
+        <>
           <SettingRow title="场景模板" desc="修改下方指令并保存时将同步更新所选模板">
             <SelectMenu
               value={activeTemplate?.key ?? ''}
@@ -662,7 +658,7 @@ function ListenerSection({
           <SettingRow title="回复后结束会话" desc="关闭后话题内可免 @ 继续跟进">
             <Switch label="回复后结束会话" checked={rule.autoCloseAfterCompletion} onChange={(autoCloseAfterCompletion) => patch({ autoCloseAfterCompletion })} />
           </SettingRow>
-        </NestedSettings>
+        </>
       )}
     </>
   )
@@ -783,7 +779,7 @@ function GroupConversationAndMessageSection({
         />
       </SettingRow>
       {effectiveUseCard && (
-        <NestedSettings>
+        <>
           <SettingRow title="附带会话链接">
             <SelectMenu
               value={draft.dshSessionLinkInCard ?? 'inherit'}
@@ -850,7 +846,7 @@ function GroupConversationAndMessageSection({
               </SettingRow>
             </NestedSettings>
           )}
-        </NestedSettings>
+        </>
       )}
     </>
   )
@@ -928,7 +924,7 @@ function GroupRoleSection({
         ))}
 
       {draft.role.mode !== 'inherit' && (
-        <NestedSettings>
+        <>
           {draft.role.mode === 'append' &&
             (botRoleActive && bot ? (
               <SettingRow
@@ -939,7 +935,7 @@ function GroupRoleSection({
                 <TextArea value={botRolePrompt} rows={5} readOnly onChange={() => {}} />
               </SettingRow>
             ) : (
-              <div className="fb-banner" style={{ marginTop: 8, marginBottom: 4 }}>
+              <div className="fb-banner" style={{ marginTop: 12, marginBottom: 4 }}>
                 <span className="fb-row-desc">
                   {`智能体「${bot?.name ?? draft.botId}」未启用基础角色，将仅注入下方本群设定。`}
                 </span>
@@ -986,7 +982,7 @@ function GroupRoleSection({
               placeholder="补充本群项目范围、回答风格与协作边界"
             />
           </SettingRow>
-        </NestedSettings>
+        </>
       )}
     </>
   )

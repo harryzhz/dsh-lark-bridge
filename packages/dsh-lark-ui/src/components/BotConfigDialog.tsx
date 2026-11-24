@@ -1095,15 +1095,13 @@ function EditBotDialog({
           </SettingRow>
 
           {draft.router.enabled && (
-            <NestedSettings>
-              <TriageConfigFields
-                value={draft.router}
-                runtimes={runtimes}
-                models={models}
-                triageDefaults={triageDefaults}
-                onChange={(next) => patch({ router: { ...draft.router, ...next } })}
-              />
-            </NestedSettings>
+            <TriageConfigFields
+              value={draft.router}
+              runtimes={runtimes}
+              models={models}
+              triageDefaults={triageDefaults}
+              onChange={(next) => patch({ router: { ...draft.router, ...next } })}
+            />
           )}
         </>
       )}
@@ -1116,7 +1114,7 @@ function EditBotDialog({
             <Switch label="启用角色设定" checked={draft.role.enabled} onChange={(enabled) => patch({ role: { ...draft.role, enabled } })} />
           </SettingRow>
           {draft.role.enabled && (
-            <NestedSettings>
+            <>
               <SettingRow title="模板">
                 <SelectMenu
                   value={draft.role.presetKey ?? ''}
@@ -1133,7 +1131,7 @@ function EditBotDialog({
               <SettingRow title="角色提示词" stack>
                 <TextArea value={draft.role.systemPrompt} onChange={(systemPrompt) => patch({ role: { ...draft.role, systemPrompt } })} rows={8} placeholder="定义职责、回答风格与协作边界" />
               </SettingRow>
-            </NestedSettings>
+            </>
           )}
         </>
       )}
@@ -1213,7 +1211,7 @@ function BotConversationAndMessageSection({
         <Switch label="使用消息卡片" checked={draft.useInteractiveCard} onChange={(useInteractiveCard) => patch({ useInteractiveCard })} />
       </SettingRow>
       {draft.useInteractiveCard && (
-        <NestedSettings>
+        <>
           <SettingRow title="附带会话链接" desc="卡片底部提供跳转 DSH 接管会话的入口">
             <Switch label="附带会话链接" checked={draft.dshSessionLinkInCard} onChange={(dshSessionLinkInCard) => patch({ dshSessionLinkInCard })} />
           </SettingRow>
@@ -1245,7 +1243,7 @@ function BotConversationAndMessageSection({
               placeholder="留空不展示，例如 AI 回复仅供参考"
             />
           </SettingRow>
-        </NestedSettings>
+        </>
       )}
     </>
   )
@@ -1316,7 +1314,7 @@ function AccessSection({
         <Switch label="允许私聊" checked={draft.p2pEnabled} onChange={(p2pEnabled) => patch({ p2pEnabled })} />
       </SettingRow>
       {draft.p2pEnabled && (
-        <NestedSettings>
+        <>
           <SettingRow title="私聊会话">
             <SelectMenu value={draft.p2pSessionMode} options={P2P_SESSION_MODES} onChange={(p2pSessionMode) => patch({ p2pSessionMode })} />
           </SettingRow>
@@ -1337,7 +1335,7 @@ function AccessSection({
               placeholder="输入姓名、邮箱或 ou_xxx 搜索添加…"
             />
           </SettingRow>
-        </NestedSettings>
+        </>
       )}
 
       <GroupTitle>管理权限</GroupTitle>
@@ -1364,7 +1362,7 @@ function AccessSection({
         <Switch label="代答指定成员" checked={sub.enabled} onChange={(enabled) => setSub({ enabled })} />
       </SettingRow>
       {sub.enabled && (
-        <NestedSettings>
+        <>
           <SettingRow
             title="身份说明"
             desc={DISCLOSURE_MODES.find((m) => m.value === sub.disclosure)?.desc}
@@ -1386,7 +1384,7 @@ function AccessSection({
               placeholder="输入姓名、邮箱或 ou_xxx 搜索代答成员…"
             />
           </SettingRow>
-        </NestedSettings>
+        </>
       )}
     </>
   )
