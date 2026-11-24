@@ -11,6 +11,7 @@ import {
   composeRouterHandoffReminder,
   composeTurnPrompt,
   decideLarkRouting,
+  isSilentReplySentinel,
   normalizeReplyText,
   resolveEffectiveCardBot,
   resolveEffectiveRouterConfig,
@@ -37,6 +38,7 @@ import type { LarkPendingTurn } from './types.js'
 
 const SHUTDOWN_TURN_CLEANUP_TIMEOUT_MS = 5_000
 const STALE_PENDING_TURN_MAX_AGE_MS = 24 * 60 * 60_000
+const UNEXPECTED_SILENT_SENTINEL_FALLBACK = '抱歉，当前消息不在我的职责范围内或暂无法直接回复。'
 
 export interface ActiveTurnRecord {
   readonly id: string
@@ -653,10 +655,14 @@ export class InboundPipeline {
     )
 
     const silencedItem = batchItems.find((i) => i.activeTurn.silencedByControl)
+    const interceptedSilentSentinel =
+      !silencedItem &&
+      !effectiveDecision.allowSilentEmptyReply &&
+      isSilentReplySentinel(replyText)
     const normalizedReply = silencedItem
       ? ''
       : normalizeReplyText(replyText, {
-          allowSilentSentinel: effectiveDecision.allowSilentEmptyReply,
+          allowSilentSentinel: true,
         })
     const hasFinalText = normalizedReply.length > 0
     const isSilentSkip =
@@ -686,6 +692,14 @@ export class InboundPipeline {
         summary: silentSummary,
       })
     } else {
+      if (interceptedSilentSentinel) {
+        this.host.ctx.logger.warn(
+          `[lark-bridge][trace=${latestItem.traceId}][bot=${bot.id}][session=${acquired.sessionId}] intercepted silent sentinel on non-silent turn (trigger=${effectiveDecision.trigger})`,
+        )
+      }
+      const fallbackText = interceptedSilentSentinel
+        ? UNEXPECTED_SILENT_SENTINEL_FALLBACK
+        : undefined
       if (hasFinalText || intermediateSentCount === 0) {
         await this.deliverReply(
           bot,
@@ -695,6 +709,7 @@ export class InboundPipeline {
           acquired.sessionId,
           normalizedReply,
           groupConfig,
+          fallbackText,
         )
       }
       if (hasFinalText && latestItem.msg.chatType === 'group') {
@@ -709,6 +724,12 @@ export class InboundPipeline {
         latencyMs,
       })
       const batchSuffix = batchSize > 1 ? `（合并 ${batchSize} 条消息）` : ''
+      const replySummary =
+        intermediateSentCount > 0
+          ? `已发送 ${intermediateSentCount} 条过程消息${hasFinalText ? ` + 最终回复 ${normalizedReply.length} 字` : ''}`
+          : interceptedSilentSentinel
+            ? `已拦截非静默轮次的 <no_reply/> 并回退兜底回复（${UNEXPECTED_SILENT_SENTINEL_FALLBACK.length} 字）`
+            : `已回复 ${normalizedReply.length} 字`
       this.host.store.recordEvent({
         botId: bot.id,
         chatId: latestItem.msg.chatId,
@@ -717,10 +738,7 @@ export class InboundPipeline {
         traceId: latestItem.traceId,
         durationMs: latencyMs,
         kind: 'reply',
-        summary:
-          (intermediateSentCount > 0
-            ? `已发送 ${intermediateSentCount} 条过程消息${hasFinalText ? ` + 最终回复 ${normalizedReply.length} 字` : ''}`
-            : `已回复 ${normalizedReply.length} 字`) + batchSuffix,
+        summary: replySummary + batchSuffix,
       })
     }
 
@@ -924,7 +942,7 @@ export class InboundPipeline {
     }
 
     if (result.verdict.action === 'quick_reply' && !hasActiveWorker && result.verdict.replyText) {
-      const replyText = normalizeReplyText(result.verdict.replyText)
+      const replyText = normalizeReplyText(result.verdict.replyText, { allowSilentSentinel: true })
       if (replyText) {
         const sent = await transport.sendReply({
           chatId: msg.chatId,
@@ -1147,6 +1165,8 @@ export class InboundPipeline {
         msg: primary.msg,
         ...(resolvedChatName ? { chatName: resolvedChatName } : {}),
         ...(primary.senderName ? { senderName: primary.senderName } : {}),
+        trigger: effectiveDecision.trigger,
+        allowSilentEmptyReply: effectiveDecision.allowSilentEmptyReply,
         replyMode: effectiveDecision.replyMode,
         useCard: effectiveDecision.useCard,
         includeFullGuide: isNewSession,
@@ -1249,7 +1269,7 @@ export class InboundPipeline {
     stepText: string,
   ): Promise<boolean> {
     const text = normalizeReplyText(stepText, {
-      allowSilentSentinel: decision.allowSilentEmptyReply,
+      allowSilentSentinel: true,
     })
     if (!text) return false
     const card = decision.useCard
@@ -1276,8 +1296,12 @@ export class InboundPipeline {
     sessionId: string,
     replyText: string,
     groupConfig?: LarkGroupConfig,
+    fallbackText?: string,
   ): Promise<void> {
-    const text = normalizeReplyText(replyText) || '（已完成，无文本输出）'
+    const text =
+      normalizeReplyText(replyText, { allowSilentSentinel: true }) ||
+      fallbackText ||
+      '（已完成，无文本输出）'
     const cardBot = resolveEffectiveCardBot(
       bot,
       msg.chatType === 'group' ? groupConfig : undefined,

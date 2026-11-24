@@ -1,7 +1,7 @@
 import { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import {
   TurnAbortedError,
   TurnFinalReplyTracker,
@@ -599,5 +599,73 @@ describe('TurnFinalReplyTracker & runTurnAndCollectReply', () => {
 
     const reply = await runTurnAndCollectReply(ctx, agent, [{ type: 'text', text: '飞书提问' }])
     expect(reply).toBe('这是飞书这轮的正确回复')
+  })
+
+  it('logs a diagnostic warning when turn/end stalls for >= 3s after step/end', async () => {
+    vi.useFakeTimers()
+    try {
+      const handlers: Array<(s: Session, ev: SessionEvent) => void> = []
+      const warn = vi.fn()
+      const session = { id: 'session-stall-diag' } as unknown as Session
+      const ctx = {
+        logger: { warn },
+        on(_event: string, fn: (s: Session, ev: SessionEvent) => void) {
+          handlers.push(fn)
+          return () => {
+            const idx = handlers.indexOf(fn)
+            if (idx >= 0) handlers.splice(idx, 1)
+          }
+        },
+      } as unknown as Context
+      const emit = (ev: Record<string, unknown>) => {
+        for (const h of [...handlers]) h(session, ev as unknown as SessionEvent)
+      }
+
+      const slowAgent = {
+        session,
+        followup(msg: { id?: string }) {
+          emit({ type: 'turn/start', data: { turn: 1 } })
+          emit({ type: 'user/message', data: { id: msg.id, source: { kind: 'user' } } })
+          emit({
+            type: 'assistant/message',
+            data: { turn: 1, step: 1, message: { content: [{ type: 'text', text: '模型已回复' }] } },
+          })
+          emit({ type: 'step/end', data: { turn: 1, step: 1 } })
+          setTimeout(() => {
+            emit({ type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+          }, 18_200)
+        },
+      } as unknown as Agent
+
+      const slowPromise = runTurnAndCollectReply(ctx, slowAgent, [{ type: 'text', text: 'hello' }])
+      await vi.advanceTimersByTimeAsync(18_200)
+      expect(await slowPromise).toBe('模型已回复')
+      expect(warn).toHaveBeenCalledTimes(1)
+      expect(warn.mock.calls[0]?.[0]).toContain('post-step turn-stopping stall detected: 18200ms')
+      expect(warn.mock.calls[0]?.[0]).toContain('workspace-changes')
+
+      warn.mockClear()
+      const fastAgent = {
+        session,
+        followup(msg: { id?: string }) {
+          emit({ type: 'turn/start', data: { turn: 2 } })
+          emit({ type: 'user/message', data: { id: msg.id, source: { kind: 'user' } } })
+          emit({
+            type: 'assistant/message',
+            data: { turn: 2, step: 1, message: { content: [{ type: 'text', text: '秒回' }] } },
+          })
+          emit({ type: 'step/end', data: { turn: 2, step: 1 } })
+          setTimeout(() => {
+            emit({ type: 'turn/end', data: { turn: 2, reason: { kind: 'completed' } } })
+          }, 120)
+        },
+      } as unknown as Agent
+      const fastPromise = runTurnAndCollectReply(ctx, fastAgent, [{ type: 'text', text: 'hi' }])
+      await vi.advanceTimersByTimeAsync(120)
+      expect(await fastPromise).toBe('秒回')
+      expect(warn).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

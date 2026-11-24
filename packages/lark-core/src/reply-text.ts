@@ -36,6 +36,18 @@ export function hasVisibleText(raw: string): boolean {
   return raw.replace(ALL_INVISIBLE_RE, '').length > 0
 }
 
+/**
+ * Returns true when the text consists solely of internal silent-skip sentinels
+ * (`<no_reply/>` / `<no_reminder_needed/>`, optionally wrapped in inline code backticks)
+ * plus optional whitespace or invisible characters.
+ */
+export function isSilentReplySentinel(raw: string): boolean {
+  const trimmed = trimInvisibleText(raw)
+  if (!trimmed) return false
+  const withoutSentinels = trimmed.replace(SILENT_SENTINEL_RE, '')
+  return !hasVisibleText(withoutSentinels)
+}
+
 export interface NormalizeReplyTextOptions {
   /**
    * When true, replies consisting solely of silent sentinels (`<no_reply/>` /
@@ -54,11 +66,8 @@ export function normalizeReplyText(
 ): string {
   const trimmed = trimInvisibleText(raw)
   if (!trimmed) return ''
-  if (options.allowSilentSentinel) {
-    const withoutSentinels = trimmed.replace(SILENT_SENTINEL_RE, '')
-    if (!hasVisibleText(withoutSentinels)) {
-      return ''
-    }
+  if (options.allowSilentSentinel && isSilentReplySentinel(trimmed)) {
+    return ''
   }
   return trimmed
 }

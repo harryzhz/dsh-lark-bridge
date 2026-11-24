@@ -626,7 +626,7 @@ export class ScheduleNotifier {
     const explicit = this.host.store.getScheduleBinding(entry.id)
     if (!explicit?.enabled || !explicit.sendIntermediateMessages) return
     const cleanStep = normalizeReplyText(stepText, {
-      allowSilentSentinel: explicit.notifyOn !== 'always',
+      allowSilentSentinel: true,
     })
     if (!cleanStep) return
 
@@ -723,7 +723,7 @@ export class ScheduleNotifier {
     this.maybeTitleScheduleSession(session, entry.title)
 
     const replyText = normalizeReplyText(turn.replyTracker.result(), {
-      allowSilentSentinel: notifyOn !== 'always',
+      allowSilentSentinel: true,
     })
     const isError = Boolean(errorMessage)
     const latencyMs = Date.now() - turn.startedMs
