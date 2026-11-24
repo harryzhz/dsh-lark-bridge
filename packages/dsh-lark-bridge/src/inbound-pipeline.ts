@@ -27,7 +27,7 @@ import {
   type SendLarkReplyResult,
 } from '@dsh-lark/lark-core'
 import type { BotConnectionPool } from './bot-connection-pool.js'
-import type { BridgeMemoryService } from './memory-service.js'
+import type { MemoryService } from './memory-service.js'
 import type { RuntimeCatalog } from './runtime-catalog.js'
 import type { AcquiredAgent, AgentDecision, SessionCoordinator } from './session-coordinator.js'
 import type { SessionTitleGuard } from './session-title-guard.js'
@@ -69,7 +69,7 @@ export interface InboundPipelineHost {
   readonly runtimes: RuntimeCatalog
   readonly connections: BotConnectionPool
   readonly sessions: SessionCoordinator
-  readonly memory?: BridgeMemoryService
+  readonly memory?: MemoryService
   readonly triage?: LlmTriageService
   readonly titleGuard: SessionTitleGuard
   readonly shutdownSignal: AbortSignal

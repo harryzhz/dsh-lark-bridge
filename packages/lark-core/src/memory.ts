@@ -164,7 +164,7 @@ function singleLineExcerpt(raw: string, maxChars: number): string {
   return `${flat.slice(0, Math.max(1, maxChars - 1)).trimEnd()}…`
 }
 
-export interface BridgeMemoryReminderResult {
+export interface MemoryReminderResult {
   readonly reminder: string
   readonly includedEntryIds: readonly string[]
 }
@@ -174,13 +174,13 @@ export interface BridgeMemoryReminderResult {
  * Synthesizes a strictly budgeted core memory index for the first turn of a session,
  * leaving full details and historical search to on-demand Layer 2 CLI tools.
  */
-export function composeBridgeMemoryReminder(input: {
+export function composeMemoryReminder(input: {
   readonly botId: string
   readonly entries: readonly LarkMemoryEntry[]
   readonly totalActiveCount?: number
   readonly maxEntries?: number
   readonly maxChars?: number
-}): BridgeMemoryReminderResult | undefined {
+}): MemoryReminderResult | undefined {
   const maxEntries = Math.max(1, input.maxEntries ?? MEMORY_LAYER1_MAX_ENTRIES)
   const maxChars = Math.max(400, input.maxChars ?? MEMORY_LAYER1_MAX_CHARS)
   const totalActive = input.totalActiveCount ?? input.entries.length
@@ -193,18 +193,18 @@ export function composeBridgeMemoryReminder(input: {
 
   if (input.entries.length === 0) {
     const emptyBlock = [
-      `<bridge_memory bot_id="${escapeXmlAttr(input.botId)}" active_count="${totalActive}">`,
+      `<memory bot_id="${escapeXmlAttr(input.botId)}" active_count="${totalActive}">`,
       '当前尚无已沉淀的跨会话长期记忆。仅当用户明确纠偏、给出长期偏好或确立关键隐性决策时写入，避免记录一次性细节。',
       ...footerLines,
-      '</bridge_memory>',
+      '</memory>',
     ].join('\n')
     return { reminder: emptyBlock, includedEntryIds: [] }
   }
 
-  const header = `<bridge_memory bot_id="${escapeXmlAttr(input.botId)}" active_count="${totalActive}">`
+  const header = `<memory bot_id="${escapeXmlAttr(input.botId)}" active_count="${totalActive}">`
   const lead =
     '以下为按优先级精选的长期记忆索引（仅作高信号线索，执行代码操作前仍须以当前仓库事实为准）：'
-  const footer = [...footerLines, '</bridge_memory>'].join('\n')
+  const footer = [...footerLines, '</memory>'].join('\n')
   const reservedChars = header.length + lead.length + footer.length + 120
   let remainingChars = Math.max(200, maxChars - reservedChars)
 
@@ -264,7 +264,7 @@ export function renderMemoryMarkdownProjection(input: {
   const updatedIso = formatMemoryDateIso(input.generatedAtMs ?? Date.now())
   const headerName = input.botName?.trim() ? `${input.botName.trim()} (${input.botId})` : input.botId
   const lines: string[] = [
-    `# Bridge Memory — ${headerName}`,
+    `# Memory — ${headerName}`,
     '',
     `> 自动生成的只读镜像（真相源位于 SQLite \`memory_entries\` 表）。更新时间：${updatedIso} · 有效记忆：${active.length} 条。`,
     '',
@@ -335,7 +335,7 @@ const DREAM_WRITE_FAILURE_PATTERNS: readonly RegExp[] = [
 
 /**
  * Detects explicit runtime/tooling failure messages when a Dreaming pass produced zero
- * Bridge Memory mutations, preventing false-positive `succeeded` status & watermark advancement.
+ * Memory mutations, preventing false-positive `succeeded` status & watermark advancement.
  */
 export function detectDreamingMemoryWriteFailure(replyText: string): string | undefined {
   const clean = replyText.replace(/\s+/g, ' ').trim()

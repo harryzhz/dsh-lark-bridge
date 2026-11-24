@@ -1,8 +1,8 @@
 import type { SqlMigration } from './001-initial.js'
 
-export const BRIDGE_MEMORY_MIGRATION: SqlMigration = {
+export const MEMORY_MIGRATION: SqlMigration = {
   version: 3,
-  name: '003_bridge_memory',
+  name: '003_memory',
   sql: `
 CREATE TABLE IF NOT EXISTS memory_entries (
   id                TEXT PRIMARY KEY,

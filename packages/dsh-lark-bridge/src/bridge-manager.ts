@@ -23,7 +23,7 @@ import { LarkDirectoryEnricher } from './directory-enrichment.js'
 import { DreamingService } from './dreaming-service.js'
 import { InboundPipeline } from './inbound-pipeline.js'
 import { InstanceLock } from './instance-lock.js'
-import { BridgeMemoryService } from './memory-service.js'
+import { MemoryService } from './memory-service.js'
 import { ProactiveReminderService } from './reminder-service.js'
 import { RuntimeCatalog } from './runtime-catalog.js'
 import { ScheduleNotifier, type ScheduleCreateInputLike } from './schedule-notifier.js'
@@ -56,7 +56,7 @@ export type { AgentCliSendInput } from './agent-tool-facade.js'
 export class LarkBridgeManager {
   readonly runtimes: RuntimeCatalog
   readonly schedules: ScheduleNotifier
-  readonly memory: BridgeMemoryService
+  readonly memory: MemoryService
   readonly dreaming: DreamingService
   readonly reminders: ProactiveReminderService
   readonly platform: LarkPlatformManager
@@ -136,7 +136,7 @@ export class LarkBridgeManager {
 
     const triageRecorder = new TriageSessionRecorder(ctx, store, this.workspaces)
     this.triage = new LlmTriageService(ctx, this.runtimes, triageRecorder)
-    this.memory = new BridgeMemoryService(config.dataDir, store)
+    this.memory = new MemoryService(config.dataDir, store)
 
     this.inbound = new InboundPipeline({
       ctx,

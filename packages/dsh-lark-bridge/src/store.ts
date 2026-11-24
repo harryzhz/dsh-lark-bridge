@@ -338,7 +338,7 @@ export class LarkBridgeStore {
     return this.runtimeRepo.deletePendingTurn(id)
   }
 
-  // ── Bridge Memory (Runtime-Agnostic Long-Term Memory) ────────────────────
+  // ── Memory (Runtime-Agnostic Long-Term Memory) ───────────────────────────
 
   getMemoryEntry(id: string): LarkMemoryEntry | undefined {
     return this.memoryRepo.get(id)

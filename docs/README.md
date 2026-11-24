@@ -40,7 +40,7 @@ flowchart TB
 | --- | --- | --- |
 | **系统架构** | [architecture/overview.md](./architecture/overview.md) | 六大模块防腐层分层、动态运行时发现、产物目录边界、HTTP/RPC 鉴权与 Desktop 会话接管约束 |
 | **系统架构** | [architecture/session-management.md](./architecture/session-management.md) | 飞书消息拓扑与 `routeKey`、五级入站路由、多路由别名索引、`SessionActor` 生命周期状态机与场景示例 |
-| **系统架构** | [architecture/memory-and-dreaming.md](./architecture/memory-and-dreaming.md) | 跨运行时 Bridge Memory 架构、四分类与三级隔离、SQLite v3/FTS5 与产物目录、两层渐进披露及 Auto-Dream 四阶段与诚信水位线 |
+| **系统架构** | [architecture/memory-and-dreaming.md](./architecture/memory-and-dreaming.md) | 跨运行时 Memory 架构、四分类与三级隔离、SQLite v3/FTS5 与产物目录、两层渐进披露及 Auto-Dream 四阶段与诚信水位线 |
 | **工程规范** | [guidelines/development.md](./guidelines/development.md) | Worktree + 分支 + PR 工作流、Commit 约定、常用验证/打包命令与开源隐私脱敏清单 |
 | **工程规范** | [guidelines/ui.md](./guidelines/ui.md) | `packages/dsh-lark-ui` 设计令牌、控件右对齐、原位下钻子视图、防双层遮罩与标签流样式硬性规范 |
 

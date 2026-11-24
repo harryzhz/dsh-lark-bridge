@@ -957,7 +957,7 @@ function EditBotDialog({
       subview={
         memoryViewOpen
           ? {
-              title: `${draft.name || existingId} · Bridge Memory`,
+              title: `${draft.name || existingId} · Memory`,
               onBack: () => setMemoryViewOpen(false),
               content: (
                 <BotMemoryPanel

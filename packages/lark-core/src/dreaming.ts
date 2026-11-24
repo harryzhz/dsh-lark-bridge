@@ -21,7 +21,7 @@ export interface DreamExecutionPromptInput {
 
 /**
  * Builds the 4-phase offline Auto-Dream consolidation prompt inside `<system_reminder><dream_job>...`.
- * Operates against runtime-agnostic Bridge Memory via `lark-bridge memory` CLI so all
+ * Operates against runtime-agnostic Memory via `lark-bridge memory` CLI so all
  * native and external runtimes share durable, auditable, bi-temporal memory consolidation.
  */
 export function composeDreamExecutionPrompt(input: DreamExecutionPromptInput): string {
@@ -52,7 +52,7 @@ export function composeDreamExecutionPrompt(input: DreamExecutionPromptInput): s
   const orientationLines = [
     '### Phase 1 · 摸底现有记忆（Orientation）',
     ...(input.memoryMarkdownPath
-      ? [`- 读取当前 Bridge Memory 只读镜像：\`${input.memoryMarkdownPath}\`（当前有效 ${input.activeMemoryCount ?? 0} 条）。`]
+      ? [`- 读取当前 Memory 只读镜像：\`${input.memoryMarkdownPath}\`（当前有效 ${input.activeMemoryCount ?? 0} 条）。`]
       : []),
     `- 按需运行 \`lark-bridge memory list --bot ${input.botId} --status active\` 查看完整有效条目与 ID，避免重复写入。`,
   ]
@@ -67,7 +67,7 @@ export function composeDreamExecutionPrompt(input: DreamExecutionPromptInput): s
   const consolidateLines = [
     '### Phase 3 · 沉淀、合并与双时态纠偏（Consolidate & Supersede）',
     scopeBlock,
-    '- 使用运行时无关的 Bridge Memory CLI 持久化写入（4 类语义分类：`feedback` 纠偏/防踩坑规则、`user` 用户/团队偏好、`project` 项目决策与背景、`reference` 外部系统/文档指针）：',
+    '- 使用运行时无关的 Memory CLI 持久化写入（4 类语义分类：`feedback` 纠偏/防踩坑规则、`user` 用户/团队偏好、`project` 项目决策与背景、`reference` 外部系统/文档指针）：',
     `  - 新增或幂等更新：\`lark-bridge memory upsert --bot ${input.botId} --type <feedback|user|project|reference> --title "<精炼标题>" --content "<事实要点>" [--scope bot|chat|workspace] [--scope-id <chatId或目录>] [--tags "a,b"] [--pin]\``,
     config.cleanupAndCorrect
       ? `  - 事实纠偏与旧结论替代（优先 \`代码库与文档现状 > 最新用户明确反馈 > 历史旧记忆\`）：\`lark-bridge memory supersede <oldId> --bot ${input.botId} --reason "<纠偏依据>" --type <type> --title "<新标题>" --content "<新结论>"\``
@@ -93,7 +93,7 @@ export function composeDreamExecutionPrompt(input: DreamExecutionPromptInput): s
 
   const dreamSection = [
     `<dream_job agent="${escapeXmlAttr(input.botName)}" bot_id="${escapeXmlAttr(input.botId)}" date="${escapeXmlAttr(currentDateIso)}" sessions="${input.sessionCount}">`,
-    '执行离线 **Auto-Dream（跨运行时 Bridge Memory 沉淀、核验与双时态纠偏）**：',
+    '执行离线 **Auto-Dream（跨运行时 Memory 沉淀、核验与双时态纠偏）**：',
     '',
     ...orientationLines,
     '',

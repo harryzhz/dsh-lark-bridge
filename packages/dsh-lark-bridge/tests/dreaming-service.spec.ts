@@ -19,7 +19,7 @@ import type { LarkBridgeManager } from '../src/bridge-manager.js'
 import { ensureCliAuthEndpoint } from '../src/cli-support.js'
 import { DreamingService } from '../src/dreaming-service.js'
 import { createLarkHttpHandler, type ConnectionAdmitter } from '../src/http-api.js'
-import { BridgeMemoryService } from '../src/memory-service.js'
+import { MemoryService } from '../src/memory-service.js'
 import { RuntimeCatalog } from '../src/runtime-catalog.js'
 import { LarkBridgeStore } from '../src/store.js'
 import type { WorkspaceGrouping } from '../src/workspace-grouping.js'
@@ -597,11 +597,11 @@ describe('DreamingService dual-gate scheduling, product dataDir isolation & nati
     expect(runPrompts[0]).toContain('勿盲目遍历无关仓库')
   })
 
-  it('tracks real Bridge Memory mutations during Auto-Dream and rejects false-positive succeeded status when runtime reports memory write failure', async () => {
+  it('tracks real Memory mutations during Auto-Dream and rejects false-positive succeeded status when runtime reports memory write failure', async () => {
     const dataDir = makeTempDir()
     const workDir = makeTempDir()
     const store = new LarkBridgeStore(dataDir)
-    const memory = new BridgeMemoryService(dataDir, store)
+    const memory = new MemoryService(dataDir, store)
 
     store.upsertBot({
       id: 'dream-mem-bot',
@@ -705,7 +705,7 @@ describe('DreamingService dual-gate scheduling, product dataDir isolation & nati
     expect(capturedPrompts[0]).toContain('lark-bridge memory upsert')
     expect(capturedPrompts[0]).toContain(memory.memoryMarkdownPath('dream-mem-bot'))
 
-    // 2. Retry with real Bridge Memory writes -> succeeds, records exact memoryStats & advances watermark!
+    // 2. Retry with real Memory writes -> succeeds, records exact memoryStats & advances watermark!
     runMode = 'real_write'
     const okState = await dreaming.runForBot('dream-mem-bot', {
       force: true,

@@ -11,7 +11,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { LarkBridgeManager } from '../src/bridge-manager.js'
 import { ensureCliAuthEndpoint } from '../src/cli-support.js'
 import { createLarkHttpHandler, type ConnectionAdmitter } from '../src/http-api.js'
-import { BridgeMemoryService } from '../src/memory-service.js'
+import { MemoryService } from '../src/memory-service.js'
 import { LarkBridgeStore } from '../src/store.js'
 
 const execFileAsync = promisify(execFile)
@@ -60,13 +60,13 @@ function invokeHandler(
   })
 }
 
-describe('BridgeMemoryService: SOTA typed memory, scope isolation, FTS5 search, bi-temporal supersede & CLI/HTTP auth', () => {
+describe('MemoryService: SOTA typed memory, scope isolation, FTS5 search, bi-temporal supersede & CLI/HTTP auth', () => {
   it('supports scope isolation, priority ranking, FTS5 + short-token LIKE search, bi-temporal supersede, Layer 1 budget & MEMORY.md projection', () => {
     const dataDir = makeTempDir()
     const repoA = makeTempDir('repo-a-')
     const repoB = makeTempDir('repo-b-')
     const store = new LarkBridgeStore(dataDir)
-    const memory = new BridgeMemoryService(dataDir, store)
+    const memory = new MemoryService(dataDir, store)
 
     store.upsertBot({
       id: 'bot-main',
@@ -183,7 +183,7 @@ describe('BridgeMemoryService: SOTA typed memory, scope isolation, FTS5 search, 
       workingDir: repoA,
     })
     expect(reminder).toBeDefined()
-    expect(reminder).toContain('<bridge_memory bot_id="bot-main"')
+    expect(reminder).toContain('<memory bot_id="bot-main"')
     expect(reminder).toContain('禁止在晚间自动合并 PR')
     expect(reminder).toContain('存储层已升级至 SQLite WAL v3 + FTS5')
     expect(reminder).toContain('发布监控看板入口')
@@ -207,7 +207,7 @@ describe('BridgeMemoryService: SOTA typed memory, scope isolation, FTS5 search, 
     expect(existsSync(mdPath)).toBe(true)
     expect(existsSync(join(repoA, '.local'))).toBe(false)
     const mdText = readFileSync(mdPath, 'utf8')
-    expect(mdText).toContain('# Bridge Memory — 研发助手 (bot-main)')
+    expect(mdText).toContain('# Memory — 研发助手 (bot-main)')
     expect(mdText).toContain('禁止在晚间自动合并 PR')
     expect(mdText).toContain('存储层已升级至 SQLite WAL v3 + FTS5')
     expect(mdText).not.toContain('存储层迁移至 SQLite WAL')
@@ -219,7 +219,7 @@ describe('BridgeMemoryService: SOTA typed memory, scope isolation, FTS5 search, 
     const dataDir = makeTempDir()
     const workDir = makeTempDir('work-')
     const store = new LarkBridgeStore(dataDir)
-    const memory = new BridgeMemoryService(dataDir, store)
+    const memory = new MemoryService(dataDir, store)
 
     store.upsertBot({
       id: 'cli-bot',

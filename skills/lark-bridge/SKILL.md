@@ -1,6 +1,6 @@
 ---
 name: lark-bridge
-description: DSH 飞书桥接（dsh-lark-bridge）辅助技能与 CLI。用于在飞书会话或自动化任务中查询当前绑定的智能体与群上下文、获取应用级真实群成员 OpenID（用于 @ 提及）、主动发送图片/文件附件/自定义飞书卡片/进度播报、读取群聊或话题历史消息与被引用消息附件、读写跨运行时 Bridge Memory 长期记忆（memory）、管理一次性智能跟进提醒事项（reminder）、创建隔离 Git Worktree 分支（worktree），以及管理周期性定时任务（schedule）。
+description: DSH 飞书桥接（dsh-lark-bridge）辅助技能与 CLI。用于在飞书会话或自动化任务中查询当前绑定的智能体与群上下文、获取应用级真实群成员 OpenID（用于 @ 提及）、主动发送图片/文件附件/自定义飞书卡片/进度播报、读取群聊或话题历史消息与被引用消息附件、读写跨运行时 Memory 长期记忆（memory）、管理一次性智能跟进提醒事项（reminder）、创建隔离 Git Worktree 分支（worktree），以及管理周期性定时任务（schedule）。
 ---
 
 # lark-bridge — 飞书桥接工具指南
@@ -131,7 +131,7 @@ lark-bridge schedule run <scheduleId>
 
 ### 7. 跨运行时长期记忆（`memory`）
 
-Bridge Memory 为所有原生与外部运行时提供统一的长期记忆库（四类分类：`feedback` 纠偏规则、`user` 用户偏好、`project` 项目决策、`reference` 外部指针；三级作用域：`bot` 全局、`chat` 群聊、`workspace` 工作区；支持双时态纠偏 `supersede`）：
+Memory 为所有原生与外部运行时提供统一的长期记忆库（四类分类：`feedback` 纠偏规则、`user` 用户偏好、`project` 项目决策、`reference` 外部指针；三级作用域：`bot` 全局、`chat` 群聊、`workspace` 工作区；支持双时态纠偏 `supersede`）：
 
 ```bash
 # 列出或检索记忆（默认按当前会话自动推断 --bot；支持中文与英文关键词）

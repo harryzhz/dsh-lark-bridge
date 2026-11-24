@@ -326,7 +326,7 @@ export async function dispatchLarkApiRequest(
       }
     }
 
-    // ── Bridge Memory (Runtime-Agnostic Long-Term Memory) ────────────────
+    // ── Memory (Runtime-Agnostic Long-Term Memory) ───────────────────────
     if (segments[0] === 'memory') {
       const handled = await dispatchMemoryApiRequest(manager, {
         method,
