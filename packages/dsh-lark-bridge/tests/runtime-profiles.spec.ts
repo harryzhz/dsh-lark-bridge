@@ -23,8 +23,10 @@ import {
   type RuntimeProfileSummary,
 } from '../src/runtime-catalog.js'
 import { ScheduleNotifier } from '../src/schedule-notifier.js'
+import { SessionCoordinator } from '../src/session-coordinator.js'
 import { handleSlashCommand } from '../src/slash-commands.js'
 import { LarkBridgeStore } from '../src/store.js'
+import { WorkspaceGrouping } from '../src/workspace-grouping.js'
 
 const tempDirs: string[] = []
 afterEach(() => {
@@ -453,5 +455,169 @@ describe('RuntimeCatalog, HTTP API, Slash Commands & ScheduleNotifier profile su
       runtimeId: 'agy',
       profileId: 'demo-proxy',
     })
+  })
+
+  it('prefers profile catalog isDefault over parent runtime static defaultModel in resolveDefaultModel', async () => {
+    const { ctx, profiles } = createRuntimeContext()
+    profiles.set('agy:settings-only', {
+      id: 'settings-only',
+      runtimeId: 'agy',
+      name: 'Settings Only Proxy',
+      source: 'user',
+      configFile: '~/.config/demo-proxy/agy/settings.json',
+      // Intentionally no explicit defaultModel (relies on settings.json probed as isDefault)
+    })
+    const extDir = ctx.get('externalRuntimes' as never) as {
+      listModelsForRuntime: (runtimeId: string, profileId?: string) => Promise<unknown[]>
+    }
+    const origListModels = extDir.listModelsForRuntime
+    extDir.listModelsForRuntime = async (runtimeId: string, profileId?: string) => {
+      if (runtimeId === 'agy' && profileId === 'settings-only') {
+        return [
+          { id: 'gemini-4-neon', name: 'Gemini 4 Neon' },
+          { id: 'gemini-4-carbon', name: 'Gemini 4 Carbon', isDefault: true },
+        ]
+      }
+      return origListModels(runtimeId, profileId)
+    }
+
+    const runtimes = new RuntimeCatalog(ctx)
+    await expect(
+      runtimes.resolveDefaultModel('agy', 'gemini-4-neon', 'settings-only'),
+    ).resolves.toBe('gemini-4-carbon')
+  })
+
+  it('passes agentOptions and reconciles missing model selection on external cold resume without clobbering manual overrides', async () => {
+    const { ctx } = createRuntimeContext()
+    const store = new LarkBridgeStore(makeTempDir())
+    const runtimes = new RuntimeCatalog(ctx)
+    const resumeCalls: unknown[] = []
+    let currentSel: { provider: string; model: string; reasoningEffort?: string } | undefined
+    const selectMock = vi.fn((next: { provider: string; model: string; reasoningEffort?: string }) => {
+      currentSel = next
+    })
+    const liveAgents = new Map<string, unknown>()
+
+    ;(ctx as unknown as { agents: Record<string, unknown> }).agents = {
+      get: (id: string) => liveAgents.get(id),
+      resume: vi.fn(async (opts: { resumeSessionId: string }) => {
+        resumeCalls.push(opts)
+        const fakeAgent = {
+          id: opts.resumeSessionId,
+          session: { id: opts.resumeSessionId, header: { cwd: '/tmp', agentPreset: 'agy' } },
+          model: {
+            current: () => currentSel,
+            select: selectMock,
+          },
+        }
+        liveAgents.set(opts.resumeSessionId, fakeAgent)
+        return { agent: fakeAgent, dispose: vi.fn() }
+      }),
+    }
+
+    const bot = store.upsertBot({
+      id: 'b-resume',
+      name: 'ResumeBot',
+      larkAppId: 'cli_resume_1',
+      larkAppSecret: 'sec_resume_1',
+      agentPreset: 'agy',
+      runtimeProfileId: 'demo-proxy',
+      model: 'gemini-4-carbon',
+      reasoningEffort: 'medium',
+      defaultWorkingDir: '/tmp',
+    })
+
+    const routeKey = 'cli_resume_1:oc_team:om_root_1'
+    store.upsertBinding({
+      routeKey,
+      botId: bot.id,
+      botName: bot.name,
+      larkAppId: bot.larkAppId,
+      chatType: 'group',
+      chatId: 'oc_team',
+      chatName: 'Demo Group',
+      workspaceName: 'tmp',
+      sessionId: 'session-ext-resume-1',
+      agentPreset: 'agy',
+      runtimeProfileId: 'demo-proxy',
+      model: 'gemini-4-carbon',
+      reasoningEffort: 'medium',
+      workingDir: '/tmp',
+      trigger: 'mention',
+      hasReplied: true,
+      createdAtMs: Date.now() - 60_000,
+      lastActivityMs: Date.now() - 30_000,
+    })
+
+    const workspaces = { attachSession: vi.fn(async () => {}) } as unknown as WorkspaceGrouping
+    const coordinator = new SessionCoordinator({
+      ctx,
+      store,
+      runtimes,
+      workspaces,
+      instrumentAgent: vi.fn(),
+      disposeReminderHandle: vi.fn(async () => {}),
+    })
+
+    const msg = {
+      botId: bot.id,
+      larkAppId: bot.larkAppId,
+      botOpenId: 'ou_bot_resume',
+      messageId: 'om_follow_1',
+      rootId: 'om_root_1',
+      chatId: 'oc_team',
+      chatType: 'group' as const,
+      msgType: 'text',
+      senderOpenId: 'ou_user_1',
+      senderType: 'user' as const,
+      text: 'continue',
+      rawContent: '{"text":"continue"}',
+      mentions: [],
+      imageKeys: [],
+      createTimeMs: Date.now(),
+    }
+    const decision = {
+      action: 'agent' as const,
+      trigger: 'active-thread' as const,
+      routeKey,
+      workingDir: '/tmp',
+      workspaceName: 'tmp',
+      agentPreset: 'agy',
+      runtimeProfileId: 'demo-proxy',
+      model: 'gemini-4-carbon',
+      reasoningEffort: 'medium',
+      replyMode: 'reply' as const,
+      sessionMode: 'thread' as const,
+      allowSilentEmptyReply: false,
+      autoCloseAfterCompletion: false,
+    }
+
+    // 1. Cold resume where legacy session has no recorded selection (currentSel === undefined)
+    currentSel = undefined
+    const acquired1 = await coordinator.acquireAgent(bot, msg, decision)
+    expect(acquired1.isNew).toBe(false)
+    expect(resumeCalls).toEqual([
+      {
+        resumeSessionId: 'session-ext-resume-1',
+        agentOptions: {
+          provider: 'agy-cli',
+          model: 'gemini-4-carbon',
+          reasoningEffort: 'medium',
+        },
+      },
+    ])
+    expect(selectMock).toHaveBeenCalledTimes(1)
+    expect(selectMock).toHaveBeenCalledWith({
+      provider: 'agy-cli',
+      model: 'gemini-4-carbon',
+      reasoningEffort: 'medium',
+    })
+
+    // 2. Subsequent turn after user manually switched model via /model (same provider, config unchanged)
+    //    must NOT clobber the user's live session override.
+    selectMock.mockClear()
+    currentSel = { provider: 'agy-cli', model: 'gpt-6.1-sol', reasoningEffort: 'high' }
+    await coordinator.acquireAgent(bot, msg, decision)
+    expect(selectMock).not.toHaveBeenCalled()
   })
 })

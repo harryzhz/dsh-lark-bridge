@@ -634,12 +634,23 @@ export class RuntimeCatalog {
     const ext = this.directory()?.get(presetId)
     const profileId = runtimeProfileId?.trim() || undefined
     const profileMeta = profileId ? this.getProfile(presetId, profileId) : undefined
-    const configured = profileMeta?.defaultModel ?? fallbackDefault ?? ext?.defaultModel ?? ''
+    const explicitProfileDefault = profileMeta?.defaultModel?.trim() || ''
+    const baseConfigured = fallbackDefault?.trim() || ext?.defaultModel?.trim() || ''
+    const configured = explicitProfileDefault || baseConfigured
     if (!ext) return configured
     const catalog = profileId
       ? await this.modelsForRuntime(presetId, profileId).catch(() => undefined)
       : await this.modelsForProvider(ext.providerId).catch(() => undefined)
     if (!catalog || catalog.length === 0) return configured
+    if (profileId) {
+      if (explicitProfileDefault && catalog.some((m) => m.id === explicitProfileDefault)) {
+        return explicitProfileDefault
+      }
+      const catalogDefault = catalog.find((m) => m.isDefault)?.id
+      if (catalogDefault) return catalogDefault
+      if (baseConfigured && catalog.some((m) => m.id === baseConfigured)) return baseConfigured
+      return catalog[0]?.id ?? configured
+    }
     if (configured && catalog.some((m) => m.id === configured)) return configured
     return catalog.find((m) => m.isDefault)?.id ?? catalog[0]?.id ?? configured
   }

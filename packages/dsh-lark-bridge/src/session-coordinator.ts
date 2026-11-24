@@ -591,16 +591,20 @@ export class SessionCoordinator {
     if (!agent) {
       actor.state = 'creating'
       try {
+        const agentOptions = {
+          ...(launch.provider ? { provider: launch.provider } : {}),
+          ...(launch.model ? { model: launch.model } : {}),
+          ...(launch.reasoningEffort ? { reasoningEffort: launch.reasoningEffort } : {}),
+        }
         const handle = await this.host.ctx.agents.resume(
           launch.isExternal
-            ? { resumeSessionId: sessionId }
+            ? {
+                resumeSessionId: sessionId,
+                ...(Object.keys(agentOptions).length > 0 ? { agentOptions } : {}),
+              }
             : {
                 resumeSessionId: sessionId,
-                agentOptions: {
-                  ...(launch.provider ? { provider: launch.provider } : {}),
-                  ...(launch.model ? { model: launch.model } : {}),
-                  ...(launch.reasoningEffort ? { reasoningEffort: launch.reasoningEffort } : {}),
-                },
+                agentOptions,
                 setup: async (agentCtx) => {
                   await launch.mountPreset(agentCtx)
                 },
@@ -619,33 +623,42 @@ export class SessionCoordinator {
 
     const modelChanged = (binding.model ?? '') !== (decision.model ?? '')
     const effortChanged = (binding.reasoningEffort ?? '') !== (decision.reasoningEffort ?? '')
-    if ((modelChanged || effortChanged) && agent.model?.select) {
+    const currentSel = agent.model?.current?.()
+    const expectedProvider =
+      launch.provider ??
+      this.host.runtimes.providerFor(decision.agentPreset) ??
+      bot.provider
+    const selectionMissingOrMismatched =
+      !currentSel || Boolean(expectedProvider && currentSel.provider !== expectedProvider)
+
+    if ((modelChanged || effortChanged || selectionMissingOrMismatched) && agent.model?.select) {
       const provider =
-        agent.model.current?.()?.provider ??
-        launch.provider ??
-        this.host.runtimes.providerFor(decision.agentPreset) ??
-        bot.provider
-      const targetModel = decision.model ?? launch.model ?? agent.model.current?.()?.model
+        (selectionMissingOrMismatched ? expectedProvider : currentSel?.provider) ??
+        expectedProvider
+      const targetModel = decision.model ?? launch.model ?? currentSel?.model
+      const targetEffort = decision.reasoningEffort ?? launch.reasoningEffort
       if (provider && targetModel) {
         try {
           agent.model.select({
             provider,
             model: targetModel,
-            ...(decision.reasoningEffort
-              ? { reasoningEffort: brandString<ReasoningEffortId>(decision.reasoningEffort) }
+            ...(targetEffort
+              ? { reasoningEffort: brandString<ReasoningEffortId>(targetEffort) }
               : {}),
           })
         } catch {
           // Ignore if native adapter does not support runtime hot-select.
         }
       }
-      this.host.store.upsertBinding({
-        ...binding,
-        ...(decision.model ? { model: decision.model } : { model: undefined }),
-        ...(decision.reasoningEffort
-          ? { reasoningEffort: decision.reasoningEffort }
-          : { reasoningEffort: undefined }),
-      })
+      if (modelChanged || effortChanged) {
+        this.host.store.upsertBinding({
+          ...binding,
+          ...(decision.model ? { model: decision.model } : { model: undefined }),
+          ...(decision.reasoningEffort
+            ? { reasoningEffort: decision.reasoningEffort }
+            : { reasoningEffort: undefined }),
+        })
+      }
     }
 
     this.host.instrumentAgent(agent)
