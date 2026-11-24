@@ -60,6 +60,7 @@ const DEFAULT_USER_SCOPES = [
 
 const BASELINE_APP_EVENTS = [
   'im.message.receive_v1',
+  'im.message.recalled_v1',
   'im.chat.member.bot.added_v1',
   'im.chat.member.bot.deleted_v1',
   'im.message.reaction.created_v1',

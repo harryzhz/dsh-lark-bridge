@@ -12,6 +12,7 @@ import {
   type LarkPlatformManager,
   type LarkQrJobView,
   type LarkUserSearchHit,
+  type RecalledLarkMessageEvent,
   type SubstituteTarget,
   type TransportDiagnosticsSnapshot,
 } from '@dsh-lark/lark-core'
@@ -40,6 +41,11 @@ export interface BotConnectionPoolHost {
     transport: LarkBotTransport,
     msg: InboundLarkMessage,
   ) => Promise<void>
+  readonly onMessageRecalled?: (
+    botId: string,
+    transport: LarkBotTransport,
+    event: RecalledLarkMessageEvent,
+  ) => Promise<void> | void
   readonly onCardAction: (action: CardActionEvent) => Promise<{ toast?: string } | void>
   readonly onBotReady: (botId: string) => void
 }
@@ -388,6 +394,7 @@ export class BotConnectionPool {
 
     const transport: LarkBotTransport = new LarkBotTransport(bot, {
       onMessage: (msg) => this.host.onInboundMessage(bot.id, transport, msg),
+      onMessageRecalled: (event) => this.host.onMessageRecalled?.(bot.id, transport, event),
       onCardAction: (action) => this.host.onCardAction(action),
       onChatMembershipChange: () => {
         void this.syncJoinedChats(bot.id)

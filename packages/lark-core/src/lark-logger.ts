@@ -32,6 +32,12 @@ export function explainLarkErrorCode(code: string | number | undefined): string 
   return KNOWN_ERROR_HINTS[key]
 }
 
+export function isLarkMessageRecalledError(err: unknown): boolean {
+  if (err === undefined || err === null) return false
+  const formatted = formatSdkLogArgs([err])
+  return formatted.code === '230006'
+}
+
 const REDACT_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
   [/Bearer\s+[A-Za-z0-9._-]+/gi, 'Bearer [REDACTED]'],
   [/"?(?:app_secret|larkAppSecret|client_secret|tenant_access_token|user_access_token|refresh_token|access_token)"?\s*[:=]\s*"?[^",\s}]+"?/gi, '[REDACTED_SECRET]'],

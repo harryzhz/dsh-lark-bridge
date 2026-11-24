@@ -6,6 +6,7 @@ import { hasVisibleText, trimInvisibleText } from '@dsh-lark/lark-core'
 
 export type TurnAbortKind =
   | 'disposed'
+  | 'recalled'
   | 'user'
   | 'parent'
   | 'hook'
@@ -152,6 +153,12 @@ export class TurnFinalReplyTracker {
 
 const claimedTurnsBySession = new Map<string, Set<number>>()
 const POST_STEP_STALL_WARN_MS = 3_000
+const DEFAULT_CANCEL_SETTLE_TIMEOUT_MS = 5_000
+
+function toCancelAbortError(reason: unknown): TurnAbortedError {
+  if (reason instanceof TurnAbortedError) return reason
+  return new TurnAbortedError('recalled', '原消息已撤回，已取消当前轮次并停止执行')
+}
 
 function claimSessionTurn(sessionId: string, turn: number): boolean {
   let set = claimedTurnsBySession.get(sessionId)
@@ -178,6 +185,13 @@ export interface RunTurnOptions {
   readonly onIntermediate?: (text: string) => void | Promise<void>
   readonly onActivity?: (timestampMs: number) => void
   readonly signal?: AbortSignal
+  /**
+   * Optional per-turn cancellation signal (e.g. inbound message recalled).
+   * Fires `agent.cancel({ kind: 'user' }, { keepInbox: true })` to stop active
+   * execution and awaits `turn/end` settlement up to `cancelFallbackTimeoutMs`.
+   */
+  readonly cancelSignal?: AbortSignal
+  readonly cancelFallbackTimeoutMs?: number
 }
 
 /**
@@ -196,12 +210,24 @@ export function runTurnAndCollectReply(
       reject(new TurnAbortedError('disposed', '本轮执行因服务重载或停机已中断'))
       return
     }
+    if (options.cancelSignal?.aborted) {
+      reject(toCancelAbortError(options.cancelSignal.reason))
+      return
+    }
 
     const sessionId = String(agent.session.id)
     const userMessage = createUserMessage({ content, source: { kind: 'user' } })
     const expectedUserMessageId = (userMessage as { id?: string }).id
+    let cancelError: TurnAbortedError | undefined
+    let cancelTimer: ReturnType<typeof setTimeout> | undefined
+    const guardedOnIntermediate = options.onIntermediate
+      ? (text: string) => {
+          if (cancelError || options.cancelSignal?.aborted) return
+          return options.onIntermediate!(text)
+        }
+      : undefined
     let tracker = new TurnFinalReplyTracker({
-      ...(options.onIntermediate ? { onIntermediate: options.onIntermediate } : {}),
+      ...(guardedOnIntermediate ? { onIntermediate: guardedOnIntermediate } : {}),
     })
     let targetTurn: number | undefined
     let targetTurnConfirmed = false
@@ -215,9 +241,46 @@ export function runTurnAndCollectReply(
       fail(new TurnAbortedError('disposed', '本轮执行因服务重载或停机已中断'))
     }
 
+    const onCancelSignal = () => {
+      if (cancelError) return
+      cancelError = toCancelAbortError(options.cancelSignal?.reason)
+      if (phase === 'settled') return
+      if (phase === 'flushing') {
+        phase = 'settled'
+        cleanup()
+        reject(cancelError)
+        return
+      }
+      const cancelFn = (agent as { cancel?: Agent['cancel'] }).cancel
+      if (typeof cancelFn === 'function') {
+        try {
+          cancelFn.call(agent, { kind: 'user' }, { keepInbox: true })
+        } catch {
+          // Fall through to timeout/immediate rejection if agent.cancel throws.
+        }
+        const fallbackMs = Math.max(
+          50,
+          options.cancelFallbackTimeoutMs ?? DEFAULT_CANCEL_SETTLE_TIMEOUT_MS,
+        )
+        cancelTimer = setTimeout(() => {
+          if (phase === 'running' && cancelError) {
+            fail(cancelError)
+          }
+        }, fallbackMs)
+        cancelTimer.unref?.()
+      } else {
+        fail(cancelError)
+      }
+    }
+
     const cleanup = (skipDisposeEffect = false) => {
       releaseSessionTurn(sessionId, targetTurn)
       options.signal?.removeEventListener('abort', onAbortSignal)
+      options.cancelSignal?.removeEventListener('abort', onCancelSignal)
+      if (cancelTimer) {
+        clearTimeout(cancelTimer)
+        cancelTimer = undefined
+      }
       if (offEvent) {
         const fn = offEvent
         offEvent = undefined
@@ -240,6 +303,12 @@ export function runTurnAndCollectReply(
 
     const succeed = (text: string) => {
       if (phase === 'settled') return
+      if (cancelError || options.cancelSignal?.aborted) {
+        phase = 'settled'
+        cleanup()
+        reject(cancelError ?? toCancelAbortError(options.cancelSignal?.reason))
+        return
+      }
       phase = 'settled'
       cleanup()
       resolve(text)
@@ -253,6 +322,7 @@ export function runTurnAndCollectReply(
     }
 
     options.signal?.addEventListener('abort', onAbortSignal, { once: true })
+    options.cancelSignal?.addEventListener('abort', onCancelSignal, { once: true })
 
     try {
       offEvent = ctx.on(
@@ -282,7 +352,7 @@ export function runTurnAndCollectReply(
               lastStepEndAtMs = undefined
               lastAssistantMessageAtMs = undefined
               tracker = new TurnFinalReplyTracker({
-                ...(options.onIntermediate ? { onIntermediate: options.onIntermediate } : {}),
+                ...(guardedOnIntermediate ? { onIntermediate: guardedOnIntermediate } : {}),
               })
               return
             }
@@ -292,6 +362,7 @@ export function runTurnAndCollectReply(
             event.data.turn === targetTurn
           ) {
             targetTurnConfirmed = true
+            if (cancelError || options.cancelSignal?.aborted) return
             const nowMs = Date.now()
             if (event.type === 'assistant/message') {
               lastAssistantMessageAtMs = nowMs
@@ -314,6 +385,10 @@ export function runTurnAndCollectReply(
             return
           }
           if (event.type === 'turn/end' && event.data.turn === targetTurn) {
+            if (cancelError || options.cancelSignal?.aborted) {
+              fail(cancelError ?? toCancelAbortError(options.cancelSignal?.reason))
+              return
+            }
             const stallAnchorMs = lastStepEndAtMs ?? lastAssistantMessageAtMs
             if (stallAnchorMs !== undefined) {
               const postStepGapMs = Date.now() - stallAnchorMs

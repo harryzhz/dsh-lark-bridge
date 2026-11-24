@@ -376,6 +376,25 @@ export class TriageContextStore {
     return summary.text
   }
 
+  removeMessage(messageId: string): boolean {
+    const targetId = messageId.trim()
+    if (!targetId) return false
+    let removed = false
+    for (const [scopeKey, bucket] of [...this.recentByScope.entries()]) {
+      const nextEntries = bucket.entries.filter((e) => e.messageId !== targetId)
+      if (nextEntries.length === bucket.entries.length) continue
+      removed = true
+      if (nextEntries.length === 0) {
+        this.recentByScope.delete(scopeKey)
+        this.deletePersistedScope(scopeKey, 'history')
+      } else {
+        bucket.entries.splice(0, bucket.entries.length, ...nextEntries)
+        this.persistScope(scopeKey, 'history', bucket, bucket.updatedAtMs)
+      }
+    }
+    return removed
+  }
+
   clearRoute(routeKey: string): void {
     const normalized = this.normalizeRouteKey(routeKey)
     const primary =
@@ -672,6 +691,15 @@ export class LlmTriageService {
 
     const finishedAtMs = Date.now()
     const durationMs = finishedAtMs - startedAtMs
+
+    if (input.signal?.aborted) {
+      return {
+        verdict: { action: 'silent', reason: '原消息已撤回或服务正在关闭，已取消分流' },
+        provider: target.provider,
+        model: target.model,
+        durationMs,
+      }
+    }
 
     if (run.errorMessage) {
       this.ctx.logger.warn(
