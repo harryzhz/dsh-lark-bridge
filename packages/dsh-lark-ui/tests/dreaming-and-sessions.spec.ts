@@ -20,7 +20,6 @@ vi.mock('@deepseek-ai/dsh-client-ui-primitives', () => {
 })
 
 import { buildDreamStatusPresentation } from '../src/components/ExperimentalSection.js'
-import { buildTriageUserMessagePreview } from '../src/components/TriageConfigFields.js'
 import { mergeSessionRows } from '../src/views/SessionsView.js'
 import type { DreamRunState, DreamSession, SessionBinding, TriageSession } from '../src/types.js'
 
@@ -169,35 +168,5 @@ describe('Dreaming status presentation & unified SessionsView merging', () => {
 
     const dreamOnly = mergeSessionRows(bindings, dreams, 'dreaming', triages)
     expect(dreamOnly.map(rowId)).toEqual(['sess-dream-new', 'sess-dream-old'])
-  })
-
-  it('generates live UserMessage preview reflecting recentMessageCount, contextTtlMinutes, and includeLastReply', () => {
-    const full = buildTriageUserMessagePreview(
-      {
-        scope: 'passive_only',
-        recentMessageCount: 10,
-        contextTtlMinutes: 45,
-        includeLastReply: true,
-      },
-      { chatName: '研发协作群', listenerName: '项目讨论' },
-    )
-    expect(full).toContain('trigger=listener')
-    expect(full).toContain('chat="研发协作群"')
-    expect(full).toContain('listener="项目讨论"')
-    expect(full).toContain('<last_reply>')
-    expect(full).toContain('<recent_context>')
-    expect(full).toContain('最近 45 分钟内最多携带 10 条上下文')
-    expect(full).toContain('<incoming_message>')
-
-    const minimal = buildTriageUserMessagePreview({
-      scope: 'all_group',
-      recentMessageCount: 0,
-      contextTtlMinutes: 30,
-      includeLastReply: false,
-    })
-    expect(minimal).toContain('trigger=mention')
-    expect(minimal).not.toContain('<last_reply>')
-    expect(minimal).not.toContain('<recent_context>')
-    expect(minimal).toContain('<incoming_message>')
   })
 })

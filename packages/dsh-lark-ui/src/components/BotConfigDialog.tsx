@@ -1075,7 +1075,6 @@ function EditBotDialog({
                 runtimes={runtimes}
                 models={models}
                 triageDefaults={triageDefaults}
-                previewContext={{ botName: draft.name || existingId }}
                 onChange={(next) => patch({ router: { ...draft.router, ...next } })}
               />
             </NestedSettings>

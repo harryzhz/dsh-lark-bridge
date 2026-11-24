@@ -38,72 +38,6 @@ export interface TriageFieldsValue {
   readonly coalesceQueuedMessages: boolean
 }
 
-export interface TriagePreviewContext {
-  readonly botName?: string
-  readonly chatName?: string
-  readonly listenerName?: string
-}
-
-const SAMPLE_RECENT_ENTRIES: ReadonlyArray<string> = [
-  '- [成员A] 刚发了一个版本，大家关注下线上指标',
-  '- [智能体] 已记录本次变更，如触发异常可直接排查',
-  '- [成员B] 登录接口偶发 504，麻烦看下是不是超时配置问题',
-  '- [智能体] 排查完毕，请问按方案 A 还是方案 B 调整超时？',
-]
-
-/**
- * Generates a live preview mirroring `@dsh-lark/lark-core`'s `buildTriageUserMessage()`
- * for the currently configured triage parameters.
- */
-export function buildTriageUserMessagePreview(
-  value: Pick<
-    TriageFieldsValue,
-    'scope' | 'recentMessageCount' | 'contextTtlMinutes' | 'includeLastReply'
-  >,
-  ctx: TriagePreviewContext = {},
-): string {
-  const trigger = ctx.listenerName
-    ? 'listener'
-    : value.scope === 'all_group'
-      ? 'mention'
-      : 'active-thread'
-  const chatName = ctx.chatName?.trim() || '示例群聊'
-  const metaParts = [
-    `trigger=${trigger}`,
-    'has_active_session=true',
-    'session_busy=false',
-    `chat="${chatName}"`,
-    ...(ctx.listenerName ? [`listener="${ctx.listenerName}"`] : []),
-    'sender_type=user',
-    'sender="成员B"',
-  ]
-
-  const sections: string[] = [`<triage_meta ${metaParts.join(' ')} />`]
-
-  if (value.includeLastReply) {
-    sections.push(
-      '<last_reply>\n排查完毕，请问按方案 A 还是方案 B 调整超时？（实际运行时透传上一轮主回复全文）\n</last_reply>',
-    )
-  }
-
-  const maxRecent = Math.max(0, Math.floor(value.recentMessageCount))
-  if (maxRecent > 0) {
-    const shownCount = Math.min(maxRecent, SAMPLE_RECENT_ENTRIES.length)
-    const lines = SAMPLE_RECENT_ENTRIES.slice(-shownCount)
-    if (maxRecent > SAMPLE_RECENT_ENTRIES.length) {
-      lines.unshift(
-        `…（最近 ${value.contextTtlMinutes} 分钟内最多携带 ${maxRecent} 条上下文，原文不截断）`,
-      )
-    }
-    sections.push(`<recent_context>\n${lines.join('\n')}\n</recent_context>`)
-  }
-
-  sections.push(
-    '<incoming_message>\n好的，按方案 B 调整吧（实际运行时透传入站消息全文）\n</incoming_message>',
-  )
-  return sections.join('\n\n')
-}
-
 function listNativeModelGroups(
   models: readonly ModelGroup[],
   runtimes: readonly RuntimeOption[],
@@ -257,12 +191,10 @@ function ToolSchemaModal({
 function TriagePromptSection({
   value,
   triageDefaults,
-  previewContext,
   onChange,
 }: {
   value: TriageFieldsValue
   triageDefaults: TriageDefaultsPayload
-  previewContext?: TriagePreviewContext
   onChange: (patch: Partial<TriageFieldsValue>) => void
 }) {
   const promptRef = useRef<HTMLTextAreaElement | null>(null)
@@ -273,27 +205,6 @@ function TriagePromptSection({
   const isPromptCustomized =
     Boolean(value.systemPrompt.trim()) && value.systemPrompt.trim() !== defaultPrompt.trim()
   const toolSchema = triageDefaults.toolSchema ?? FALLBACK_TRIAGE_DEFAULTS.toolSchema!
-
-  const userPreviewText = useMemo(
-    () => buildTriageUserMessagePreview(value, previewContext),
-    [
-      value.scope,
-      value.recentMessageCount,
-      value.contextTtlMinutes,
-      value.includeLastReply,
-      previewContext?.botName,
-      previewContext?.chatName,
-      previewContext?.listenerName,
-    ],
-  )
-
-  const previewSummary = [
-    value.recentMessageCount > 0
-      ? `最近 ${value.recentMessageCount} 条（${value.contextTtlMinutes} 分钟内）`
-      : '不带历史消息',
-    value.includeLastReply ? '含上一轮主回复' : '不含上一轮主回复',
-    '全文不截断',
-  ].join(' · ')
 
   const updatePrompt = (nextText: string) => {
     if (!nextText.trim() || nextText.trim() === defaultPrompt.trim()) {
@@ -400,9 +311,6 @@ function TriagePromptSection({
           onChange={(includeLastReply) => onChange({ includeLastReply })}
         />
       </SettingRow>
-      <SettingRow title="UserMessage 预览" desc={`按当前配置实时生成：${previewSummary}`} stack>
-        <pre className="fb-code-preview fb-mono">{userPreviewText}</pre>
-      </SettingRow>
 
       {schemaOpen && <ToolSchemaModal schema={toolSchema} onClose={() => setSchemaOpen(false)} />}
     </>
@@ -419,7 +327,6 @@ export function TriageConfigFields({
   models,
   triageDefaults = FALLBACK_TRIAGE_DEFAULTS,
   emptyModelLabel = '跟随 DSH 默认原生模型',
-  previewContext,
   onChange,
 }: {
   value: TriageFieldsValue
@@ -427,7 +334,6 @@ export function TriageConfigFields({
   models: readonly ModelGroup[]
   triageDefaults?: TriageDefaultsPayload
   emptyModelLabel?: string
-  previewContext?: TriagePreviewContext
   onChange: (patch: Partial<TriageFieldsValue>) => void
 }) {
   const nativeGroups = listNativeModelGroups(models, runtimes)
@@ -513,7 +419,6 @@ export function TriageConfigFields({
       <TriagePromptSection
         value={value}
         triageDefaults={triageDefaults}
-        previewContext={previewContext}
         onChange={onChange}
       />
     </>

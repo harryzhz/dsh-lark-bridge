@@ -450,13 +450,6 @@ export function GroupConfigDialog({
                       models={models}
                       triageDefaults={triageDefaults}
                       emptyModelLabel={emptyGroupModelLabel}
-                      previewContext={{
-                        botName: bot?.name || target.botName,
-                        chatName: draft.chatName || target.chatName,
-                        ...(draft.listener.enabled && draft.listener.name
-                          ? { listenerName: draft.listener.name }
-                          : {}),
-                      }}
                       onChange={(next) =>
                         patch({ router: { ...currentRouter, mode: 'override', ...next } })
                       }
