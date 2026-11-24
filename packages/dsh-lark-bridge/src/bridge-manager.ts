@@ -511,11 +511,16 @@ export class LarkBridgeManager {
     return this.connections.listBotStatuses()
   }
 
-  syncBot(
+  async syncBot(
     botId: string,
     options: { readonly preserveLocalDescription?: boolean } = {},
   ): Promise<void> {
-    return this.connections.syncBot(botId, options)
+    this.inbound.cancelDisabledTurns(botId)
+    await this.connections.syncBot(botId, options)
+  }
+
+  cancelDisabledTurns(botId: string, chatId?: string): number {
+    return this.inbound.cancelDisabledTurns(botId, chatId)
   }
 
   ensureBotProfileHydrated(botId: string): Promise<void> {

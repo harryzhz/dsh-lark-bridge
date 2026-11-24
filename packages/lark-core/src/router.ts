@@ -297,7 +297,7 @@ function isUserAllowedForP2p(bot: LarkBotConfig, senderOpenId?: string): boolean
   return bot.allowedUsers.includes(senderOpenId)
 }
 
-function isGroupEnabled(bot: LarkBotConfig, group?: LarkGroupConfig): boolean {
+export function isGroupEnabled(bot: LarkBotConfig, group?: LarkGroupConfig): boolean {
   if (group) return group.enabled
   return bot.groupAccessMode === 'all_joined'
 }
@@ -565,6 +565,9 @@ export function decideLarkRouting(
       : existingThreadTrigger === 'listener'
         ? hasThreadReplied && mentionTriggerMode === 'mention_and_active_thread'
         : mentionTriggerMode === 'mention_and_active_thread'
+  const isActiveThreadContext = Boolean(
+    (msg.rootId || msg.threadId) && (hasWorkerSession || hasEphemeralThread),
+  )
   const allowSenderInActiveThread =
     msg.senderType !== 'bot' ||
     (existingThreadTrigger === 'listener' &&
@@ -574,12 +577,26 @@ export function decideLarkRouting(
     msg.mentions.length > 0 &&
     msg.imageKeys.length === 0 &&
     stripBotMentions(msg.text, msg.mentions).length === 0
+  if (isActiveThreadContext && !allowSenderInActiveThread) {
+    // Never fall through to passive listeners when a peer bot posts in an active thread
+    // (otherwise a bot-enabled `scope: 'all'` listener would re-trigger a multi-bot loop).
+    return { action: 'ignore', reason: 'no_matching_rule' }
+  }
+  const matchesSubstituteTarget =
+    bot.substituteMode.enabled &&
+    bot.substituteMode.targets.length > 0 &&
+    (msg.msgType === 'text' || msg.msgType === 'post') &&
+    bot.substituteMode.targets.some(
+      (t) => mentionsOpenId(msg, t.openId) && msg.senderOpenId !== t.openId,
+    )
+  if (isActiveThreadContext && isBarePeerMentionOnly && !matchesSubstituteTarget) {
+    return { action: 'ignore', reason: 'no_matching_rule' }
+  }
   if (
     allowThreadFollowup &&
     allowSenderInActiveThread &&
     !isBarePeerMentionOnly &&
-    (msg.rootId || msg.threadId) &&
-    (hasWorkerSession || hasEphemeralThread)
+    isActiveThreadContext
   ) {
     const clean = replaceMentionKeysWithNames(msg.text, msg.mentions)
     const cmd = parseSlashCommand(clean)
