@@ -890,6 +890,7 @@ export class LlmTriageService {
       ...(input.decision.listenerName ? { listenerName: input.decision.listenerName } : {}),
       ...(input.senderName ? { senderName: input.senderName } : {}),
       senderType: input.msg.senderType,
+      msgType: input.msg.msgType,
       userText: input.decision.userText,
       ...(input.quotedMessage ? { quotedMessage: input.quotedMessage } : {}),
       ...(attachedImageCount > 0 ? { attachedImageCount } : {}),
