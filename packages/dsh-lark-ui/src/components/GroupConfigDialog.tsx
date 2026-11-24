@@ -74,6 +74,7 @@ const DEFAULT_GROUP_ROUTER: GroupRouterConfig = {
   scope: 'passive_only',
   bypass: cloneRouterBypass(DEFAULT_ROUTER_BYPASS),
   timeoutMs: 4000,
+  maxTriageImages: 5,
   systemPrompt: '',
   recentMessageCount: 6,
   contextTtlMinutes: 30,
@@ -428,6 +429,8 @@ export function GroupConfigDialog({
                             scope: base?.scope ?? currentRouter.scope,
                             bypass: cloneRouterBypass(base?.bypass ?? currentRouter.bypass),
                             timeoutMs: base?.timeoutMs ?? currentRouter.timeoutMs,
+                            maxTriageImages:
+                              base?.maxTriageImages ?? currentRouter.maxTriageImages ?? 5,
                             systemPrompt: currentRouter.systemPrompt || base?.systemPrompt || '',
                             recentMessageCount:
                               base?.recentMessageCount ?? currentRouter.recentMessageCount,

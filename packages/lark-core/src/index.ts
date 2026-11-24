@@ -66,6 +66,11 @@ export {
 } from './open-platform.js'
 export { generateDefaultBotIconPng, renderQrSvgDataUrl } from './qr-svg.js'
 export {
+  detectImageMediaType,
+  extensionForImageMediaType,
+  type SupportedImageMediaType,
+} from './image-mime.js'
+export {
   buildRouteKey,
   composeLarkContextReminder,
   composeRoleReminder,
@@ -76,6 +81,7 @@ export {
   isGroupEnabled,
   isListenerSenderEnabled,
   type LarkConversationContextInput,
+  type PrefetchedQuotedMessageSummary,
   type ScheduleContextReminderInput,
   type ScheduleTargetContextItem,
 } from './router.js'
@@ -168,6 +174,7 @@ export {
   type TriageHistoryEntry,
   type TriagePromptInput,
   type TriagePromptVariable,
+  type TriageQuotedMessage,
   type TriageSystemPromptVars,
   type TriageToolSchema,
   type TriageVerdict,

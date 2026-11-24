@@ -35,6 +35,14 @@ export interface TriageHistoryEntry {
   readonly messageId?: string
 }
 
+export interface TriageQuotedMessage {
+  readonly messageId: string
+  readonly senderName?: string
+  readonly msgType: string
+  readonly text?: string
+  readonly imageCount: number
+}
+
 export interface TriagePromptInput {
   readonly botName: string
   readonly botRoleName?: string
@@ -47,6 +55,8 @@ export interface TriagePromptInput {
   readonly senderName?: string
   readonly senderType: 'user' | 'bot'
   readonly userText: string
+  readonly quotedMessage?: TriageQuotedMessage
+  readonly attachedImageCount?: number
   readonly hasActiveWorker: boolean
   readonly workerBusy?: boolean
   readonly lastWorkerReply?: string
@@ -117,10 +127,11 @@ export const DEFAULT_TRIAGE_SYSTEM_PROMPT = [
   '## 可选动作与铁律',
   '1. `handoff`（直接移交给主运行时智能体接管，高召回优先）：',
   '   - 任何涉及代码库、文档、配置、日志、监控、工具执行、排查排障、写代码、方案设计、数据分析或需要历史记忆的任务；',
+  '   - 若消息或引用消息附带图片：报错截图、监控图表、界面 Bug、架构/设计图或含实质业务信息的内容，一律选 `handoff`；',
   '   - 任何你无法 100% 确定不需要工具或上下文核实的问题（**拿不准一律选 `handoff`，宁可多移交、绝不漏任务或编造事实**）；',
   '   - 当已有活跃主会话且消息是追问、补充信息、或对上一轮提问的答复/批准（如上一轮问“是否执行/选 A 还是 B”，用户回“好的”“执行吧”“B”）时，必须选 `handoff`。',
   '2. `silent`（静默跳过，不发消息也不唤醒主运行时）：',
-  '   - 群友之间的闲聊、寒暄、无关插话、明确指派给他人的事项；',
+  '   - 群友之间的闲聊、寒暄、表情包/梗图/生活晒图、无关插话、明确指派给他人的事项；',
   '   - 无需回应的纯陈述确认语（如“收到”“好的”“了解”“+1”“辛苦了”“谢谢”），前提是它**不是**对上一轮提问的确认答复。',
   '{{active_session_rule}}',
   '',
@@ -171,21 +182,25 @@ export function shouldRunTriage(
 
 /**
  * Deterministic zero-cost fast-bypass to the main runtime:
- * 1. Always bypasses non-text media attachments that the text-only triage gate cannot inspect.
- * 2. Evaluates optional declarative bypass rules (senderTypes / msgTypes / keywords, OR logic).
+ * 1. Always bypasses non-image binary attachments (`file` / `media` / `merge_forward`) that triage cannot inspect.
+ * 2. Evaluates optional declarative bypass rules (senderTypes / msgTypes / keywords, OR logic),
+ *    including explicit `image` message-type bypass and optional `maxTriageImages` cap.
  */
 export function shouldFastBypassTriage(
   msg: Pick<InboundLarkMessage, 'msgType' | 'imageKeys'> &
     Partial<Pick<InboundLarkMessage, 'senderType' | 'text'>>,
   decision?: Pick<AgentRoutingDecision, 'trigger' | 'userText'>,
   bypass?: RouterBypassConfig,
+  options?: { readonly maxTriageImages?: number; readonly extraImageCount?: number },
 ): { readonly bypass: boolean; readonly reason?: string } {
-  if (msg.imageKeys.length > 0 || msg.msgType === 'image') {
-    return { bypass: true, reason: '包含图片附件，直通主运行时' }
-  }
   if (msg.msgType === 'file' || msg.msgType === 'media' || msg.msgType === 'merge_forward') {
     return { bypass: true, reason: `消息类型 ${msg.msgType} 直通主运行时` }
   }
+  const hasImage =
+    msg.imageKeys.length > 0 || msg.msgType === 'image' || (options?.extraImageCount ?? 0) > 0
+  const totalImages =
+    Math.max(msg.imageKeys.length, msg.msgType === 'image' ? 1 : 0) +
+    (options?.extraImageCount ?? 0)
   if (bypass) {
     if (
       msg.senderType &&
@@ -196,6 +211,12 @@ export function shouldFastBypassTriage(
         bypass: true,
         reason:
           msg.senderType === 'bot' ? '应用/机器人消息直通主运行时' : '成员消息直通主运行时',
+      }
+    }
+    if (hasImage && bypass.msgTypes.includes('image')) {
+      return {
+        bypass: true,
+        reason: '包含图片附件，按直通规则直通主运行时',
       }
     }
     if (
@@ -221,6 +242,15 @@ export function shouldFastBypassTriage(
           }
         }
       }
+    }
+  }
+  if (hasImage && options?.maxTriageImages !== undefined) {
+    const cap = Math.max(0, Math.floor(options.maxTriageImages))
+    if (cap === 0) {
+      return { bypass: true, reason: '分流图片上限为 0，直通主运行时' }
+    }
+    if (totalImages > cap) {
+      return { bypass: true, reason: `图片数量（${totalImages} 张）超过分流上限（${cap} 张），直通主运行时` }
     }
   }
   return { bypass: false }
@@ -353,12 +383,31 @@ export function buildTriageUserMessage(input: TriagePromptInput): string {
     ...(input.listenerName ? [`listener="${input.listenerName}"`] : []),
     `sender_type=${input.senderType}`,
     ...(input.senderName ? [`sender="${input.senderName}"`] : []),
+    ...(input.attachedImageCount && input.attachedImageCount > 0
+      ? [`images=${input.attachedImageCount}`]
+      : []),
   ]
   sections.push(`<triage_meta ${metaParts.join(' ')} />`)
 
   const includeLastReply = input.includeLastReply !== false
   if (includeLastReply && input.hasActiveWorker && input.lastWorkerReply?.trim()) {
     sections.push(`<last_reply>\n${input.lastWorkerReply.trim()}\n</last_reply>`)
+  }
+
+  if (input.quotedMessage) {
+    const q = input.quotedMessage
+    const qAttrs = [
+      `message_id="${q.messageId}"`,
+      `msg_type="${q.msgType}"`,
+      ...(q.senderName ? [`sender="${q.senderName}"`] : []),
+      ...(q.imageCount > 0 ? [`images=${q.imageCount}`] : []),
+    ]
+    const rawText = q.text?.trim() ?? ''
+    const clippedText =
+      rawText.length > 1500 ? `${rawText.slice(0, 1500)}…` : rawText
+    const qBody =
+      clippedText || (q.imageCount > 0 ? `[引用图片消息，共 ${q.imageCount} 张]` : `[${q.msgType}]`)
+    sections.push(`<quoted_message ${qAttrs.join(' ')}>\n${qBody}\n</quoted_message>`)
   }
 
   const maxRecent =

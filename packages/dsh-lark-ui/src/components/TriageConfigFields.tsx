@@ -42,6 +42,7 @@ export interface TriageFieldsValue {
   readonly scope: RouterScopeMode
   readonly bypass?: RouterBypassConfig
   readonly timeoutMs: number
+  readonly maxTriageImages?: number
   readonly systemPrompt: string
   readonly recentMessageCount: number
   readonly contextTtlMinutes: number
@@ -421,6 +422,19 @@ export function TriageConfigFields({
         />
       </SettingRow>
       <SettingRow
+        title="分流图片上限"
+        desc="含引用图片在内超过该张数时直通主运行时（0 表示所有图片均直通）"
+      >
+        <NumberField
+          value={value.maxTriageImages ?? 5}
+          min={0}
+          onChange={(count) =>
+            onChange({ maxTriageImages: Math.min(20, Math.max(0, Math.round(count))) })
+          }
+          suffix="张"
+        />
+      </SettingRow>
+      <SettingRow
         title="忙碌队列合批"
         desc="主运行时处理期间堆积的多条有效消息自动合并为一轮增量提交"
       >
@@ -445,7 +459,7 @@ export function TriageConfigFields({
       </SettingRow>
       <SettingRow
         title="直通消息类型"
-        desc="图片、文件、媒体与合并转发始终直通主运行时"
+        desc="文件、媒体与合并转发始终直通主运行时；未勾选图片且分流模型支持视觉时将参与分流"
         stack
       >
         <ChipToggles

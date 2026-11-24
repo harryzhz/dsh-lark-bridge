@@ -45,6 +45,7 @@ export interface RecordTriageSessionInput {
   readonly toolSchema: ToolSchema
   readonly systemPrompt: string
   readonly userMessage: string
+  readonly userContent?: readonly ContentBlock[]
   readonly blocks: readonly ContentBlock[]
   readonly stream: readonly AssistantStreamRecord[]
   readonly usage?: TokenUsage
@@ -231,7 +232,10 @@ export class TriageSessionRecorder {
     session.append(
       'user/message',
       createUserMessage({
-        content: [{ type: 'text', text: input.userMessage }],
+        content:
+          input.userContent && input.userContent.length > 0
+            ? [...input.userContent]
+            : [{ type: 'text', text: input.userMessage }],
         source: { kind: 'user' },
       }),
       { surfaceOp: 'append' },

@@ -103,6 +103,7 @@ export const DEFAULT_ROUTER_CONFIG: BotRouterConfig = {
   scope: 'passive_only',
   bypass: cloneRouterBypass(DEFAULT_ROUTER_BYPASS),
   timeoutMs: 4000,
+  maxTriageImages: 5,
   systemPrompt: '',
   recentMessageCount: 6,
   contextTtlMinutes: 30,
