@@ -1307,7 +1307,7 @@ export class InboundPipeline {
     } = input
     const chatName = resolvedChatName ? { chatName: resolvedChatName } : {}
 
-    const bypass = shouldFastBypassTriage(msg, decision)
+    const bypass = shouldFastBypassTriage(msg, decision, routerConfig.bypass)
     if (bypass.bypass) {
       this.host.triage?.context.recordInboundMessage(chatScopeKey, decision.routeKey, {
         role: 'user',
@@ -1315,6 +1315,15 @@ export class InboundPipeline {
         text: decision.userText,
         timestampMs: startedMs,
         messageId: msg.messageId,
+      })
+      this.host.store.recordEvent({
+        botId: bot.id,
+        chatId: msg.chatId,
+        ...chatName,
+        routeKey: decision.routeKey,
+        traceId,
+        kind: 'triage',
+        summary: `规则直通：${bypass.reason || '直通主运行时'}`,
       })
       return { handled: false, ...(bypass.reason ? { triageNote: bypass.reason } : {}) }
     }

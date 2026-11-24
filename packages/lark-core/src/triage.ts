@@ -1,6 +1,7 @@
 import type {
   EffectiveRouterConfig,
   InboundLarkMessage,
+  RouterBypassConfig,
   RoutingDecision,
 } from './types.js'
 
@@ -154,6 +155,9 @@ export function shouldRunTriage(
 ): boolean {
   if (!routerConfig.enabled) return false
   if (decision.trigger === 'p2p') return false
+  if (routerConfig.scope === 'active_thread_only') {
+    return decision.trigger === 'active-thread'
+  }
   if (routerConfig.scope === 'passive_only') {
     return decision.trigger === 'listener' || decision.trigger === 'active-thread'
   }
@@ -166,18 +170,54 @@ export function shouldRunTriage(
 }
 
 /**
- * Deterministic zero-cost fast-bypass to the main runtime only for non-text media attachments
- * that the text-only triage gate cannot inspect directly (images, files, media, merge-forward).
+ * Deterministic zero-cost fast-bypass to the main runtime:
+ * 1. Always bypasses non-text media attachments that the text-only triage gate cannot inspect.
+ * 2. Evaluates optional declarative bypass rules (senderTypes / msgTypes / keywords, OR logic).
  */
 export function shouldFastBypassTriage(
-  msg: Pick<InboundLarkMessage, 'msgType' | 'imageKeys'>,
-  _decision?: Pick<AgentRoutingDecision, 'trigger' | 'userText'>,
+  msg: Pick<InboundLarkMessage, 'msgType' | 'imageKeys'> &
+    Partial<Pick<InboundLarkMessage, 'senderType' | 'text'>>,
+  decision?: Pick<AgentRoutingDecision, 'trigger' | 'userText'>,
+  bypass?: RouterBypassConfig,
 ): { readonly bypass: boolean; readonly reason?: string } {
   if (msg.imageKeys.length > 0 || msg.msgType === 'image') {
     return { bypass: true, reason: '包含图片附件，直通主运行时' }
   }
   if (msg.msgType === 'file' || msg.msgType === 'media' || msg.msgType === 'merge_forward') {
     return { bypass: true, reason: `消息类型 ${msg.msgType} 直通主运行时` }
+  }
+  if (bypass) {
+    if (msg.senderType && bypass.senderTypes.includes(msg.senderType)) {
+      return {
+        bypass: true,
+        reason:
+          msg.senderType === 'bot' ? '应用/机器人消息直通主运行时' : '成员消息直通主运行时',
+      }
+    }
+    if (
+      (msg.msgType === 'interactive' || msg.msgType === 'text' || msg.msgType === 'post') &&
+      bypass.msgTypes.includes(msg.msgType)
+    ) {
+      return {
+        bypass: true,
+        reason: `消息类型 ${msg.msgType} 直通主运行时`,
+      }
+    }
+    if (bypass.keywords.length > 0) {
+      const hay = (decision?.userText ?? msg.text ?? '').toLowerCase()
+      if (hay) {
+        const matched = bypass.keywords.find((kw) => {
+          const needle = kw.trim().toLowerCase()
+          return needle.length > 0 && hay.includes(needle)
+        })
+        if (matched) {
+          return {
+            bypass: true,
+            reason: `命中直通关键词「${matched.trim()}」，直通主运行时`,
+          }
+        }
+      }
+    }
   }
   return { bypass: false }
 }

@@ -9,20 +9,30 @@ import {
   Switch,
   Tag,
 } from '@deepseek-ai/dsh-client-ui-primitives'
-import { choiceLabel, FALLBACK_TRIAGE_DEFAULTS, ROUTER_SCOPE_MODES } from '../presets.js'
+import {
+  choiceLabel,
+  cloneRouterBypass,
+  FALLBACK_TRIAGE_DEFAULTS,
+  ROUTER_BYPASS_MSG_TYPES,
+  ROUTER_SCOPE_MODES,
+  SENDER_TYPES,
+} from '../presets.js'
 import type {
   BotRouterConfig,
   ModelGroup,
+  RouterBypassConfig,
   RouterScopeMode,
   RuntimeOption,
   TriageDefaultsPayload,
   TriageToolSchema,
 } from '../types.js'
 import {
+  ChipToggles,
   GroupTitle,
   NumberField,
   SelectMenu,
   SettingRow,
+  TagInput,
   type SelectOption,
 } from './fields.js'
 
@@ -30,6 +40,7 @@ export interface TriageFieldsValue {
   readonly provider: string
   readonly model: string
   readonly scope: RouterScopeMode
+  readonly bypass?: RouterBypassConfig
   readonly timeoutMs: number
   readonly systemPrompt: string
   readonly recentMessageCount: number
@@ -357,6 +368,10 @@ export function TriageConfigFields({
     })
   }
 
+  const bypass = cloneRouterBypass(value.bypass)
+  const patchBypass = (patch: Partial<RouterBypassConfig>) =>
+    onChange({ bypass: { ...bypass, ...patch } })
+
   return (
     <>
       <GroupTitle>基本配置</GroupTitle>
@@ -413,6 +428,41 @@ export function TriageConfigFields({
           label="忙碌队列合批"
           checked={value.coalesceQueuedMessages}
           onChange={(coalesceQueuedMessages) => onChange({ coalesceQueuedMessages })}
+        />
+      </SettingRow>
+
+      <GroupTitle>直通规则</GroupTitle>
+      <SettingRow
+        title="直通发送者"
+        desc="命中以下发送者时跳过分流，直接交由主运行时处理"
+        stack
+      >
+        <ChipToggles
+          values={bypass.senderTypes}
+          options={SENDER_TYPES}
+          onChange={(senderTypes) => patchBypass({ senderTypes })}
+        />
+      </SettingRow>
+      <SettingRow
+        title="直通消息类型"
+        desc="图片、文件、媒体与合并转发始终直通主运行时"
+        stack
+      >
+        <ChipToggles
+          values={bypass.msgTypes}
+          options={ROUTER_BYPASS_MSG_TYPES}
+          onChange={(msgTypes) => patchBypass({ msgTypes })}
+        />
+      </SettingRow>
+      <SettingRow
+        title="直通关键词"
+        desc="命中任一关键词（不区分大小写）时跳过分流，留空不限"
+        stack
+      >
+        <TagInput
+          values={bypass.keywords}
+          onChange={(keywords) => patchBypass({ keywords })}
+          placeholder="回车添加，如 P0、CRITICAL"
         />
       </SettingRow>
 

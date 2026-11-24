@@ -28,8 +28,15 @@ export interface SubstituteMode {
 }
 
 export type ReminderCreationMode = 'silent' | 'notify' | 'confirm'
-export type RouterScopeMode = 'passive_only' | 'all_group'
+export type RouterScopeMode = 'passive_only' | 'active_thread_only' | 'all_group'
 export type GroupRouterMode = 'inherit' | 'override' | 'off'
+export type RouterBypassMsgType = 'interactive' | 'text' | 'post'
+
+export interface RouterBypassConfig {
+  senderTypes: ListenerSenderType[]
+  msgTypes: RouterBypassMsgType[]
+  keywords: string[]
+}
 
 export interface BotDreamingConfig {
   enabled: boolean
@@ -76,6 +83,7 @@ export interface BotRouterConfig {
   provider: string
   model: string
   scope: RouterScopeMode
+  bypass?: RouterBypassConfig
   timeoutMs: number
   systemPrompt: string
   recentMessageCount: number
@@ -89,6 +97,7 @@ export interface GroupRouterConfig {
   provider: string
   model: string
   scope: RouterScopeMode
+  bypass?: RouterBypassConfig
   timeoutMs: number
   systemPrompt: string
   recentMessageCount: number

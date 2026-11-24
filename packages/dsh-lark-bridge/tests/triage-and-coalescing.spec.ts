@@ -1160,4 +1160,207 @@ describe('Smart Triage Gate, Per-Group Overrides & Busy-Queue Coalescing', () =>
     await h.manager.stop()
     h.store.close()
   })
+
+  it('bypasses alert bot messages by default while triaging human follow-ups in the alert thread, and respects active_thread_only & group bypass overrides', async () => {
+    const h = createHarness({
+      triageStream: (opts) => {
+        const userText = opts.messages[opts.messages.length - 1]?.content?.[0]?.text ?? ''
+        if (userText.includes('收到')) {
+          return makeToolCallStream({ action: 'silent', reason: '话题确认语' })
+        }
+        return makeToolCallStream({ action: 'handoff', reason: '需要处理' })
+      },
+      workerReply: () => '已定位告警根因，建议先回滚网关配置。',
+    })
+    const fx = makeFakeTransport()
+
+    h.store.upsertBot({
+      id: 'bot-1',
+      name: 'OncallBot',
+      larkAppId: 'cli_demo',
+      larkAppSecret: 'sec_demo',
+      defaultWorkingDir: h.dir,
+      agentPreset: 'standard',
+      router: {
+        enabled: true,
+        provider: 'deepseek',
+        model: 'deepseek-chat',
+        scope: 'passive_only',
+      },
+    })
+
+    // Group 1: Alert group inherits default bypass (senderTypes=['bot'])
+    h.store.upsertGroup({
+      key: 'bot-1:oc_alert',
+      botId: 'bot-1',
+      chatId: 'oc_alert',
+      chatName: '稳定性告警群',
+      enabled: true,
+      listener: {
+        enabled: true,
+        name: '告警排查',
+        prompt: '排查线上告警',
+        scope: 'top_level',
+        replyMode: 'new-topic',
+        sessionMode: 'thread',
+        allowSilentEmptyReply: true,
+        autoCloseAfterCompletion: false,
+        msgTypes: ['interactive', 'text'],
+        senderTypes: ['bot', 'user'],
+      },
+    })
+
+    // 1a. Alert bot card bypasses triage -> direct to Worker, audit event recorded
+    await h.manager.inbound.handleInbound(
+      'bot-1',
+      fx.transport,
+      makeGroupMsg({
+        chatId: 'oc_alert',
+        messageId: 'om_alert_1',
+        msgType: 'interactive',
+        senderType: 'bot',
+        senderOpenId: 'cli_monitor_bot',
+        text: '[P1] API 5xx 告警触发',
+      }),
+    )
+    expect(h.triageCalls).toHaveLength(0)
+    expect(h.submittedWorkerPrompts).toHaveLength(1)
+    const bypassEvent = h.store
+      .listEvents({ botId: 'bot-1', limit: 20 })
+      .find((e) => e.kind === 'triage' && e.summary.includes('规则直通'))
+    expect(bypassEvent?.summary).toContain('应用/机器人')
+
+    // 1b. Human "收到" in the same alert thread enters triage (with alert context) and is silenced
+    await h.manager.inbound.handleInbound(
+      'bot-1',
+      fx.transport,
+      makeGroupMsg({
+        chatId: 'oc_alert',
+        messageId: 'om_ack_2',
+        rootId: 'om_alert_1',
+        threadId: 'omt_alert_1',
+        senderType: 'user',
+        senderOpenId: 'ou_oncall',
+        text: '收到，我看下',
+      }),
+    )
+    expect(h.triageCalls).toHaveLength(1)
+    const followUpTriageText = (h.triageCalls[0]?.messages[0]?.content ?? [])
+      .map((b) => ('text' in b && typeof b.text === 'string' ? b.text : ''))
+      .join('\n')
+    expect(followUpTriageText).toContain('[P1] API 5xx 告警触发')
+    expect(h.submittedWorkerPrompts).toHaveLength(1)
+
+    // Group 2: active_thread_only lets human listener first message bypass, while triaging active-thread follow-ups
+    h.store.upsertGroup({
+      key: 'bot-1:oc_active_only',
+      botId: 'bot-1',
+      chatId: 'oc_active_only',
+      chatName: '人工值班群',
+      enabled: true,
+      router: {
+        mode: 'override',
+        scope: 'active_thread_only',
+        bypass: { senderTypes: [], msgTypes: [], keywords: [] },
+      },
+      listener: {
+        enabled: true,
+        name: '人工报障',
+        prompt: '排查人工报障',
+        scope: 'top_level',
+        replyMode: 'new-topic',
+        sessionMode: 'thread',
+        allowSilentEmptyReply: true,
+        autoCloseAfterCompletion: false,
+        msgTypes: ['text'],
+        senderTypes: ['user'],
+      },
+    })
+
+    await h.manager.inbound.handleInbound(
+      'bot-1',
+      fx.transport,
+      makeGroupMsg({
+        chatId: 'oc_active_only',
+        messageId: 'om_manual_1',
+        senderType: 'user',
+        text: '订单接口超时了',
+      }),
+    )
+    expect(h.triageCalls).toHaveLength(1)
+    expect(h.submittedWorkerPrompts).toHaveLength(2)
+
+    await h.manager.inbound.handleInbound(
+      'bot-1',
+      fx.transport,
+      makeGroupMsg({
+        chatId: 'oc_active_only',
+        messageId: 'om_manual_ack_2',
+        rootId: 'om_manual_1',
+        threadId: 'omt_manual_1',
+        senderType: 'user',
+        text: '收到',
+      }),
+    )
+    expect(h.triageCalls).toHaveLength(2)
+    expect(h.submittedWorkerPrompts).toHaveLength(2)
+
+    // Group 3: group override clears bot bypass and adds keyword bypass ("P0")
+    h.store.upsertGroup({
+      key: 'bot-1:oc_mixed',
+      botId: 'bot-1',
+      chatId: 'oc_mixed',
+      chatName: '发布协同群',
+      enabled: true,
+      router: {
+        mode: 'override',
+        scope: 'passive_only',
+        bypass: { senderTypes: [], msgTypes: [], keywords: ['P0'] },
+      },
+      listener: {
+        enabled: true,
+        name: '变更观察',
+        prompt: '关注发布异常',
+        scope: 'top_level',
+        replyMode: 'reply',
+        sessionMode: 'per_message',
+        allowSilentEmptyReply: true,
+        autoCloseAfterCompletion: true,
+        msgTypes: ['text'],
+        senderTypes: ['bot', 'user'],
+      },
+    })
+
+    // Non-keyword bot message now enters triage because senderTypes was cleared
+    await h.manager.inbound.handleInbound(
+      'bot-1',
+      fx.transport,
+      makeGroupMsg({
+        chatId: 'oc_mixed',
+        messageId: 'om_release_ok_1',
+        senderType: 'bot',
+        senderOpenId: 'cli_ci_bot',
+        text: '构建完成，收到请忽略',
+      }),
+    )
+    expect(h.triageCalls).toHaveLength(3)
+    expect(h.submittedWorkerPrompts).toHaveLength(2)
+
+    // Human message matching keyword "p0" (case-insensitive) bypasses triage directly to Worker
+    await h.manager.inbound.handleInbound(
+      'bot-1',
+      fx.transport,
+      makeGroupMsg({
+        chatId: 'oc_mixed',
+        messageId: 'om_p0_2',
+        senderType: 'user',
+        text: '线上 p0 故障，支付失败',
+      }),
+    )
+    expect(h.triageCalls).toHaveLength(3)
+    expect(h.submittedWorkerPrompts).toHaveLength(3)
+
+    await h.manager.stop()
+    h.store.close()
+  })
 })

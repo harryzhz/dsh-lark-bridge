@@ -16,7 +16,9 @@ import {
 import { bridgeApi } from '../api.js'
 import {
   ACCESS_MODES,
+  cloneRouterBypass,
   DEFAULT_DREAMING_SCOPES,
+  DEFAULT_ROUTER_BYPASS,
   DISCLOSURE_MODES,
   P2P_SESSION_MODES,
   REPLY_MODES,
@@ -99,6 +101,7 @@ export const DEFAULT_ROUTER_CONFIG: BotRouterConfig = {
   provider: '',
   model: '',
   scope: 'passive_only',
+  bypass: cloneRouterBypass(DEFAULT_ROUTER_BYPASS),
   timeoutMs: 4000,
   systemPrompt: '',
   recentMessageCount: 6,
@@ -147,7 +150,7 @@ export function newBotConfig(
     idleCloseMinutes: 720,
     role: { enabled: false, name: '', systemPrompt: '' },
     substituteMode: { enabled: false, targets: [], disclosure: 'none', activeThreadFollowup: true },
-    router: { ...DEFAULT_ROUTER_CONFIG },
+    router: { ...DEFAULT_ROUTER_CONFIG, bypass: cloneRouterBypass(DEFAULT_ROUTER_BYPASS) },
     experimental: {
       dreaming: { ...DEFAULT_DREAMING_CONFIG, scopes: [...DEFAULT_DREAMING_CONFIG.scopes] },
       proactive: { ...DEFAULT_PROACTIVE_CONFIG },
@@ -176,6 +179,7 @@ function toBotConfig(record: BotRecord): BotConfig {
     router: {
       ...DEFAULT_ROUTER_CONFIG,
       ...(cloned.router ?? {}),
+      bypass: cloneRouterBypass(cloned.router?.bypass),
     },
     experimental: {
       dreaming: {
