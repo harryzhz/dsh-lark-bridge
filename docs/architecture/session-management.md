@@ -344,7 +344,7 @@ sequenceDiagram
   - `UserMessage` 与监听/角色规则**全文透传不截断**，近期群聊或话题消息条数由 `recentMessageCount`（0–50，默认 6）、有效时间窗由 `contextTtlMinutes`（1–1440 分钟，默认 30）、是否附带上一轮主回复全文由 `includeLastReply`（默认开启）控制。
 - **轻量分流闸门与可查看特殊会话（`LlmTriageService` + `TriageSessionRecorder`）**：
   - 热路径直接调用 DSH 原生或自定义配置的 `ctx.llm.stream()`（自动选择模型最低推理强度、思考模型自动省略 `temperature` 并放宽 `maxTokens`、不启动 Agent 循环、不阻塞主运行时队列）；
-  - 每次模型调用完成后通过 `ctx.sessionPersistence` 落盘为标准 DSH v4 特殊会话（完整保留 `system/message`、`request/header`、`user/message`、模型 `reasoning` / `tool-call` / `usage` 与 `tool/call` + `tool/result`），挂载对应工作区并**立即自动归档**（不污染左侧主栏），同时写入 SQLite `triage_sessions`（默认保留最近 200 条，支持单删与清空），可在控制台「会话 → 智能分流」及「运行日志」一键打开复盘：
+  - 每次模型调用完成后通过 `ctx.sessionPersistence` 落盘为标准 DSH v4 特殊会话（Step 1 完整保留 `system/message`、`request/header`、`user/message`、模型 `reasoning` / `tool-call` / `usage` 与 `tool/call` + `tool/result`，Step 2 零开销追加最终 `assistant/message` 裁决结论如 `` `handoff` `` / `` `silent` `` / `` `quick_reply` `` 与原因，打开会话无需展开过程折叠即可直接查看结论），挂载对应工作区并**立即自动归档**（不污染左侧主栏），同时写入 SQLite `triage_sessions`（默认保留最近 200 条，支持单删与清空），可在控制台「会话 → 智能分流」及「运行日志」一键打开复盘：
     - `silent`：闲聊或无需回应的纯确认语，零飞书写入（不贴 `OnIt` 表情），运行日志 `静默` 记录关联该分流会话；
     - `quick_reply`：**仅在当前路由尚无活跃主会话时允许**，直接以简洁纯文本回复并在内存记录临时轻回复话题（TTL 30 分钟），运行日志 `回复` 记录关联该分流会话；若群友随后在该话题下免 `@` 追问并升级为正式任务，自动将前序问答拼装为 `<triage_handoff_context>` 注入主运行时首轮并承接话题别名；
     - `handoff` / 回退直通：记录 `分流` 审计事件关联该分流会话并回填转交后的主会话 ID，随后安静贴上 `OnIt` 表情由主运行时接管处理。

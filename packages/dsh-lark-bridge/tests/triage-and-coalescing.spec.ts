@@ -960,8 +960,33 @@ describe('Smart Triage Gate, Per-Group Overrides & Busy-Queue Coalescing', () =>
       'tool/call',
       'tool/result',
       'step/end',
+      'step/start',
+      'assistant/message',
+      'step/end',
       'turn/end',
     ])
+
+    // Final Step 2 assistant/message exposes the verdict conclusion directly in Conversation View (zero tool-call)
+    const extractFinalText = (events: readonly SessionEvent[]): string => {
+      const assistantEvents = events.filter((e) => e.type === 'assistant/message')
+      const last = assistantEvents[assistantEvents.length - 1] as
+        | { data?: { step?: number; usage?: unknown; message?: { content?: Array<{ type: string; text?: string }> } } }
+        | undefined
+      expect(last?.data?.step).toBe(2)
+      expect(last?.data?.usage).toBeUndefined()
+      const blocks = last?.data?.message?.content ?? []
+      expect(blocks.some((b) => b.type === 'tool-call')).toBe(false)
+      return blocks.map((b) => b.text ?? '').join('\n')
+    }
+
+    const silentConclusion = extractFinalText(silentLog.events)
+    expect(silentConclusion).toContain('`silent`')
+    expect(silentConclusion).toContain('纯确认语')
+
+    const handoffLog = h.persistedSessions.get(handoffRow.sessionId)!
+    const handoffConclusion = extractFinalText(handoffLog.events)
+    expect(handoffConclusion).toContain('`handoff`')
+    expect(handoffConclusion).toContain('完整长日志需主运行时排查')
 
     // Verify untruncated 3500-char payload & recentMessageCount=1 in Call 2
     const handoffUserContent = h.triageCalls[1]?.messages[0]?.content
@@ -1040,6 +1065,97 @@ describe('Smart Triage Gate, Per-Group Overrides & Busy-Queue Coalescing', () =>
     })
     expect(delAll.status).toBe(200)
     expect(h.store.listTriageSessions('bot-1')).toHaveLength(0)
+
+    await h.manager.stop()
+    h.store.close()
+  })
+
+  it('appends a clean Step 2 conclusion assistant/message for quick_reply and fail-open error sessions', async () => {
+    let callSeq = 0
+    const h = createHarness({
+      triageStream: () => {
+        callSeq += 1
+        if (callSeq === 1) {
+          return makeToolCallStream({
+            action: 'quick_reply',
+            reason: '简单打招呼',
+            reply_text: '在的，请说。',
+          })
+        }
+        return {
+          async *[Symbol.asyncIterator]() {
+            yield {
+              type: 'finish',
+              reason: { kind: 'error', failure: { code: 'NETWORK', message: 'upstream 502' } },
+            } as unknown as StreamChunk
+          },
+        }
+      },
+      workerReply: () => '主运行时兜底已处理',
+    })
+    const fx = makeFakeTransport()
+
+    h.store.upsertBot({
+      id: 'bot-1',
+      name: 'DevBot',
+      larkAppId: 'cli_demo',
+      larkAppSecret: 'sec_demo',
+      defaultWorkingDir: h.dir,
+      agentPreset: 'standard',
+      router: {
+        enabled: true,
+        provider: 'deepseek',
+        model: 'deepseek-chat',
+        scope: 'all_group',
+      },
+    })
+
+    await h.manager.inbound.handleInbound(
+      'bot-1',
+      fx.transport,
+      makeGroupMsg({
+        messageId: 'om_qr_1',
+        text: '@DevBot 在吗',
+        mentions: [{ key: '@_user_1', openId: 'ou_bot', name: 'DevBot' }],
+      }),
+    )
+
+    await h.manager.inbound.handleInbound(
+      'bot-1',
+      fx.transport,
+      makeGroupMsg({
+        messageId: 'om_err_1',
+        text: '@DevBot 查一下报错日志',
+        mentions: [{ key: '@_user_1', openId: 'ou_bot', name: 'DevBot' }],
+      }),
+    )
+
+    const rows = h.store.listTriageSessions('bot-1')
+    const qrRow = rows.find((r) => r.action === 'quick_reply')!
+    const errRow = rows.find((r) => r.fallback === true)!
+    expect(qrRow).toBeDefined()
+    expect(errRow).toBeDefined()
+
+    const readStep2Text = (sessionId: string): string => {
+      const rec = h.persistedSessions.get(sessionId)!
+      const step2 = rec.events.find(
+        (e) =>
+          e.type === 'assistant/message' &&
+          (e.data as { step?: number }).step === 2,
+      ) as { data?: { message?: { content?: Array<{ type: string; text?: string }> } } } | undefined
+      expect(step2).toBeDefined()
+      return (step2?.data?.message?.content ?? []).map((b) => b.text ?? '').join('\n')
+    }
+
+    const qrText = readStep2Text(qrRow.sessionId)
+    expect(qrText).toContain('`quick_reply`')
+    expect(qrText).toContain('原因：简单打招呼')
+    expect(qrText).toContain('回复：在的，请说。')
+
+    const errText = readStep2Text(errRow.sessionId)
+    expect(errText).toContain('`handoff`（回退直通）')
+    expect(errText).toContain('原因：分流异常，自动直通主运行时')
+    expect(errText).toContain('异常：upstream 502')
 
     await h.manager.stop()
     h.store.close()

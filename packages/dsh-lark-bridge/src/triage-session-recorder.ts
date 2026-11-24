@@ -63,6 +63,30 @@ function actionLabel(verdict: TriageVerdict): string {
   return '转交'
 }
 
+function conclusionActionTag(verdict: TriageVerdict): string {
+  if (verdict.fallback) return `\`${verdict.action}\`（回退直通）`
+  if (verdict.action === 'silent') return '`silent`（静默跳过）'
+  if (verdict.action === 'quick_reply') return '`quick_reply`（轻回复）'
+  return '`handoff`（转交主运行时）'
+}
+
+export function formatTriageConclusion(verdict: TriageVerdict, errorMessage?: string): string {
+  const lines = [conclusionActionTag(verdict)]
+  const reason = verdict.reason.trim()
+  if (reason) {
+    lines.push('', `原因：${reason}`)
+  }
+  const replyText = verdict.replyText?.trim()
+  if (replyText) {
+    lines.push(`回复：${replyText}`)
+  }
+  const error = errorMessage?.trim()
+  if (error) {
+    lines.push(`异常：${error}`)
+  }
+  return lines.join('\n')
+}
+
 function formatTriageToolOutput(verdict: TriageVerdict, errorMessage?: string): string {
   const lines = [`裁决：${verdict.action}${verdict.fallback ? '（回退直通）' : ''}`, `原因：${verdict.reason}`]
   if (verdict.replyText) {
@@ -232,6 +256,7 @@ export class TriageSessionRecorder {
     this.appendAssistantAndToolEvents(session, input)
 
     session.append('step/end', { turn: 1, step: 1 })
+    this.appendConclusionStep(session, input)
     session.append('turn/end', {
       turn: 1,
       reason: input.errorMessage
@@ -245,6 +270,27 @@ export class TriageSessionRecorder {
         : { kind: 'completed' },
     })
     return session
+  }
+
+  private appendConclusionStep(session: Session, input: RecordTriageSessionInput): void {
+    const provider = input.provider || 'unknown'
+    const model = input.model || 'unknown'
+    const conclusionText = formatTriageConclusion(input.verdict, input.errorMessage)
+    session.append('step/start', { turn: 1, step: 2 })
+    session.append(
+      'assistant/message',
+      {
+        turn: 1,
+        step: 2,
+        message: createAssistantMessage({
+          content: [{ type: 'text', text: conclusionText }],
+          source: { provider, model },
+        }),
+        stream: [],
+      },
+      { surfaceOp: 'append' },
+    )
+    session.append('step/end', { turn: 1, step: 2 })
   }
 
   private appendAssistantAndToolEvents(session: Session, input: RecordTriageSessionInput): void {
