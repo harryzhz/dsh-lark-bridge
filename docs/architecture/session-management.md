@@ -368,9 +368,27 @@ sequenceDiagram
 
 宿主 DSH 在收到 `SIGTERM` / `SIGINT` 时提供 `5s` 进程停机宽限期。为消除计划内发版重启与意外重载/崩溃导致的消息中断报错，系统提供三层重启韧性保障：
 
-1. **计划内重启零中断（优雅排空 Drain）**：
-   - 重启前通过 Owner 控制台 API 或本机运维 CLI 执行 `lark-bridge lifecycle drain --wait --timeout 180`（底层调用 `POST /api/lark-bridge/lifecycle/drain`，严格限定 Owner 会话或独立 `0600` `operator-token`，普通 Agent CLI Token 禁止调用）；
-   - 进入排空后立即暂停所有 Bot 的飞书 WSClient 入站长连接与新提醒/Dreaming 派发，同时**保留 REST 客户端在线**，等待全部在途回合、分流与后台任务自然回复完成；若取消维护可执行 `lark-bridge lifecycle resume-intake`。
+1. **计划内重启零中断（优雅排空 Drain，默认超时 2 分钟）**：
+   - 重启前在宿主机运维终端执行 `lark-bridge lifecycle drain --wait`（**默认等待超时 `120` 秒 / 2 分钟**，可通过 `--timeout <秒>` 覆盖，上限 `900` 秒；底层调用 `POST /api/lark-bridge/lifecycle/drain`，严格限定 Owner 会话或独立 `0600` `operator-token`，普通 Agent CLI Token 及 Agent 会话内默认禁止调用）；
+   - 进入排空后立即暂停所有 Bot 的飞书 WSClient 入站长连接与新提醒/Dreaming 派发，同时**保留 REST 客户端在线**，等待全部在途回合、分流与后台任务自然回复完成；退出码 `0` 表示完全排空，`2` 表示超过等待超时仍有在途任务，`1` 表示调用或鉴权失败；若取消维护可执行 `lark-bridge lifecycle resume-intake` 恢复入站：
+     ```bash
+     # 查看排空与在途任务状态
+     lark-bridge lifecycle status
+
+     # 严格零中断重启（默认等待 2 分钟，仅完全排空即退出码为 0 时重启）
+     lark-bridge lifecycle drain --wait --reason "upgrade" \
+       && launchctl kickstart -k "gui/$(id -u)/com.example.dsh-web"   # 或 systemctl --user restart dsh-web / kill -TERM <pid>
+
+     # 限时排空后强制重启（最多等待 2 分钟，退出码 0 或 2 均重启，在途任务交由断点自动续跑）
+     lark-bridge lifecycle drain --wait --reason "upgrade"
+     rc=$?
+     if [ "$rc" -eq 0 ] || [ "$rc" -eq 2 ]; then
+       launchctl kickstart -k "gui/$(id -u)/com.example.dsh-web"
+     fi
+
+     # 取消维护并恢复飞书入站
+     lark-bridge lifecycle resume-intake
+     ```
 2. **非计划重启 / 热重载 / 崩溃自动续跑（Durable Pending Turns）**：
    - 每个在途回合在 `pending_turns` 持久化完整可重放的入站消息快照（`inbound_msg_json`）、`sessionId`、`reactionId`、`intermediate_sent_count`、`handoff_turns_json` 与 `recovery_attempts`；
    - 发生停机或 HMR 重载时，不再草率删除 `pending_turns`、删 `OnIt` 表情并向群里刷屏报错，而是将可恢复回合标记为 `interrupted` 落盘，并在 `2.5s` 并行停机预算内完成句柄释放、SQLite WAL checkpoint 与 `bridge.lock` 释放；
