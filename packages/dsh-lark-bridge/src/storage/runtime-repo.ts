@@ -816,8 +816,12 @@ export class RuntimeRepo {
       sender_name: string | null
       intermediate_sent_count: number | null
       recovery_attempts: number | null
+      graceful_recovery_attempts: number | null
       handoff_turns_json: string | null
       updated_at_ms: number | null
+      interrupted_at_ms: number | null
+      last_activity_at_ms: number | null
+      interrupt_kind: string | null
     }>
     return rows.map((row) => {
       let inboundMsg: LarkPendingTurn['inboundMsg']
@@ -841,6 +845,10 @@ export class RuntimeRepo {
         row.status === 'interrupted' || row.status === 'recovering' || row.status === 'running'
           ? row.status
           : 'running'
+      const interruptKind =
+        row.interrupt_kind === 'graceful_shutdown' || row.interrupt_kind === 'crash'
+          ? row.interrupt_kind
+          : undefined
       return {
         id: row.id,
         botId: row.bot_id,
@@ -863,8 +871,14 @@ export class RuntimeRepo {
         ...(row.sender_name ? { senderName: row.sender_name } : {}),
         ...(row.intermediate_sent_count ? { intermediateSentCount: Number(row.intermediate_sent_count) } : {}),
         ...(row.recovery_attempts ? { recoveryAttempts: Number(row.recovery_attempts) } : {}),
+        ...(row.graceful_recovery_attempts
+          ? { gracefulRecoveryAttempts: Number(row.graceful_recovery_attempts) }
+          : {}),
         ...(handoffTurns && handoffTurns.length > 0 ? { handoffTurns } : {}),
         ...(row.updated_at_ms !== null ? { updatedAtMs: Number(row.updated_at_ms) } : {}),
+        ...(row.interrupted_at_ms !== null ? { interruptedAtMs: Number(row.interrupted_at_ms) } : {}),
+        ...(row.last_activity_at_ms !== null ? { lastActivityAtMs: Number(row.last_activity_at_ms) } : {}),
+        ...(interruptKind ? { interruptKind } : {}),
       }
     })
   }
@@ -877,8 +891,9 @@ export class RuntimeRepo {
            id, bot_id, chat_id, chat_name, message_id, route_key, reply_mode,
            trigger, allow_silent_empty_reply, reaction_id, session_id, trace_id, started_at_ms,
            status, inbound_msg_json, sender_name, intermediate_sent_count, recovery_attempts,
-           handoff_turns_json, updated_at_ms
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           graceful_recovery_attempts, handoff_turns_json, updated_at_ms, interrupted_at_ms,
+           last_activity_at_ms, interrupt_kind
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            bot_id = excluded.bot_id,
            chat_id = excluded.chat_id,
@@ -897,8 +912,12 @@ export class RuntimeRepo {
            sender_name = excluded.sender_name,
            intermediate_sent_count = excluded.intermediate_sent_count,
            recovery_attempts = excluded.recovery_attempts,
+           graceful_recovery_attempts = excluded.graceful_recovery_attempts,
            handoff_turns_json = excluded.handoff_turns_json,
-           updated_at_ms = excluded.updated_at_ms`,
+           updated_at_ms = excluded.updated_at_ms,
+           interrupted_at_ms = excluded.interrupted_at_ms,
+           last_activity_at_ms = excluded.last_activity_at_ms,
+           interrupt_kind = excluded.interrupt_kind`,
       )
       .run(
         turn.id,
@@ -919,8 +938,12 @@ export class RuntimeRepo {
         turn.senderName ?? null,
         turn.intermediateSentCount ?? 0,
         turn.recoveryAttempts ?? 0,
+        turn.gracefulRecoveryAttempts ?? 0,
         turn.handoffTurns && turn.handoffTurns.length > 0 ? JSON.stringify(turn.handoffTurns) : null,
         updatedAtMs,
+        turn.interruptedAtMs ?? null,
+        turn.lastActivityAtMs ?? null,
+        turn.interruptKind ?? null,
       )
     return { ...turn, updatedAtMs }
   }

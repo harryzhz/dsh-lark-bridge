@@ -44,11 +44,17 @@ import {
   inspectPersistedTurnCompletion,
 } from './turn-recovery.js'
 import { TurnAbortedError, runTurnAndCollectReply } from './turn-runner.js'
-import type { ActiveTurnSummary, LarkPendingTurn, PendingTurnStatus } from './types.js'
+import type {
+  ActiveTurnSummary,
+  LarkPendingTurn,
+  PendingTurnInterruptKind,
+  PendingTurnStatus,
+} from './types.js'
 
 const SHUTDOWN_TURN_CLEANUP_TIMEOUT_MS = 2_000
 const STALE_PENDING_TURN_MAX_AGE_MS = 24 * 60 * 60_000
 const TRIAGE_HISTORY_BACKFILL_TIMEOUT_MS = 1_200
+const ACTIVE_TURN_HEARTBEAT_PERSIST_INTERVAL_MS = 15_000
 const RECALLED_MESSAGE_TTL_MS = 10 * 60_000
 const MAX_RECALLED_MESSAGES = 2_000
 const UNEXPECTED_SILENT_SENTINEL_FALLBACK = '抱歉，当前消息不在我的职责范围内或暂无法直接回复。'
@@ -116,6 +122,11 @@ export interface ActiveTurnRecord {
   sessionId?: string
   intermediateSentCount: number
   recoveryAttempts: number
+  gracefulRecoveryAttempts: number
+  lastActivityAtMs: number
+  lastPersistedActivityAtMs: number
+  interruptedAtMs?: number
+  interruptKind?: PendingTurnInterruptKind
   status: PendingTurnStatus
   silencedByControl: boolean
   silenceReason?: string
@@ -145,6 +156,8 @@ interface RecoveryRunContext {
   readonly existingReactionId?: string
   readonly previousSessionId?: string
   readonly recoveryAttempts: number
+  readonly gracefulRecoveryAttempts: number
+  readonly totalRecoveryAttempts: number
   readonly previousIntermediateSentCount: number
   readonly handoffTurns?: readonly RouterHandoffTurn[]
   readonly startedAtMs: number
@@ -191,10 +204,11 @@ export class InboundPipeline {
     return active + this.recoveringTurnIds.size
   }
 
-  listActiveTurnSummaries(): ActiveTurnSummary[] {
+  listActiveTurnSummaries(nowMs = Date.now()): ActiveTurnSummary[] {
     const out: ActiveTurnSummary[] = []
     for (const turn of this.activeTurns.values()) {
       if (turn.settled) continue
+      const lastActivityAtMs = turn.lastActivityAtMs || turn.startedAtMs
       out.push({
         id: turn.id,
         botId: turn.botId,
@@ -205,6 +219,9 @@ export class InboundPipeline {
         ...(turn.sessionId ? { sessionId: turn.sessionId } : {}),
         trigger: turn.trigger,
         startedAtMs: turn.startedAtMs,
+        lastActivityAtMs,
+        idleSec: Math.max(0, Math.round((nowMs - lastActivityAtMs) / 1000)),
+        willAutoResume: canAutoResumePendingTurn(turn, nowMs, { phase: 'shutdown' }),
       })
     }
     return out.sort((a, b) => a.startedAtMs - b.startedAtMs)
@@ -642,7 +659,7 @@ export class InboundPipeline {
         }
 
         // 2. Automatically resume eligible in-flight turns within the recovery window & retry budget.
-        if (bot?.enabled && canAutoResumePendingTurn(item, nowMs)) {
+        if (bot?.enabled && canAutoResumePendingTurn(item, nowMs, { phase: 'startup' })) {
           const replayMsg = item.inboundMsg!
           const knownChatName =
             item.chatName ||
@@ -651,12 +668,21 @@ export class InboundPipeline {
               : undefined)
           const decision = this.resolveDecisionForMessage(bot, replayMsg, groupConfig, knownChatName)
           if (decision.action === 'agent') {
-            const nextAttempt = (item.recoveryAttempts ?? 0) + 1
+            const isGracefulShutdown = item.interruptKind === 'graceful_shutdown'
+            const nextCrashAttempts = isGracefulShutdown
+              ? (item.recoveryAttempts ?? 0)
+              : (item.recoveryAttempts ?? 0) + 1
+            const nextGracefulAttempts = isGracefulShutdown
+              ? (item.gracefulRecoveryAttempts ?? 0) + 1
+              : (item.gracefulRecoveryAttempts ?? 0)
+            const totalAttempts = nextCrashAttempts + nextGracefulAttempts
             const traceId = item.traceId || createTraceId()
             this.host.store.upsertPendingTurn({
               ...item,
               status: 'recovering',
-              recoveryAttempts: nextAttempt,
+              recoveryAttempts: nextCrashAttempts,
+              gracefulRecoveryAttempts: nextGracefulAttempts,
+              lastActivityAtMs: nowMs,
               updatedAtMs: nowMs,
             })
             this.host.store.recordEvent({
@@ -667,14 +693,16 @@ export class InboundPipeline {
               ...(item.sessionId ? { sessionId: item.sessionId } : {}),
               traceId,
               kind: 'lifecycle',
-              summary: `服务重启后自动恢复处理中消息（第 ${nextAttempt} 次恢复）`,
+              summary: `服务重启后自动恢复处理中消息（第 ${totalAttempts} 次恢复）`,
             })
 
             const task = this.runAgentTurn(bot, transport, replayMsg, decision, groupConfig, traceId, {
               pendingTurnId: item.id,
               ...(item.reactionId ? { existingReactionId: item.reactionId } : {}),
               ...(item.sessionId ? { previousSessionId: item.sessionId } : {}),
-              recoveryAttempts: nextAttempt,
+              recoveryAttempts: nextCrashAttempts,
+              gracefulRecoveryAttempts: nextGracefulAttempts,
+              totalRecoveryAttempts: totalAttempts,
               previousIntermediateSentCount: item.intermediateSentCount ?? 0,
               ...(item.handoffTurns ? { handoffTurns: item.handoffTurns } : {}),
               startedAtMs: item.startedAtMs,
@@ -732,7 +760,7 @@ export class InboundPipeline {
       if (record.settled) continue
       record.settled = true
       record.reactionRemoved = true
-      if (canAutoResumePendingTurn(record, nowMs)) {
+      if (canAutoResumePendingTurn(record, nowMs, { phase: 'shutdown' })) {
         recoverable.push(record)
       } else {
         nonRecoverable.push(record)
@@ -743,6 +771,8 @@ export class InboundPipeline {
 
     for (const record of recoverable) {
       record.status = 'interrupted'
+      record.interruptedAtMs = nowMs
+      record.interruptKind = 'graceful_shutdown'
       this.persistActiveTurn(record, { force: true })
       this.host.store.recordEvent({
         botId: record.botId,
@@ -1001,6 +1031,7 @@ export class InboundPipeline {
         ...(recovery?.handoffTurns ? { handoffTurns: recovery.handoffTurns } : {}),
         intermediateSentCount: recovery?.previousIntermediateSentCount ?? 0,
         recoveryAttempts: recovery?.recoveryAttempts ?? 0,
+        gracefulRecoveryAttempts: recovery?.gracefulRecoveryAttempts ?? 0,
       })
 
       let trackedSessionId: string | undefined
@@ -1058,7 +1089,7 @@ export class InboundPipeline {
           acquired.sessionId === recovery.previousSessionId &&
           !acquired.isNew
             ? composeRestartRecoveryReminder({
-                attempt: recovery.recoveryAttempts,
+                attempt: recovery.totalRecoveryAttempts,
                 intermediateSentCount: recovery.previousIntermediateSentCount,
               })
             : undefined
@@ -1105,13 +1136,17 @@ export class InboundPipeline {
         }
         if (slot.role === 'aborted') {
           batchItems = slot.orphanedItems
+          const abortNowMs = Date.now()
           let anyRecalled = false
           for (const orphaned of slot.orphanedItems) {
             if (this.isTurnRecalled(bot.id, orphaned)) {
               anyRecalled = true
               this.settleRecalledTurn(orphaned.activeTurn, '原消息已撤回，已取消排队轮次')
-            } else if (this.host.isDisposed() && canAutoResumePendingTurn(orphaned.activeTurn)) {
-              this.suspendSingleTurnForRestart(orphaned.activeTurn)
+            } else if (
+              this.host.isDisposed() &&
+              canAutoResumePendingTurn(orphaned.activeTurn, abortNowMs, { phase: 'shutdown' })
+            ) {
+              this.suspendSingleTurnForRestart(orphaned.activeTurn, abortNowMs)
             } else {
               this.claimActiveTurn(orphaned.activeTurn)
             }
@@ -1161,7 +1196,7 @@ export class InboundPipeline {
 
         const inboundBaseSummary = `${effectiveDecision.listenerName ? `监听「${effectiveDecision.listenerName}」` : effectiveDecision.trigger} → ${effectiveDecision.agentPreset} · ${effectiveDecision.workspaceName}`
         const inboundTags = [
-          ...(recovery ? [`重启自动恢复 #${recovery.recoveryAttempts}`] : []),
+          ...(recovery ? [`重启自动恢复 #${recovery.totalRecoveryAttempts}`] : []),
           ...(triageNote ? [triageNote] : []),
           ...(batchSize > 1 ? [`合并 ${batchSize} 条排队消息`] : []),
         ]
@@ -1204,6 +1239,11 @@ export class InboundPipeline {
           replyText = await runTurnAndCollectReply(this.host.ctx, acquired.agent, content, {
             signal: this.host.shutdownSignal,
             cancelSignal: linkedCancel.signal,
+            onActivity: (timestampMs) => {
+              for (const item of batchItems) {
+                this.touchActiveTurnActivity(item.activeTurn, timestampMs)
+              }
+            },
             ...(effectiveDecision.sendIntermediateMessages
               ? {
                   onIntermediate: async (stepText) => {
@@ -1216,7 +1256,10 @@ export class InboundPipeline {
                       stepText,
                     )
                     if (sent) {
+                      const sentAtMs = Date.now()
                       latestItem.activeTurn.intermediateSentCount += 1
+                      latestItem.activeTurn.lastActivityAtMs = sentAtMs
+                      latestItem.activeTurn.lastPersistedActivityAtMs = sentAtMs
                       this.persistActiveTurn(latestItem.activeTurn)
                       this.host.store.markBindingReplied(effectiveDecision.routeKey)
                     }
@@ -1536,10 +1579,15 @@ export class InboundPipeline {
     if (isRestartAbort) {
       const nonRecoverableItems: QueuedWorkerTurnItem[] = []
       const nowMs = Date.now()
+      let suspendedCount = 0
       for (const item of batchItems) {
-        if (item.activeTurn.settled) continue
-        if (canAutoResumePendingTurn(item.activeTurn, nowMs)) {
-          this.suspendSingleTurnForRestart(item.activeTurn)
+        if (item.activeTurn.settled) {
+          if (item.activeTurn.status === 'interrupted') suspendedCount += 1
+          continue
+        }
+        if (canAutoResumePendingTurn(item.activeTurn, nowMs, { phase: 'shutdown' })) {
+          this.suspendSingleTurnForRestart(item.activeTurn, nowMs)
+          suspendedCount += 1
         } else {
           nonRecoverableItems.push(item)
         }
@@ -1565,6 +1613,9 @@ export class InboundPipeline {
         auditSummary: err.message,
         replyText: `${err.message}，可重新回复继续。`,
       })
+      if (suspendedCount > 0) {
+        return { dispose: false, archive: false }
+      }
       return { dispose, archive }
     }
 
@@ -1987,11 +2038,13 @@ export class InboundPipeline {
     }
   }
 
-  private suspendSingleTurnForRestart(record: ActiveTurnRecord): void {
+  private suspendSingleTurnForRestart(record: ActiveTurnRecord, nowMs = Date.now()): void {
     if (record.settled) return
     record.settled = true
     record.reactionRemoved = true
     record.status = 'interrupted'
+    record.interruptedAtMs = nowMs
+    record.interruptKind = 'graceful_shutdown'
     this.activeTurns.delete(record.id)
     this.persistActiveTurn(record, { force: true })
     this.host.store.recordEvent({
@@ -2005,6 +2058,15 @@ export class InboundPipeline {
       summary: '服务重载或停机，已保存处理中任务待重启自动恢复',
     })
     this.host.onActivityChange?.()
+  }
+
+  private touchActiveTurnActivity(record: ActiveTurnRecord, nowMs = Date.now()): void {
+    if (record.settled || this.host.isDisposed()) return
+    record.lastActivityAtMs = nowMs
+    if (nowMs - record.lastPersistedActivityAtMs >= ACTIVE_TURN_HEARTBEAT_PERSIST_INTERVAL_MS) {
+      record.lastPersistedActivityAtMs = nowMs
+      this.persistActiveTurn(record)
+    }
   }
 
   private isTurnRecalled(botId: string, item: Pick<QueuedWorkerTurnItem, 'msg' | 'activeTurn' | 'cancelController'>): boolean {
@@ -2035,13 +2097,25 @@ export class InboundPipeline {
   private registerActiveTurn(
     input: Omit<
       ActiveTurnRecord,
-      'id' | 'silencedByControl' | 'cancelledByRecall' | 'settled' | 'reactionRemoved' | 'status'
+      | 'id'
+      | 'silencedByControl'
+      | 'cancelledByRecall'
+      | 'settled'
+      | 'reactionRemoved'
+      | 'status'
+      | 'lastActivityAtMs'
+      | 'lastPersistedActivityAtMs'
+      | 'interruptedAtMs'
+      | 'interruptKind'
     > & { readonly id?: string },
   ): ActiveTurnRecord {
+    const nowMs = Date.now()
     const record: ActiveTurnRecord = {
       ...input,
       id: input.id || randomUUID(),
       status: 'running',
+      lastActivityAtMs: nowMs,
+      lastPersistedActivityAtMs: nowMs,
       silencedByControl: false,
       cancelledByRecall: false,
       settled: false,
@@ -2077,9 +2151,13 @@ export class InboundPipeline {
       ...(record.senderName ? { senderName: record.senderName } : {}),
       intermediateSentCount: record.intermediateSentCount,
       recoveryAttempts: record.recoveryAttempts,
+      gracefulRecoveryAttempts: record.gracefulRecoveryAttempts,
       ...(record.handoffTurns && record.handoffTurns.length > 0
         ? { handoffTurns: record.handoffTurns }
         : {}),
+      lastActivityAtMs: record.lastActivityAtMs,
+      ...(record.interruptedAtMs !== undefined ? { interruptedAtMs: record.interruptedAtMs } : {}),
+      ...(record.interruptKind ? { interruptKind: record.interruptKind } : {}),
       updatedAtMs: Date.now(),
     })
   }

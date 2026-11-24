@@ -6,14 +6,21 @@ import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
 import { TurnFinalReplyTracker } from './turn-runner.js'
 import type { LarkPendingTurn } from './types.js'
 
-/** Maximum age of an interrupted turn eligible for automatic post-restart recovery (15 minutes). */
+/** Maximum downtime / inactivity gap eligible for automatic post-restart recovery (15 minutes). */
 export const MAX_AUTO_RESUME_AGE_MS = 15 * 60_000
 
-/** Maximum automatic recovery attempts per inbound message to prevent poison-pill restart loops. */
+/** Absolute maximum age of a single pending turn eligible for automatic recovery (6 hours). */
+export const MAX_AUTO_RESUME_TOTAL_AGE_MS = 6 * 60 * 60_000
+
+/** Maximum automatic recovery attempts after an ungraceful crash to prevent poison-pill restart loops. */
 export const MAX_AUTO_RESUME_ATTEMPTS = 1
+
+/** Maximum automatic recovery attempts across planned graceful shutdowns / reloads. */
+export const MAX_GRACEFUL_AUTO_RESUME_ATTEMPTS = 3
 
 const READ_PAGE_SIZE = 200
 const MAX_INSPECT_EVENTS = 2000
+const MAX_PERSISTENCE_SCAN_EVENTS = 50_000
 
 export type PersistedTurnInspection =
   | {
@@ -60,17 +67,21 @@ async function loadSessionEventsForRecovery(
   try {
     const handle = await persistence.open(sid, 'read')
     try {
-      const events: SessionEvent[] = []
+      const tailEvents: SessionEvent[] = []
       let offset = 0
-      while (events.length < MAX_INSPECT_EVENTS) {
-        const pageSize = Math.min(READ_PAGE_SIZE, MAX_INSPECT_EVENTS - events.length)
-        const res = await handle.read(offset, pageSize)
+      let scanned = 0
+      while (scanned < MAX_PERSISTENCE_SCAN_EVENTS) {
+        const res = await handle.read(offset, READ_PAGE_SIZE)
         if (!res.events || res.events.length === 0) break
-        events.push(...res.events)
+        tailEvents.push(...res.events)
+        if (tailEvents.length > MAX_INSPECT_EVENTS) {
+          tailEvents.splice(0, tailEvents.length - MAX_INSPECT_EVENTS)
+        }
         offset += res.events.length
-        if (res.events.length < pageSize) break
+        scanned += res.events.length
+        if (res.events.length < READ_PAGE_SIZE) break
       }
-      return events
+      return tailEvents
     } finally {
       await handle.close().catch(() => {})
     }
@@ -148,18 +159,54 @@ export async function inspectPersistedTurnCompletion(
   return { state: 'incomplete' }
 }
 
+export interface AutoResumeEligibilityOptions {
+  /**
+   * - `'shutdown'`: evaluated while the turn is actively running during a graceful stop/reload.
+   *   Does not penalize long-running turns for their elapsed execution duration (`startedAtMs`),
+   *   only checking payload presence, absolute safety cap, and recovery budget.
+   * - `'startup'` (default): evaluated when a new process boots and inspects persisted pending turns.
+   *   Measures downtime / inactivity since `interruptedAtMs ?? lastActivityAtMs ?? startedAtMs`.
+   */
+  readonly phase?: 'shutdown' | 'startup'
+}
+
 /**
  * Whether an active or persisted pending turn is eligible to be automatically resumed
  * across a service restart/reload.
  */
 export function canAutoResumePendingTurn(
-  turn: Pick<LarkPendingTurn, 'inboundMsg' | 'startedAtMs' | 'recoveryAttempts'>,
+  turn: Pick<
+    LarkPendingTurn,
+    | 'inboundMsg'
+    | 'startedAtMs'
+    | 'recoveryAttempts'
+    | 'gracefulRecoveryAttempts'
+    | 'interruptedAtMs'
+    | 'lastActivityAtMs'
+    | 'interruptKind'
+  >,
   nowMs = Date.now(),
+  options: AutoResumeEligibilityOptions = {},
 ): boolean {
   if (!turn.inboundMsg) return false
-  const priorAttempts = turn.recoveryAttempts ?? 0
-  if (priorAttempts >= MAX_AUTO_RESUME_ATTEMPTS) return false
-  if (nowMs - turn.startedAtMs > MAX_AUTO_RESUME_AGE_MS) return false
+  if (nowMs - turn.startedAtMs > MAX_AUTO_RESUME_TOTAL_AGE_MS) return false
+
+  const phase = options.phase ?? 'startup'
+  const crashAttempts = turn.recoveryAttempts ?? 0
+  if (crashAttempts >= MAX_AUTO_RESUME_ATTEMPTS) return false
+
+  const isGraceful = phase === 'shutdown' || turn.interruptKind === 'graceful_shutdown'
+  if (isGraceful) {
+    const gracefulAttempts = turn.gracefulRecoveryAttempts ?? 0
+    if (gracefulAttempts >= MAX_GRACEFUL_AUTO_RESUME_ATTEMPTS) return false
+  }
+
+  if (phase === 'shutdown') {
+    return true
+  }
+
+  const downtimeAnchorMs = turn.interruptedAtMs ?? turn.lastActivityAtMs ?? turn.startedAtMs
+  if (nowMs - downtimeAnchorMs > MAX_AUTO_RESUME_AGE_MS) return false
   return true
 }
 

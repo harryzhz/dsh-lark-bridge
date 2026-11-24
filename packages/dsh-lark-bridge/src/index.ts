@@ -261,9 +261,12 @@ export { runDbCliCommand, inspectInstanceLockFile, type ActiveLockSummary, type 
 export {
   MAX_AUTO_RESUME_AGE_MS,
   MAX_AUTO_RESUME_ATTEMPTS,
+  MAX_AUTO_RESUME_TOTAL_AGE_MS,
+  MAX_GRACEFUL_AUTO_RESUME_ATTEMPTS,
   canAutoResumePendingTurn,
   composeRestartRecoveryReminder,
   inspectPersistedTurnCompletion,
+  type AutoResumeEligibilityOptions,
   type PersistedTurnInspection,
 } from './turn-recovery.js'
 export {
@@ -292,5 +295,6 @@ export {
   type LarkScheduleBinding,
   type LarkScheduleView,
   type LarkSessionBinding,
+  type PendingTurnInterruptKind,
   type PendingTurnStatus,
 } from './types.js'

@@ -14,7 +14,13 @@ import {
   InstanceLockConflictError,
 } from '../src/instance-lock.js'
 import { LarkBridgeStore } from '../src/store.js'
-import { MAX_AUTO_RESUME_AGE_MS } from '../src/turn-recovery.js'
+import {
+  MAX_AUTO_RESUME_AGE_MS,
+  MAX_AUTO_RESUME_TOTAL_AGE_MS,
+  MAX_GRACEFUL_AUTO_RESUME_ATTEMPTS,
+  canAutoResumePendingTurn,
+  inspectPersistedTurnCompletion,
+} from '../src/turn-recovery.js'
 
 const tempDirs: string[] = []
 
@@ -829,5 +835,248 @@ describe('Restart resilience, triage context persistence/backfill & graceful dra
 
     await manager.stop()
     store.close()
+  })
+
+  it('preserves and auto-resumes a long-running (>15m) active turn across graceful shutdown and consecutive reloads', async () => {
+    const dir = makeTempDir()
+    const workDir = makeTempDir('dsh-lark-wd-')
+    const store1 = new LarkBridgeStore(dir)
+    seedBotAndGroup(store1, workDir)
+
+    const host1 = createFakeHostContext({ manualTurnControl: true })
+    const manager1 = new LarkBridgeManager(
+      host1.ctx,
+      {
+        dataDir: dir,
+        publicBaseUrl: 'http://127.0.0.1:3880',
+        idleSweepIntervalMs: 0,
+        maxAuditEvents: 100,
+        autoInstallCliAndSkill: false,
+        enableInstanceLock: false,
+      },
+      store1,
+    )
+    const { transport: t1, sentReplies: sentReplies1 } = createFakeTransport()
+    manager1.connections.transports.set('bot-res', { config: store1.getBot('bot-res')!, transport: t1 })
+
+    const msg = makeMsg({
+      messageId: 'om_long_20m',
+      text: '@_bot 执行长耗时研发任务',
+      mentions: [{ key: '@_bot', openId: 'ou_bot_res', name: 'ResBot' }],
+    })
+    const turnPromise = manager1.inbound.handleInbound('bot-res', t1, msg)
+    await vi.waitFor(() => expect(host1.pendingTurnCount()).toBe(1))
+
+    // Backdate startedAtMs by 20 minutes (> 15m MAX_AUTO_RESUME_AGE_MS) to simulate a long-running turn.
+    const activeMap = (
+      manager1.inbound as unknown as {
+        activeTurns: Map<string, { startedAtMs: number; lastActivityAtMs: number }>
+      }
+    ).activeTurns
+    const activeTurn = [...activeMap.values()][0]!
+    const twentyMinAgo = Date.now() - 20 * 60_000
+    activeTurn.startedAtMs = twentyMinAgo
+    activeTurn.lastActivityAtMs = Date.now() - 5_000
+
+    const lifecycle = manager1.getLifecycleStatus()
+    expect(lifecycle.activeTurns).toHaveLength(1)
+    expect(lifecycle.activeTurns[0]?.willAutoResume).toBe(true)
+    expect(lifecycle.activeTurns[0]?.idleSec).toBeGreaterThanOrEqual(4)
+    expect(lifecycle.activeTurns[0]?.lastActivityAtMs).toBeGreaterThan(twentyMinAgo)
+
+    // Graceful shutdown must persist the >15m active turn instead of discarding it as expired.
+    await manager1.stop()
+    await turnPromise
+    expect(sentReplies1).toHaveLength(0)
+
+    const persisted = store1.listPendingTurns()
+    expect(persisted).toHaveLength(1)
+    expect(persisted[0]?.status).toBe('interrupted')
+    expect(persisted[0]?.interruptKind).toBe('graceful_shutdown')
+    expect(persisted[0]?.interruptedAtMs).toBeTypeOf('number')
+    store1.close()
+
+    // Restart #1: 10 seconds after shutdown -> auto-resumes using downtime window, increments graceful budget only.
+    const store2 = new LarkBridgeStore(dir)
+    const host2 = createFakeHostContext({ manualTurnControl: true })
+    const manager2 = new LarkBridgeManager(
+      host2.ctx,
+      {
+        dataDir: dir,
+        publicBaseUrl: 'http://127.0.0.1:3880',
+        idleSweepIntervalMs: 0,
+        maxAuditEvents: 100,
+        autoInstallCliAndSkill: false,
+        enableInstanceLock: false,
+      },
+      store2,
+    )
+    const { transport: t2, sentReplies: sentReplies2 } = createFakeTransport()
+    manager2.connections.transports.set('bot-res', { config: store2.getBot('bot-res')!, transport: t2 })
+
+    const recovered1 = await manager2.recoverStalePendingTurns(undefined, Date.now() + 10_000)
+    expect(recovered1).toBe(1)
+    await vi.waitFor(() => expect(host2.pendingTurnCount()).toBe(1))
+    expect(host2.submittedWorkerPrompts[0]).toContain('<restart_recovery attempt="1"')
+
+    // Restart #2 (consecutive deploy while still running): must still preserve & auto-resume!
+    await manager2.stop()
+    await manager2.inbound.waitForRecoveries()
+    expect(sentReplies2).toHaveLength(0)
+    const persistedAfterSecondStop = store2.listPendingTurns()
+    expect(persistedAfterSecondStop).toHaveLength(1)
+    expect(persistedAfterSecondStop[0]?.gracefulRecoveryAttempts).toBe(1)
+    expect(persistedAfterSecondStop[0]?.recoveryAttempts ?? 0).toBe(0)
+    store2.close()
+
+    const store3 = new LarkBridgeStore(dir)
+    const host3 = createFakeHostContext({
+      workerReply: () => '历经两次优雅重启后顺利交付最终结果',
+    })
+    const manager3 = new LarkBridgeManager(
+      host3.ctx,
+      {
+        dataDir: dir,
+        publicBaseUrl: 'http://127.0.0.1:3880',
+        idleSweepIntervalMs: 0,
+        maxAuditEvents: 100,
+        autoInstallCliAndSkill: false,
+        enableInstanceLock: false,
+      },
+      store3,
+    )
+    const { transport: t3, sentReplies: sentReplies3 } = createFakeTransport()
+    manager3.connections.transports.set('bot-res', { config: store3.getBot('bot-res')!, transport: t3 })
+
+    const recovered2 = await manager3.recoverStalePendingTurns(undefined, Date.now() + 20_000)
+    await manager3.inbound.waitForRecoveries()
+    expect(recovered2).toBe(1)
+    expect(host3.submittedWorkerPrompts[0]).toContain('<restart_recovery attempt="2"')
+    expect(sentReplies3).toHaveLength(1)
+    expect(sentReplies3[0]?.text).toContain('历经两次优雅重启后顺利交付最终结果')
+    expect(store3.listPendingTurns()).toHaveLength(0)
+
+    await manager3.stop()
+    store3.close()
+  })
+
+  it('enforces downtime window, graceful attempt cap, and absolute age safety cap in canAutoResumePendingTurn', () => {
+    const now = Date.now()
+    const baseMsg = makeMsg({ messageId: 'om_policy_1' })
+
+    // Long turn (45 min old) interrupted 30 seconds ago -> eligible at both shutdown and startup.
+    expect(
+      canAutoResumePendingTurn(
+        {
+          inboundMsg: baseMsg,
+          startedAtMs: now - 45 * 60_000,
+          interruptedAtMs: now - 30_000,
+          interruptKind: 'graceful_shutdown',
+          gracefulRecoveryAttempts: MAX_GRACEFUL_AUTO_RESUME_ATTEMPTS - 1,
+          recoveryAttempts: 0,
+        },
+        now,
+        { phase: 'startup' },
+      ),
+    ).toBe(true)
+
+    // Downtime exceeded 15 minutes since interruption -> rejected at startup.
+    expect(
+      canAutoResumePendingTurn(
+        {
+          inboundMsg: baseMsg,
+          startedAtMs: now - 45 * 60_000,
+          interruptedAtMs: now - MAX_AUTO_RESUME_AGE_MS - 1_000,
+          interruptKind: 'graceful_shutdown',
+          gracefulRecoveryAttempts: 0,
+          recoveryAttempts: 0,
+        },
+        now,
+        { phase: 'startup' },
+      ),
+    ).toBe(false)
+
+    // Graceful retry cap reached -> rejected even at shutdown.
+    expect(
+      canAutoResumePendingTurn(
+        {
+          inboundMsg: baseMsg,
+          startedAtMs: now - 5 * 60_000,
+          interruptKind: 'graceful_shutdown',
+          gracefulRecoveryAttempts: MAX_GRACEFUL_AUTO_RESUME_ATTEMPTS,
+          recoveryAttempts: 0,
+        },
+        now,
+        { phase: 'shutdown' },
+      ),
+    ).toBe(false)
+
+    // Absolute safety age cap (> 6 hours) -> rejected even at shutdown.
+    expect(
+      canAutoResumePendingTurn(
+        {
+          inboundMsg: baseMsg,
+          startedAtMs: now - MAX_AUTO_RESUME_TOTAL_AGE_MS - 1_000,
+          gracefulRecoveryAttempts: 0,
+          recoveryAttempts: 0,
+        },
+        now,
+        { phase: 'shutdown' },
+      ),
+    ).toBe(false)
+  })
+
+  it('scans the tail window of persisted sessions exceeding 2000 events when checking turn completion', async () => {
+    const now = Date.now()
+    const longEvents: SessionEvent[] = []
+    for (let i = 0; i < 2300; i += 1) {
+      longEvents.push({
+        type: 'assistant/message',
+        seq: i,
+        time: now - 60_000 + i,
+        data: {
+          turn: 1,
+          message: { role: 'assistant', content: [{ type: 'text', text: `history-${i}` }] },
+        },
+      } as unknown as SessionEvent)
+    }
+    longEvents.push(
+      { type: 'turn/start', seq: 2300, time: now - 5_000, data: { turn: 99 } } as unknown as SessionEvent,
+      {
+        type: 'user/message',
+        seq: 2301,
+        time: now - 5_000,
+        data: {
+          content: [{ type: 'text', text: '<lark_context message_id="om_tail_done" />\n检查末尾回合' }],
+        },
+      } as unknown as SessionEvent,
+      {
+        type: 'assistant/message',
+        seq: 2302,
+        time: now - 2_000,
+        data: {
+          turn: 99,
+          message: { role: 'assistant', content: [{ type: 'text', text: '长会话末尾已完成回复' }] },
+        },
+      } as unknown as SessionEvent,
+      {
+        type: 'turn/end',
+        seq: 2303,
+        time: now - 2_000,
+        data: { turn: 99, reason: { kind: 'completed' } },
+      } as unknown as SessionEvent,
+    )
+
+    const persistedEventsBySession = new Map<string, readonly SessionEvent[]>([
+      ['session-long-tail', longEvents],
+    ])
+    const host = createFakeHostContext({ persistedEventsBySession })
+    const result = await inspectPersistedTurnCompletion(host.ctx, 'session-long-tail', 'om_tail_done')
+    expect(result).toEqual({
+      state: 'completed',
+      replyText: '长会话末尾已完成回复',
+      silencedByTool: false,
+      turn: 99,
+    })
   })
 })
