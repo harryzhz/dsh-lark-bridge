@@ -97,7 +97,7 @@ export {
   MEMORY_MAX_TITLE_CHARS,
   MEMORY_SCOPE_LABELS,
   MEMORY_TYPE_LABELS,
-  composeBridgeMemoryReminder,
+  composeMemoryReminder,
   detectDreamingMemoryWriteFailure,
   formatMemoryDateIso,
   matchesMemoryContext,
@@ -106,7 +106,6 @@ export {
   normalizeMemoryTitleKey,
   rankMemoryEntriesForContext,
   renderMemoryMarkdownProjection,
-  type BridgeMemoryReminderResult,
   type LarkMemoryConfidence,
   type LarkMemoryEntry,
   type LarkMemoryMutationStats,
@@ -114,6 +113,7 @@ export {
   type LarkMemoryStatus,
   type LarkMemoryType,
   type MemoryRecallContext,
+  type MemoryReminderResult,
 } from './memory.js'
 export {
   LarkReminderItemSchema,

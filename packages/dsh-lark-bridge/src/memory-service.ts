@@ -1,7 +1,7 @@
 import { chmodSync, mkdirSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import {
-  composeBridgeMemoryReminder,
+  composeMemoryReminder,
   rankMemoryEntriesForContext,
   renderMemoryMarkdownProjection,
   type LarkMemoryEntry,
@@ -45,13 +45,13 @@ function atomicWritePrivate(filePath: string, content: string): void {
 }
 
 /**
- * Runtime-agnostic Bridge Memory service:
+ * Runtime-agnostic Memory service:
  * - Single source of truth in SQLite (`memory_entries` + FTS5 trigram index)
  * - Atomic human-auditable Markdown mirror at `<dataDir>/memory/<botId>/MEMORY.md`
  * - Progressive disclosure Layer 1 context injection + recall telemetry
  * - Scoped mutation trackers for honest Dreaming consolidation accounting
  */
-export class BridgeMemoryService {
+export class MemoryService {
   private readonly trackersByBot = new Map<string, Set<MutableStats>>()
 
   constructor(
@@ -176,7 +176,7 @@ export class BridgeMemoryService {
   }
 
   /**
-   * Builds Layer 1 progressive disclosure `<bridge_memory>` reminder for a new session
+   * Builds Layer 1 progressive disclosure `<memory>` reminder for a new session
    * and updates recall statistics for the surfaced entries.
    */
   composeFirstTurnReminder(
@@ -192,7 +192,7 @@ export class BridgeMemoryService {
     if (ranked.length === 0 && !options.includeWhenEmpty) {
       return undefined
     }
-    const composed = composeBridgeMemoryReminder({
+    const composed = composeMemoryReminder({
       botId: context.botId,
       entries: ranked,
       totalActiveCount: ranked.length,

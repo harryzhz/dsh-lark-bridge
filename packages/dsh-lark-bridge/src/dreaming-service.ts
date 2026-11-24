@@ -17,7 +17,7 @@ import {
   resolveEffectiveWorkspaceName,
   type LarkMemoryMutationStats,
 } from '@dsh-lark/lark-core'
-import type { BridgeMemoryService } from './memory-service.js'
+import type { MemoryService } from './memory-service.js'
 import type { RuntimeCatalog } from './runtime-catalog.js'
 import type { LarkBridgeStore } from './store.js'
 import {
@@ -39,7 +39,7 @@ export interface DreamingHost {
   readonly ctx: Context
   readonly dataDir: string
   readonly store: LarkBridgeStore
-  readonly memory?: BridgeMemoryService
+  readonly memory?: MemoryService
   readonly runtimes: RuntimeCatalog
   readonly workspaces: WorkspaceGrouping
   runTurn(agent: Agent, content: ContentBlock[]): Promise<string>

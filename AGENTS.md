@@ -29,6 +29,6 @@
 | 修改前端界面、弹窗、表单或样式（**必读**） | [docs/guidelines/ui.md](./docs/guidelines/ui.md) | 设计令牌、控件右对齐规范、原位子视图与防双层遮罩、级联子配置与标签流样式 |
 | 改动包分层 / 鉴权路由 / Desktop 接管 / 目录边界 | [docs/architecture/overview.md](./docs/architecture/overview.md) | 六大模块分层、能力驱动边界、产物目录、HTTP/RPC 与 Electron Desktop 约束 |
 | 改动消息路由、话题复用、代答/监听或自动归档 | [docs/architecture/session-management.md](./docs/architecture/session-management.md) | 五级入站路由、多路由别名索引、`SessionActor` 状态机与典型配置场景 |
-| 改动 Bridge Memory、Dreaming 整理或记忆产物组织 | [docs/architecture/memory-and-dreaming.md](./docs/architecture/memory-and-dreaming.md) | 跨运行时 Bridge Memory 数据模型、SQLite v3/FTS5 与 `MEMORY.md` 产物组织、两层渐进披露与 Auto-Dream 四阶段机制 |
+| 改动 Memory、Dreaming 整理或记忆产物组织 | [docs/architecture/memory-and-dreaming.md](./docs/architecture/memory-and-dreaming.md) | 跨运行时 Memory 数据模型、SQLite v3/FTS5 与 `MEMORY.md` 产物组织、两层渐进披露与 Auto-Dream 四阶段机制 |
 | 涉及凭据、权限边界、脱敏示例或漏洞响应 | [SECURITY.md](./SECURITY.md) | 运行期安全架构、开源防泄露基线与漏洞披露流程 |
 | 新增文档 / 查阅历史审查与演进背景 | [docs/README.md](./docs/README.md) · [docs/reports/](./docs/reports/2026-11-23-architecture-review.md) | 文档目录与放置约定；已归档的架构审查报告与演进记录 |

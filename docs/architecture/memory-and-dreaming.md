@@ -1,10 +1,10 @@
-# Bridge Memory 与 Auto-Dream 架构实现
+# Memory 与 Auto-Dream 架构实现
 
-本文档说明 `dsh-lark-bridge` 跨运行时长期记忆（**Bridge Memory**）与离线整理（**Auto-Dream**）的整体架构、数据模型、存储与混合检索机制、两层渐进披露协议、鉴权边界及磁盘产物组织。
+本文档说明 `dsh-lark-bridge` 跨运行时长期记忆（**Memory**）与离线整理（**Auto-Dream**）的整体架构、数据模型、存储与混合检索机制、两层渐进披露协议、鉴权边界及磁盘产物组织。
 
 > 核心源码参考：
 > - 领域协议与纯函数（零 DSH 依赖）：[packages/lark-core/src/memory.ts](../../packages/lark-core/src/memory.ts)、[packages/lark-core/src/dreaming.ts](../../packages/lark-core/src/dreaming.ts)
-> - 存储迁移与仓储：[packages/dsh-lark-bridge/src/storage/migrations/003-bridge-memory.ts](../../packages/dsh-lark-bridge/src/storage/migrations/003-bridge-memory.ts)、[packages/dsh-lark-bridge/src/storage/memory-repo.ts](../../packages/dsh-lark-bridge/src/storage/memory-repo.ts)
+> - 存储迁移与仓储：[packages/dsh-lark-bridge/src/storage/migrations/003-memory.ts](../../packages/dsh-lark-bridge/src/storage/migrations/003-memory.ts)、[packages/dsh-lark-bridge/src/storage/memory-repo.ts](../../packages/dsh-lark-bridge/src/storage/memory-repo.ts)
 > - 服务编排、首轮注入与 HTTP 路由：[packages/dsh-lark-bridge/src/memory-service.ts](../../packages/dsh-lark-bridge/src/memory-service.ts)、[packages/dsh-lark-bridge/src/inbound-pipeline.ts](../../packages/dsh-lark-bridge/src/inbound-pipeline.ts)、[packages/dsh-lark-bridge/src/http-memory-routes.ts](../../packages/dsh-lark-bridge/src/http-memory-routes.ts)、[packages/dsh-lark-bridge/src/dreaming-service.ts](../../packages/dsh-lark-bridge/src/dreaming-service.ts)
 > - CLI、技能文档与控制台 UI：[packages/dsh-bundle/bin/lark-bridge.mjs](../../packages/dsh-bundle/bin/lark-bridge.mjs)、[skills/lark-bridge/SKILL.md](../../skills/lark-bridge/SKILL.md)、[packages/dsh-lark-ui/src/components/BotMemoryPanel.tsx](../../packages/dsh-lark-ui/src/components/BotMemoryPanel.tsx)、[packages/dsh-lark-ui/src/components/ExperimentalSection.tsx](../../packages/dsh-lark-ui/src/components/ExperimentalSection.tsx)
 
@@ -16,13 +16,13 @@
 
 在 `dsh-lark-bridge` 的多运行时体系中，DSH 原生 Agent 与外部 CLI 运行时（如 `codex`、`agy`、`claude-code`、`trae`）并存，**外部运行时并不暴露统一的内置可写 Memory API**。若离线 Dreaming 仅依赖“调用运行时自身内置记忆”，会导致外部运行时无法落盘、反复返回失败说明，却仍被标记为成功并推进增量水位线。
 
-Bridge Memory 将长期记忆下沉为**桥接层一等公民**，做到**运行时无关、可审计、可防串味、可双时态演进**。
+Memory 系统将长期记忆下沉为**桥接层一等公民**，做到**运行时无关、可审计、可防串味、可双时态演进**。
 
 ### 1.2 业界 SOTA 机制对照
 
 | 业界 SOTA 参考 | 核心设计思想 | 在 `dsh-lark-bridge` 中的落地实现 |
 | --- | --- | --- |
-| **Letta (MemGPT)** | 有界核心记忆（Always-in-Context Core Memory）+ 按需外部检索 + 离线 Sleep-Time 整理 | 首轮严格预算注入 `<bridge_memory>`（≤ 20 条、≤ 2600 字符）；详情与检索下沉至 `lark-bridge memory` CLI；夜间 Auto-Dream 离线维护 |
+| **Letta (MemGPT)** | 有界核心记忆（Always-in-Context Core Memory）+ 按需外部检索 + 离线 Sleep-Time 整理 | 首轮严格预算注入 `<memory>`（≤ 20 条、≤ 2600 字符）；详情与检索下沉至 `lark-bridge memory` CLI；夜间 Auto-Dream 离线维护 |
 | **Claude Code Auto-Memory & Auto-Dream** | 四分类语义记忆 + 渐进披露（索引 → 详情 → 源码）+ 四阶段离线整理 | `feedback / user / project / reference` 四分类；首轮仅下发单行索引 + 工具指针；Auto-Dream 严格执行「摸底 → 采信 → 沉淀/纠偏 → 汇报」四阶段 |
 | **Zep / Graphiti** | 双时态非破坏式事实替代（Bi-Temporal Superseding） | 新事实推翻旧事实时通过 `supersede` 将旧条目置为 `superseded` 并记录 `supersededBy / supersededAtMs / supersedeReason`，检索默认仅返回 `active` 真相 |
 
@@ -40,7 +40,7 @@ flowchart TB
     subgraph Host["packages/dsh-lark-bridge (Host 插件编排层)"]
         Inbound["InboundPipeline\n新会话首轮 Layer 1 注入"]
         DreamSvc["DreamingService\n分页/去噪/折叠 + MutationTracker\n诚实水位线控制"]
-        MemSvc["BridgeMemoryService\n业务编排 / 变更追踪 / MEMORY.md 同步"]
+        MemSvc["MemoryService\n业务编排 / 变更追踪 / MEMORY.md 同步"]
         MemHttp["http-memory-routes.ts\n/api/lark-bridge/memory/*\nOwner vs CLI 鉴权边界"]
         MemRepo["MemoryRepo\nSQLite 事务 / FTS5 + LIKE 混合检索"]
     end
@@ -133,13 +133,13 @@ stateDiagram-v2
 
 ### 4.1 产物目录拓扑与严格边界
 
-Bridge Memory 严格遵守 `AGENTS.md` 与 [overview.md](./overview.md) 的产物目录隔离红线：**所有记忆真相源、镜像与增量摘要均集中在 `$DSH_HOME/lark-bridge/`（默认 `~/.dsh/lark-bridge/`），严禁向任何目标业务工作区的 `.local/` 写入产品运行产物**。
+Memory 严格遵守 `AGENTS.md` 与 [overview.md](./overview.md) 的产物目录隔离红线：**所有记忆真相源、镜像与增量摘要均集中在 `$DSH_HOME/lark-bridge/`（默认 `~/.dsh/lark-bridge/`），严禁向任何目标业务工作区的 `.local/` 写入产品运行产物**。
 
 ```text
 ~/.dsh/lark-bridge/                              # 产品运行期全局数据目录 (0o700)
 ├── lark-bridge.db                               # SQLite WAL 唯一真相源 (0o600，含 schema v3)
 ├── lark-bridge.db-wal / -shm                    # SQLite WAL 事务日志与共享内存 (0o600)
-├── memory/                                      # Bridge Memory 派生只读镜像目录
+├── memory/                                      # Memory 派生只读镜像目录
 │   └── <botId>/
 │       └── MEMORY.md                            # 人类/Agent 可直接审阅的 Markdown 投影 (0o600, ≤ 200 行 / 12 KB)
 ├── dreaming/                                    # Auto-Dream 离线整理中间输入目录
@@ -158,13 +158,13 @@ Bridge Memory 严格遵守 `AGENTS.md` 与 [overview.md](./overview.md) 的产�
 
 | 产物 | 权威角色 | 写入方式与权限 | 预算与维护策略 |
 | --- | --- | --- | --- |
-| `lark-bridge.db`（`memory_entries` + `memory_entries_fts`） | **唯一真相源（Single Source of Truth）** | SQLite `BEGIN IMMEDIATE` 事务，主表与 FTS5 同步更新，文件权限 `0o600` | Schema Migration v3（`003_bridge_memory`）自动无损升级 |
+| `lark-bridge.db`（`memory_entries` + `memory_entries_fts`） | **唯一真相源（Single Source of Truth）** | SQLite `BEGIN IMMEDIATE` 事务，主表与 FTS5 同步更新，文件权限 `0o600` | Schema Migration v3（`003_memory`）自动无损升级 |
 | `memory/<botId>/MEMORY.md` | **只读派生产物（投影镜像）** | 每次记忆变更后 `tmp + chmod 0o600 + renameSync` 原子替换；Auto-Dream 启动前也会刷新 | 严格 ≤ 200 行 / 12 KB，按 `feedback → user → project → reference` 分组，超预算末尾提示使用 CLI 查全量 |
 | `dreaming/<botId>/recent-transcripts.md` | **单次整理临时输入** | 每次 Auto-Dream 执行前覆盖生成 | 最多 20 条有效会话、单会话 ≤ 2800 字符、已过滤静默监听噪音并折叠同主题重复告警 |
 
 ### 4.2 SQLite Schema v3 与中英文混合检索
 
-Migration `003_bridge_memory` 在 `lark-bridge.db` 中创建两张表：
+Migration `003_memory` 在 `lark-bridge.db` 中创建两张表：
 
 1. **主表 `memory_entries`（`STRICT`）**：
    - `idx_memory_bot_status(bot_id, status, pinned DESC, last_verified_ms DESC)`：支撑按 Bot 快速拉取活跃记忆与 UI 列表排序。
@@ -189,13 +189,13 @@ flowchart LR
 
 ## 5. 在线读写链路：两层渐进披露（Progressive Disclosure）
 
-为兼顾**上下文召回质量**与**首轮 Token 成本可控**，Bridge Memory 不把整库记忆倾倒进 Prompt，而是采用严格分层的渐进披露架构：
+为兼顾**上下文召回质量**与**首轮 Token 成本可控**，Memory 不把整库记忆倾倒进 Prompt，而是采用严格分层的渐进披露架构：
 
 ```mermaid
 sequenceDiagram
     participant U as 飞书用户
     participant Pipe as InboundPipeline
-    participant Mem as BridgeMemoryService
+    participant Mem as MemoryService
     participant Agent as 任意 DSH / 外部 Agent
     participant CLI as lark-bridge memory CLI
     participant DB as SQLite + MEMORY.md
@@ -204,8 +204,8 @@ sequenceDiagram
     Pipe->>Mem: composeFirstTurnReminder({ botId, chatId, workingDir })
     Mem->>DB: 查询该 Bot active 记忆并按优先级排序
     Mem->>DB: 批量递增命中条目的 recall_count & last_recalled_ms
-    Mem-->>Pipe: 返回有界 <bridge_memory> (≤ 20 条, ≤ 2600 字符)
-    Pipe->>Agent: 首轮 <system_reminder> 注入 <bridge_memory> 索引
+    Mem-->>Pipe: 返回有界 <memory> (≤ 20 条, ≤ 2600 字符)
+    Pipe->>Agent: 首轮 <system_reminder> 注入 <memory> 索引
 
     Note over Agent: 回合中按需进入 Layer 2
     Agent->>CLI: lark-bridge memory search "限流" / get mem-xxx
@@ -266,8 +266,8 @@ flowchart TD
 
 ### 真实记账与反“假成功”机制
 
-1. **进程内变更追踪（`BridgeMemoryService.beginMutationTracker(botId)`）**：
-   - Auto-Dream 执行期间，所有经 `BridgeMemoryService` 落盘的 `created / updated / superseded / archived` 写操作都会实时计入该次运行的统计快照 `memoryStats`，最终写入 `dream_sessions.payload_json` 与 `dream_states.last_summary`。
+1. **进程内变更追踪（`MemoryService.beginMutationTracker(botId)`）**：
+   - Auto-Dream 执行期间，所有经 `MemoryService` 落盘的 `created / updated / superseded / archived` 写操作都会实时计入该次运行的统计快照 `memoryStats`，最终写入 `dream_sessions.payload_json` 与 `dream_states.last_summary`。
 2. **写失败诚信检测（`detectDreamingMemoryWriteFailure`）**：
    - 当 `totalMutations === 0` 且模型最终回复匹配明确写失败信号（如「未暴露可写…记忆」「无法写入…记忆」「`lark-bridge: command not found`」「`memory write failed`」等），`DreamingService` 主动抛出异常并将本次标记为 `failed`，**保持 `processedSessionIds` 原状不变**，杜绝丢失待整理会话。
 3. **静默噪音提前退役**：

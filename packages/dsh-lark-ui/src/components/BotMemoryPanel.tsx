@@ -97,7 +97,7 @@ function draftFromEntry(entry: MemoryEntry): MemoryFormDraft {
 
 /**
  * In-place subview inside BotConfigDialog (`ConfigDialog.subview`) for inspecting,
- * searching, creating, editing, pinning, archiving, and deleting Bridge Memory entries.
+ * searching, creating, editing, pinning, archiving, and deleting Memory entries.
  */
 export function BotMemoryPanel({
   botId,
@@ -304,7 +304,7 @@ export function BotMemoryPanel({
           <span className="fb-dialog-header-sep" aria-hidden="true">
             /
           </span>
-          <div className="fb-dialog-title">{`${botName} · Bridge Memory`}</div>
+          <div className="fb-dialog-title">{`${botName} · Memory`}</div>
         </div>
         <button type="button" className="fb-icon-btn" aria-label="关闭" onClick={onClose}>
           <IconCloseOutlineRegular size={14} />

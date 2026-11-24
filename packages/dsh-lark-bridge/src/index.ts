@@ -138,7 +138,7 @@ export {
   type CliAuthEndpoint,
 } from './cli-support.js'
 export { DreamingService, type DreamingHost } from './dreaming-service.js'
-export { BridgeMemoryService, type MemoryMutationTracker } from './memory-service.js'
+export { MemoryService, type MemoryMutationTracker } from './memory-service.js'
 export {
   MemoryRepo,
   type MemoryQueryOptions,

@@ -33,13 +33,13 @@ flowchart LR
 
 - **协议层零宿主依赖**：`packages/lark-core` 不得反向依赖任何 `@deepseek-ai/*` 包。
 - **动态运行时发现**：业务桥接层与前端统一通过 `RuntimeCatalog` / `/api/lark-bridge/runtimes` 动态读取 DSH 原生预设及可选的 `ctx.externalRuntimes`（由独立配套插件 `dsh-external-agents` 提供），**禁止硬编码引擎分支**。
-- **记忆路径解耦（跨运行时 Bridge Memory）**：桥接层不得感知或硬编码各 Agent 运行时私有的本地记忆文件路径，而是通过统一、运行时无关的 Bridge Memory 层（SQLite `memory_entries` + FTS5 trigram 索引 + `$DSH_HOME/lark-bridge/memory/<botId>/MEMORY.md` 只读镜像）提供首轮有界渐进披露注入与 `lark-bridge memory` 按需检索/沉淀/双时态纠偏能力，供所有原生与外部运行时及 Auto-Dream 离线整理共享。
+- **记忆路径解耦（跨运行时 Memory）**：桥接层不得感知或硬编码各 Agent 运行时私有的本地记忆文件路径，而是通过统一、运行时无关的 Memory 层（SQLite `memory_entries` + FTS5 trigram 索引 + `$DSH_HOME/lark-bridge/memory/<botId>/MEMORY.md` 只读镜像）提供首轮有界渐进披露注入与 `lark-bridge memory` 按需检索/沉淀/双时态纠偏能力，供所有原生与外部运行时及 Auto-Dream 离线整理共享。
 
 ## 3. 产物目录边界
 
 | 产物类型 | 存放路径 | 约束 |
 | --- | --- | --- |
-| 产品运行期全局数据与状态 | `~/.dsh/lark-bridge/`（`$DSH_HOME/lark-bridge`） | 包含 `lark-bridge.db`（SQLite WAL 主库，含 `memory_entries`）、`memory/<botId>/MEMORY.md`（Bridge Memory 人类可读只读镜像）、`dreaming/<botId>/recent-transcripts.md`、`config.snapshot.json`（低频配置只读灾备快照）、`bridge.lock`（本机 PID 互斥锁）、`backups/`（迁移前 JSON 原样备份与热备）、`cli-endpoint.json`、`open-platform-session.json`、`user-oauth-tokens.json`（POSIX `0o700` / `0o600`） |
+| 产品运行期全局数据与状态 | `~/.dsh/lark-bridge/`（`$DSH_HOME/lark-bridge`） | 包含 `lark-bridge.db`（SQLite WAL 主库，含 `memory_entries`）、`memory/<botId>/MEMORY.md`（Memory 人类可读只读镜像）、`dreaming/<botId>/recent-transcripts.md`、`config.snapshot.json`（低频配置只读灾备快照）、`bridge.lock`（本机 PID 互斥锁）、`backups/`（迁移前 JSON 原样备份与热备）、`cli-endpoint.json`、`open-platform-session.json`、`user-oauth-tokens.json`（POSIX `0o700` / `0o600`） |
 | 目标工作区产品产物（如消息附件） | `<workingDir>/.dsh-lark-bridge/` | 自动写入目标仓库 `.gitignore` |
 | 主动代码修改隔离工作树 | `<workingDir>/.worktrees/` | 自动写入目标仓库 `.gitignore` |
 | 本仓库研发临时产物 | `<本仓库>/.local/` | 仅用于开发 `dsh-lark-bridge` 自身；**严禁将产品运行产物写入目标工作区的 `.local/` 目录** |
