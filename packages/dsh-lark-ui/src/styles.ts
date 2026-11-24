@@ -116,6 +116,20 @@ const CSS = `
   color: var(--dsw-alias-label-primary); font: inherit; font-size: 12.5px; font-weight: 500;
   cursor: pointer; transition: background 120ms ease;
 }
+.fb-view-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px 12px;
+  margin-bottom: 12px;
+}
+.fb-view-bar-right {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
 .fb-toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
 .fb-toolbar .fb-search { flex: 1; min-width: 0; height: 36px; padding: 0 12px; gap: 8px; }
 .fb-toolbar .fb-search input::placeholder { color: var(--dsw-alias-label-tertiary); opacity: 1; }

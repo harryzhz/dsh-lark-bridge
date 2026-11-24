@@ -6,6 +6,8 @@ import {
   IconCloseOutlineRegular,
   IconEllipsisOutlineRegular,
   IconPlusOutlineRegular,
+  IconSearchOutlineRegular,
+  Input,
   Menu,
   Pill,
   type MenuEntry,
@@ -205,6 +207,63 @@ export function FilterTabs<T extends string>({
           </button>
         )
       })}
+    </div>
+  )
+}
+
+export interface BotFilterOption {
+  readonly id: string
+  readonly name: string
+}
+
+/**
+ * Clamp a selected bot filter ID against the live bot list.
+ * Falls back to `''` ("全部智能体") when only 0/1 bot exists or the selected bot was removed.
+ */
+export function resolveEffectiveBotId(
+  botId: string,
+  bots: readonly { readonly id: string }[],
+): string {
+  if (!botId || bots.length <= 1) return ''
+  return bots.some((b) => b.id === botId) ? botId : ''
+}
+
+/** Unified list search + bot scope filter bar shared across Groups, Automation, and Sessions views. */
+export function ListFilterBar({
+  query,
+  onQueryChange,
+  searchPlaceholder,
+  bots = [],
+  botId = '',
+  onBotIdChange,
+}: {
+  query: string
+  onQueryChange: (next: string) => void
+  searchPlaceholder: string
+  bots?: readonly BotFilterOption[]
+  botId?: string
+  onBotIdChange?: (next: string) => void
+}) {
+  const effectiveBotId = resolveEffectiveBotId(botId, bots)
+  return (
+    <div className="fb-toolbar">
+      <Input
+        className="fb-search"
+        icon={<IconSearchOutlineRegular size={16} />}
+        placeholder={searchPlaceholder}
+        value={query}
+        onChange={(e) => onQueryChange(e.target.value)}
+      />
+      {bots.length > 1 && onBotIdChange && (
+        <SelectMenu
+          value={effectiveBotId}
+          options={[
+            { value: '', label: '全部智能体' },
+            ...bots.map((b) => ({ value: b.id, label: b.name })),
+          ]}
+          onChange={onBotIdChange}
+        />
+      )}
     </div>
   )
 }
