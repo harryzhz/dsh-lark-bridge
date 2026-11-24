@@ -137,6 +137,36 @@ export class InstanceLock {
     throw new Error(`Unable to acquire instance lock at ${this.lockPath}`)
   }
 
+  /**
+   * Acquires the exclusive lock with bounded backoff when a same-host predecessor
+   * process is still releasing the lock during a rapid restart (e.g. within DSH's
+   * 5s shutdown grace window). Cross-host conflicts fail immediately to prevent split-brain.
+   */
+  async acquireAsync(
+    options: { readonly waitMs?: number; readonly pollMs?: number } = {},
+  ): Promise<InstanceLockStatus> {
+    const waitMs = Math.max(0, options.waitMs ?? 6_000)
+    const pollMs = Math.max(25, Math.min(options.pollMs ?? 150, 1_000))
+    const deadline = Date.now() + waitMs
+    const localHost = hostname()
+
+    while (true) {
+      try {
+        return this.acquire()
+      } catch (err) {
+        if (!(err instanceof InstanceLockConflictError)) throw err
+        if (err.holder.host !== localHost || Date.now() >= deadline) {
+          throw err
+        }
+        const remaining = deadline - Date.now()
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, Math.min(pollMs, Math.max(10, remaining)))
+          timer.unref?.()
+        })
+      }
+    }
+  }
+
   status(): InstanceLockStatus {
     return {
       held: Boolean(this.holder),

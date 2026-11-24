@@ -315,6 +315,11 @@ export class BridgeDatabase {
       if (applied.has(mig.version)) continue
       const checksum = sha256(mig.sql)
       this.transaction(() => {
+        // Re-check inside BEGIN IMMEDIATE write lock so concurrent openers never re-run a migration.
+        const already = this.prepare('SELECT 1 FROM schema_migrations WHERE version = ?').get(
+          mig.version,
+        )
+        if (already) return
         this.db.exec(mig.sql)
         this.prepare(
           'INSERT INTO schema_migrations (version, name, checksum, applied_at_ms) VALUES (?, ?, ?, ?)',

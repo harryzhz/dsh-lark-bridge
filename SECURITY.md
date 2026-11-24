@@ -8,12 +8,12 @@
 
 - **零遥测与无第三方中转**：本插件不收集任何使用遥测数据，不向除用户主动连接的飞书开放平台官方接口（`open.feishu.cn`、`accounts.feishu.cn`、`ask.feishu.cn`）及本地 DSH 宿主之外的任何第三方服务器发送配置、消息或代码内容。
 - **本地存储与严格文件权限**：
-  - 全局状态与敏感凭据统一存储在 `$DSH_HOME/lark-bridge/`（默认 `~/.dsh/lark-bridge/`），包括 `lark-bridge.db`（SQLite WAL 主库）、`config.snapshot.json`、`bridge.lock`、`open-platform-session.json`、`user-oauth-tokens.json`、`cli-endpoint.json`（及迁移前的旧版 `lark-bridge-state.json` 备份）。
+  - 全局状态与敏感凭据统一存储在 `$DSH_HOME/lark-bridge/`（默认 `~/.dsh/lark-bridge/`），包括 `lark-bridge.db`（SQLite WAL 主库）、`config.snapshot.json`、`bridge.lock`、`operator-token`、`open-platform-session.json`、`user-oauth-tokens.json`、`cli-endpoint.json`（及迁移前的旧版 `lark-bridge-state.json` 备份）。
   - 数据目录以 `0o700` 创建，凭据与状态文件均以 `0o600` 权限原子写入（POSIX 平台）。
   - 工作区级附件下载与临时文件隔离写入 `<workingDir>/.dsh-lark-bridge/`，主动代码修改隔离在 `<workingDir>/.worktrees/`，均自动加入目标仓库 `.gitignore`。
 - **密钥隔离边界**：
   - 面向前端控制台返回的视图经 `toPublicBotView()` 脱敏，不回传 `larkAppSecret` 明文。
-  - 面向 Agent 会话注入的 `lark-bridge` CLI 仅持有本地受限 Bearer Token（`timingSafeEqual` 校验），严禁访问 `/api/lark-bridge/auth/*`、`bots` 写接口与任何飞书应用密钥或用户 OAuth Token。
+  - 面向 Agent 会话注入的 `lark-bridge` CLI 仅持有本地受限 Bearer Token（`timingSafeEqual` 校验），严禁访问 `/api/lark-bridge/auth/*`、`bots` 写接口、`/api/lark-bridge/lifecycle/drain|resume-intake` 运维排空接口及任何飞书应用密钥或用户 OAuth Token；运维排空接口严格限定 Owner Web/Desktop 会话或独立 `0o600` `operator-token`。
 - **鉴权与会话接管边界**：
   - `/api/lark-bridge/*` 与 `/api/lark-bridge-rpc` 默认 fail-closed，必须通过 DSH `ctx.connection.admit(req)` 或本地 CLI Bearer Token 鉴权，写操作额外执行同源（Origin/Host）校验。
   - 宿主机本地目录浏览接口（`/api/lark-bridge/fs/dirs`）、只读链接密钥重置接口（`/api/lark-bridge/viewer/rotate-secret`）与桌面端会话打开通道（`/api/lark-bridge/desktop/*`）严格限定为 Owner 会话访问。

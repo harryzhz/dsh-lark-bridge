@@ -338,6 +338,34 @@ export class LarkBridgeStore {
     return this.runtimeRepo.deletePendingTurn(id)
   }
 
+  resolvePrimaryRouteKey(routeKey: string): string {
+    return this.runtimeRepo.resolvePrimaryRouteKey(routeKey)
+  }
+
+  loadTriageContextScopes(minUpdatedAtMs = 0) {
+    return this.runtimeRepo.loadTriageContextScopes(minUpdatedAtMs)
+  }
+
+  upsertTriageContextScope(
+    scopeKey: string,
+    kind: 'history' | 'worker_reply' | 'ephemeral_thread',
+    payloadJson: string,
+    updatedAtMs: number,
+  ): void {
+    this.runtimeRepo.upsertTriageContextScope(scopeKey, kind, payloadJson, updatedAtMs)
+  }
+
+  deleteTriageContextScope(
+    scopeKey: string,
+    kind?: 'history' | 'worker_reply' | 'ephemeral_thread',
+  ): number {
+    return this.runtimeRepo.deleteTriageContextScope(scopeKey, kind)
+  }
+
+  pruneTriageContextScopes(cutoffMs: number): number {
+    return this.runtimeRepo.pruneTriageContextScopes(cutoffMs)
+  }
+
   // ── Memory (Runtime-Agnostic Long-Term Memory) ───────────────────────────
 
   getMemoryEntry(id: string): LarkMemoryEntry | undefined {

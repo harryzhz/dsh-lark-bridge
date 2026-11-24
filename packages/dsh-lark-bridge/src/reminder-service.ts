@@ -78,6 +78,7 @@ export interface ReminderServiceHost {
   readonly store: LarkBridgeStore
   readonly runtimes: RuntimeCatalog
   readonly workspaces: WorkspaceGrouping
+  readonly onActivityChange?: () => void
   runTurn(agent: Agent, content: ContentBlock[]): Promise<string>
   sendOriginCard(
     origin: LarkReminderOrigin,
@@ -158,8 +159,27 @@ export class ProactiveReminderService {
     { reminderId: string; silenced: boolean; reason?: string }
   >()
   private disposed = false
+  private dispatchPaused = false
 
   constructor(private readonly host: ReminderServiceHost) {}
+
+  getActiveCount(): number {
+    return this.runningIds.size
+  }
+
+  pauseDispatch(): void {
+    this.dispatchPaused = true
+    if (this.nextDueTimer) {
+      clearTimeout(this.nextDueTimer)
+      this.nextDueTimer = null
+    }
+  }
+
+  resumeDispatch(): void {
+    if (this.disposed) return
+    this.dispatchPaused = false
+    this.rearmNextDueTimer()
+  }
 
   start(sweepMs = SWEEP_INTERVAL_MS): void {
     this.rearmNextDueTimer()
@@ -513,7 +533,7 @@ export class ProactiveReminderService {
   }
 
   async tick(nowMs = Date.now()): Promise<void> {
-    if (this.disposed) return
+    if (this.disposed || this.dispatchPaused) return
     const due = this.host.store
       .listReminders('active')
       .filter(
@@ -581,6 +601,7 @@ export class ProactiveReminderService {
     }
 
     this.runningIds.add(item.id)
+    this.host.onActivityChange?.()
     this.host.store.upsertReminder({ ...item, status: 'running', updatedAtMs: nowMs })
 
     const startedMs = Date.now()
@@ -721,6 +742,7 @@ export class ProactiveReminderService {
       return { runningItem, completion }
     } catch (err) {
       this.runningIds.delete(item.id)
+      this.host.onActivityChange?.()
       if (createdSession) {
         await this.disposeSessionHandle(sessionId)
       }
@@ -857,6 +879,7 @@ export class ProactiveReminderService {
     } finally {
       this.activeReminderSessions.delete(sessionId)
       this.runningIds.delete(item.id)
+      this.host.onActivityChange?.()
     }
   }
 

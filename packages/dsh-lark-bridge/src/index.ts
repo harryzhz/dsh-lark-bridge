@@ -130,12 +130,16 @@ export {
 } from './session-coordinator.js'
 export { SessionTitleGuard } from './session-title-guard.js'
 export {
+  OPERATOR_TOKEN_FILENAME,
+  OPERATOR_TOKEN_HEADER,
   buildCliWrapperContent,
   ensureCliAuthEndpoint,
+  ensureOperatorAuth,
   installLocalCliAndSkill,
   resolveBundledAssetPaths,
   type BundledAssetPaths,
   type CliAuthEndpoint,
+  type OperatorAuthToken,
 } from './cli-support.js'
 export { DreamingService, type DreamingHost } from './dreaming-service.js'
 export { MemoryService, type MemoryMutationTracker } from './memory-service.js'
@@ -255,6 +259,14 @@ export {
 } from './storage/legacy-migrator.js'
 export { runDbCliCommand, inspectInstanceLockFile, type ActiveLockSummary, type DbCliResult } from './storage/db-cli.js'
 export {
+  MAX_AUTO_RESUME_AGE_MS,
+  MAX_AUTO_RESUME_ATTEMPTS,
+  canAutoResumePendingTurn,
+  composeRestartRecoveryReminder,
+  inspectPersistedTurnCompletion,
+  type PersistedTurnInspection,
+} from './turn-recovery.js'
+export {
   TurnAbortedError,
   TurnFinalReplyTracker,
   runTurnAndCollectReply,
@@ -264,6 +276,9 @@ export {
 } from './turn-runner.js'
 export {
   LARK_ORIGIN_RECORD_TYPE,
+  type ActiveTurnSummary,
+  type BridgeLifecyclePhase,
+  type BridgeLifecycleStatus,
   type LarkAuditEvent,
   type LarkBridgeConfig,
   type LarkCockpitPayload,
@@ -277,4 +292,5 @@ export {
   type LarkScheduleBinding,
   type LarkScheduleView,
   type LarkSessionBinding,
+  type PendingTurnStatus,
 } from './types.js'

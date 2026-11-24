@@ -1,9 +1,11 @@
 import type {
   GroupReplyMode,
+  InboundLarkMessage,
   LarkBotStatus,
   LarkGroupConfig,
   LarkMemoryMutationStats,
   ListenerTemplate,
+  RouterHandoffTurn,
   TriageAction,
   TriagePromptVariable,
   TriageToolSchema,
@@ -56,6 +58,7 @@ export interface LarkBridgeConfig {
   readonly maxAuditEvents: number
   readonly autoInstallCliAndSkill?: boolean
   readonly enableInstanceLock?: boolean
+  readonly instanceLockWaitMs?: number
 }
 
 export interface LarkSessionBinding {
@@ -96,6 +99,8 @@ export interface LarkManagedSession {
   readonly archivedAtMs?: number
 }
 
+export type PendingTurnStatus = 'running' | 'interrupted' | 'recovering'
+
 export interface LarkPendingTurn {
   readonly id: string
   readonly botId: string
@@ -109,6 +114,43 @@ export interface LarkPendingTurn {
   readonly reactionId?: string
   readonly sessionId?: string
   readonly traceId?: string
+  readonly startedAtMs: number
+  readonly status?: PendingTurnStatus
+  readonly inboundMsg?: InboundLarkMessage
+  readonly senderName?: string
+  readonly intermediateSentCount?: number
+  readonly recoveryAttempts?: number
+  readonly handoffTurns?: readonly RouterHandoffTurn[]
+  readonly updatedAtMs?: number
+}
+
+export type BridgeLifecyclePhase = 'starting' | 'running' | 'draining' | 'stopping' | 'stopped'
+
+export interface ActiveTurnSummary {
+  readonly id: string
+  readonly botId: string
+  readonly chatId: string
+  readonly chatName?: string
+  readonly messageId: string
+  readonly routeKey: string
+  readonly sessionId?: string
+  readonly trigger: string
+  readonly startedAtMs: number
+}
+
+export interface BridgeLifecycleStatus {
+  readonly phase: BridgeLifecyclePhase
+  readonly draining: boolean
+  readonly drainRequestedAtMs?: number
+  readonly drainReason?: string
+  readonly drained: boolean
+  readonly activeTurns: readonly ActiveTurnSummary[]
+  readonly activeTriageCount: number
+  readonly activeRemindersCount: number
+  readonly activeDreamingCount: number
+  readonly totalInFlight: number
+  readonly persistedPendingTurns: number
+  readonly pid: number
   readonly startedAtMs: number
 }
 

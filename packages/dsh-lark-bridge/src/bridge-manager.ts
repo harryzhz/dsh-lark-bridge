@@ -17,7 +17,13 @@ import {
 } from '@dsh-lark/lark-core'
 import { AgentToolFacade, type AgentCliSendInput } from './agent-tool-facade.js'
 import { BotConnectionPool } from './bot-connection-pool.js'
-import { ensureCliAuthEndpoint, installLocalCliAndSkill, type CliAuthEndpoint } from './cli-support.js'
+import {
+  ensureCliAuthEndpoint,
+  ensureOperatorAuth,
+  installLocalCliAndSkill,
+  type CliAuthEndpoint,
+  type OperatorAuthToken,
+} from './cli-support.js'
 import { buildBridgeDiagnostics, type BridgeDiagnosticsPayload } from './diagnostics.js'
 import { LarkDirectoryEnricher } from './directory-enrichment.js'
 import { DreamingService } from './dreaming-service.js'
@@ -37,13 +43,32 @@ import { TriageSessionRecorder } from './triage-session-recorder.js'
 import { LlmTriageService } from './triage-service.js'
 import { runTurnAndCollectReply } from './turn-runner.js'
 import type {
+  BridgeLifecyclePhase,
+  BridgeLifecycleStatus,
   LarkBridgeConfig,
   LarkScheduleDeliveryMode,
   LarkScheduleNotifyOn,
 } from './types.js'
 import { WorkspaceGrouping } from './workspace-grouping.js'
 
+const SHUTDOWN_DISPOSE_BUDGET_MS = 2_500
+
 export type { AgentCliSendInput } from './agent-tool-facade.js'
+
+async function withShutdownBudget(work: Promise<unknown>, budgetMs: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    await Promise.race([
+      work,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, budgetMs)
+        timer.unref?.()
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
 
 /**
  * Thin lifecycle coordinator & public facade assembling:
@@ -61,6 +86,7 @@ export class LarkBridgeManager {
   readonly reminders: ProactiveReminderService
   readonly platform: LarkPlatformManager
   readonly cliAuth: CliAuthEndpoint
+  readonly operatorAuth: OperatorAuthToken
   readonly sessionHandoff = new LoopbackSessionHandoff()
   readonly sessionViewer: LarkSessionViewerService
   readonly connections: BotConnectionPool
@@ -76,10 +102,14 @@ export class LarkBridgeManager {
   private readonly workspaces: WorkspaceGrouping
   private readonly shutdownController = new AbortController()
   private readonly disposers: Array<() => void> = []
+  private readonly drainWaiters = new Set<() => void>()
   private readonly startedAtMs = Date.now()
   private liveWebOrigin = ''
   private liveConnection?: { authenticatedUrl?: (baseUrl: string) => string }
   private idleTimer: ReturnType<typeof setInterval> | null = null
+  private phase: BridgeLifecyclePhase = 'starting'
+  private drainRequestedAtMs?: number
+  private drainReason?: string
   private disposed = false
 
   constructor(
@@ -94,6 +124,8 @@ export class LarkBridgeManager {
     this.sessionViewer = new LarkSessionViewerService(ctx, store)
     this.directoryEnricher = new LarkDirectoryEnricher(this.platform, () => this.store.listBots())
     this.cliAuth = ensureCliAuthEndpoint(config.dataDir, config.publicBaseUrl)
+    this.operatorAuth = ensureOperatorAuth(config.dataDir)
+    const notifyActivityChange = () => this.notifyDrainWaitersIfQuiescent()
 
     this.connections = new BotConnectionPool({
       ctx,
@@ -112,6 +144,7 @@ export class LarkBridgeManager {
         return toast ? { toast } : undefined
       },
       onBotReady: (botId) => {
+        if (this.phase === 'draining' || this.disposed) return
         void this.inbound.recoverStalePendingTurns(botId).catch((err) => {
           this.ctx.logger.warn(
             `[lark-bridge] bot "${botId}" pending turn recovery warning: ${err instanceof Error ? err.message : String(err)}`,
@@ -135,7 +168,32 @@ export class LarkBridgeManager {
     )
 
     const triageRecorder = new TriageSessionRecorder(ctx, store, this.workspaces)
-    this.triage = new LlmTriageService(ctx, this.runtimes, triageRecorder)
+    const triagePersistence =
+      typeof store.loadTriageContextScopes === 'function'
+        ? {
+            loadTriageContextScopes: (minUpdatedAtMs?: number) =>
+              store.loadTriageContextScopes(minUpdatedAtMs),
+            upsertTriageContextScope: (
+              scopeKey: string,
+              kind: 'history' | 'worker_reply' | 'ephemeral_thread',
+              payloadJson: string,
+              updatedAtMs: number,
+            ) => store.upsertTriageContextScope(scopeKey, kind, payloadJson, updatedAtMs),
+            deleteTriageContextScope: (
+              scopeKey: string,
+              kind?: 'history' | 'worker_reply' | 'ephemeral_thread',
+            ) => store.deleteTriageContextScope(scopeKey, kind),
+            pruneTriageContextScopes: (cutoffMs: number) =>
+              store.pruneTriageContextScopes(cutoffMs),
+          }
+        : undefined
+    this.triage = new LlmTriageService(ctx, this.runtimes, triageRecorder, {
+      ...(triagePersistence ? { persistence: triagePersistence } : {}),
+      ...(typeof store.resolvePrimaryRouteKey === 'function'
+        ? { resolvePrimaryRouteKey: (routeKey) => store.resolvePrimaryRouteKey(routeKey) }
+        : {}),
+      onActivityChange: notifyActivityChange,
+    })
     this.memory = new MemoryService(config.dataDir, store)
 
     this.inbound = new InboundPipeline({
@@ -149,6 +207,8 @@ export class LarkBridgeManager {
       titleGuard: this.titleGuard,
       shutdownSignal: this.shutdownController.signal,
       isDisposed: () => this.disposed,
+      isDraining: () => this.phase === 'draining' || this.phase === 'stopping',
+      onActivityChange: notifyActivityChange,
       sessionWebUrl: (sid) => this.sessionWebUrl(sid),
     })
 
@@ -178,6 +238,7 @@ export class LarkBridgeManager {
       memory: this.memory,
       runtimes: this.runtimes,
       workspaces: this.workspaces,
+      onActivityChange: notifyActivityChange,
       runTurn: (agent, content) =>
         runTurnAndCollectReply(this.ctx, agent, content, {
           signal: this.shutdownController.signal,
@@ -189,6 +250,7 @@ export class LarkBridgeManager {
       store,
       runtimes: this.runtimes,
       workspaces: this.workspaces,
+      onActivityChange: notifyActivityChange,
       runTurn: (agent, content) =>
         runTurnAndCollectReply(this.ctx, agent, content, {
           signal: this.shutdownController.signal,
@@ -218,8 +280,13 @@ export class LarkBridgeManager {
   }
 
   async start(): Promise<void> {
+    this.phase = 'starting'
     if (this.config.enableInstanceLock !== false) {
-      const lockStatus = this.instanceLock.acquire()
+      const lockStatus = await this.instanceLock.acquireAsync({
+        ...(this.config.instanceLockWaitMs !== undefined
+          ? { waitMs: this.config.instanceLockWaitMs }
+          : {}),
+      })
       if (lockStatus.recoveredStaleLock) {
         this.ctx.logger.warn(
           `[lark-bridge] recovered stale instance lock from PID=${lockStatus.recoveredStaleLock.pid} (${lockStatus.recoveredStaleLock.host})`,
@@ -244,6 +311,7 @@ export class LarkBridgeManager {
     await this.workspaces.reconcileBindings()
 
     await this.connections.startAllEnabled()
+    this.phase = 'running'
 
     await this.inbound.recoverStalePendingTurns().catch((err) => {
       this.ctx.logger.warn(
@@ -260,22 +328,129 @@ export class LarkBridgeManager {
 
     if (this.config.idleSweepIntervalMs > 0) {
       this.idleTimer = setInterval(
-        () => void this.sweepIdleBindings(),
+        () => {
+          if (this.phase === 'draining' || this.disposed) return
+          void this.sweepIdleBindings()
+        },
         this.config.idleSweepIntervalMs,
       )
       this.idleTimer.unref?.()
     }
   }
 
+  getLifecycleStatus(): BridgeLifecycleStatus {
+    const activeTurns = this.inbound.listActiveTurnSummaries()
+    const activeTurnsCount = this.inbound.getActiveCount()
+    const activeTriageCount = this.triage.getActiveCount()
+    const activeRemindersCount = this.reminders.getActiveCount()
+    const activeDreamingCount = this.dreaming.getActiveCount()
+    const totalInFlight =
+      activeTurnsCount + activeTriageCount + activeRemindersCount + activeDreamingCount
+    const persistedPendingTurns = this.store.listPendingTurns().length
+    return {
+      phase: this.phase,
+      draining: this.phase === 'draining',
+      ...(this.drainRequestedAtMs ? { drainRequestedAtMs: this.drainRequestedAtMs } : {}),
+      ...(this.drainReason ? { drainReason: this.drainReason } : {}),
+      drained: totalInFlight === 0,
+      activeTurns,
+      activeTriageCount,
+      activeRemindersCount,
+      activeDreamingCount,
+      totalInFlight,
+      persistedPendingTurns,
+      pid: process.pid,
+      startedAtMs: this.startedAtMs,
+    }
+  }
+
+  /**
+   * Enters graceful maintenance drain: pauses inbound Feishu WSClient intake and
+   * background reminder/dreaming dispatches while keeping REST clients alive so
+   * every currently running turn can complete and deliver its final reply cleanly.
+   */
+  async beginDrain(options: { readonly reason?: string } = {}): Promise<BridgeLifecycleStatus> {
+    if (this.disposed) return this.getLifecycleStatus()
+    if (this.phase !== 'draining') {
+      this.phase = 'draining'
+      this.drainRequestedAtMs = Date.now()
+      this.drainReason = options.reason?.trim() || 'operator_drain'
+      this.reminders.pauseDispatch()
+      this.dreaming.pauseDispatch()
+      await this.connections.pauseAllInbound()
+      this.store.recordEvent({
+        botId: 'system',
+        kind: 'lifecycle',
+        summary: `已进入优雅排空模式（停止接入新消息，等待在途任务完成：${this.drainReason}）`,
+      })
+    }
+    return this.getLifecycleStatus()
+  }
+
+  /** Waits until all in-flight turns, triage calls, reminders and dreaming runs complete or timeout. */
+  async waitForDrain(timeoutMs = 120_000, signal?: AbortSignal): Promise<BridgeLifecycleStatus> {
+    const clampedTimeoutMs = Math.max(0, Math.min(timeoutMs, 15 * 60_000))
+    const initial = this.getLifecycleStatus()
+    if (initial.drained || clampedTimeoutMs === 0 || signal?.aborted) {
+      return initial
+    }
+
+    await new Promise<void>((resolve) => {
+      let settled = false
+      const done = () => {
+        if (settled) return
+        settled = true
+        clearTimeout(timeoutTimer)
+        clearInterval(pollTimer)
+        this.drainWaiters.delete(check)
+        signal?.removeEventListener('abort', done)
+        resolve()
+      }
+      const check = () => {
+        if (this.disposed || this.getLifecycleStatus().drained) {
+          done()
+        }
+      }
+      const timeoutTimer = setTimeout(done, clampedTimeoutMs)
+      timeoutTimer.unref?.()
+      const pollTimer = setInterval(check, 250)
+      pollTimer.unref?.()
+      this.drainWaiters.add(check)
+      signal?.addEventListener('abort', done, { once: true })
+      check()
+    })
+
+    return this.getLifecycleStatus()
+  }
+
+  /** Exits graceful drain and resumes Feishu WSClient intake & background schedulers. */
+  async cancelDrain(): Promise<BridgeLifecycleStatus> {
+    if (this.disposed || this.phase !== 'draining') return this.getLifecycleStatus()
+    this.phase = 'running'
+    this.drainRequestedAtMs = undefined
+    this.drainReason = undefined
+    this.reminders.resumeDispatch()
+    this.dreaming.resumeDispatch()
+    await this.connections.resumeAllInbound()
+    this.store.recordEvent({
+      botId: 'system',
+      kind: 'lifecycle',
+      summary: '已取消排空模式并恢复飞书消息接入',
+    })
+    return this.getLifecycleStatus()
+  }
+
   async stop(): Promise<void> {
+    this.phase = 'stopping'
     this.disposed = true
+    // 1. Snapshot recoverable in-flight turns to SQLite BEFORE aborting handles so
+    //    no turn is prematurely failed or stripped of its Feishu reaction.
+    await this.inbound.suspendActiveTurnsForShutdown()
     this.shutdownController.abort()
-    await this.inbound.cleanupActiveTurnsOnShutdown()
     this.sessionHandoff.dispose()
     this.sessionViewer.dispose()
     this.schedules.stop()
     this.dreaming.stop()
-    await this.reminders.stop()
     while (this.disposers.length > 0) {
       this.disposers.pop()?.()
     }
@@ -283,11 +458,32 @@ export class LarkBridgeManager {
       clearInterval(this.idleTimer)
       this.idleTimer = null
     }
-    await this.connections.stopAll()
-    await this.sessions.disposeAll()
+    // 2. Dispose WS connections, agent handles and reminders in parallel within a
+    //    strict 2.5s budget so SQLite WAL checkpoint and bridge.lock release always
+    //    complete inside DSH host's 5s process shutdown grace window.
+    await withShutdownBudget(
+      Promise.allSettled([
+        this.connections.stopAll(),
+        this.sessions.disposeAll(),
+        this.reminders.stop(),
+      ]),
+      SHUTDOWN_DISPOSE_BUDGET_MS,
+    )
+    this.triage.context.prunePersisted()
     this.store.flushSeenMessages?.()
     this.store.flushConfigSnapshot?.()
     this.instanceLock.release()
+    this.phase = 'stopped'
+    this.notifyDrainWaitersIfQuiescent(true)
+  }
+
+  private notifyDrainWaitersIfQuiescent(force = false): void {
+    if (this.drainWaiters.size === 0) return
+    if (force || this.getLifecycleStatus().drained) {
+      for (const wake of [...this.drainWaiters]) {
+        wake()
+      }
+    }
   }
 
   // ── Diagnostics & Split-Brain ────────────────────────────────────────────

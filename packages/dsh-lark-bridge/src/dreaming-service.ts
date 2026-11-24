@@ -42,6 +42,7 @@ export interface DreamingHost {
   readonly memory?: MemoryService
   readonly runtimes: RuntimeCatalog
   readonly workspaces: WorkspaceGrouping
+  readonly onActivityChange?: () => void
   runTurn(agent: Agent, content: ContentBlock[]): Promise<string>
 }
 
@@ -178,8 +179,22 @@ export class DreamingService {
   private timer: ReturnType<typeof setInterval> | null = null
   private readonly runningBots = new Set<string>()
   private disposed = false
+  private dispatchPaused = false
 
   constructor(private readonly host: DreamingHost) {}
+
+  getActiveCount(): number {
+    return this.runningBots.size
+  }
+
+  pauseDispatch(): void {
+    this.dispatchPaused = true
+  }
+
+  resumeDispatch(): void {
+    if (this.disposed) return
+    this.dispatchPaused = false
+  }
 
   start(intervalMs = TICK_INTERVAL_MS): void {
     if (intervalMs <= 0) return
@@ -198,7 +213,7 @@ export class DreamingService {
   }
 
   async tick(now = new Date()): Promise<void> {
-    if (this.disposed) return
+    if (this.disposed || this.dispatchPaused) return
     const dateKey = formatDateKey(now)
     const curMins = now.getHours() * 60 + now.getMinutes()
 
@@ -258,6 +273,7 @@ export class DreamingService {
     }
 
     this.runningBots.add(botId)
+    this.host.onActivityChange?.()
     this.host.store.upsertDreamState({
       ...prev,
       status: 'running',
@@ -493,6 +509,7 @@ export class DreamingService {
     } finally {
       mutationTracker?.dispose()
       this.runningBots.delete(botId)
+      this.host.onActivityChange?.()
     }
   }
 

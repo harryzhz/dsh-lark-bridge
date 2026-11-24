@@ -346,7 +346,8 @@ sequenceDiagram
 - **可定制 System Prompt 与固定工具契约**：
   - 支持在配置页编辑完整 System Prompt，并通过 `{{bot_name}}`、`{{bot_role}}`、`{{chat_name}}`、`{{trigger}}`、`{{trigger_guide}}`、`{{active_session_rule}}`、`{{listener_name}}`、`{{listener_prompt}}` 占位注入运行时上下文（空变量自动折叠多余空行；留空回退内置默认模板；存量旧版 `customPrompt` 读取时自动合并迁移）；
   - `route_message` 工具定义（`silent` / `quick_reply` / `handoff`）固定下发，不可被用户修改；
-  - `UserMessage` 与监听/角色规则**全文透传不截断**，近期群聊或话题消息条数由 `recentMessageCount`（0–50，默认 6）、有效时间窗由 `contextTtlMinutes`（1–1440 分钟，默认 30）、是否附带上一轮主回复全文由 `includeLastReply`（默认开启）控制。
+  - `UserMessage` 与监听/角色规则**全文透传不截断**，近期群聊或话题消息条数由 `recentMessageCount`（0–50，默认 6）、有效时间窗由 `contextTtlMinutes`（1–1440 分钟，默认 30）、是否附带上一轮主回复全文由 `includeLastReply`（默认开启）控制；
+  - **跨重启持久化与冷启动回填**：分流滑窗、上一轮主回复与轻回复临时话题（含别名）均增量持久化至 SQLite `triage_context_scopes`，同时启用群聊内被规则 `ignore` 的非自发消息与 Bot 自身回复也会同步写入群级滑窗；冷启动或停机空窗期若本地滑窗条数不足，首次分流会自动通过 `transport.listMessages`（`1.2s` 短超时兜底）懒回填真实群/话题历史并按 `messageId` 去重，确保重启后第一条消息依然具备完整上下文。
 - **轻量分流闸门与可查看特殊会话（`LlmTriageService` + `TriageSessionRecorder`）**：
   - 热路径直接调用 DSH 原生或自定义配置的 `ctx.llm.stream()`（自动选择模型最低推理强度、思考模型自动省略 `temperature` 并放宽 `maxTokens`、不启动 Agent 循环、不阻塞主运行时队列）；
   - 每次模型调用完成后通过 `ctx.sessionPersistence` 落盘为标准 DSH v4 特殊会话（Step 1 完整保留 `system/message`、`request/header`、`user/message`、模型 `reasoning` / `tool-call` / `usage` 与 `tool/call` + `tool/result`，Step 2 零开销追加最终 `assistant/message` 裁决结论如 `` `handoff` `` / `` `silent` `` / `` `quick_reply` `` 与原因，打开会话无需展开过程折叠即可直接查看结论），挂载对应工作区并**立即自动归档**（不污染左侧主栏），同时写入 SQLite `triage_sessions`（默认保留最近 200 条，支持单删与清空），可在控制台「会话 → 智能分流」及「运行日志」一键打开复盘：
@@ -363,7 +364,24 @@ sequenceDiagram
 
 ---
 
-## 8. 关键并发与一致性不变量
+## 8. 优雅排空（Drain）、重启自动恢复与一致性不变量
+
+宿主 DSH 在收到 `SIGTERM` / `SIGINT` 时提供 `5s` 进程停机宽限期。为消除计划内发版重启与意外重载/崩溃导致的消息中断报错，系统提供三层重启韧性保障：
+
+1. **计划内重启零中断（优雅排空 Drain）**：
+   - 重启前通过 Owner 控制台 API 或本机运维 CLI 执行 `lark-bridge lifecycle drain --wait --timeout 180`（底层调用 `POST /api/lark-bridge/lifecycle/drain`，严格限定 Owner 会话或独立 `0600` `operator-token`，普通 Agent CLI Token 禁止调用）；
+   - 进入排空后立即暂停所有 Bot 的飞书 WSClient 入站长连接与新提醒/Dreaming 派发，同时**保留 REST 客户端在线**，等待全部在途回合、分流与后台任务自然回复完成；若取消维护可执行 `lark-bridge lifecycle resume-intake`。
+2. **非计划重启 / 热重载 / 崩溃自动续跑（Durable Pending Turns）**：
+   - 每个在途回合在 `pending_turns` 持久化完整可重放的入站消息快照（`inbound_msg_json`）、`sessionId`、`reactionId`、`intermediate_sent_count`、`handoff_turns_json` 与 `recovery_attempts`；
+   - 发生停机或 HMR 重载时，不再草率删除 `pending_turns`、删 `OnIt` 表情并向群里刷屏报错，而是将可恢复回合标记为 `interrupted` 落盘，并在 `2.5s` 并行停机预算内完成句柄释放、SQLite WAL checkpoint 与 `bridge.lock` 释放；
+   - 新进程启动并连上飞书后自动按三步恢复：
+     1. **先查已完成未送达**：核对持久化 DSH 会话中匹配该 `messageId` 的 turn 是否已 `turn/end (completed)`，若已完成直接补发最终回复并移除原 `OnIt` 表情（零重复执行）；
+     2. **自动续跑护栏**：15 分钟有效窗口内且 `recoveryAttempts < 1` 时，沿用原 `reactionId` 自动恢复——已有 `sessionId` 则复用原会话并注入 `<restart_recovery>` 避免重复副作用，未建会话则按原消息重投；
+     3. **防循环兜底**：超窗、超过自动恢复上限、缺快照（老版本记录）或 Bot/群已禁用时，才清理表情、记 `error` 审计并按需通知交互用户。
+3. **快速重启防撞锁（`InstanceLock.acquireAsync`）**：
+   - 启动时若发现同主机旧 PID 仍短暂持有 `bridge.lock`（正处于 5s 停机释放窗口），自动退避等待最多 `6s` 无缝接管；跨主机锁冲突仍立即拒绝以杜绝双脑。
+
+### 关键并发与一致性不变量
 
 1. **单会话多锚点（`aliasRouteKeys`）**：所有写操作（`touchBinding`、`markBindingReplied`、`deleteBinding`）统一经 `resolvePrimaryRouteKey()` 落到单一主实体，确保空闲超时计时、`hasReplied` 标记与解绑归档不会发生副本分裂。
 2. **句柄归属 `sessionId`**：`handles` 以 `sessionId` 为键，解绑或跨会话覆写绑定（`replaceRouteBinding`）时均精准释放目标句柄，杜绝孤立句柄泄漏。

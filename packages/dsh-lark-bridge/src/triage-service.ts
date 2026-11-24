@@ -74,8 +74,34 @@ export interface TriageEvaluationResult {
   readonly triageSessionId?: string
 }
 
+export interface TriageContextPersistence {
+  loadTriageContextScopes(minUpdatedAtMs?: number): ReadonlyArray<{
+    readonly scopeKey: string
+    readonly kind: 'history' | 'worker_reply' | 'ephemeral_thread'
+    readonly payloadJson: string
+    readonly updatedAtMs: number
+  }>
+  upsertTriageContextScope(
+    scopeKey: string,
+    kind: 'history' | 'worker_reply' | 'ephemeral_thread',
+    payloadJson: string,
+    updatedAtMs: number,
+  ): void
+  deleteTriageContextScope(
+    scopeKey: string,
+    kind?: 'history' | 'worker_reply' | 'ephemeral_thread',
+  ): number
+  pruneTriageContextScopes(cutoffMs: number): number
+}
+
+export interface TriageContextStoreOptions {
+  readonly persistence?: TriageContextPersistence
+  readonly resolvePrimaryRouteKey?: (routeKey: string) => string
+}
+
 /**
- * Bounded in-memory sliding context and ephemeral quick-reply thread store.
+ * Bounded sliding context and ephemeral quick-reply thread store with optional
+ * SQLite WAL persistence and route-alias normalization.
  * Retains full, untruncated recent messages up to `MAX_MESSAGES_PER_SCOPE` per scope
  * so configurable `recentMessageCount` and `contextTtlMinutes` slice cleanly without loss.
  */
@@ -84,16 +110,41 @@ export class TriageContextStore {
   private readonly workerSummaryByRoute = new Map<string, WorkerReplyRecord>()
   private readonly ephemeralThreads = new Map<string, EphemeralRouterThread>()
   private readonly ephemeralAliases = new Map<string, string>()
+  private readonly hydratedScopes = new Set<string>()
+  private readonly persistence?: TriageContextPersistence
+  private readonly resolveBindingPrimary?: (routeKey: string) => string
+
+  constructor(options: TriageContextStoreOptions = {}) {
+    this.persistence = options.persistence
+    this.resolveBindingPrimary = options.resolvePrimaryRouteKey
+    this.hydrateFromPersistence()
+  }
+
+  private normalizeRouteKey(routeKey: string): string {
+    return this.resolveBindingPrimary ? this.resolveBindingPrimary(routeKey) : routeKey
+  }
+
+  hasHydratedScope(scopeKey: string): boolean {
+    return this.hydratedScopes.has(scopeKey)
+  }
+
+  markScopeHydrated(scopeKey: string): void {
+    if (scopeKey) this.hydratedScopes.add(scopeKey)
+  }
 
   resolveEphemeralPrimary(routeKey: string, now = Date.now()): string | undefined {
-    const primaryKey = this.ephemeralAliases.get(routeKey) ?? routeKey
-    const thread = this.ephemeralThreads.get(primaryKey)
+    const normalized = this.normalizeRouteKey(routeKey)
+    const primaryKey =
+      this.ephemeralAliases.get(routeKey) ??
+      this.ephemeralAliases.get(normalized) ??
+      normalized
+    const thread = this.ephemeralThreads.get(primaryKey) ?? this.ephemeralThreads.get(routeKey)
     if (!thread) return undefined
     if (now - thread.updatedAtMs > DEFAULT_CONTEXT_TTL_MS) {
-      this.deleteEphemeralThread(primaryKey)
+      this.deleteEphemeralThread(thread.primaryRouteKey)
       return undefined
     }
-    return primaryKey
+    return thread.primaryRouteKey
   }
 
   hasEphemeralThread(routeKey: string, now = Date.now()): boolean {
@@ -107,6 +158,7 @@ export class TriageContextStore {
 
   recordEphemeralQuickReply(input: {
     readonly routeKey: string
+    readonly chatScopeKey?: string
     readonly aliasRouteKeys?: readonly string[]
     readonly trigger: AgentRoutingDecision['trigger']
     readonly senderName?: string
@@ -116,7 +168,8 @@ export class TriageContextStore {
   }): void {
     const now = input.nowMs ?? Date.now()
     this.pruneExpired(now)
-    const primaryKey = this.resolveEphemeralPrimary(input.routeKey, now) ?? input.routeKey
+    const primaryKey =
+      this.resolveEphemeralPrimary(input.routeKey, now) ?? this.normalizeRouteKey(input.routeKey)
     let thread = this.ephemeralThreads.get(primaryKey)
     if (!thread) {
       thread = {
@@ -147,7 +200,17 @@ export class TriageContextStore {
       }
       this.ephemeralAliases.set(alias, primaryKey)
     }
-    this.appendHistory(primaryKey, { role: 'router', text: input.routerReply, timestampMs: now }, now)
+    this.persistScope(primaryKey, 'ephemeral_thread', thread, now)
+
+    const routerEntry: TriageHistoryEntry = {
+      role: 'router',
+      text: input.routerReply,
+      timestampMs: now,
+    }
+    this.appendHistory(primaryKey, routerEntry, now)
+    if (input.chatScopeKey && input.chatScopeKey !== primaryKey) {
+      this.appendHistory(input.chatScopeKey, routerEntry, now)
+    }
     this.enforceBounds()
   }
 
@@ -173,19 +236,103 @@ export class TriageContextStore {
     entry: TriageHistoryEntry,
     now = entry.timestampMs,
   ): void {
-    const targetRouteKey = this.resolveEphemeralPrimary(routeKey, now) ?? routeKey
+    const targetRouteKey =
+      this.resolveEphemeralPrimary(routeKey, now) ?? this.normalizeRouteKey(routeKey)
     this.appendHistory(targetRouteKey, entry, now)
-    if (chatScopeKey !== targetRouteKey) {
+    if (chatScopeKey && chatScopeKey !== targetRouteKey) {
       this.appendHistory(chatScopeKey, entry, now)
     }
     this.enforceBounds()
   }
 
-  recordWorkerReply(routeKey: string, replyText: string, now = Date.now()): void {
+  /** Records a group-level message (e.g. ignored by trigger rules) without creating a thread bucket. */
+  recordChatMessage(
+    chatScopeKey: string,
+    entry: TriageHistoryEntry,
+    options: { readonly routeKey?: string; readonly now?: number } = {},
+  ): void {
+    const now = options.now ?? entry.timestampMs
+    if (chatScopeKey) {
+      this.appendHistory(chatScopeKey, entry, now)
+    }
+    if (options.routeKey) {
+      const targetRouteKey =
+        this.resolveEphemeralPrimary(options.routeKey, now) ??
+        this.normalizeRouteKey(options.routeKey)
+      if (targetRouteKey && targetRouteKey !== chatScopeKey) {
+        this.appendHistory(targetRouteKey, entry, now)
+      }
+    }
+    this.enforceBounds()
+  }
+
+  /**
+   * Merges historical messages fetched from Feishu (e.g. cold-start backfill after restart)
+   * into the target scope without duplicating existing `messageId` entries or overwriting newer items.
+   */
+  hydrateScopeHistory(
+    scopeKey: string,
+    entries: readonly TriageHistoryEntry[],
+    now = Date.now(),
+  ): void {
+    if (!scopeKey) return
+    this.hydratedScopes.add(scopeKey)
+    if (entries.length === 0) return
+
+    let bucket = this.recentByScope.get(scopeKey)
+    if (!bucket || now - bucket.updatedAtMs > MAX_RETAINED_CONTEXT_TTL_MS) {
+      bucket = { entries: [], updatedAtMs: now }
+      this.recentByScope.set(scopeKey, bucket)
+    }
+
+    const existingIds = new Set<string>()
+    for (const item of bucket.entries) {
+      if (item.messageId) existingIds.add(item.messageId)
+    }
+
+    let changed = false
+    for (const entry of entries) {
+      if (!entry.text.trim()) continue
+      if (entry.messageId && existingIds.has(entry.messageId)) continue
+      if (entry.messageId) existingIds.add(entry.messageId)
+      bucket.entries.push(entry)
+      changed = true
+    }
+
+    if (!changed) return
+    bucket.entries.sort((a, b) => a.timestampMs - b.timestampMs)
+    if (bucket.entries.length > MAX_MESSAGES_PER_SCOPE) {
+      bucket.entries.splice(0, bucket.entries.length - MAX_MESSAGES_PER_SCOPE)
+    }
+    const latestTs = bucket.entries[bucket.entries.length - 1]?.timestampMs ?? now
+    bucket.updatedAtMs = Math.max(bucket.updatedAtMs, latestTs)
+    this.persistScope(scopeKey, 'history', bucket, bucket.updatedAtMs)
+    this.enforceBounds()
+  }
+
+  recordWorkerReply(
+    routeKey: string,
+    replyText: string,
+    now = Date.now(),
+    options: { readonly chatScopeKey?: string; readonly messageId?: string } = {},
+  ): void {
     const trimmed = replyText.trim()
     if (!trimmed) return
-    this.workerSummaryByRoute.set(routeKey, { text: trimmed, updatedAtMs: now })
-    this.appendHistory(routeKey, { role: 'worker', text: trimmed, timestampMs: now }, now)
+    const targetRouteKey = this.normalizeRouteKey(routeKey)
+    const summary: WorkerReplyRecord = { text: trimmed, updatedAtMs: now }
+    this.workerSummaryByRoute.set(targetRouteKey, summary)
+    this.persistScope(targetRouteKey, 'worker_reply', summary, now)
+
+    const entry: TriageHistoryEntry = {
+      role: 'worker',
+      text: trimmed,
+      timestampMs: now,
+      ...(options.messageId ? { messageId: options.messageId } : {}),
+    }
+    this.appendHistory(targetRouteKey, entry, now)
+    if (options.chatScopeKey && options.chatScopeKey !== targetRouteKey) {
+      this.appendHistory(options.chatScopeKey, entry, now)
+    }
     this.enforceBounds()
   }
 
@@ -199,7 +346,8 @@ export class TriageContextStore {
     const maxCount = options.maxCount ?? MAX_MESSAGES_PER_SCOPE
     if (maxCount <= 0) return []
 
-    const resolvedRoute = this.resolveEphemeralPrimary(routeKey, now) ?? routeKey
+    const resolvedRoute =
+      this.resolveEphemeralPrimary(routeKey, now) ?? this.normalizeRouteKey(routeKey)
     const pickFrom = (scopeKey: string): TriageHistoryEntry[] => {
       const bucket = this.recentByScope.get(scopeKey)
       if (!bucket) return []
@@ -218,7 +366,9 @@ export class TriageContextStore {
   ): string | undefined {
     const now = options.now ?? Date.now()
     const ttlMs = options.ttlMs ?? DEFAULT_CONTEXT_TTL_MS
-    const summary = this.workerSummaryByRoute.get(routeKey)
+    const normalized = this.normalizeRouteKey(routeKey)
+    const summary =
+      this.workerSummaryByRoute.get(normalized) ?? this.workerSummaryByRoute.get(routeKey)
     if (!summary) return undefined
     if (now - summary.updatedAtMs > ttlMs) {
       return undefined
@@ -227,10 +377,122 @@ export class TriageContextStore {
   }
 
   clearRoute(routeKey: string): void {
-    const primary = this.ephemeralAliases.get(routeKey) ?? routeKey
+    const normalized = this.normalizeRouteKey(routeKey)
+    const primary =
+      this.ephemeralAliases.get(routeKey) ?? this.ephemeralAliases.get(normalized) ?? normalized
     this.deleteEphemeralThread(primary)
     this.workerSummaryByRoute.delete(routeKey)
+    this.workerSummaryByRoute.delete(normalized)
     this.recentByScope.delete(routeKey)
+    this.recentByScope.delete(normalized)
+    this.deletePersistedScope(routeKey)
+    if (normalized !== routeKey) {
+      this.deletePersistedScope(normalized)
+    }
+  }
+
+  prunePersisted(now = Date.now()): void {
+    this.pruneExpired(now)
+    try {
+      this.persistence?.pruneTriageContextScopes(now - MAX_RETAINED_CONTEXT_TTL_MS)
+    } catch {
+      // Best-effort persistence prune.
+    }
+  }
+
+  private hydrateFromPersistence(now = Date.now()): void {
+    if (!this.persistence) return
+    let rows: ReturnType<TriageContextPersistence['loadTriageContextScopes']>
+    try {
+      rows = this.persistence.loadTriageContextScopes(now - MAX_RETAINED_CONTEXT_TTL_MS)
+    } catch {
+      return
+    }
+    for (const row of rows) {
+      try {
+        if (row.kind === 'history') {
+          const parsed = JSON.parse(row.payloadJson) as Partial<ScopedHistoryBucket>
+          if (!Array.isArray(parsed.entries)) continue
+          const entries = parsed.entries
+            .filter(
+              (e): e is TriageHistoryEntry =>
+                Boolean(e) &&
+                typeof e === 'object' &&
+                (e.role === 'user' || e.role === 'router' || e.role === 'worker') &&
+                typeof e.text === 'string' &&
+                typeof e.timestampMs === 'number',
+            )
+            .slice(-MAX_MESSAGES_PER_SCOPE)
+          if (entries.length === 0) continue
+          this.recentByScope.set(row.scopeKey, {
+            entries,
+            updatedAtMs:
+              typeof parsed.updatedAtMs === 'number' ? parsed.updatedAtMs : row.updatedAtMs,
+          })
+        } else if (row.kind === 'worker_reply') {
+          const parsed = JSON.parse(row.payloadJson) as Partial<WorkerReplyRecord>
+          if (typeof parsed.text !== 'string' || !parsed.text.trim()) continue
+          this.workerSummaryByRoute.set(row.scopeKey, {
+            text: parsed.text,
+            updatedAtMs:
+              typeof parsed.updatedAtMs === 'number' ? parsed.updatedAtMs : row.updatedAtMs,
+          })
+        } else if (row.kind === 'ephemeral_thread') {
+          if (now - row.updatedAtMs > DEFAULT_CONTEXT_TTL_MS) continue
+          const parsed = JSON.parse(row.payloadJson) as Partial<EphemeralRouterThread>
+          if (!parsed.primaryRouteKey || !Array.isArray(parsed.turns) || !parsed.trigger) continue
+          const aliases = Array.isArray(parsed.aliasRouteKeys)
+            ? parsed.aliasRouteKeys.filter((a): a is string => typeof a === 'string' && Boolean(a))
+            : []
+          const thread: EphemeralRouterThread = {
+            primaryRouteKey: parsed.primaryRouteKey,
+            aliasRouteKeys: aliases,
+            trigger: parsed.trigger,
+            turns: parsed.turns.slice(-MAX_EPHEMERAL_TURNS),
+            updatedAtMs:
+              typeof parsed.updatedAtMs === 'number' ? parsed.updatedAtMs : row.updatedAtMs,
+          }
+          this.ephemeralThreads.set(thread.primaryRouteKey, thread)
+          for (const alias of aliases) {
+            this.ephemeralAliases.set(alias, thread.primaryRouteKey)
+          }
+        }
+      } catch {
+        // Ignore malformed persisted row.
+      }
+    }
+    this.enforceBounds()
+  }
+
+  private persistScope(
+    scopeKey: string,
+    kind: 'history' | 'worker_reply' | 'ephemeral_thread',
+    payload: unknown,
+    updatedAtMs: number,
+  ): void {
+    if (!this.persistence || !scopeKey) return
+    try {
+      this.persistence.upsertTriageContextScope(
+        scopeKey,
+        kind,
+        JSON.stringify(payload),
+        updatedAtMs,
+      )
+    } catch {
+      // Never fail hot triage path on SQLite write error (e.g. closing DB during shutdown).
+    }
+  }
+
+  private deletePersistedScope(
+    scopeKey: string,
+    kind?: 'history' | 'worker_reply' | 'ephemeral_thread',
+  ): void {
+    if (!this.persistence || !scopeKey) return
+    try {
+      this.persistence.deleteTriageContextScope(scopeKey, kind)
+    } catch {
+      // Ignore cleanup error during shutdown.
+    }
   }
 
   private appendHistory(scopeKey: string, entry: TriageHistoryEntry, now: number): void {
@@ -239,17 +501,31 @@ export class TriageContextStore {
       bucket = { entries: [], updatedAtMs: now }
       this.recentByScope.set(scopeKey, bucket)
     }
+    if (entry.messageId) {
+      const existingIdx = bucket.entries.findIndex((item) => item.messageId === entry.messageId)
+      if (existingIdx >= 0) {
+        // Upgrade senderName if previously missing, otherwise keep idempotent.
+        const existing = bucket.entries[existingIdx]!
+        if (!existing.senderName && entry.senderName) {
+          bucket.entries[existingIdx] = { ...existing, senderName: entry.senderName }
+          this.persistScope(scopeKey, 'history', bucket, bucket.updatedAtMs)
+        }
+        return
+      }
+    }
     bucket.entries.push(entry)
     if (bucket.entries.length > MAX_MESSAGES_PER_SCOPE) {
       bucket.entries.splice(0, bucket.entries.length - MAX_MESSAGES_PER_SCOPE)
     }
     bucket.updatedAtMs = now
+    this.persistScope(scopeKey, 'history', bucket, now)
   }
 
   private deleteEphemeralThread(primaryKey: string): void {
     const existing = this.ephemeralThreads.get(primaryKey)
     if (!existing) return
     this.ephemeralThreads.delete(primaryKey)
+    this.deletePersistedScope(primaryKey, 'ephemeral_thread')
     for (const alias of existing.aliasRouteKeys) {
       if (this.ephemeralAliases.get(alias) === primaryKey) {
         this.ephemeralAliases.delete(alias)
@@ -259,11 +535,15 @@ export class TriageContextStore {
 
   private pruneExpired(now: number): void {
     for (const [key, bucket] of this.recentByScope) {
-      if (now - bucket.updatedAtMs > MAX_RETAINED_CONTEXT_TTL_MS) this.recentByScope.delete(key)
+      if (now - bucket.updatedAtMs > MAX_RETAINED_CONTEXT_TTL_MS) {
+        this.recentByScope.delete(key)
+        this.deletePersistedScope(key, 'history')
+      }
     }
     for (const [key, summary] of this.workerSummaryByRoute) {
       if (now - summary.updatedAtMs > MAX_RETAINED_CONTEXT_TTL_MS) {
         this.workerSummaryByRoute.delete(key)
+        this.deletePersistedScope(key, 'worker_reply')
       }
     }
     for (const [key, thread] of this.ephemeralThreads) {
@@ -276,11 +556,13 @@ export class TriageContextStore {
       const oldest = this.recentByScope.keys().next().value
       if (!oldest) break
       this.recentByScope.delete(oldest)
+      this.deletePersistedScope(oldest, 'history')
     }
     while (this.workerSummaryByRoute.size > MAX_SCOPE_ENTRIES) {
       const oldest = this.workerSummaryByRoute.keys().next().value
       if (!oldest) break
       this.workerSummaryByRoute.delete(oldest)
+      this.deletePersistedScope(oldest, 'worker_reply')
     }
     while (this.ephemeralThreads.size > MAX_SCOPE_ENTRIES) {
       const oldest = this.ephemeralThreads.keys().next().value
@@ -305,15 +587,36 @@ function normalizeChunkForRecording(chunk: StreamChunk, fallbackCallId: () => To
  * Optionally persists each invocation as a standard archived DSH v4 inspection session.
  */
 export class LlmTriageService {
-  readonly context = new TriageContextStore()
+  readonly context: TriageContextStore
+  private activeEvaluations = 0
+  private readonly onActivityChange?: () => void
 
   constructor(
     private readonly ctx: Context,
     private readonly runtimes: RuntimeCatalog,
     private readonly recorder?: TriageSessionRecorder,
-  ) {}
+    options: TriageContextStoreOptions & { readonly onActivityChange?: () => void } = {},
+  ) {
+    this.context = new TriageContextStore(options)
+    this.onActivityChange = options.onActivityChange
+  }
+
+  getActiveCount(): number {
+    return this.activeEvaluations
+  }
 
   async evaluate(input: EvaluateTriageInput): Promise<TriageEvaluationResult> {
+    this.activeEvaluations += 1
+    this.onActivityChange?.()
+    try {
+      return await this.evaluateInner(input)
+    } finally {
+      this.activeEvaluations = Math.max(0, this.activeEvaluations - 1)
+      this.onActivityChange?.()
+    }
+  }
+
+  private async evaluateInner(input: EvaluateTriageInput): Promise<TriageEvaluationResult> {
     const startedAtMs = Date.now()
     const failOpen = (
       reason: string,
