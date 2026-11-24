@@ -154,9 +154,9 @@ export interface ProactiveSessionReminderInput {
 }
 
 /**
- * Injected as `<proactive>` on the first turn of a session when proactive capabilities
- * are enabled. Teaches the Agent concrete scenarios, non-goals, and CLI workflows for
- * one-shot follow-up reminders and isolated `.worktrees/` code changes.
+ * Injected as a compact `<proactive>` directive on the first turn of a session when
+ * proactive capabilities are enabled. Carries only dynamic runtime config, trigger/non-trigger
+ * boundaries, and hard isolation redlines; full CLI flags and examples live in the `lark-bridge` skill.
  */
 export function composeProactiveSessionReminder(
   input: ProactiveSessionReminderInput,
@@ -166,46 +166,30 @@ export function composeProactiveSessionReminder(
 
   const absWorkDir = expandWorkingDir(input.workingDir) || input.workingDir
   const modeAttr = `reminders="${config.remindersEnabled ? config.reminderCreationMode : 'off'}" auto_code="${config.autoCodeEnabled ? 'on' : 'off'}"`
-  const lines: string[] = [
-    `<proactive ${modeAttr}>`,
-    '完成当轮响应的同时，按以下边界执行主动协作：',
-  ]
+  const lines: string[] = [`<proactive ${modeAttr}>`]
 
   if (config.remindersEnabled) {
     const modeRule =
       config.reminderCreationMode === 'confirm'
-        ? '当前为 `confirm` 模式：执行命令后发送确认卡片，用户确认后生效。'
+        ? '建后发确认卡待确认'
         : config.reminderCreationMode === 'notify'
-          ? '当前为 `notify` 模式：执行命令后自动附带可取消提示卡，正文中无需重复说明。'
-          : '当前为 `silent` 模式：后台静默生效，正文中无需专门播报“已创建提醒”。'
+          ? '建后附可取消卡（正文勿重复说明）'
+          : '后台静默生效（正文勿播报）'
     const quietRule = config.quietHoursEnabled
-      ? `夜间免打扰已开启（${config.quietHoursStart}–${config.quietHoursEnd}）：普通提醒将自动顺延至结束时刻，仅确属线上 P0 紧急止损复查时才显式传 \`--urgency high\`。`
-      : '若属线上 P0 紧急止损复查可显式标注 `--urgency high`。'
+      ? `；免打扰 ${config.quietHoursStart}–${config.quietHoursEnd}（普通顺延，仅 P0 止损传 \`--urgency high\`）`
+      : ''
+    const maxChainHours = Math.round(MAX_REMINDER_CHAIN_WINDOW_MS / 3_600_000)
     lines.push(
-      '1. **一次性跟进提醒（`lark-bridge reminder`）**：',
-      '   - 触发场景（仅在存在明确时间锚点或待闭环责任时创建）：',
-      '     a) **承诺与发版核查**：对话约定“下午 16:00 发版 / 稍后回填压测数据 / 今晚回滚配置”，在约定时间后创建核查提醒（已完成则静默，未完成才提醒责任人）；',
-      '     b) **变更与止损后复查**：执行限流、降级、热修或放量灰度后，创建 `30~60` 分钟后的复查提醒（核查错误率/延迟是否回落、临时开关是否需清理）；',
-      '     c) **待审与外部依赖催办**：PR/MR 待评审、跨团队接口确认或问题单超过合理等待窗口未响应时，创建跟进提醒（已合入/已回复则静默，仍挂起则提醒对应人员）；',
-      '     d) **多节点里程碑跟进**：跨天交付事项（如“周五前完成迁移”），可拆分前置进度核查（如周三上午，正常则静默）与截止兜底核查（周五下午）；',
-      '     e) **非工作时段错峰交付**：夜间或节假日自动排查产出非紧急优化方案/PR 时，创建下一工作日上午（如 `10:00`）提醒推送给负责人。',
-      '   - 不创建边界：纯技术问答、无时间锚点与责任人的泛泛讨论、或已有周期性 `schedule` 覆盖的例行任务；创建前先用 `lark-bridge reminder list` 避免重复。单次提醒仅用于有限跟进（系统硬限制单链最多续查 3 次且总跨度 ≤ 6 小时、单条指令 ≤ 2400 字），禁止用于无限小时级轮询。',
-      `   - 模式说明：自动继承当前会话投递路径；${modeRule} ${quietRule}`,
-      '   - 命令示例：',
-      '     - 按时间点核查：`lark-bridge reminder create --title "核查 16:00 发版结果" --at "<YYYY-MM-DD HH:mm>" --mention "<open_id>:<姓名>" --prompt "运行 lark-bridge history --limit 20 并检查部署状态：已完成或群内已同步延期则调用 lark-bridge silence --reason \\"已闭环\\" 静默；未完成且无说明则简短提醒负责人"`',
-      '     - 按相对延时复查：`lark-bridge reminder create --title "复查降级恢复情况" --after 1800 --prompt "检查近 30 分钟错误率与群内通报：指标已恢复且无遗留开关则调用 lark-bridge silence --reason \\"指标已恢复\\" 静默；异常持续则同步数据提醒值班人"`',
+      `- **跟进提醒（\`lark-bridge reminder\`）**：仅在有明确时间锚点或待闭环责任时创建（发版/承诺、变更止损复查、待审催办、里程碑/错峰交付）；纯问答、无锚点或已有 \`schedule\` 覆盖不建。先 \`reminder list\` 去重，单链限 ${MAX_REMINDER_CHAIN_DEPTH} 次/${maxChainHours}h 勿作轮询，\`--prompt\` 须约定闭环后调 \`lark-bridge silence\` 静默；自动继承当前路由，${modeRule}${quietRule}，参数见 \`lark-bridge\` 技能。`,
     )
   }
 
   if (config.autoCodeEnabled) {
+    const reminderPairSuffix = config.remindersEnabled
+      ? '（错峰提审可配 `lark-bridge reminder create --worktree <path> --branch <branch> [--pr <url>]`）'
+      : ''
     lines.push(
-      `${config.remindersEnabled ? '2' : '1'}. **隔离工作树主动编码（\`lark-bridge worktree\`）**：`,
-      '   - 触发场景：',
-      '     a) **告警/报错确定性缺陷**：排查线上告警、异常堆栈或构建失败时，定位到明确的空指针、超时/重试配置遗漏、幂等边界漏洞或类型错误；',
-      '     b) **代码评审与巡检隐患**：发现契约不一致、缺失边界校验、遗漏单测或过时死代码，可附带可验证补丁辅助评审；',
-      '     c) **群内已达成共识的待办小改**：讨论已明确方案但暂无人动手的小步重构、配置收敛、脚本或文档更新。',
-      `   - 隔离红线：**严禁直接修改主工作目录 \`${absWorkDir}\`**；需求模糊、涉及不兼容协议变更/架构大改/破坏性迁移或无法本地验证时，仅输出方案不擅自改码。`,
-      `   - 命令示例：运行 \`lark-bridge worktree create <slug> --prefix "${config.branchPrefix}"\` 在 \`${absWorkDir}/.worktrees/<slug>\` 创建隔离分支 -> 在该工作树内完成修改与构建/单测验证 -> 按仓库规范提交分支或创建 PR/MR（非工作时段可搭配 \`lark-bridge reminder create --worktree <path> --branch <branch> [--pr <url>]\` 错峰提审）。`,
+      `- **隔离编码（\`lark-bridge worktree\`）**：仅限根因明确可验证的缺陷、评审隐患或共识小改；需求模糊、破坏性大改或无法本地验证时只给方案。**严禁直改主工作目录**，须用 \`lark-bridge worktree create <slug> --prefix "${config.branchPrefix}"\` 在 \`${absWorkDir}/.worktrees/<slug>\` 改码验证并提交/提 PR${reminderPairSuffix}。`,
     )
   }
 

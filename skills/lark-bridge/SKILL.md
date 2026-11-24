@@ -90,18 +90,34 @@ lark-bridge message om_xxx --raw --download-dir ./.dsh-lark-bridge/attachments/q
 
 ### 5. 一次性跟进提醒（`reminder`）与隔离工作树（`worktree`）
 
-`reminder` 单次到期触发后自动归档，默认继承创建会话的群聊/话题或私聊路由：
+`reminder` 单次到期触发后自动归档，默认继承创建会话的群聊/话题或私聊路由；创建前先 `reminder list` 去重，系统硬限制单链最多续查 3 次且总跨度 ≤ 6 小时、单条指令 ≤ 2400 字（禁止用作无限小时级轮询）：
 
 ```bash
 # 查看待触发（active）或已归档（archived）提醒事项
 lark-bridge reminder list [--status active|archived|all]
 
-# 按指定时间点或相对秒数（--after <sec>）创建核查提醒
+# 按时间点核查（已完成或已延期时务必约定调 lark-bridge silence 静默）
 lark-bridge reminder create \
   --title "核查下午发版结果" \
   --at "<YYYY-MM-DD HH:mm>" \
   --mention "<open_id>:<负责人>" \
-  --prompt "读取本群最新消息与部署记录：已完成或已同步延期则输出 <no_reminder_needed/>；未完成则简短提醒负责人。"
+  --prompt '运行 lark-bridge history --limit 20 并检查部署状态：已完成或群内已同步延期则调用 lark-bridge silence --reason "已闭环" 静默；未完成则简短提醒负责人。'
+
+# 按相对秒数复查（P0 紧急止损复查需穿透免打扰时加 --urgency high）
+lark-bridge reminder create \
+  --title "复查降级恢复情况" \
+  --after 1800 \
+  [--urgency high] \
+  --prompt '检查近 30 分钟错误率与群内通报：指标已恢复且无遗留开关则调用 lark-bridge silence --reason "指标已恢复" 静默；异常持续则同步数据提醒值班人。'
+
+# 关联隔离工作树分支/PR 做错峰提审提醒
+lark-bridge reminder create \
+  --title "提审修复分支" \
+  --at "<YYYY-MM-DD 10:00>" \
+  --worktree "<workingDir>/.worktrees/<slug>" \
+  --branch "agent/<slug>" \
+  [--pr "<prUrl>"] \
+  --prompt "确认分支状态并向负责人发起评审。"
 
 # 提前闭环时取消后续冗余提醒
 lark-bridge reminder cancel <reminderId>
