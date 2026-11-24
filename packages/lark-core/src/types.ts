@@ -1,6 +1,7 @@
 import { homedir } from 'node:os'
 import { basename, join, parse, resolve } from 'node:path'
 import { z } from 'zod'
+import { DEFAULT_TRIAGE_SYSTEM_PROMPT } from './triage.js'
 
 export function expandWorkingDir(rawDir: string): string {
   const trimmed = rawDir.trim()
@@ -124,15 +125,33 @@ export const DEFAULT_BOT_PROACTIVE_CONFIG: z.output<typeof BotProactiveConfigSch
 export const RouterScopeModeSchema = z.enum(['passive_only', 'all_group'])
 export const GroupRouterModeSchema = z.enum(['inherit', 'override', 'off'])
 
-export const BotRouterConfigSchema = z.object({
-  enabled: z.boolean().default(false),
-  provider: z.string().default(''),
-  model: z.string().default(''),
-  scope: RouterScopeModeSchema.default('passive_only'),
-  timeoutMs: z.number().int().min(1000).max(15000).default(4000),
-  customPrompt: z.string().default(''),
-  coalesceQueuedMessages: z.boolean().default(true),
-})
+function migrateLegacyRouterConfig(input: unknown): unknown {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return input
+  const rec = { ...(input as Record<string, unknown>) }
+  const legacyCustom = typeof rec.customPrompt === 'string' ? rec.customPrompt.trim() : ''
+  const currentSystem = typeof rec.systemPrompt === 'string' ? rec.systemPrompt.trim() : ''
+  if (!currentSystem && legacyCustom) {
+    rec.systemPrompt = `${DEFAULT_TRIAGE_SYSTEM_PROMPT}\n\n## 额外分流约定\n${legacyCustom}`
+  }
+  delete rec.customPrompt
+  return rec
+}
+
+export const BotRouterConfigSchema = z.preprocess(
+  migrateLegacyRouterConfig,
+  z.object({
+    enabled: z.boolean().default(false),
+    provider: z.string().default(''),
+    model: z.string().default(''),
+    scope: RouterScopeModeSchema.default('passive_only'),
+    timeoutMs: z.number().int().min(1000).max(15000).default(4000),
+    systemPrompt: z.string().default(''),
+    recentMessageCount: z.number().int().min(0).max(50).default(6),
+    contextTtlMinutes: z.number().int().min(1).max(1440).default(30),
+    includeLastReply: z.boolean().default(true),
+    coalesceQueuedMessages: z.boolean().default(true),
+  }),
+)
 
 export const DEFAULT_BOT_ROUTER_CONFIG: z.output<typeof BotRouterConfigSchema> = {
   enabled: false,
@@ -140,19 +159,28 @@ export const DEFAULT_BOT_ROUTER_CONFIG: z.output<typeof BotRouterConfigSchema> =
   model: '',
   scope: 'passive_only',
   timeoutMs: 4000,
-  customPrompt: '',
+  systemPrompt: '',
+  recentMessageCount: 6,
+  contextTtlMinutes: 30,
+  includeLastReply: true,
   coalesceQueuedMessages: true,
 }
 
-export const GroupRouterConfigSchema = z.object({
-  mode: GroupRouterModeSchema.default('inherit'),
-  provider: z.string().default(''),
-  model: z.string().default(''),
-  scope: RouterScopeModeSchema.default('passive_only'),
-  timeoutMs: z.number().int().min(1000).max(15000).default(4000),
-  customPrompt: z.string().default(''),
-  coalesceQueuedMessages: z.boolean().default(true),
-})
+export const GroupRouterConfigSchema = z.preprocess(
+  migrateLegacyRouterConfig,
+  z.object({
+    mode: GroupRouterModeSchema.default('inherit'),
+    provider: z.string().default(''),
+    model: z.string().default(''),
+    scope: RouterScopeModeSchema.default('passive_only'),
+    timeoutMs: z.number().int().min(1000).max(15000).default(4000),
+    systemPrompt: z.string().default(''),
+    recentMessageCount: z.number().int().min(0).max(50).default(6),
+    contextTtlMinutes: z.number().int().min(1).max(1440).default(30),
+    includeLastReply: z.boolean().default(true),
+    coalesceQueuedMessages: z.boolean().default(true),
+  }),
+)
 
 export const DEFAULT_GROUP_ROUTER_CONFIG: z.output<typeof GroupRouterConfigSchema> = {
   mode: 'inherit',
@@ -160,7 +188,10 @@ export const DEFAULT_GROUP_ROUTER_CONFIG: z.output<typeof GroupRouterConfigSchem
   model: '',
   scope: 'passive_only',
   timeoutMs: 4000,
-  customPrompt: '',
+  systemPrompt: '',
+  recentMessageCount: 6,
+  contextTtlMinutes: 30,
+  includeLastReply: true,
   coalesceQueuedMessages: true,
 }
 
@@ -877,7 +908,10 @@ export interface EffectiveRouterConfig {
   readonly model: string
   readonly scope: RouterScopeMode
   readonly timeoutMs: number
-  readonly customPrompt: string
+  readonly systemPrompt: string
+  readonly recentMessageCount: number
+  readonly contextTtlMinutes: number
+  readonly includeLastReply: boolean
   readonly coalesceQueuedMessages: boolean
 }
 
@@ -895,7 +929,10 @@ export function resolveEffectiveRouterConfig(
       model: base.model.trim(),
       scope: base.scope,
       timeoutMs: base.timeoutMs,
-      customPrompt: base.customPrompt.trim(),
+      systemPrompt: base.systemPrompt.trim(),
+      recentMessageCount: base.recentMessageCount,
+      contextTtlMinutes: base.contextTtlMinutes,
+      includeLastReply: base.includeLastReply,
       coalesceQueuedMessages: base.enabled && base.coalesceQueuedMessages,
     }
   }
@@ -907,7 +944,10 @@ export function resolveEffectiveRouterConfig(
       model: base.model.trim(),
       scope: base.scope,
       timeoutMs: base.timeoutMs,
-      customPrompt: '',
+      systemPrompt: '',
+      recentMessageCount: base.recentMessageCount,
+      contextTtlMinutes: base.contextTtlMinutes,
+      includeLastReply: base.includeLastReply,
       coalesceQueuedMessages: false,
     }
   }
@@ -922,7 +962,10 @@ export function resolveEffectiveRouterConfig(
     model,
     scope: groupRouter.scope,
     timeoutMs: groupRouter.timeoutMs,
-    customPrompt: groupRouter.customPrompt.trim(),
+    systemPrompt: groupRouter.systemPrompt.trim(),
+    recentMessageCount: groupRouter.recentMessageCount,
+    contextTtlMinutes: groupRouter.contextTtlMinutes,
+    includeLastReply: groupRouter.includeLastReply,
     coalesceQueuedMessages: groupRouter.coalesceQueuedMessages,
   }
 }

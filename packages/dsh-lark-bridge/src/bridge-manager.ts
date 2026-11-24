@@ -32,6 +32,7 @@ import { SessionTitleGuard } from './session-title-guard.js'
 import { LarkSessionViewerService } from './session-viewer.js'
 import type { SplitBrainDetector } from './split-brain-detector.js'
 import type { LarkBridgeStore } from './store.js'
+import { TriageSessionRecorder } from './triage-session-recorder.js'
 import { LlmTriageService } from './triage-service.js'
 import { runTurnAndCollectReply } from './turn-runner.js'
 import type {
@@ -131,7 +132,8 @@ export class LarkBridgeManager {
       this.sessions.archiveManagedSession(sid),
     )
 
-    this.triage = new LlmTriageService(ctx, this.runtimes)
+    const triageRecorder = new TriageSessionRecorder(ctx, store, this.workspaces)
+    this.triage = new LlmTriageService(ctx, this.runtimes, triageRecorder)
 
     this.inbound = new InboundPipeline({
       ctx,

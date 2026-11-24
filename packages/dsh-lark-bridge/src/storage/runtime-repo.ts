@@ -9,11 +9,13 @@ import type {
   LarkManagedSession,
   LarkPendingTurn,
   LarkSessionBinding,
+  LarkTriageSession,
 } from '../types.js'
 import type { BridgeDatabase } from './database.js'
 
 const MAX_MANAGED_SESSIONS = 600
 const MAX_DREAM_SESSIONS = 100
+const MAX_TRIAGE_SESSIONS = 200
 const MAX_ARCHIVED_REMINDERS = 300
 const MAX_SEEN_MESSAGES = 2000
 const SEEN_MESSAGE_TTL_MS = 24 * 60 * 60_000
@@ -618,6 +620,99 @@ export class RuntimeRepo {
     return Number(res.changes) > 0
   }
 
+  // ── Smart Triage Sessions ───────────────────────────────────────────────
+
+  listRawTriageSessions(botId?: string): LarkTriageSession[] {
+    const rows = (
+      botId
+        ? this.db
+            .prepare(
+              'SELECT payload_json FROM triage_sessions WHERE bot_id = ? ORDER BY last_activity_ms DESC',
+            )
+            .all(botId)
+        : this.db
+            .prepare('SELECT payload_json FROM triage_sessions ORDER BY last_activity_ms DESC')
+            .all()
+    ) as Array<{ payload_json: string }>
+    const out: LarkTriageSession[] = []
+    for (const row of rows) {
+      try {
+        out.push(JSON.parse(row.payload_json) as LarkTriageSession)
+      } catch {
+        // Skip malformed entry.
+      }
+    }
+    return out
+  }
+
+  upsertTriageSession(entry: LarkTriageSession): LarkTriageSession {
+    return this.db.transaction(() => {
+      const existingRow = this.db
+        .prepare('SELECT payload_json FROM triage_sessions WHERE session_id = ?')
+        .get(entry.sessionId) as { payload_json?: string } | undefined
+      const existing = existingRow?.payload_json
+        ? (JSON.parse(existingRow.payload_json) as LarkTriageSession)
+        : undefined
+      const next: LarkTriageSession = {
+        ...(existing ?? {}),
+        ...entry,
+      }
+      this.db
+        .prepare(
+          `INSERT INTO triage_sessions (
+             session_id, bot_id, chat_id, action, created_at_ms, last_activity_ms, payload_json
+           ) VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(session_id) DO UPDATE SET
+             bot_id = excluded.bot_id,
+             chat_id = excluded.chat_id,
+             action = excluded.action,
+             created_at_ms = excluded.created_at_ms,
+             last_activity_ms = excluded.last_activity_ms,
+             payload_json = excluded.payload_json`,
+        )
+        .run(
+          next.sessionId,
+          next.botId,
+          next.chatId,
+          next.action,
+          next.createdAtMs,
+          next.lastActivityMs,
+          JSON.stringify(next),
+        )
+      this.pruneTriageSessions()
+      return next
+    })
+  }
+
+  linkTriageHandoffSession(triageSessionId: string, handoffSessionId: string): boolean {
+    const row = this.db
+      .prepare('SELECT payload_json FROM triage_sessions WHERE session_id = ?')
+      .get(triageSessionId) as { payload_json?: string } | undefined
+    if (!row?.payload_json) return false
+    try {
+      const parsed = JSON.parse(row.payload_json) as LarkTriageSession
+      const next: LarkTriageSession = { ...parsed, handoffSessionId }
+      const res = this.db
+        .prepare('UPDATE triage_sessions SET payload_json = ? WHERE session_id = ?')
+        .run(JSON.stringify(next), triageSessionId)
+      return Number(res.changes) > 0
+    } catch {
+      return false
+    }
+  }
+
+  deleteTriageSession(sessionId: string): boolean {
+    const res = this.db.prepare('DELETE FROM triage_sessions WHERE session_id = ?').run(sessionId)
+    return Number(res.changes) > 0
+  }
+
+  clearTriageSessions(botId?: string): number {
+    const res = botId
+      ? this.db.prepare('DELETE FROM triage_sessions WHERE bot_id = ?').run(botId)
+      : this.db.prepare('DELETE FROM triage_sessions').run()
+    return Number(res.changes)
+  }
+
   // ── Reminders ───────────────────────────────────────────────────────────
 
   listReminders(filter: 'active' | 'archived' | 'all' = 'all'): LarkReminderItem[] {
@@ -896,6 +991,21 @@ export class RuntimeRepo {
       .prepare(
         `DELETE FROM dream_sessions WHERE session_id IN (
            SELECT session_id FROM dream_sessions ORDER BY last_activity_ms ASC LIMIT ?
+         )`,
+      )
+      .run(excess)
+  }
+
+  private pruneTriageSessions(): void {
+    const countRow = this.db.prepare('SELECT COUNT(*) AS cnt FROM triage_sessions').get() as {
+      cnt?: number
+    }
+    const excess = Number(countRow?.cnt ?? 0) - MAX_TRIAGE_SESSIONS
+    if (excess <= 0) return
+    this.db
+      .prepare(
+        `DELETE FROM triage_sessions WHERE session_id IN (
+           SELECT session_id FROM triage_sessions ORDER BY last_activity_ms ASC LIMIT ?
          )`,
       )
       .run(excess)

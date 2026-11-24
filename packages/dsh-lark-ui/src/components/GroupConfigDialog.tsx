@@ -34,6 +34,7 @@ import type {
   ListenerTemplate,
   ModelGroup,
   RuntimeOption,
+  TriageDefaultsPayload,
 } from '../types.js'
 import { AgentRuntimeFields } from './AgentRuntimeFields.js'
 import { ConfigDialog, type ConfigSection } from './ConfigDialog.js'
@@ -70,7 +71,10 @@ const DEFAULT_GROUP_ROUTER: GroupRouterConfig = {
   model: '',
   scope: 'passive_only',
   timeoutMs: 4000,
-  customPrompt: '',
+  systemPrompt: '',
+  recentMessageCount: 6,
+  contextTtlMinutes: 30,
+  includeLastReply: true,
   coalesceQueuedMessages: true,
 }
 
@@ -107,6 +111,7 @@ export function GroupConfigDialog({
   runtimes,
   models,
   listenerTemplates,
+  triageDefaults,
   onClose,
   onSave,
   onProfilesChanged,
@@ -116,6 +121,7 @@ export function GroupConfigDialog({
   runtimes: readonly RuntimeOption[]
   models: readonly ModelGroup[]
   listenerTemplates: readonly ListenerTemplate[]
+  triageDefaults?: TriageDefaultsPayload
   onClose: () => void
   onSave: (config: GroupConfig) => Promise<void>
   onProfilesChanged?: () => Promise<void>
@@ -381,11 +387,6 @@ export function GroupConfigDialog({
           )}
 
           <GroupTitle>智能分流</GroupTitle>
-          <div className="fb-banner" style={{ margin: '6px 0 2px' }}>
-            <div className="fb-row-desc" style={{ minWidth: 0, flex: 1 }}>
-              使用轻量原生模型前置判断本群消息意图，闲聊与确认语静默跳过或轻回复，正式任务直接交由主运行时处理，并在忙碌时自动合批排队消息。
-            </div>
-          </div>
           {(() => {
             const currentRouter: GroupRouterConfig = {
               ...DEFAULT_GROUP_ROUTER,
@@ -404,7 +405,9 @@ export function GroupConfigDialog({
                   desc={
                     currentRouter.mode === 'inherit'
                       ? `当前继承：${formatTriageSummary(bot?.router, models)}`
-                      : undefined
+                      : currentRouter.mode === 'off'
+                        ? '本群关闭智能分流，消息直接交由主运行时处理'
+                        : '用轻量模型前置判断本群消息意图，闲聊静默或轻回复，正式任务直通主运行时'
                   }
                 >
                   <SegmentedControl
@@ -422,7 +425,13 @@ export function GroupConfigDialog({
                             model: currentRouter.model || base?.model || '',
                             scope: base?.scope ?? currentRouter.scope,
                             timeoutMs: base?.timeoutMs ?? currentRouter.timeoutMs,
-                            customPrompt: currentRouter.customPrompt || base?.customPrompt || '',
+                            systemPrompt: currentRouter.systemPrompt || base?.systemPrompt || '',
+                            recentMessageCount:
+                              base?.recentMessageCount ?? currentRouter.recentMessageCount,
+                            contextTtlMinutes:
+                              base?.contextTtlMinutes ?? currentRouter.contextTtlMinutes,
+                            includeLastReply:
+                              base?.includeLastReply ?? currentRouter.includeLastReply,
                             coalesceQueuedMessages:
                               base?.coalesceQueuedMessages ?? currentRouter.coalesceQueuedMessages,
                           },
@@ -439,6 +448,7 @@ export function GroupConfigDialog({
                       value={currentRouter}
                       runtimes={runtimes}
                       models={models}
+                      triageDefaults={triageDefaults}
                       emptyModelLabel={emptyGroupModelLabel}
                       onChange={(next) =>
                         patch({ router: { ...currentRouter, mode: 'override', ...next } })

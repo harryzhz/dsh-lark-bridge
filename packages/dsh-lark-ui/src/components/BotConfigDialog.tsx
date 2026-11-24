@@ -37,6 +37,7 @@ import type {
   QrJobView,
   RuntimeOption,
   SubstituteTarget,
+  TriageDefaultsPayload,
 } from '../types.js'
 import { AgentRuntimeFields } from './AgentRuntimeFields.js'
 import { ConfigDialog, type ConfigSection } from './ConfigDialog.js'
@@ -95,7 +96,10 @@ export const DEFAULT_ROUTER_CONFIG: BotRouterConfig = {
   model: '',
   scope: 'passive_only',
   timeoutMs: 4000,
-  customPrompt: '',
+  systemPrompt: '',
+  recentMessageCount: 6,
+  contextTtlMinutes: 30,
+  includeLastReply: true,
   coalesceQueuedMessages: true,
 }
 
@@ -203,6 +207,7 @@ export function BotConfigDialog({
   bots,
   runtimes,
   models,
+  triageDefaults,
   auth,
   onClose,
   onSave,
@@ -218,6 +223,7 @@ export function BotConfigDialog({
   bots: readonly BotRecord[]
   runtimes: readonly RuntimeOption[]
   models: readonly ModelGroup[]
+  triageDefaults?: TriageDefaultsPayload
   auth: AuthStatusPayload | null
   onClose: () => void
   onSave: (config: BotConfig, existingId: string | null) => Promise<void>
@@ -251,6 +257,7 @@ export function BotConfigDialog({
       target={target}
       runtimes={runtimes}
       models={models}
+      triageDefaults={triageDefaults}
       auth={auth}
       onClose={onClose}
       onSave={onSave}
@@ -800,6 +807,7 @@ function EditBotDialog({
   target,
   runtimes,
   models,
+  triageDefaults,
   auth,
   onClose,
   onSave,
@@ -811,6 +819,7 @@ function EditBotDialog({
   target: BotRecord
   runtimes: readonly RuntimeOption[]
   models: readonly ModelGroup[]
+  triageDefaults?: TriageDefaultsPayload
   auth: AuthStatusPayload | null
   onClose: () => void
   onSave: (config: BotConfig, existingId: string | null) => Promise<void>
@@ -1048,13 +1057,10 @@ function EditBotDialog({
           />
 
           <GroupTitle>智能分流</GroupTitle>
-          <div className="fb-banner" style={{ margin: '6px 0 2px' }}>
-            <div className="fb-row-desc" style={{ minWidth: 0, flex: 1 }}>
-              使用轻量原生模型先判断群聊消息意图：闲聊与确认语直接静默或轻文本回应，不创建会话也不阻塞队列；正式任务安静贴上表情并直接交由主运行时接管处理，超时或异常自动直通主运行时。各群聊也可在群配置中单独覆盖。
-            </div>
-          </div>
-
-          <SettingRow title="启用智能分流">
+          <SettingRow
+            title="启用智能分流"
+            desc="用轻量模型前置判断群消息意图，闲聊静默或轻回复，正式任务直通主运行时，各群可单独覆盖"
+          >
             <Switch
               label="启用智能分流"
               checked={draft.router.enabled}
@@ -1068,6 +1074,7 @@ function EditBotDialog({
                 value={draft.router}
                 runtimes={runtimes}
                 models={models}
+                triageDefaults={triageDefaults}
                 onChange={(next) => patch({ router: { ...draft.router, ...next } })}
               />
             </NestedSettings>

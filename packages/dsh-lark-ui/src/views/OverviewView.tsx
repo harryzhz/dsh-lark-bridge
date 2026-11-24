@@ -8,6 +8,7 @@ import type { AuditEventKind, CockpitPayload, DiagnosticAlert, ModelGroup, Runti
 
 const EVENT_TONE: Record<AuditEventKind, { label: string; tone: 'neutral' | 'success' | 'info' | 'warning' | 'danger' | 'quiet' }> = {
   inbound: { label: '收到', tone: 'info' },
+  triage: { label: '分流', tone: 'info' },
   reply: { label: '回复', tone: 'success' },
   silent_skip: { label: '静默', tone: 'neutral' },
   command: { label: '命令', tone: 'neutral' },

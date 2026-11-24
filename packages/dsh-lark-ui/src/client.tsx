@@ -20,9 +20,11 @@ import { ScheduleConfigDialog } from './components/ScheduleConfigDialog.js'
 import { installSessionModelFilter } from './session-model-filter.js'
 import {
   activateDshSession,
+  activateDshSessionDetailed,
   parseSessionDeepLinkFromLocation,
   stripSessionDeepLinkUrl,
   type LayoutNavigationLike,
+  type SessionActivationResult,
   type WorkspaceNavigationScope,
 } from './session-navigation.js'
 import { useBridgeData } from './state.js'
@@ -47,7 +49,7 @@ const TABS: ReadonlyArray<{ key: Tab; label: string; icon: ReactNode }> = [
   { key: 'sessions', label: '会话', icon: <IconNewChatOutlineRegular size={16} /> },
 ]
 
-let openDshSession: ((sessionId: string) => void) | undefined
+let openDshSession: ((sessionId: string) => Promise<SessionActivationResult>) | undefined
 let openDshSchedules: (() => void) | undefined
 
 function LarkBridgePage() {
@@ -88,6 +90,19 @@ function LarkBridgePage() {
   const syncChats = () => {
     setSyncing(true)
     void act(async () => setToast({ text: `已同步 ${await bridgeApi.syncAllChats()} 个群聊`, ok: true })).finally(() => setSyncing(false))
+  }
+
+  const handleOpenSession = (sessionId: string) => {
+    const opener = openDshSession
+    if (!opener) {
+      setToast({ text: '会话视图尚未就绪，请稍后重试', ok: false })
+      return
+    }
+    void opener(sessionId).then((res) => {
+      if (!res.ok) {
+        setToast({ text: res.message, ok: false })
+      }
+    })
   }
 
   const opIdentity = data.auth?.openPlatform.authenticated ? data.auth.openPlatform.identity : undefined
@@ -199,7 +214,7 @@ function LarkBridgePage() {
                   }),
                 ),
               runNow: (s) => void act(() => bridgeApi.runSchedule(s.id), '已触发执行'),
-              openSession: (sid) => openDshSession?.(sid),
+              openSession: handleOpenSession,
               reset: (s) =>
                 setConfirm({
                   title: `恢复「${s.title}」的默认通知设置？`,
@@ -214,7 +229,7 @@ function LarkBridgePage() {
               cancel: (r) => void act(() => bridgeApi.cancelReminder(r.id), '提醒事项已取消并归档'),
               runNow: (r) => void act(() => bridgeApi.runReminder(r.id), '已触发执行'),
               remove: (r) => void act(() => bridgeApi.deleteReminder(r.id), '已删除记录'),
-              openSession: (sid) => openDshSession?.(sid),
+              openSession: handleOpenSession,
             }}
           />
         )}
@@ -222,13 +237,25 @@ function LarkBridgePage() {
           <SessionsView
             bindings={data.bindings}
             dreamSessions={data.dreamSessions}
+            triageSessions={data.triageSessions}
             events={data.events}
             runtimes={data.runtimes}
             models={data.models}
-            onOpen={(sid) => openDshSession?.(sid)}
+            onOpen={handleOpenSession}
             onUnbind={(b) => void act(() => bridgeApi.unbind(b.routeKey), '会话已归档')}
             onDeleteDreamSession={(s) =>
               void act(() => bridgeApi.deleteDreamSession(s.sessionId), '已移除记录')
+            }
+            onDeleteTriageSession={(s) =>
+              void act(() => bridgeApi.deleteTriageSession(s.sessionId), '已移除记录')
+            }
+            onClearTriageSessions={() =>
+              setConfirm({
+                title: '清空智能分流会话记录？',
+                description: '仅清理桥接列表中的分流记录索引，不影响正在进行的群聊对话。',
+                confirmLabel: '清空记录',
+                run: () => act(() => bridgeApi.clearTriageSessions(), '已清空分流记录'),
+              })
             }
             onRotateViewerSecret={() =>
               setConfirm({
@@ -248,6 +275,7 @@ function LarkBridgePage() {
         bots={data.bots}
         runtimes={data.runtimes}
         models={data.models}
+        triageDefaults={data.triageDefaults}
         auth={data.auth}
         onClose={() => setEditingBot(null)}
         onSave={saveBot}
@@ -264,7 +292,7 @@ function LarkBridgePage() {
         onProfilesChanged={data.refreshRuntimes}
         onAuthUpdated={data.refreshAuth}
         onOpenAuth={() => setAuthOpen(true)}
-        onOpenSession={(sid) => openDshSession?.(sid)}
+        onOpenSession={handleOpenSession}
       />
       <GroupConfigDialog
         target={editingGroup}
@@ -272,6 +300,7 @@ function LarkBridgePage() {
         runtimes={data.runtimes}
         models={data.models}
         listenerTemplates={data.listenerTemplates}
+        triageDefaults={data.triageDefaults}
         onClose={() => setEditingGroup(null)}
         onProfilesChanged={data.refreshRuntimes}
         onSave={async (config) => {
@@ -434,25 +463,30 @@ export function apply(ctx: ClientContext): void {
   ensureLarkUiStyles()
 
   let layoutRef: LayoutNavigationLike | undefined = readOptionalService<LayoutNavigationLike>(ctx, 'layout')
-  let activateReadySession: ((sessionId: string) => Promise<boolean>) | undefined
-  let activatorWaiters: Array<(fn: ((sessionId: string) => Promise<boolean>) | undefined) => void> = []
+  let activateReadySession: ((sessionId: string) => Promise<SessionActivationResult>) | undefined
+  let activatorWaiters: Array<(fn: ((sessionId: string) => Promise<SessionActivationResult>) | undefined) => void> = []
   let pendingDeepLinkSessionId = parseSessionDeepLinkFromLocation(window.location)
 
-  const resolveActivatorWaiters = (fn: ((sessionId: string) => Promise<boolean>) | undefined) => {
+  const resolveActivatorWaiters = (fn: ((sessionId: string) => Promise<SessionActivationResult>) | undefined) => {
     const list = activatorWaiters
     activatorWaiters = []
     for (const wake of list) wake(fn)
   }
 
-  const openSessionAndAwait = async (sessionId: string, signal?: AbortSignal): Promise<boolean> => {
+  const openSessionAndAwaitDetailed = async (
+    sessionId: string,
+    signal?: AbortSignal,
+  ): Promise<SessionActivationResult> => {
     const sid = sessionId.trim()
-    if (!sid) return false
+    if (!sid) return { ok: false, reason: 'empty', message: '无效的会话 ID' }
     if (activateReadySession) {
       return await activateReadySession(sid)
     }
-    if (signal?.aborted) return false
-    const activator = await new Promise<((id: string) => Promise<boolean>) | undefined>((resolve) => {
-      const wake = (fn: ((id: string) => Promise<boolean>) | undefined) => {
+    if (signal?.aborted) return { ok: false, reason: 'disposed', message: '页面已卸载' }
+    const activator = await new Promise<
+      ((id: string) => Promise<SessionActivationResult>) | undefined
+    >((resolve) => {
+      const wake = (fn: ((id: string) => Promise<SessionActivationResult>) | undefined) => {
         clearTimeout(timer)
         signal?.removeEventListener('abort', onAbort)
         resolve(fn)
@@ -468,7 +502,14 @@ export function apply(ctx: ClientContext): void {
       signal?.addEventListener('abort', onAbort, { once: true })
       activatorWaiters.push(wake)
     })
-    return activator ? await activator(sid) : false
+    return activator
+      ? await activator(sid)
+      : { ok: false, reason: 'disposed', message: '会话视图尚未就绪，请稍后重试' }
+  }
+
+  const openSessionAndAwait = async (sessionId: string, signal?: AbortSignal): Promise<boolean> => {
+    const res = await openSessionAndAwaitDetailed(sessionId, signal)
+    return res.ok
   }
 
   let desktopListenerRpc: BridgeConnectionRpcLike | undefined
@@ -554,19 +595,8 @@ export function apply(ctx: ClientContext): void {
     }, 'dsh-lark-ui.layout-ref')
   })
 
-  const navigate = (sessionId: string) => {
-    const sid = sessionId.trim()
-    if (!sid) return
-    if (activateReadySession) {
-      void activateReadySession(sid)
-      return
-    }
-    pendingDeepLinkSessionId = sid
-    const uiWorkspace = readOptionalService<{ openSession?: (id: string) => void }>(ctx, 'uiWorkspace')
-    if (uiWorkspace?.openSession) {
-      uiWorkspace.openSession(sid)
-    }
-  }
+  const navigate = (sessionId: string): Promise<SessionActivationResult> =>
+    openSessionAndAwaitDetailed(sessionId)
   openDshSession = navigate
 
   ctx.inject?.(
@@ -574,7 +604,7 @@ export function apply(ctx: ClientContext): void {
     (scope: WorkspaceNavigationScope & { effect?: ClientContext['effect'] }) => {
       let disposed = false
       const openAndRevealSession = (sessionId: string) =>
-        activateDshSession({
+        activateDshSessionDetailed({
           sessionId,
           scope,
           getLayout: () => layoutRef ?? readOptionalService<LayoutNavigationLike>(ctx, 'layout'),

@@ -3,7 +3,13 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
-import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
+import { Session, type SessionEvent, type SessionHeader } from '@deepseek-ai/dsh-session'
+import {
+  assertContiguous,
+  materializeAppendBatch,
+  materializeCreateHeader,
+  validateStoredEvents,
+} from '@deepseek-ai/dsh-session-persistence'
 import type { InboundLarkMessage, LarkBotTransport } from '@dsh-lark/lark-core'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { LarkBridgeManager } from '../src/bridge-manager.js'
@@ -49,6 +55,7 @@ function createHarness(options: {
   readonly triageStream?: StreamHandler
   readonly manualTurnControl?: boolean
   readonly workerReply?: (prompt: string, turn: number) => string
+  readonly enableSessionPersistence?: boolean
 } = {}) {
   const dir = makeTempDir()
   const store = new LarkBridgeStore(dir)
@@ -57,6 +64,12 @@ function createHarness(options: {
   const createdSessions: string[] = []
   const submittedWorkerPrompts: string[] = []
   const triageCalls: GenerateOptions[] = []
+  const persistedSessions = new Map<
+    string,
+    { header: Record<string, unknown>; events: SessionEvent[]; flushed: boolean; closed: boolean }
+  >()
+  const workspaceAddSession = vi.fn()
+  const workspaceArchiveSession = vi.fn().mockReturnValue(true)
   const pendingTurnResolvers: Array<(replyText: string) => void> = []
   let onWorkerTurnStart: ((turn: number, prompt: string) => void) | undefined
   let turnSeq = 0
@@ -68,13 +81,53 @@ function createHarness(options: {
   const ctx = {
     logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
     get: (key: string) => {
-      if (key === 'workspaces') {
+      if (key === 'workspaceRegistry') {
         return {
           list: () => [],
-          create: () => ({ id: 'ws-1', name: 'demo', cwd: dir, sessionIds: [] }),
-          addSession: vi.fn(),
-          archiveSession: vi.fn().mockReturnValue(true),
-          getArchivedSessionIds: () => [],
+          archivedSessionIds: [] as string[],
+          create: async (_cwd: string, title?: string) => ({
+            id: 'ws-1',
+            title: title ?? 'demo',
+            cwd: dir,
+            sessionIds: [] as string[],
+            setTitle: vi.fn(),
+            attachSession: workspaceAddSession,
+          }),
+          archiveSession: workspaceArchiveSession,
+        }
+      }
+      if (key === 'sessionPersistence' && options.enableSessionPersistence !== false) {
+        return {
+          create: async (rawHeader: SessionHeader) => {
+            const header = materializeCreateHeader(rawHeader)
+            const id = String(header.id)
+            const rec = {
+              header: header as unknown as Record<string, unknown>,
+              events: [] as SessionEvent[],
+              flushed: false,
+              closed: false,
+            }
+            persistedSessions.set(id, rec)
+            return {
+              append: async (events: readonly SessionEvent[]) => {
+                const batch = materializeAppendBatch(events)
+                assertContiguous(header.id, batch, rec.events.length)
+                validateStoredEvents(header, [...batch])
+                rec.events.push(...batch)
+              },
+              flush: async () => {
+                rec.flushed = true
+                // Verify full DSH Session.fromRestore replayability on every flush
+                const restored = Session.fromRestore(header.id, rec.events, header)
+                if (restored.snapshotEvents().length < rec.events.length) {
+                  throw new Error('restored session lost events')
+                }
+              },
+              close: async () => {
+                rec.closed = true
+              },
+            }
+          },
         }
       }
       if (key === 'externalRuntimes') {
@@ -240,6 +293,9 @@ function createHarness(options: {
     createdSessions,
     submittedWorkerPrompts,
     triageCalls,
+    persistedSessions,
+    workspaceAddSession,
+    workspaceArchiveSession,
     setOnWorkerTurnStart: (cb: (turn: number, prompt: string) => void) => {
       onWorkerTurnStart = cb
     },
@@ -434,7 +490,7 @@ describe('Smart Triage Gate, Per-Group Overrides & Busy-Queue Coalescing', () =>
     expect(fx.removedReactions).toHaveLength(1)
     expect(fx.sentReplies).toHaveLength(2)
     expect(fx.sentReplies[1]?.card).toBeDefined()
-    expect(h.submittedWorkerPrompts[0]).toContain('<router_handoff_context>')
+    expect(h.submittedWorkerPrompts[0]).toContain('<triage_handoff_context>')
     expect(h.submittedWorkerPrompts[0]).toContain('在吗')
     expect(h.submittedWorkerPrompts[0]).toContain('在的，有什么可以帮你？')
 
@@ -442,7 +498,7 @@ describe('Smart Triage Gate, Per-Group Overrides & Busy-Queue Coalescing', () =>
     h.store.close()
   })
 
-  it('feeds last Worker reply excerpt into active-thread triage and fails open on timeout', async () => {
+  it('feeds last reply into active-thread triage without truncation and fails open on timeout', async () => {
     const h = createHarness({
       triageStream: (opts) => {
         const userContent = opts.messages[0]?.content
@@ -450,10 +506,10 @@ describe('Smart Triage Gate, Per-Group Overrides & Busy-Queue Coalescing', () =>
           ? userContent.map((b) => (b.type === 'text' ? b.text : '')).join('\n')
           : ''
         if (promptText.includes('好的，按 B 改')) {
-          // Verify triage sees Worker's last reply excerpt!
+          // Verify triage sees full last reply and formal metadata tag
           expect(promptText).toContain('你要按方案 A 还是方案 B 修改')
-          expect(promptText).toContain('has_active_worker=true')
-          return makeToolCallStream({ action: 'handoff', reason: '回复 Worker 确认选 B' })
+          expect(promptText).toContain('has_active_session=true')
+          return makeToolCallStream({ action: 'handoff', reason: '回复主运行时确认选 B' })
         }
         // Simulate hang -> triggers timeout fail-open!
         return {
@@ -717,7 +773,7 @@ describe('Smart Triage Gate, Per-Group Overrides & Busy-Queue Coalescing', () =>
       router: { enabled: false },
     })
 
-    // Group A overrides with its own custom provider/model, all_group scope, and customPrompt
+    // Group A overrides with its own custom provider/model, all_group scope, and custom System Prompt
     h.store.upsertGroup({
       botId: 'bot-1',
       chatId: 'oc_group_a',
@@ -729,7 +785,7 @@ describe('Smart Triage Gate, Per-Group Overrides & Busy-Queue Coalescing', () =>
         model: 'plan-fast',
         scope: 'all_group',
         timeoutMs: 3000,
-        customPrompt: '群 A 专属分流规则：纯致谢静默',
+        systemPrompt: '你是 {{bot_name}}，当前群 {{chat_name}}。群 A 专属分流规则：纯致谢静默。{{active_session_rule}}',
         coalesceQueuedMessages: true,
       },
     })
@@ -756,6 +812,7 @@ describe('Smart Triage Gate, Per-Group Overrides & Busy-Queue Coalescing', () =>
     expect(h.triageCalls).toHaveLength(1)
     expect(h.triageCalls[0]?.provider).toBe('custom-plan-cli')
     expect(h.triageCalls[0]?.model).toBe('plan-fast')
+    expect(h.triageCalls[0]?.system).toContain('你是 DevBot，当前群 独立分流群 A')
     expect(h.triageCalls[0]?.system).toContain('群 A 专属分流规则')
     expect(h.createdSessions).toHaveLength(0)
 
@@ -773,6 +830,216 @@ describe('Smart Triage Gate, Per-Group Overrides & Busy-Queue Coalescing', () =>
     expect(h.triageCalls).toHaveLength(1)
     expect(h.createdSessions).toHaveLength(1)
     expect(fx.sentReplies).toHaveLength(1)
+
+    await h.manager.stop()
+    h.store.close()
+  })
+
+  it('persists inspectable DSH v4 triage sessions, links audit & handoff sessions, applies context params without truncation, and exposes HTTP delete/clear APIs', async () => {
+    let callSeq = 0
+    const h = createHarness({
+      triageStream: () => {
+        callSeq += 1
+        if (callSeq === 1) {
+          return {
+            async *[Symbol.asyncIterator]() {
+              yield { type: 'block-start', index: 0, blockType: 'reasoning' }
+              yield { type: 'block-delta', index: 0, delta: '这是一句纯确认语，直接静默。' }
+              yield {
+                type: 'block-end',
+                index: 0,
+                block: { type: 'reasoning', text: '这是一句纯确认语，直接静默。' },
+              }
+              yield {
+                type: 'block-end',
+                index: 1,
+                block: {
+                  type: 'tool-call',
+                  id: 'tc_silent_1' as never,
+                  name: 'route_message',
+                  arguments: JSON.stringify({ action: 'silent', reason: '纯确认语' }),
+                },
+              }
+              yield {
+                type: 'usage',
+                usage: { input: 120, output: 35, total: 155 } as never,
+              }
+              yield { type: 'finish', reason: { kind: 'tool-calls' } }
+            },
+          }
+        }
+        return makeToolCallStream({ action: 'handoff', reason: '完整长日志需主运行时排查' })
+      },
+      workerReply: () => '主运行时已收到完整长日志并定位问题。',
+    })
+    const fx = makeFakeTransport()
+
+    h.store.upsertBot({
+      id: 'bot-1',
+      name: 'DevBot',
+      larkAppId: 'cli_demo',
+      larkAppSecret: 'sec_demo',
+      defaultWorkingDir: h.dir,
+      agentPreset: 'standard',
+      router: {
+        enabled: true,
+        provider: 'deepseek',
+        model: 'deepseek-chat',
+        scope: 'all_group',
+        recentMessageCount: 1,
+        contextTtlMinutes: 60,
+        includeLastReply: false,
+      },
+    })
+    h.store.upsertGroup({
+      botId: 'bot-1',
+      chatId: 'oc_team',
+      chatName: '稳定性群',
+      enabled: true,
+    })
+
+    // Call 1: silent verdict -> persisted as archived DSH v4 triage session & linked to audit event
+    await h.manager.inbound.handleInbound(
+      'bot-1',
+      fx.transport,
+      makeGroupMsg({
+        messageId: 'om_tr_1',
+        text: '@DevBot 收到',
+        mentions: [{ key: '@_user_1', openId: 'ou_bot', name: 'DevBot' }],
+      }),
+    )
+
+    // Call 2: long untruncated message (3500 chars) -> handoff -> persisted + linked to main session
+    const longPayload = `长报错日志开始-${'E'.repeat(3500)}-END_OF_STACK`
+    await h.manager.inbound.handleInbound(
+      'bot-1',
+      fx.transport,
+      makeGroupMsg({
+        messageId: 'om_tr_2',
+        text: `@DevBot ${longPayload}`,
+        mentions: [{ key: '@_user_1', openId: 'ou_bot', name: 'DevBot' }],
+      }),
+    )
+
+    expect(h.persistedSessions.size).toBe(2)
+    const triageRows = h.store.listTriageSessions('bot-1')
+    expect(triageRows).toHaveLength(2)
+
+    const silentRow = triageRows.find((r) => r.action === 'silent')!
+    const handoffRow = triageRows.find((r) => r.action === 'handoff')!
+    expect(silentRow).toBeDefined()
+    expect(handoffRow).toBeDefined()
+    expect(handoffRow.handoffSessionId).toBe(h.createdSessions[0])
+
+    // Every triage session was attached to workspace and immediately archived
+    expect(h.workspaceAddSession).toHaveBeenCalledWith(silentRow.sessionId)
+    expect(h.workspaceAddSession).toHaveBeenCalledWith(handoffRow.sessionId)
+    expect(h.workspaceArchiveSession).toHaveBeenCalledWith(silentRow.sessionId, {
+      stopActivity: true,
+    })
+    expect(h.workspaceArchiveSession).toHaveBeenCalledWith(handoffRow.sessionId, {
+      stopActivity: true,
+    })
+
+    // Inspect persisted DSH v4 event sequence on silent session (strict lifecycle ordering & header contract)
+    const silentLog = h.persistedSessions.get(silentRow.sessionId)!
+    expect(silentLog.flushed).toBe(true)
+    expect(silentLog.closed).toBe(true)
+    expect(silentLog.header.delegationDepth).toBe(0)
+    const types = silentLog.events.map((e) => e.type)
+    expect(types).toEqual([
+      'plugin:lark-bridge/origin',
+      'session/title',
+      'model/selection',
+      'turn/start',
+      'step/start',
+      'system/message',
+      'user/message',
+      'request/header',
+      'assistant/message',
+      'tool/call',
+      'tool/result',
+      'step/end',
+      'turn/end',
+    ])
+
+    // Verify untruncated 3500-char payload & recentMessageCount=1 in Call 2
+    const handoffUserContent = h.triageCalls[1]?.messages[0]?.content
+    const handoffUserText = Array.isArray(handoffUserContent)
+      ? handoffUserContent.map((b) => (b.type === 'text' ? b.text : '')).join('\n')
+      : ''
+    expect(handoffUserText).toContain('END_OF_STACK')
+    expect(handoffUserText).toContain('<recent_context>')
+
+    // Audit events link to triageSessionId (both silent_skip and triage handoff)
+    const events = h.store.listEvents(20)
+    const silentEv = events.find((e) => e.kind === 'silent_skip')
+    const triageEv = events.find((e) => e.kind === 'triage')
+    expect(silentEv?.sessionId).toBe(silentRow.sessionId)
+    expect(triageEv?.sessionId).toBe(handoffRow.sessionId)
+
+    // HTTP endpoints: GET /cockpit returns triageDefaults, GET /bindings returns triageSessions
+    const cockpitRes = await dispatchLarkApiRequest(h.ctx, h.manager, {
+      method: 'GET',
+      path: '/api/lark-bridge/cockpit',
+      isCliAuthenticated: false,
+      principalKind: 'owner',
+    })
+    expect(cockpitRes.status).toBe(200)
+    const cockpitPayload = cockpitRes.payload as {
+      triageDefaults?: {
+        defaultSystemPrompt: string
+        toolName: string
+        toolSchema?: { name: string; parameters?: { properties?: Record<string, unknown> } }
+        variables: Array<{ key: string }>
+      }
+    }
+    expect(cockpitPayload.triageDefaults?.defaultSystemPrompt).toContain('{{bot_name}}')
+    expect(cockpitPayload.triageDefaults?.toolName).toBe('route_message')
+    expect(cockpitPayload.triageDefaults?.toolSchema?.name).toBe('route_message')
+    expect(cockpitPayload.triageDefaults?.toolSchema?.parameters?.properties).toHaveProperty('action')
+    expect(cockpitPayload.triageDefaults?.variables.length).toBeGreaterThanOrEqual(8)
+
+    const bindingsRes = await dispatchLarkApiRequest(h.ctx, h.manager, {
+      method: 'GET',
+      path: '/api/lark-bridge/bindings',
+      isCliAuthenticated: false,
+      principalKind: 'owner',
+    })
+    expect(bindingsRes.status).toBe(200)
+    const bindingsPayload = bindingsRes.payload as {
+      triageSessions: Array<{ sessionId: string; sessionUrl?: string }>
+    }
+    expect(bindingsPayload.triageSessions).toHaveLength(2)
+    expect(bindingsPayload.triageSessions[0]?.sessionUrl).toContain('#session=')
+
+    // CLI bearer token must be rejected from destructive DELETE /triage-sessions
+    const cliDelRes = await dispatchLarkApiRequest(h.ctx, h.manager, {
+      method: 'DELETE',
+      path: `/api/lark-bridge/triage-sessions/${silentRow.sessionId}`,
+      isCliAuthenticated: true,
+      principalKind: 'cli',
+    })
+    expect(cliDelRes.status).toBe(403)
+
+    // Owner delete single + clear all
+    const delOne = await dispatchLarkApiRequest(h.ctx, h.manager, {
+      method: 'DELETE',
+      path: `/api/lark-bridge/triage-sessions/${silentRow.sessionId}`,
+      isCliAuthenticated: false,
+      principalKind: 'owner',
+    })
+    expect(delOne.status).toBe(200)
+    expect(h.store.listTriageSessions('bot-1')).toHaveLength(1)
+
+    const delAll = await dispatchLarkApiRequest(h.ctx, h.manager, {
+      method: 'DELETE',
+      path: '/api/lark-bridge/triage-sessions',
+      isCliAuthenticated: false,
+      principalKind: 'owner',
+    })
+    expect(delAll.status).toBe(200)
+    expect(h.store.listTriageSessions('bot-1')).toHaveLength(0)
 
     await h.manager.stop()
     h.store.close()

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
   activateDshSession,
+  activateDshSessionDetailed,
   parseSessionDeepLinkFromLocation,
   stripSessionDeepLinkUrl,
   type SnapshotSourceLike,
@@ -123,5 +124,90 @@ describe('DSH Web session deep-link parsing & deferred activation', () => {
     warnSpy.mockRestore()
     expect(opened).toBe(false)
     expect(openSession).not.toHaveBeenCalled()
+  })
+
+  it('refreshes session catalog when target cold session was evicted after dispose, waits for projection & unarchive, and opens cleanly', async () => {
+    const sid = 'session-00000000-0000-4000-8000-000000000002'
+    const wsList = createMockSource({
+      phase: 'ready',
+      archivedSessionIds: [sid] as readonly string[],
+    })
+    // Cold session initially missing from byId (simulating api-session/removed after handle.dispose())
+    const sessList = createMockSource({
+      phase: 'ready',
+      byId: { 'session-other': {} } as Record<string, unknown>,
+    })
+
+    const callOrder: string[] = []
+    const refresh = vi.fn(async () => {
+      callOrder.push('refresh')
+      // Simulate SessionManager's async microtask projection flush
+      queueMicrotask(() => {
+        sessList.set({ phase: 'ready', byId: { 'session-other': {}, [sid]: { id: sid } } })
+      })
+    })
+    const unarchiveSession = vi.fn(async (id: string) => {
+      callOrder.push(`unarchive:${id}`)
+      // Simulate delayed WS workspace/updated broadcast after RPC resolves
+      setTimeout(() => {
+        wsList.set({ phase: 'ready', archivedSessionIds: [] })
+      }, 10)
+    })
+    const openSession = vi.fn((id: string) => {
+      // Must NOT run before workspaces.list confirms unarchived!
+      expect(wsList.getSnapshot().archivedSessionIds).not.toContain(id)
+      callOrder.push(`open:${id}`)
+    })
+
+    const result = await activateDshSessionDetailed({
+      sessionId: sid,
+      scope: {
+        uiWorkspace: { openSession, unarchiveSession },
+        workspaces: { list: wsList },
+        sessions: { list: sessList, refresh },
+      },
+    })
+
+    expect(result).toEqual({ ok: true })
+    expect(refresh).toHaveBeenCalledTimes(1)
+    expect(unarchiveSession).toHaveBeenCalledWith(sid)
+    expect(openSession).toHaveBeenCalledWith(sid)
+    expect(callOrder).toEqual(['refresh', `unarchive:${sid}`, `open:${sid}`])
+  })
+
+  it('returns structured not_found and open_failed errors for user-visible feedback', async () => {
+    const wsList = createMockSource({ phase: 'ready', archivedSessionIds: [] })
+    const sessList = createMockSource({ phase: 'ready', byId: {} as Record<string, unknown> })
+    const refresh = vi.fn(async () => {})
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const missing = await activateDshSessionDetailed({
+      sessionId: 'session-truly-missing',
+      scope: {
+        uiWorkspace: { openSession: vi.fn() },
+        workspaces: { list: wsList },
+        sessions: { list: sessList, refresh },
+      },
+    })
+    expect(refresh).toHaveBeenCalledTimes(1)
+    expect(missing).toMatchObject({ ok: false, reason: 'not_found' })
+
+    const sid = 'session-throws'
+    sessList.set({ phase: 'ready', byId: { [sid]: { id: sid } } })
+    const failed = await activateDshSessionDetailed({
+      sessionId: sid,
+      scope: {
+        uiWorkspace: {
+          openSession: () => {
+            throw new Error('boom')
+          },
+        },
+        workspaces: { list: wsList },
+        sessions: { list: sessList },
+      },
+    })
+    warnSpy.mockRestore()
+    expect(failed).toMatchObject({ ok: false, reason: 'open_failed' })
+    if (!failed.ok) expect(failed.message).toContain('boom')
   })
 })

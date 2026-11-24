@@ -1,5 +1,9 @@
 import {
+  DEFAULT_TRIAGE_SYSTEM_PROMPT,
   LarkGroupConfigSchema,
+  ROUTE_MESSAGE_TOOL_SCHEMA,
+  TRIAGE_PROMPT_VARIABLES,
+  TRIAGE_TOOL_NAME,
   buildGroupKey,
   expandWorkingDir,
   resolveEffectiveAgentRuntime,
@@ -14,6 +18,7 @@ import type {
   LarkDreamSession,
   LarkGroupView,
   LarkSessionBinding,
+  LarkTriageSession,
 } from '../types.js'
 import type { ConfigRepo } from './config-repo.js'
 import type { RuntimeRepo } from './runtime-repo.js'
@@ -97,6 +102,24 @@ export class CockpitProjector {
         ...s,
         ...(bot?.name ? { botName: bot.name } : {}),
         workspaceName: bot ? this.resolveBotWorkspaceName(bot) : s.workspaceName,
+      }
+    })
+  }
+
+  listTriageSessions(botId?: string): LarkTriageSession[] {
+    const botsById = new Map(this.config.listBots().map((b) => [b.id, b]))
+    const groupsByKey = new Map(this.config.listGroups().map((g) => [g.key, g]))
+    const discovered = this.config.getDiscoveredChats()
+    return this.runtime.listRawTriageSessions(botId).map((s) => {
+      const bot = botsById.get(s.botId)
+      const gKey = buildGroupKey(s.botId, s.chatId)
+      const grp = groupsByKey.get(gKey)
+      const disc = discovered.get(gKey)
+      const resolvedChatName = s.chatName || grp?.chatName || disc?.name
+      return {
+        ...s,
+        ...(bot?.name ? { botName: bot.name } : {}),
+        ...(resolvedChatName ? { chatName: resolvedChatName } : {}),
       }
     })
   }
@@ -323,6 +346,12 @@ export class CockpitProjector {
       bindings,
       recentEvents: this.telemetry.listEvents(40),
       listenerTemplates: this.config.listListenerTemplates(),
+      triageDefaults: {
+        defaultSystemPrompt: DEFAULT_TRIAGE_SYSTEM_PROMPT,
+        variables: TRIAGE_PROMPT_VARIABLES,
+        toolName: TRIAGE_TOOL_NAME,
+        toolSchema: ROUTE_MESSAGE_TOOL_SCHEMA,
+      },
     }
   }
 

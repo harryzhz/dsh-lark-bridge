@@ -10,6 +10,7 @@ import type {
   RouterScopeMode,
   ScheduleDeliveryMode,
   ScheduleNotifyOn,
+  TriageDefaultsPayload,
 } from './types.js'
 
 export interface Choice<T extends string> {
@@ -105,6 +106,68 @@ export const ROUTER_SCOPE_MODES: readonly Choice<RouterScopeMode>[] = [
     desc: '包含显式 @ 在内的全部群聊消息均先经轻量模型分流（私聊除外）',
   },
 ]
+
+export const FALLBACK_TRIAGE_DEFAULTS: TriageDefaultsPayload = {
+  toolName: 'route_message',
+  toolSchema: {
+    name: 'route_message',
+    description:
+      'Decide how to route the incoming group chat message: silent (ignore chatter/acks), quick_reply (brief reply without invoking the main runtime, ONLY allowed when has_active_session=false), or handoff (transfer directly to the main runtime agent).',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['silent', 'quick_reply', 'handoff'],
+          description:
+            'Routing decision. Use "handoff" whenever tools, codebase/doc inspection, memory lookup, multi-step reasoning, or follow-up to an active session is needed, or whenever uncertain.',
+        },
+        reason: {
+          type: 'string',
+          description: 'Brief Simplified Chinese reason for audit logs (<= 40 chars).',
+        },
+        reply_text: {
+          type: 'string',
+          description:
+            'Required only when action is "quick_reply". Concise, natural Simplified Chinese reply text (1-2 sentences, no fabrication of codebase/internal facts).',
+        },
+      },
+      required: ['action', 'reason'],
+      additionalProperties: false,
+    },
+  },
+  variables: [
+    { key: 'bot_name', token: '{{bot_name}}', label: '智能体名称', desc: '当前响应的智能体显示名称' },
+    { key: 'bot_role', token: '{{bot_role}}', label: '角色设定', desc: '当前生效的角色名称与说明全文（未配置时为空）' },
+    { key: 'chat_name', token: '{{chat_name}}', label: '群聊名称', desc: '当前消息所在群聊名称' },
+    { key: 'trigger', token: '{{trigger}}', label: '触发来源', desc: '群主动监听 / 显式 @ 智能体 / 活跃话题续聊 / 代答模式' },
+    { key: 'trigger_guide', token: '{{trigger_guide}}', label: '触发场景规则', desc: '按触发来源自动生成的对应判断说明' },
+    { key: 'active_session_rule', token: '{{active_session_rule}}', label: '活跃会话约束', desc: '根据是否存在活跃主会话决定是否允许 quick_reply' },
+    { key: 'listener_name', token: '{{listener_name}}', label: '监听规则名', desc: '命中主动监听时的规则名称（非监听为空）' },
+    { key: 'listener_prompt', token: '{{listener_prompt}}', label: '监听指令全文', desc: '群主动监听配置的完整判断指令（非监听为空）' },
+  ],
+  defaultSystemPrompt: [
+    '你是飞书群聊智能体「{{bot_name}}」的前置智能分流助手。你的唯一职责是在极短时间内判断当前入站消息的处理去向，并调用 `route_message` 工具（或直接输出严格 JSON）。',
+    '',
+    '## 可选动作与铁律',
+    '1. `handoff`（直接移交给主运行时智能体接管，高召回优先）：',
+    '   - 任何涉及代码库、文档、配置、日志、监控、工具执行、排查排障、写代码、方案设计、数据分析或需要历史记忆的任务；',
+    '   - 任何你无法 100% 确定不需要工具或上下文核实的问题（**拿不准一律选 `handoff`，宁可多移交、绝不漏任务或编造事实**）；',
+    '   - 当已有活跃主会话且消息是追问、补充信息、或对上一轮提问的答复/批准（如上一轮问“是否执行/选 A 还是 B”，用户回“好的”“执行吧”“B”）时，必须选 `handoff`。',
+    '2. `silent`（静默跳过，不发消息也不唤醒主运行时）：',
+    '   - 群友之间的闲聊、寒暄、无关插话、明确指派给他人的事项；',
+    '   - 无需回应的纯陈述确认语（如“收到”“好的”“了解”“+1”“辛苦了”“谢谢”），前提是它**不是**对上一轮提问的确认答复。',
+    '{{active_session_rule}}',
+    '',
+    '{{trigger_guide}}',
+    '',
+    '{{listener_prompt}}',
+    '',
+    '{{bot_role}}',
+    '',
+    '请优先调用工具 `route_message` 返回裁决；若当前通道不支持工具调用，仅输出一行合法 JSON：{"action":"silent|quick_reply|handoff","reason":"...","reply_text":"..."}。',
+  ].join('\n'),
+}
 
 export const REASONING_EFFORTS: readonly Choice<string>[] = [
   { value: 'none', label: 'None' },

@@ -26,6 +26,7 @@ import type {
   ScheduleBinding,
   ScheduleView,
   SessionBinding,
+  TriageSession,
   UserSearchHit,
 } from './types.js'
 
@@ -110,13 +111,20 @@ export const bridgeApi = {
   groups: async () => (await request<{ groups: GroupView[] }>('/groups')).groups,
   bindings: async () => (await request<{ bindings: SessionBinding[] }>('/bindings')).bindings,
   sessionsOverview: async () => {
-    const res = await request<{ bindings: SessionBinding[]; dreamSessions?: DreamSession[] }>('/bindings')
+    const res = await request<{
+      bindings: SessionBinding[]
+      dreamSessions?: DreamSession[]
+      triageSessions?: TriageSession[]
+    }>('/bindings')
     return {
       bindings: res.bindings ?? [],
       dreamSessions: res.dreamSessions ?? [],
+      triageSessions: res.triageSessions ?? [],
     }
   },
   deleteDreamSession: (sessionId: string) => del(`/dream-sessions/${seg(sessionId)}`),
+  deleteTriageSession: (sessionId: string) => del(`/triage-sessions/${seg(sessionId)}`),
+  clearTriageSessions: () => del('/triage-sessions'),
   events: async (limit = 120) => (await request<{ events: AuditEvent[] }>(`/events?limit=${limit}`)).events,
   runtimes: async () => (await request<{ runtimes: RuntimeOption[] }>('/runtimes')).runtimes,
   runtimeCatalog: async (): Promise<RuntimeCatalogPayload> => {

@@ -605,10 +605,15 @@ export async function dispatchLarkApiRequest(
         ...s,
         sessionUrl: manager.sessionWebUrl(s.sessionId),
       }))
+      const triageSessions = (manager.store.listTriageSessions?.() ?? []).map((s) => ({
+        ...s,
+        sessionUrl: manager.sessionWebUrl(s.sessionId),
+      }))
       return ok({
         ok: true,
         bindings,
         dreamSessions,
+        triageSessions,
         archivedSessionIds: manager.listArchivedSessionIds(),
       })
     }
@@ -620,6 +625,23 @@ export async function dispatchLarkApiRequest(
         return ok({ ok: false, error: 'dream_session_running' }, 400)
       }
       const deleted = manager.store.deleteDreamSession?.(sessionId) ?? false
+      return ok({ ok: deleted }, deleted ? 200 : 404)
+    }
+
+    if (method === 'DELETE' && pathname === 'triage-sessions') {
+      if (isCliAuthenticated) {
+        return ok({ ok: false, error: 'owner_web_session_required' }, 403)
+      }
+      const botId = url.searchParams.get('botId')?.trim() || undefined
+      const deletedCount = manager.store.clearTriageSessions?.(botId) ?? 0
+      return ok({ ok: true, deletedCount })
+    }
+
+    if (method === 'DELETE' && segments[0] === 'triage-sessions' && segments[1] && segments.length === 2) {
+      if (isCliAuthenticated) {
+        return ok({ ok: false, error: 'owner_web_session_required' }, 403)
+      }
+      const deleted = manager.store.deleteTriageSession?.(segments[1]) ?? false
       return ok({ ok: deleted }, deleted ? 200 : 404)
     }
 
