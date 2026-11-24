@@ -48,8 +48,19 @@
 单元测试与静态检查不能替代真实运行环境的联调验收。除纯文档修改外，所有需求开发与缺陷修复在交付用户验收前，均须在本地运行的 DSH 环境中完成端到端真实验证：
 
 ### 2.1 本地构建部署与服务自检
-- 将当前功能分支构建产物（`dist/`）替换至本地 DSH 运行环境并重启服务（原产物可备份至 `.local/`，不污染 `main` 分支）。
-- 核对启动日志无报错、SQLite Schema 迁移与既有数据完好、新增或变更的 `/api/lark-bridge/*` 接口返回符合预期。
+- 重启本地 DSH 服务前，优先在宿主机运维终端执行优雅排空（**默认超时 2 分钟 / `120` 秒**，可用 `--timeout <秒>` 覆盖），避免中断正在进行中的真实会话：
+  ```bash
+  # 先排空在途任务（退出码 0=已排空，2=超时仍有在途任务将走断点续跑，1=调用失败）
+  lark-bridge lifecycle drain --wait --reason "local-deploy"
+  rc=$?
+  if [ "$rc" -eq 0 ] || [ "$rc" -eq 2 ]; then
+    # 将当前功能分支构建产物（dist/）替换至本地 DSH 运行环境（原产物可备份至 .local/，不污染 main 分支）
+    # 再通过宿主机托管工具重启（如 macOS launchctl kickstart -k / Linux systemctl --user restart / 手动重启进程）
+    launchctl kickstart -k "gui/$(id -u)/com.example.dsh-web"
+  fi
+  # 若中止部署，执行 lark-bridge lifecycle resume-intake 恢复入站
+  ```
+- 重启完成后运行 `lark-bridge doctor` 与 `lark-bridge lifecycle status`，核对启动日志无报错、SQLite Schema 迁移与既有数据完好、新增或变更的 `/api/lark-bridge/*` 接口返回符合预期。
 
 ### 2.2 真实浏览器 UI 与交互验证（涉及前端页面、配置弹窗、样式或会话跳转时必做）
 - 使用真实浏览器（手工打开或无头 Chrome / Playwright 驱动本地 DSH Web）访问实际运行中的控制台页面，逐项核验改动涉及的配置页、弹窗、列表与跳转入口：

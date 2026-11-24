@@ -98,6 +98,35 @@ lark-bridge context
 
 插件启动时会自动安装并维护 `~/.local/bin/lark-bridge`（Windows 为 `lark-bridge.cmd`）、`~/.agents/skills/lark-bridge/SKILL.md` 及 `~/.dsh/lark-bridge/cli-endpoint.json`。
 
+#### 优雅重启（零中断排空，默认超时 2 分钟）
+
+升级插件或重启常驻 DSH 服务前，建议先在**宿主机运维终端**（非 Agent 会话）执行排空，避免直接中断正在推理或回复中的飞书会话。`lark-bridge lifecycle drain --wait` 会立即暂停所有智能体的飞书入站长连接与新定时/提醒派发，同时保持出站 REST 在线，等待在途回合自然回复完成后再退出（**默认等待超时 2 分钟 / `120` 秒**，可用 `--timeout <秒>` 覆盖，上限 `900` 秒）：
+
+```bash
+# 1. 可选：查看当前活跃会话与在途任务数
+lark-bridge lifecycle status
+
+# 2. 排空并等待在途任务完成（默认超时 2 分钟 / 120 秒）
+#    - 仅在完全排空时重启（严格零中断；若超时退出码为 2，则中止重启）
+lark-bridge lifecycle drain --wait --reason "upgrade" \
+  && launchctl kickstart -k "gui/$(id -u)/com.example.dsh-web"   # macOS LaunchAgent 示例
+# Linux systemd 示例：&& systemctl --user restart dsh-web
+# 手动进程示例：      && kill -TERM <dsh_pid>
+
+#    - 限时等待最多 2 分钟后必然重启（超时退出码为 2 时仍重启，未完成回合由断点自动续跑）
+lark-bridge lifecycle drain --wait --reason "upgrade"
+rc=$?
+if [ "$rc" -eq 0 ] || [ "$rc" -eq 2 ]; then
+  launchctl kickstart -k "gui/$(id -u)/com.example.dsh-web"
+fi
+
+# 3. 若决定取消本次重启，恢复飞书入站接单
+lark-bridge lifecycle resume-intake
+```
+
+- **权限边界**：`drain` 与 `resume-intake` 需宿主机本机运维凭证（`$DSH_HOME/lark-bridge/operator-token`，权限 `0600`）或控制台 Owner 会话，在 Agent 会话内默认拒绝执行。
+- **退出码与兜底恢复**：`0` 表示全部在途任务已排空；`2` 表示超过等待超时（默认 `120` 秒）仍有在途任务；`1` 表示命令或鉴权错误。即便在退出码 `2` 时继续重启或发生非计划重启，在途回合也会持久化断点至 SQLite `pending_turns`（保留原 `OnIt` 表情），新进程启动后自动补发已完成回复或续跑未完成回合（15 分钟窗口内最多自动恢复 1 次）；新实例启动还会自动等待旧进程最多 `6` 秒平滑交接 `bridge.lock`。
+
 ### 2.3 扫码创建飞书智能体
 
 控制台支持 **自动创建飞书智能体**（开放平台全自动创建 / 扫码快速注册 SDK）与 **接入已有应用** 两种方式：
@@ -217,6 +246,12 @@ lark-bridge schedule create \
   --tz Asia/Shanghai \
   --prompt-file ./patrol.md
 lark-bridge schedule run <scheduleId>
+
+# 宿主机运维：健康自检与优雅重启排空（默认超时 2 分钟 / 120 秒）
+lark-bridge doctor
+lark-bridge lifecycle status
+lark-bridge lifecycle drain --wait [--timeout 120] [--reason "maintenance"]
+lark-bridge lifecycle resume-intake
 ```
 
 ## 5. 典型场景

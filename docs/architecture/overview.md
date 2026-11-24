@@ -39,7 +39,7 @@ flowchart LR
 
 | 产物类型 | 存放路径 | 约束 |
 | --- | --- | --- |
-| 产品运行期全局数据与状态 | `~/.dsh/lark-bridge/`（`$DSH_HOME/lark-bridge`） | 包含 `lark-bridge.db`（SQLite WAL 主库，含 `memory_entries`）、`memory/<botId>/MEMORY.md`（Memory 人类可读只读镜像）、`dreaming/<botId>/recent-transcripts.md`、`config.snapshot.json`（低频配置只读灾备快照）、`bridge.lock`（本机 PID 互斥锁）、`backups/`（迁移前 JSON 原样备份与热备）、`cli-endpoint.json`、`open-platform-session.json`、`user-oauth-tokens.json`（POSIX `0o700` / `0o600`） |
+| 产品运行期全局数据与状态 | `~/.dsh/lark-bridge/`（`$DSH_HOME/lark-bridge`） | 包含 `lark-bridge.db`（SQLite WAL 主库，含 `memory_entries`、`triage_context_scopes`、`pending_turns`）、`memory/<botId>/MEMORY.md`（Memory 人类可读只读镜像）、`dreaming/<botId>/recent-transcripts.md`、`config.snapshot.json`（低频配置只读灾备快照）、`bridge.lock`（本机 PID 互斥锁）、`operator-token`（本机运维排空凭证）、`backups/`（迁移前 JSON 原样备份与热备）、`cli-endpoint.json`、`open-platform-session.json`、`user-oauth-tokens.json`（POSIX `0o700` / `0o600`） |
 | 目标工作区产品产物（如消息附件） | `<workingDir>/.dsh-lark-bridge/` | 自动写入目标仓库 `.gitignore` |
 | 主动代码修改隔离工作树 | `<workingDir>/.worktrees/` | 自动写入目标仓库 `.gitignore` |
 | 本仓库研发临时产物 | `<本仓库>/.local/` | 仅用于开发 `dsh-lark-bridge` 自身；**严禁将产品运行产物写入目标工作区的 `.local/` 目录** |
@@ -49,7 +49,7 @@ flowchart LR
 - **统一鉴权与载体无关通道**：
   - 面向 `@deepseek-ai/dsh@0.2.2-rc.5` 的自定义 HTTP 路由（`/api/lark-bridge/*`）必须显式通过 `ctx.connection.admit(req)` 或受限 CLI Bearer Token 执行 fail-closed 鉴权。
   - Web 与 Electron Desktop 客户端统一走 `ctx.connection.fetch.register('/api/lark-bridge-rpc')` + `ctx.connection.rpc.call('/api', 'lark-bridge-rpc', ...)` 载体无关通道（兼容 Desktop `file://` 渲染进程与 `__DSH_TRANSPORT__`）。
-  - 宿主机本地目录浏览接口（`/api/lark-bridge/fs/dirs`）、只读链接密钥重置接口与桌面端会话打开通道严格限定 Owner 会话访问。
+  - 宿主机本地目录浏览接口（`/api/lark-bridge/fs/dirs`）、只读链接密钥重置接口与桌面端会话打开通道严格限定 Owner 会话访问；优雅排空与恢复入站接口（`/api/lark-bridge/lifecycle/drain|resume-intake`）限定 Owner 会话或独立 `0o600` `operator-token`，普通 Agent CLI Token 禁止访问。
 - **Electron Desktop 适配**：
   - `cli-endpoint.json` 由 `bridge-manager.ts` 在 `webServer` 就绪后以 `webServer.getOrigin()` 动态回填，以适配 OS 随机端口。
   - `cli-support.ts` 生成的 `lark-bridge` 包装脚本自动注入 `ELECTRON_RUN_AS_NODE=1` 并支持 Windows `.cmd`。
