@@ -137,7 +137,7 @@ export const DEFAULT_BOT_PROACTIVE_CONFIG: z.output<typeof BotProactiveConfigSch
 export const ListenerSenderTypeSchema = z.enum(['user', 'bot'])
 export const RouterScopeModeSchema = z.enum(['passive_only', 'active_thread_only', 'all_group'])
 export const GroupRouterModeSchema = z.enum(['inherit', 'override', 'off'])
-export const RouterBypassMsgTypeSchema = z.enum(['interactive', 'text', 'post'])
+export const RouterBypassMsgTypeSchema = z.enum(['interactive', 'text', 'post', 'image'])
 
 export const RouterBypassConfigSchema = z.object({
   senderTypes: z.array(ListenerSenderTypeSchema).default(['bot']),
@@ -185,6 +185,7 @@ export const BotRouterConfigSchema = z.preprocess(
     scope: RouterScopeModeSchema.default('passive_only'),
     bypass: RouterBypassConfigSchema.default(DEFAULT_ROUTER_BYPASS_CONFIG),
     timeoutMs: z.number().int().min(1000).max(15000).default(4000),
+    maxTriageImages: z.number().int().min(0).max(20).default(5),
     systemPrompt: z.string().default(''),
     recentMessageCount: z.number().int().min(0).max(50).default(6),
     contextTtlMinutes: z.number().int().min(1).max(1440).default(30),
@@ -204,6 +205,7 @@ export const DEFAULT_BOT_ROUTER_CONFIG: z.output<typeof BotRouterConfigSchema> =
     keywords: [],
   },
   timeoutMs: 4000,
+  maxTriageImages: 5,
   systemPrompt: '',
   recentMessageCount: 6,
   contextTtlMinutes: 30,
@@ -220,6 +222,7 @@ export const GroupRouterConfigSchema = z.preprocess(
     scope: RouterScopeModeSchema.default('passive_only'),
     bypass: RouterBypassConfigSchema.default(DEFAULT_ROUTER_BYPASS_CONFIG),
     timeoutMs: z.number().int().min(1000).max(15000).default(4000),
+    maxTriageImages: z.number().int().min(0).max(20).default(5),
     systemPrompt: z.string().default(''),
     recentMessageCount: z.number().int().min(0).max(50).default(6),
     contextTtlMinutes: z.number().int().min(1).max(1440).default(30),
@@ -239,6 +242,7 @@ export const DEFAULT_GROUP_ROUTER_CONFIG: z.output<typeof GroupRouterConfigSchem
     keywords: [],
   },
   timeoutMs: 4000,
+  maxTriageImages: 5,
   systemPrompt: '',
   recentMessageCount: 6,
   contextTtlMinutes: 30,
@@ -971,6 +975,7 @@ export interface EffectiveRouterConfig {
   readonly scope: RouterScopeMode
   readonly bypass: RouterBypassConfig
   readonly timeoutMs: number
+  readonly maxTriageImages: number
   readonly systemPrompt: string
   readonly recentMessageCount: number
   readonly contextTtlMinutes: number
@@ -993,6 +998,7 @@ export function resolveEffectiveRouterConfig(
       scope: base.scope,
       bypass: base.bypass,
       timeoutMs: base.timeoutMs,
+      maxTriageImages: base.maxTriageImages,
       systemPrompt: base.systemPrompt.trim(),
       recentMessageCount: base.recentMessageCount,
       contextTtlMinutes: base.contextTtlMinutes,
@@ -1009,6 +1015,7 @@ export function resolveEffectiveRouterConfig(
       scope: base.scope,
       bypass: base.bypass,
       timeoutMs: base.timeoutMs,
+      maxTriageImages: base.maxTriageImages,
       systemPrompt: '',
       recentMessageCount: base.recentMessageCount,
       contextTtlMinutes: base.contextTtlMinutes,
@@ -1028,6 +1035,7 @@ export function resolveEffectiveRouterConfig(
     scope: groupRouter.scope,
     bypass: groupRouter.bypass,
     timeoutMs: groupRouter.timeoutMs,
+    maxTriageImages: groupRouter.maxTriageImages,
     systemPrompt: groupRouter.systemPrompt.trim(),
     recentMessageCount: groupRouter.recentMessageCount,
     contextTtlMinutes: groupRouter.contextTtlMinutes,

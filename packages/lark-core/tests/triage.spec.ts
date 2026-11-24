@@ -11,8 +11,10 @@ import {
   buildTriageSystemPromptVars,
   buildTriageUserMessage,
   composeCoalescedUserText,
+  composeLarkContextReminder,
   composeRouterHandoffReminder,
   decideLarkRouting,
+  detectImageMediaType,
   parseTriageVerdict,
   renderTriageSystemPrompt,
   resolveEffectiveRouterConfig,
@@ -171,6 +173,7 @@ describe('Smart triage config, per-group overrides & protocol', () => {
         keywords: ['P0', 'CRITICAL'],
       },
       timeoutMs: 5000,
+      maxTriageImages: 5,
       systemPrompt: '本群仅处理告警与发布 {{trigger_guide}}',
       recentMessageCount: 12,
       contextTtlMinutes: 60,
@@ -267,13 +270,39 @@ describe('Smart triage config, per-group overrides & protocol', () => {
     expect(shouldRunTriage(makeDecision({ trigger: 'substitute' }), allGroupCfg)).toBe(true)
   })
 
-  it('bypasses triage for built-in rich media and declarative bypass rules (senderTypes / msgTypes / keywords)', () => {
+  it('bypasses triage for non-image binary media, configurable image bypass/cap, and declarative rules (senderTypes / msgTypes / keywords)', () => {
     const emptyBypass = { senderTypes: [], msgTypes: [], keywords: [] }
+    // Images now participate in multimodal triage by default (subject to model vision capability & maxTriageImages)
     expect(
       shouldFastBypassTriage(
         makeMsg({ imageKeys: ['img_1'] }),
         makeDecision({ trigger: 'mention' }),
         emptyBypass,
+        { maxTriageImages: 5 },
+      ).bypass,
+    ).toBe(false)
+    // Explicit `image` msgType bypass or exceeding `maxTriageImages` (including quoted images) bypasses triage
+    expect(
+      shouldFastBypassTriage(
+        makeMsg({ imageKeys: ['img_1'] }),
+        makeDecision({ trigger: 'listener' }),
+        { senderTypes: [], msgTypes: ['image'], keywords: [] },
+      ).bypass,
+    ).toBe(true)
+    expect(
+      shouldFastBypassTriage(
+        makeMsg({ imageKeys: ['img_1', 'img_2', 'img_3'] }),
+        makeDecision({ trigger: 'listener' }),
+        emptyBypass,
+        { maxTriageImages: 5, extraImageCount: 3 },
+      ).bypass,
+    ).toBe(true)
+    expect(
+      shouldFastBypassTriage(
+        makeMsg({ msgType: 'image', imageKeys: ['img_1'] }),
+        makeDecision({ trigger: 'listener' }),
+        emptyBypass,
+        { maxTriageImages: 0 },
       ).bypass,
     ).toBe(true)
     expect(
@@ -566,5 +595,59 @@ describe('Smart triage config, per-group overrides & protocol', () => {
       expect(decision.routeKey).toBe(routeKey)
       expect(decision.sessionMode).toBe('thread')
     }
+  })
+
+  it('detects image MIME types from magic bytes and embeds prefetched quoted messages in triage & lark context prompts', () => {
+    expect(detectImageMediaType(Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))).toBe(
+      'image/png',
+    )
+    expect(detectImageMediaType(Uint8Array.from([0xff, 0xd8, 0xff, 0xe0]))).toBe('image/jpeg')
+    expect(detectImageMediaType(Uint8Array.from([0x47, 0x49, 0x46, 0x38, 0x39, 0x61]))).toBe(
+      'image/gif',
+    )
+    expect(
+      detectImageMediaType(
+        Uint8Array.from([0x52, 0x49, 0x46, 0x46, 0x00, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50]),
+      ),
+    ).toBe('image/webp')
+    expect(detectImageMediaType(Uint8Array.from([0x00, 0x01, 0x02]))).toBeUndefined()
+
+    const triageUser = buildTriageUserMessage({
+      botName: 'TriageBot',
+      trigger: 'listener',
+      senderType: 'user',
+      userText: '帮我看下这张报错图',
+      quotedMessage: {
+        messageId: 'om_quoted_1',
+        senderName: 'Alex',
+        msgType: 'post',
+        text: '线上接口返回 502',
+        imageCount: 2,
+      },
+      attachedImageCount: 2,
+      hasActiveWorker: false,
+      recentMessages: [],
+    })
+    expect(triageUser).toContain('images=2')
+    expect(triageUser).toContain('<quoted_message message_id="om_quoted_1" msg_type="post" sender="Alex" images=2>')
+    expect(triageUser).toContain('线上接口返回 502')
+
+    const ctxReminder = composeLarkContextReminder({
+      bot: { id: 'bot-1', name: 'Bot', larkAppId: 'cli_1' },
+      msg: makeMsg({ parentId: 'om_quoted_1' }),
+      prefetchedQuote: {
+        messageId: 'om_quoted_1',
+        senderName: 'Alex',
+        senderType: 'user',
+        msgType: 'post',
+        text: '线上接口返回 502',
+        imageCount: 2,
+        attachedImageCount: 2,
+        hasUnfetchedResources: false,
+      },
+    })
+    expect(ctxReminder).toContain('<quoted_message message_id="om_quoted_1"')
+    expect(ctxReminder).toContain('线上接口返回 502')
+    expect(ctxReminder).toContain('已自动附带 2 张引用图片')
   })
 })

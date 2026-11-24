@@ -30,7 +30,7 @@ export interface SubstituteMode {
 export type ReminderCreationMode = 'silent' | 'notify' | 'confirm'
 export type RouterScopeMode = 'passive_only' | 'active_thread_only' | 'all_group'
 export type GroupRouterMode = 'inherit' | 'override' | 'off'
-export type RouterBypassMsgType = 'interactive' | 'text' | 'post'
+export type RouterBypassMsgType = 'interactive' | 'text' | 'post' | 'image'
 
 export interface RouterBypassConfig {
   senderTypes: ListenerSenderType[]
@@ -85,6 +85,7 @@ export interface BotRouterConfig {
   scope: RouterScopeMode
   bypass?: RouterBypassConfig
   timeoutMs: number
+  maxTriageImages?: number
   systemPrompt: string
   recentMessageCount: number
   contextTtlMinutes: number
@@ -99,6 +100,7 @@ export interface GroupRouterConfig {
   scope: RouterScopeMode
   bypass?: RouterBypassConfig
   timeoutMs: number
+  maxTriageImages?: number
   systemPrompt: string
   recentMessageCount: number
   contextTtlMinutes: number

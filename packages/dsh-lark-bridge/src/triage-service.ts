@@ -23,6 +23,7 @@ import {
   type LarkGroupConfig,
   type RouterHandoffTurn,
   type TriageHistoryEntry,
+  type TriageQuotedMessage,
   type TriageVerdict,
 } from '@dsh-lark/lark-core'
 import type { RuntimeCatalog } from './runtime-catalog.js'
@@ -52,6 +53,8 @@ export interface EphemeralRouterThread {
   updatedAtMs: number
 }
 
+const MULTIMODAL_TRIAGE_MIN_TIMEOUT_MS = 8_000
+
 export interface EvaluateTriageInput {
   readonly bot: LarkBotConfig
   readonly group?: LarkGroupConfig
@@ -60,6 +63,11 @@ export interface EvaluateTriageInput {
   readonly routerConfig: EffectiveRouterConfig
   readonly senderName?: string
   readonly resolvedChatName?: string
+  readonly quotedMessage?: TriageQuotedMessage
+  readonly totalImageCount?: number
+  readonly loadImages?: (
+    signal?: AbortSignal,
+  ) => Promise<{ readonly blocks: readonly ContentBlock[]; readonly failedCount: number }>
   readonly hasActiveWorker: boolean
   readonly workerBusy: boolean
   readonly traceId: string
@@ -663,15 +671,64 @@ export class LlmTriageService {
       return failOpen('未配置可用的原生分流模型，自动直通主运行时')
     }
 
-    const reasoningPlan = await this.resolveTriageReasoningPlan(target.provider, target.model)
-    const { system, userText } = this.buildTriagePrompts(input)
+    const modelCaps = await this.resolveTriageModelCapabilities(target.provider, target.model)
+    const totalImageCount =
+      input.totalImageCount ??
+      Math.max(input.msg.imageKeys.length, input.msg.msgType === 'image' ? 1 : 0) +
+        (input.quotedMessage?.imageCount ?? 0)
+
+    let imageBlocks: readonly ContentBlock[] = []
+    if (totalImageCount > 0) {
+      if (!modelCaps.supportsImage) {
+        return failOpen('分流模型不支持图片输入，自动直通主运行时', target)
+      }
+      const cap = Math.max(0, Math.floor(input.routerConfig.maxTriageImages))
+      if (cap === 0) {
+        return failOpen('分流图片上限为 0，直通主运行时', target)
+      }
+      if (totalImageCount > cap) {
+        return failOpen(
+          `图片数量（${totalImageCount} 张）超过分流上限（${cap} 张），直通主运行时`,
+          target,
+        )
+      }
+      if (!input.loadImages) {
+        return failOpen('当前上下文未提供图片加载能力，自动直通主运行时', target)
+      }
+      const loaded = await input.loadImages(input.signal).catch(() => ({
+        blocks: [] as readonly ContentBlock[],
+        failedCount: totalImageCount,
+      }))
+      if (input.signal?.aborted) {
+        return {
+          verdict: { action: 'silent', reason: '原消息已撤回或服务正在关闭，已取消分流' },
+          provider: target.provider,
+          model: target.model,
+          durationMs: Date.now() - startedAtMs,
+        }
+      }
+      if (loaded.blocks.length === 0 || loaded.failedCount > 0) {
+        return failOpen('图片加载失败，自动直通主运行时', target)
+      }
+      imageBlocks = loaded.blocks
+    }
+
+    const { system, userText } = this.buildTriagePrompts(input, imageBlocks.length)
+    const userContent: readonly ContentBlock[] = [
+      { type: 'text', text: userText },
+      ...imageBlocks,
+    ]
     const toolSchema: ToolSchema = {
       name: ROUTE_MESSAGE_TOOL_SCHEMA.name,
       description: ROUTE_MESSAGE_TOOL_SCHEMA.description,
       parameters: ROUTE_MESSAGE_TOOL_SCHEMA.parameters,
     }
-    const maxTokens = reasoningPlan.reasoningActive ? 1024 : 256
-    const temperature = reasoningPlan.reasoningActive ? undefined : 0.1
+    const maxTokens = modelCaps.reasoningActive ? 1024 : 256
+    const temperature = modelCaps.reasoningActive ? undefined : 0.1
+    const effectiveTimeoutMs =
+      imageBlocks.length > 0
+        ? Math.max(input.routerConfig.timeoutMs, MULTIMODAL_TRIAGE_MIN_TIMEOUT_MS)
+        : input.routerConfig.timeoutMs
 
     if (input.signal?.aborted) {
       return failOpen('服务正在关闭，跳过分流', target)
@@ -679,13 +736,13 @@ export class LlmTriageService {
 
     const run = await this.executeTriageStream({
       target,
-      reasoningEffort: reasoningPlan.effort,
+      reasoningEffort: modelCaps.effort,
       system,
-      userText,
+      userContent,
       toolSchema,
       maxTokens,
       temperature,
-      timeoutMs: input.routerConfig.timeoutMs,
+      timeoutMs: effectiveTimeoutMs,
       parentSignal: input.signal,
     })
 
@@ -721,12 +778,13 @@ export class LlmTriageService {
         ...(input.resolvedChatName ? { chatName: input.resolvedChatName } : {}),
         provider: target.provider,
         model: target.model,
-        ...(reasoningPlan.effort ? { reasoningEffort: reasoningPlan.effort } : {}),
+        ...(modelCaps.effort ? { reasoningEffort: modelCaps.effort } : {}),
         maxTokens,
         ...(temperature !== undefined ? { temperature } : {}),
         toolSchema,
         systemPrompt: system,
         userMessage: userText,
+        userContent,
         blocks: run.blocks,
         stream: run.stream,
         ...(run.usage ? { usage: run.usage } : {}),
@@ -753,12 +811,13 @@ export class LlmTriageService {
       ...(input.resolvedChatName ? { chatName: input.resolvedChatName } : {}),
       provider: target.provider,
       model: target.model,
-      ...(reasoningPlan.effort ? { reasoningEffort: reasoningPlan.effort } : {}),
+      ...(modelCaps.effort ? { reasoningEffort: modelCaps.effort } : {}),
       maxTokens,
       ...(temperature !== undefined ? { temperature } : {}),
       toolSchema,
       systemPrompt: system,
       userMessage: userText,
+      userContent,
       blocks: run.blocks,
       stream: run.stream,
       ...(run.usage ? { usage: run.usage } : {}),
@@ -777,7 +836,10 @@ export class LlmTriageService {
     }
   }
 
-  private buildTriagePrompts(input: EvaluateTriageInput): {
+  private buildTriagePrompts(
+    input: EvaluateTriageInput,
+    attachedImageCount = 0,
+  ): {
     readonly system: string
     readonly userText: string
   } {
@@ -829,6 +891,8 @@ export class LlmTriageService {
       ...(input.senderName ? { senderName: input.senderName } : {}),
       senderType: input.msg.senderType,
       userText: input.decision.userText,
+      ...(input.quotedMessage ? { quotedMessage: input.quotedMessage } : {}),
+      ...(attachedImageCount > 0 ? { attachedImageCount } : {}),
       hasActiveWorker: input.hasActiveWorker,
       workerBusy: input.workerBusy,
       ...(lastWorkerReply ? { lastWorkerReply } : {}),
@@ -844,7 +908,7 @@ export class LlmTriageService {
     readonly target: { readonly provider: string; readonly model: string }
     readonly reasoningEffort?: ReasoningEffortId
     readonly system: string
-    readonly userText: string
+    readonly userContent: readonly ContentBlock[]
     readonly toolSchema: ToolSchema
     readonly maxTokens: number
     readonly temperature?: number
@@ -886,7 +950,7 @@ export class LlmTriageService {
         model: params.target.model,
         ...(params.reasoningEffort ? { reasoningEffort: params.reasoningEffort } : {}),
         system: params.system,
-        messages: [{ role: 'user', content: [{ type: 'text', text: params.userText }] }],
+        messages: [{ role: 'user', content: [...params.userContent] }],
         tools: [params.toolSchema],
         maxTokens: params.maxTokens,
         ...(params.temperature !== undefined ? { temperature: params.temperature } : {}),
@@ -984,24 +1048,33 @@ export class LlmTriageService {
     return fallbackBlocks
   }
 
-  private async resolveTriageReasoningPlan(
+  private async resolveTriageModelCapabilities(
     provider: string,
     model: string,
-  ): Promise<{ readonly effort?: ReasoningEffortId; readonly reasoningActive: boolean }> {
+  ): Promise<{
+    readonly effort?: ReasoningEffortId
+    readonly reasoningActive: boolean
+    readonly supportsImage: boolean
+  }> {
     if (typeof this.ctx.llm?.resolveModelInfo !== 'function') {
-      return { reasoningActive: false }
+      return { reasoningActive: false, supportsImage: false }
     }
     try {
       const info = await this.ctx.llm.resolveModelInfo(provider, model)
+      const supportsImage = Boolean(info?.inputModalities?.includes('image'))
       const efforts = info?.reasoning?.efforts
-      if (!efforts || efforts.length === 0) return { reasoningActive: false }
+      if (!efforts || efforts.length === 0) {
+        return { reasoningActive: false, supportsImage }
+      }
       const least = efforts[0]?.id
-      if (!least) return { reasoningActive: false }
+      if (!least) {
+        return { reasoningActive: false, supportsImage }
+      }
       const normalized = String(least).trim().toLowerCase()
       const reasoningActive = normalized !== 'off' && normalized !== 'none'
-      return { effort: least, reasoningActive }
+      return { effort: least, reasoningActive, supportsImage }
     } catch {
-      return { reasoningActive: false }
+      return { reasoningActive: false, supportsImage: false }
     }
   }
 }

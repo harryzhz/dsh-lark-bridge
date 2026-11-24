@@ -157,6 +157,17 @@ export function composeRoleReminder(
   ].join('\n')
 }
 
+export interface PrefetchedQuotedMessageSummary {
+  readonly messageId: string
+  readonly senderName?: string
+  readonly senderType?: 'user' | 'bot'
+  readonly msgType: string
+  readonly text?: string
+  readonly imageCount: number
+  readonly attachedImageCount: number
+  readonly hasUnfetchedResources?: boolean
+}
+
 export interface LarkConversationContextInput {
   readonly bot: Pick<LarkBotConfig, 'id' | 'name' | 'larkAppId'>
   readonly botOpenId?: string
@@ -168,6 +179,7 @@ export interface LarkConversationContextInput {
   readonly replyMode?: GroupReplyMode
   readonly useCard?: boolean
   readonly includeFullGuide?: boolean
+  readonly prefetchedQuote?: PrefetchedQuotedMessageSummary
 }
 
 export function composeLarkContextReminder(input: LarkConversationContextInput): string {
@@ -202,9 +214,44 @@ export function composeLarkContextReminder(input: LarkConversationContextInput):
     bodyLines.push(`提及成员：${formatted}`)
   }
   if (msg.parentId) {
-    bodyLines.push(
-      `引用消息：${msg.parentId}（查看全文或下载附件：\`lark-bridge message ${msg.parentId}\`）`,
-    )
+    const q = input.prefetchedQuote
+    if (q && q.messageId === msg.parentId) {
+      const qAttrs = [
+        `message_id="${escapeXmlAttr(q.messageId)}"`,
+        `msg_type="${escapeXmlAttr(q.msgType)}"`,
+        ...(q.senderName ? [`sender="${escapeXmlAttr(q.senderName)}"`] : []),
+        ...(q.senderType ? [`sender_type="${q.senderType}"`] : []),
+        ...(q.imageCount > 0 ? [`images="${q.imageCount}"`] : []),
+      ]
+      const rawText = q.text?.trim() ?? ''
+      const maxQuoteChars = 4000
+      const truncated = rawText.length > maxQuoteChars
+      const displayText = truncated ? `${rawText.slice(0, maxQuoteChars)}…` : rawText
+      const notes: string[] = []
+      if (q.attachedImageCount > 0) {
+        notes.push(`已自动附带 ${q.attachedImageCount} 张引用图片`)
+      }
+      if (q.imageCount > q.attachedImageCount) {
+        notes.push(
+          `另有 ${q.imageCount - q.attachedImageCount} 张引用图片未附带，可运行 \`lark-bridge message ${msg.parentId}\` 查看`,
+        )
+      }
+      if (truncated || q.hasUnfetchedResources) {
+        notes.push(`完整内容或附件可运行 \`lark-bridge message ${msg.parentId}\``)
+      }
+      const quoteContent =
+        displayText || (q.imageCount > 0 ? `[图片消息，共 ${q.imageCount} 张]` : `[${q.msgType}]`)
+      bodyLines.push(
+        `<quoted_message ${qAttrs.join(' ')}>`,
+        quoteContent,
+        ...(notes.length > 0 ? [`（${notes.join('；')}）`] : []),
+        '</quoted_message>',
+      )
+    } else {
+      bodyLines.push(
+        `引用消息：${msg.parentId}（查看全文或下载附件：\`lark-bridge message ${msg.parentId}\`）`,
+      )
+    }
   }
   if (input.trigger === 'mention' && input.allowSilentEmptyReply !== true) {
     bodyLines.push(

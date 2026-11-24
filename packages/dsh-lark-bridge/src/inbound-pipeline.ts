@@ -32,6 +32,11 @@ import {
   type TriageHistoryEntry,
 } from '@dsh-lark/lark-core'
 import type { BotConnectionPool } from './bot-connection-pool.js'
+import {
+  InboundMediaCache,
+  type ImageRefTarget,
+  type PrefetchedQuotedMessage,
+} from './media-intake.js'
 import type { MemoryService } from './memory-service.js'
 import type { RuntimeCatalog } from './runtime-catalog.js'
 import type { AcquiredAgent, AgentDecision, SessionCoordinator } from './session-coordinator.js'
@@ -199,6 +204,8 @@ interface QueuedWorkerTurnItem {
   readonly decision: AgentDecision
   readonly activeTurn: ActiveTurnRecord
   readonly cancelController: AbortController
+  readonly mediaCache: InboundMediaCache
+  readonly prefetchedQuote?: PrefetchedQuotedMessage
   readonly traceId: string
   readonly senderName?: string
   readonly handoffTurns?: readonly RouterHandoffTurn[]
@@ -1057,6 +1064,7 @@ export class InboundPipeline {
     }
 
     const routerConfig = resolveEffectiveRouterConfig(bot, groupConfig)
+    const mediaCache = new InboundMediaCache()
     const msgCancelController = new AbortController()
     const untrackInflight = this.trackInflightController(
       bot.id,
@@ -1093,7 +1101,14 @@ export class InboundPipeline {
         return
       }
 
-      const senderName = await this.resolveSenderName(transport, msg)
+      const [senderName, prefetchedQuote] = await Promise.all([
+        this.resolveSenderName(transport, msg),
+        msg.parentId
+          ? mediaCache.prefetchQuotedMessage(transport, msg.parentId, {
+              signal: msgCancelController.signal,
+            })
+          : Promise.resolve(undefined),
+      ])
       const postSenderDisabled = getSelfDisabledScope()
       if (postSenderDisabled) {
         recordPreTurnCancel(disabledCancelSummary(postSenderDisabled, '已取消当前轮次并停止执行'))
@@ -1116,6 +1131,8 @@ export class InboundPipeline {
           decision,
           groupConfig,
           routerConfig,
+          mediaCache,
+          ...(prefetchedQuote ? { prefetchedQuote } : {}),
           ...(senderName ? { senderName } : {}),
           ...(resolvedChatName ? { resolvedChatName } : {}),
           chatScopeKey,
@@ -1214,6 +1231,8 @@ export class InboundPipeline {
           decision,
           activeTurn,
           cancelController: msgCancelController,
+          mediaCache,
+          ...(prefetchedQuote ? { prefetchedQuote } : {}),
           traceId,
           ...(senderName ? { senderName } : {}),
           ...(recovery?.handoffTurns ? { handoffTurns: recovery.handoffTurns } : {}),
@@ -1277,6 +1296,8 @@ export class InboundPipeline {
           decision,
           activeTurn,
           cancelController: msgCancelController,
+          mediaCache,
+          ...(prefetchedQuote ? { prefetchedQuote } : {}),
           traceId,
           ...(senderName ? { senderName } : {}),
           ...(effectiveHandoffTurns?.length ? { handoffTurns: effectiveHandoffTurns } : {}),
@@ -1980,6 +2001,8 @@ export class InboundPipeline {
     readonly decision: AgentDecision
     readonly groupConfig?: LarkGroupConfig
     readonly routerConfig: EffectiveRouterConfig
+    readonly mediaCache: InboundMediaCache
+    readonly prefetchedQuote?: PrefetchedQuotedMessage
     readonly senderName?: string
     readonly resolvedChatName?: string
     readonly chatScopeKey: string
@@ -1998,6 +2021,8 @@ export class InboundPipeline {
       decision,
       groupConfig,
       routerConfig,
+      mediaCache,
+      prefetchedQuote,
       senderName,
       resolvedChatName,
       chatScopeKey,
@@ -2011,7 +2036,24 @@ export class InboundPipeline {
       this.isMessageRecalled(bot.id, msg.messageId) ||
       (Boolean(cancelSignal?.aborted) && !this.isSignalDisabled(cancelSignal))
 
-    const bypass = shouldFastBypassTriage(msg, decision, routerConfig.bypass)
+    const quotedImageTargets: ImageRefTarget[] =
+      prefetchedQuote?.imageKeys.map((imageKey) => ({
+        messageId: prefetchedQuote.messageId,
+        imageKey,
+      })) ?? []
+    const currentImageTargets: ImageRefTarget[] = msg.imageKeys.map((imageKey) => ({
+      messageId: msg.messageId,
+      imageKey,
+    }))
+    const allTriageImageTargets: ImageRefTarget[] = [
+      ...quotedImageTargets,
+      ...currentImageTargets,
+    ]
+
+    const bypass = shouldFastBypassTriage(msg, decision, routerConfig.bypass, {
+      maxTriageImages: routerConfig.maxTriageImages,
+      extraImageCount: quotedImageTargets.length,
+    })
     if (bypass.bypass) {
       const bypassDisabled = getDisabledScope()
       if (bypassDisabled) {
@@ -2101,6 +2143,9 @@ export class InboundPipeline {
     const linkedTriageSignal = linkAbortSignals([this.host.shutdownSignal, cancelSignal])
     let result: Awaited<ReturnType<LlmTriageService['evaluate']>>
     try {
+      const totalImageCount =
+        Math.max(msg.imageKeys.length, msg.msgType === 'image' ? 1 : 0) +
+        quotedImageTargets.length
       result = await this.host.triage!.evaluate({
         bot,
         ...(groupConfig ? { group: groupConfig } : {}),
@@ -2109,6 +2154,27 @@ export class InboundPipeline {
         routerConfig,
         ...(senderName ? { senderName } : {}),
         ...(resolvedChatName ? { resolvedChatName } : {}),
+        ...(prefetchedQuote
+          ? {
+              quotedMessage: {
+                messageId: prefetchedQuote.messageId,
+                msgType: prefetchedQuote.msgType,
+                ...(prefetchedQuote.senderName ? { senderName: prefetchedQuote.senderName } : {}),
+                ...(prefetchedQuote.text ? { text: prefetchedQuote.text } : {}),
+                imageCount: prefetchedQuote.imageKeys.length,
+              },
+            }
+          : {}),
+        ...(totalImageCount > 0
+          ? {
+              totalImageCount,
+              loadImages: (sig) =>
+                mediaCache.admitImages(this.host.ctx, transport, allTriageImageTargets, {
+                  maxCount: routerConfig.maxTriageImages,
+                  ...(sig ? { signal: sig } : {}),
+                }),
+            }
+          : {}),
         hasActiveWorker,
         workerBusy,
         traceId,
@@ -2636,6 +2702,60 @@ export class InboundPipeline {
       if (item.recoveryReminder) reminders.push(item.recoveryReminder)
     }
 
+    const primaryQuote = primary.prefetchedQuote
+    const admittedQuoteBlocks: ContentBlock[] = []
+    const admittedMessageBlocks: ContentBlock[] = []
+    const seenImageKeys = new Set<string>()
+    const maxBatchImages = 10
+
+    const collectFromCache = async (
+      cache: InboundMediaCache,
+      targets: readonly ImageRefTarget[],
+      dest: ContentBlock[],
+    ): Promise<number> => {
+      const remaining = maxBatchImages - (admittedQuoteBlocks.length + admittedMessageBlocks.length)
+      if (remaining <= 0) return 0
+      const pending: ImageRefTarget[] = []
+      for (const t of targets) {
+        if (pending.length >= remaining) break
+        const k = `${t.messageId}:${t.imageKey}`
+        if (seenImageKeys.has(k)) continue
+        seenImageKeys.add(k)
+        pending.push(t)
+      }
+      if (pending.length === 0) return 0
+      const admitted = await cache.admitImages(this.host.ctx, transport, pending)
+      dest.push(...admitted.blocks)
+      return admitted.blocks.length
+    }
+
+    let primaryQuoteAttachedImages = 0
+    for (const item of items) {
+      if (item.prefetchedQuote && item.prefetchedQuote.imageKeys.length > 0) {
+        const count = await collectFromCache(
+          item.mediaCache,
+          item.prefetchedQuote.imageKeys.map((imageKey) => ({
+            messageId: item.prefetchedQuote!.messageId,
+            imageKey,
+          })),
+          admittedQuoteBlocks,
+        )
+        if (item === primary) primaryQuoteAttachedImages = count
+      }
+    }
+    for (const item of items) {
+      if (item.msg.imageKeys.length > 0) {
+        await collectFromCache(
+          item.mediaCache,
+          item.msg.imageKeys.map((imageKey) => ({
+            messageId: item.msg.messageId,
+            imageKey,
+          })),
+          admittedMessageBlocks,
+        )
+      }
+    }
+
     reminders.push(
       composeLarkContextReminder({
         bot,
@@ -2648,6 +2768,20 @@ export class InboundPipeline {
         replyMode: effectiveDecision.replyMode,
         useCard: effectiveDecision.useCard,
         includeFullGuide: isNewSession,
+        ...(primaryQuote
+          ? {
+              prefetchedQuote: {
+                messageId: primaryQuote.messageId,
+                msgType: primaryQuote.msgType,
+                ...(primaryQuote.senderName ? { senderName: primaryQuote.senderName } : {}),
+                ...(primaryQuote.senderType ? { senderType: primaryQuote.senderType } : {}),
+                ...(primaryQuote.text ? { text: primaryQuote.text } : {}),
+                imageCount: primaryQuote.imageKeys.length,
+                attachedImageCount: primaryQuoteAttachedImages,
+                hasUnfetchedResources: primaryQuote.hasNonImageResources,
+              },
+            }
+          : {}),
       }),
     )
 
@@ -2675,17 +2809,7 @@ export class InboundPipeline {
           )
 
     const text = composeTurnPrompt(reminders, combinedUserText)
-    const blocks: ContentBlock[] = [{ type: 'text', text }]
-
-    for (const item of items) {
-      for (const imageKey of item.msg.imageKeys) {
-        const data = await transport.downloadImageAsBase64(item.msg.messageId, imageKey)
-        if (data) {
-          blocks.push({ type: 'image', mediaType: 'image/png', data } as unknown as ContentBlock)
-        }
-      }
-    }
-    return blocks
+    return [{ type: 'text', text }, ...admittedQuoteBlocks, ...admittedMessageBlocks]
   }
 
   private async formatReplyModelLabel(

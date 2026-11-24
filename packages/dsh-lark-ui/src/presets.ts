@@ -118,6 +118,7 @@ export const ROUTER_BYPASS_MSG_TYPES: readonly Choice<RouterBypassMsgType>[] = [
   { value: 'interactive', label: '卡片' },
   { value: 'text', label: '文本' },
   { value: 'post', label: '富文本' },
+  { value: 'image', label: '图片' },
 ]
 
 export const DEFAULT_ROUTER_BYPASS: RouterBypassConfig = {
