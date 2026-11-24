@@ -836,11 +836,44 @@ describe('decideLarkRouting, <user_message> format, memberOverrides & title inte
     })
     expect(proactiveReminder).toContain('<proactive reminders="confirm" auto_code="on">')
     expect(proactiveReminder).not.toContain('lark_proactive')
-    expect(proactiveReminder).toContain('变更与止损后复查')
+    expect(proactiveReminder).toContain('变更止损复查')
+    expect(proactiveReminder).toContain('建后发确认卡待确认')
+    expect(proactiveReminder).not.toContain('--urgency high')
     expect(proactiveReminder).toContain(`${workDir}/.worktrees/`)
     expect(proactiveReminder).toContain('--worktree <path> --branch <branch> [--pr <url>]')
     expect(proactiveReminder).not.toContain('--worktree-path')
     expect(proactiveReminder).not.toContain('.local/')
+    expect(proactiveReminder!.length).toBeLessThan(600)
+
+    const quietHoursReminder = composeProactiveSessionReminder({
+      botId: bot.id,
+      workingDir: workDir,
+      config: {
+        ...bot.experimental.proactive,
+        reminderCreationMode: 'silent',
+        quietHoursEnabled: true,
+        quietHoursStart: '23:00',
+        quietHoursEnd: '09:00',
+        autoCodeEnabled: false,
+      },
+    })
+    expect(quietHoursReminder).toContain('<proactive reminders="silent" auto_code="off">')
+    expect(quietHoursReminder).toContain('免打扰 23:00–09:00')
+    expect(quietHoursReminder).toContain('--urgency high')
+    expect(quietHoursReminder).not.toContain('lark-bridge worktree')
+
+    const autoCodeOnlyReminder = composeProactiveSessionReminder({
+      botId: bot.id,
+      workingDir: workDir,
+      config: {
+        ...bot.experimental.proactive,
+        remindersEnabled: false,
+        autoCodeEnabled: true,
+      },
+    })
+    expect(autoCodeOnlyReminder).toContain('<proactive reminders="off" auto_code="on">')
+    expect(autoCodeOnlyReminder).toContain(`${workDir}/.worktrees/`)
+    expect(autoCodeOnlyReminder).not.toContain('lark-bridge reminder create')
 
     // One-shot reminder trigger prompt & cards
     const item = LarkReminderItemSchema.parse({
