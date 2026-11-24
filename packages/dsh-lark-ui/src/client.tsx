@@ -200,6 +200,7 @@ function LarkBridgePage() {
             schedules={data.schedules}
             reminders={data.reminders}
             groups={data.groups}
+            bots={data.bots}
             onOpenScheduleManager={data.scheduleAvailable ? () => openDshSchedules?.() : undefined}
             actions={{
               edit: setEditingSchedule,
@@ -239,6 +240,7 @@ function LarkBridgePage() {
             dreamSessions={data.dreamSessions}
             triageSessions={data.triageSessions}
             events={data.events}
+            bots={data.bots}
             runtimes={data.runtimes}
             models={data.models}
             onOpen={handleOpenSession}

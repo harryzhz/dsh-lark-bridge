@@ -2,17 +2,22 @@ import { useMemo, useState } from 'react'
 import {
   Button,
   IconAlarmClockOutlineRegular,
-  IconSearchOutlineRegular,
-  Input,
   StateDot,
   Switch,
   Tag,
   type TagTone,
 } from '@deepseek-ai/dsh-client-ui-primitives'
-import { CountSegmentedSwitch, FilterTabs, OverflowMenu, ScheduleAutomationHint } from '../components/fields.js'
+import {
+  CountSegmentedSwitch,
+  FilterTabs,
+  ListFilterBar,
+  OverflowMenu,
+  resolveEffectiveBotId,
+  ScheduleAutomationHint,
+} from '../components/fields.js'
 import { choiceLabel, SCHEDULE_NOTIFY_ON } from '../presets.js'
 import { formatIsoTime } from '../state.js'
-import type { GroupView, ReminderItem, ScheduleView } from '../types.js'
+import type { BotRecord, GroupView, ReminderItem, ScheduleView } from '../types.js'
 
 export interface ScheduleActions {
   edit: (schedule: ScheduleView) => void
@@ -32,7 +37,15 @@ export interface ReminderActions {
 }
 
 type AutomationKind = 'reminders' | 'schedules'
-type ReminderFilter = 'active' | 'archived' | 'all'
+export type ReminderFilter = 'active' | 'archived' | 'all'
+
+export function scheduleMatchesBot(schedule: ScheduleView, botId: string): boolean {
+  if (!botId) return true
+  if (schedule.binding.targets.length > 0) {
+    return schedule.binding.targets.some((t) => t.botId === botId)
+  }
+  return schedule.inferredOrigin?.botId === botId
+}
 
 function resolveTargetNames(schedule: ScheduleView, groups: readonly GroupView[]): string[] {
   if (schedule.binding.targets.length > 0) {
@@ -46,6 +59,48 @@ function resolveTargetNames(schedule: ScheduleView, groups: readonly GroupView[]
     })
   }
   return schedule.inferredOrigin ? [schedule.inferredOrigin.chatName] : []
+}
+
+export function filterSchedules(
+  schedules: readonly ScheduleView[],
+  botId: string,
+  query: string,
+  groups: readonly GroupView[] = [],
+): ScheduleView[] {
+  const q = query.trim().toLowerCase()
+  return schedules.filter((s) => {
+    if (!scheduleMatchesBot(s, botId)) return false
+    if (!q) return true
+    const targetNames = resolveTargetNames(s, groups)
+    return (
+      s.title.toLowerCase().includes(q) ||
+      s.prompt.toLowerCase().includes(q) ||
+      s.ruleSummary.toLowerCase().includes(q) ||
+      targetNames.some((name) => name.toLowerCase().includes(q))
+    )
+  })
+}
+
+export function filterReminders(
+  reminders: readonly ReminderItem[],
+  botId: string,
+  filter: ReminderFilter,
+  query: string,
+): ReminderItem[] {
+  const q = query.trim().toLowerCase()
+  return reminders.filter((r) => {
+    if (botId && r.origin.botId !== botId) return false
+    if (filter === 'active' && r.status === 'archived') return false
+    if (filter === 'archived' && r.status !== 'archived') return false
+    if (!q) return true
+    return (
+      r.title.toLowerCase().includes(q) ||
+      r.prompt.toLowerCase().includes(q) ||
+      (r.origin.chatName ?? '').toLowerCase().includes(q) ||
+      (r.origin.userName ?? '').toLowerCase().includes(q) ||
+      (r.origin.botName ?? '').toLowerCase().includes(q)
+    )
+  })
 }
 
 function reminderStatusBadge(item: ReminderItem): { label: string; tone: TagTone } {
@@ -82,6 +137,7 @@ export function SchedulesView({
   schedules,
   reminders,
   groups,
+  bots = [],
   onOpenScheduleManager,
   actions,
   reminderActions,
@@ -90,57 +146,52 @@ export function SchedulesView({
   schedules: readonly ScheduleView[]
   reminders: readonly ReminderItem[]
   groups: readonly GroupView[]
+  bots?: readonly BotRecord[]
   onOpenScheduleManager?: () => void
   actions: ScheduleActions
   reminderActions: ReminderActions
 }) {
   const [kind, setKind] = useState<AutomationKind>('schedules')
   const [reminderFilter, setReminderFilter] = useState<ReminderFilter>('active')
+  const [botId, setBotId] = useState('')
   const [query, setQuery] = useState('')
+  const effectiveBotId = resolveEffectiveBotId(botId, bots)
+
+  const botSchedules = useMemo(
+    () => schedules.filter((s) => scheduleMatchesBot(s, effectiveBotId)),
+    [schedules, effectiveBotId],
+  )
+  const botReminders = useMemo(
+    () => (effectiveBotId ? reminders.filter((r) => r.origin.botId === effectiveBotId) : reminders),
+    [reminders, effectiveBotId],
+  )
 
   const activeReminderCount = useMemo(
-    () => reminders.filter((r) => r.status !== 'archived').length,
-    [reminders],
+    () => botReminders.filter((r) => r.status !== 'archived').length,
+    [botReminders],
   )
-  const archivedReminderCount = reminders.length - activeReminderCount
+  const archivedReminderCount = botReminders.length - activeReminderCount
 
-  const visibleReminders = useMemo(() => {
-    const q = query.trim().toLowerCase()
-    return reminders.filter((r) => {
-      if (reminderFilter === 'active' && r.status === 'archived') return false
-      if (reminderFilter === 'archived' && r.status !== 'archived') return false
-      if (!q) return true
-      return (
-        r.title.toLowerCase().includes(q) ||
-        r.prompt.toLowerCase().includes(q) ||
-        (r.origin.chatName ?? '').toLowerCase().includes(q) ||
-        (r.origin.userName ?? '').toLowerCase().includes(q)
-      )
-    })
-  }, [reminders, reminderFilter, query])
+  const visibleReminders = useMemo(
+    () => filterReminders(reminders, effectiveBotId, reminderFilter, query),
+    [reminders, effectiveBotId, reminderFilter, query],
+  )
 
-  const visibleSchedules = useMemo(() => {
-    const q = query.trim().toLowerCase()
-    if (!q) return schedules
-    return schedules.filter(
-      (s) =>
-        s.title.toLowerCase().includes(q) ||
-        s.prompt.toLowerCase().includes(q) ||
-        s.ruleSummary.toLowerCase().includes(q),
-    )
-  }, [schedules, query])
+  const visibleSchedules = useMemo(
+    () => filterSchedules(schedules, effectiveBotId, query, groups),
+    [schedules, effectiveBotId, query, groups],
+  )
+
+  const hasFilter = Boolean(effectiveBotId || query.trim())
 
   return (
     <>
-      <div
-        className="fb-toolbar"
-        style={{ justifyContent: 'space-between', flexWrap: 'wrap', marginBottom: 14 }}
-      >
+      <div className="fb-view-bar">
         <CountSegmentedSwitch
           label="自动化类型"
           value={kind}
           options={[
-            { value: 'schedules', label: '定时任务', count: schedules.length },
+            { value: 'schedules', label: '定时任务', count: botSchedules.length },
             { value: 'reminders', label: '提醒事项', count: activeReminderCount },
           ]}
           onChange={(next) => {
@@ -156,7 +207,7 @@ export function SchedulesView({
             options={[
               { value: 'active', label: '待触发', count: activeReminderCount },
               { value: 'archived', label: '已归档', count: archivedReminderCount },
-              { value: 'all', label: '全部' },
+              { value: 'all', label: '全部', count: botReminders.length },
             ]}
             onChange={setReminderFilter}
           />
@@ -167,25 +218,24 @@ export function SchedulesView({
         <ScheduleAutomationHint onOpenScheduleManager={onOpenScheduleManager} />
       )}
 
-      {((kind === 'reminders' && reminders.length > 4) ||
-        (kind === 'schedules' && schedules.length > 4)) && (
-        <div className="fb-toolbar">
-          <Input
-            className="fb-search"
-            icon={<IconSearchOutlineRegular size={16} />}
-            placeholder={
-              kind === 'reminders' ? '搜索提醒事项名称、群聊或成员' : '搜索定时任务名称或规则'
-            }
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-          />
-        </div>
+      {(kind === 'reminders' || available) && (
+        <ListFilterBar
+          query={query}
+          onQueryChange={setQuery}
+          searchPlaceholder={
+            kind === 'reminders' ? '搜索提醒事项名称、群聊或成员' : '搜索定时任务名称、规则或群聊'
+          }
+          bots={bots}
+          botId={effectiveBotId}
+          onBotIdChange={setBotId}
+        />
       )}
 
       {kind === 'reminders' ? (
         <RemindersList
           items={visibleReminders}
           filter={reminderFilter}
+          filtered={hasFilter}
           actions={reminderActions}
         />
       ) : !available ? (
@@ -206,21 +256,25 @@ export function SchedulesView({
 function RemindersList({
   items,
   filter,
+  filtered,
   actions,
 }: {
   items: readonly ReminderItem[]
   filter: ReminderFilter
+  filtered: boolean
   actions: ReminderActions
 }) {
   return (
     <div className="fb-card fb-list">
       {items.length === 0 && (
         <div className="fb-empty">
-          {filter === 'active'
-            ? '暂无待触发的提醒事项。智能体开启「主动工作 → 主动创建提醒事项」或调用 lark-bridge reminder create 后会自动显示在这里'
-            : filter === 'archived'
-              ? '暂无已归档的提醒事项'
-              : '暂无提醒事项'}
+          {filtered
+            ? '没有匹配的提醒事项'
+            : filter === 'active'
+              ? '暂无待触发的提醒事项。智能体开启「主动工作 → 主动创建提醒事项」或调用 lark-bridge reminder create 后会自动显示在这里'
+              : filter === 'archived'
+                ? '暂无已归档的提醒事项'
+                : '暂无提醒事项'}
         </div>
       )}
       {items.map((item) => {

@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
-import { Button, IconSearchOutlineRegular, Input, Switch, Tag } from '@deepseek-ai/dsh-client-ui-primitives'
-import { Avatar, OverflowMenu, SelectMenu } from '../components/fields.js'
+import { Button, Switch, Tag } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Avatar, ListFilterBar, OverflowMenu, resolveEffectiveBotId } from '../components/fields.js'
 import { resolveModelDisplayName, resolveRuntimeDisplayName } from '../components/options.js'
 import { choiceLabel, REPLY_MODES, TRIGGER_MODES } from '../presets.js'
 import type { BotRecord, GroupView, ModelGroup, RuntimeOption } from '../types.js'
@@ -26,34 +26,27 @@ export function GroupsView({
 }) {
   const [query, setQuery] = useState('')
   const [botId, setBotId] = useState('')
+  const effectiveBotId = resolveEffectiveBotId(botId, bots)
 
   const visible = useMemo(() => {
     const q = query.trim().toLowerCase()
     return groups.filter(
       (g) =>
-        (!botId || g.botId === botId) &&
+        (!effectiveBotId || g.botId === effectiveBotId) &&
         (!q || g.chatName.toLowerCase().includes(q) || g.chatId.toLowerCase().includes(q)),
     )
-  }, [groups, query, botId])
+  }, [groups, query, effectiveBotId])
 
   return (
     <>
-      <div className="fb-toolbar">
-        <Input
-          className="fb-search"
-          icon={<IconSearchOutlineRegular size={16} />}
-          placeholder="搜索群名称或 Chat ID"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-        />
-        {bots.length > 1 && (
-          <SelectMenu
-            value={botId}
-            options={[{ value: '', label: '全部智能体' }, ...bots.map((b) => ({ value: b.id, label: b.name }))]}
-            onChange={setBotId}
-          />
-        )}
-      </div>
+      <ListFilterBar
+        query={query}
+        onQueryChange={setQuery}
+        searchPlaceholder="搜索群名称或 Chat ID"
+        bots={bots}
+        botId={effectiveBotId}
+        onBotIdChange={setBotId}
+      />
 
       <div className="fb-card fb-list">
         {visible.length === 0 && (

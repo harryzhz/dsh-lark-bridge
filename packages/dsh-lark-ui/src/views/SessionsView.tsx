@@ -1,12 +1,19 @@
 import { useMemo, useState } from 'react'
 import { Button, StateDot, Tag } from '@deepseek-ai/dsh-client-ui-primitives'
-import { CountSegmentedSwitch, FilterTabs, OverflowMenu, SelectMenu } from '../components/fields.js'
+import {
+  CountSegmentedSwitch,
+  FilterTabs,
+  ListFilterBar,
+  OverflowMenu,
+  resolveEffectiveBotId,
+} from '../components/fields.js'
 import { resolveModelDisplayName, resolveRuntimeDisplayName } from '../components/options.js'
 import { resolveNativeModelLabel } from '../components/TriageConfigFields.js'
 import { formatDuration, formatTime } from '../state.js'
 import type {
   AuditEvent,
   AuditEventKind,
+  BotRecord,
   DreamSession,
   ModelGroup,
   RuntimeOption,
@@ -17,14 +24,15 @@ import { eventTag } from './OverviewView.js'
 
 type Pane = 'sessions' | 'events'
 export type SessionFilter = 'all' | 'chat' | 'triage' | 'dreaming'
+export type EventFilter = 'all' | AuditEventKind
 
 export type UnifiedSessionRow =
   | { readonly kind: 'chat'; readonly lastActivityMs: number; readonly binding: SessionBinding }
   | { readonly kind: 'triage'; readonly lastActivityMs: number; readonly triage: TriageSession }
   | { readonly kind: 'dreaming'; readonly lastActivityMs: number; readonly dream: DreamSession }
 
-const EVENT_FILTERS: ReadonlyArray<{ value: 'all' | AuditEventKind; label: string }> = [
-  { value: 'all', label: '全部事件' },
+export const EVENT_FILTERS: ReadonlyArray<{ value: EventFilter; label: string }> = [
+  { value: 'all', label: '全部' },
   { value: 'triage', label: '分流' },
   { value: 'reply', label: '回复' },
   { value: 'inbound', label: '收到' },
@@ -57,6 +65,77 @@ export function mergeSessionRows(
   return rows.sort((a, b) => b.lastActivityMs - a.lastActivityMs)
 }
 
+export function filterSessionRows(
+  rows: readonly UnifiedSessionRow[],
+  query: string,
+): UnifiedSessionRow[] {
+  const q = query.trim().toLowerCase()
+  if (!q) return [...rows]
+  return rows.filter((row) => {
+    if (row.kind === 'chat') {
+      const b = row.binding
+      return (
+        (b.chatName ?? '').toLowerCase().includes(q) ||
+        b.chatId.toLowerCase().includes(q) ||
+        b.workspaceName.toLowerCase().includes(q) ||
+        (b.botName ?? '').toLowerCase().includes(q) ||
+        b.botId.toLowerCase().includes(q) ||
+        (b.listenerName ?? '').toLowerCase().includes(q)
+      )
+    }
+    if (row.kind === 'triage') {
+      const t = row.triage
+      return (
+        (t.chatName ?? '').toLowerCase().includes(q) ||
+        t.chatId.toLowerCase().includes(q) ||
+        (t.senderName ?? '').toLowerCase().includes(q) ||
+        t.reason.toLowerCase().includes(q) ||
+        (t.botName ?? '').toLowerCase().includes(q) ||
+        t.botId.toLowerCase().includes(q) ||
+        (t.listenerName ?? '').toLowerCase().includes(q)
+      )
+    }
+    const d = row.dream
+    return (
+      (d.botName ?? '').toLowerCase().includes(q) ||
+      d.botId.toLowerCase().includes(q) ||
+      d.workspaceName.toLowerCase().includes(q) ||
+      (d.summary ?? '').toLowerCase().includes(q)
+    )
+  })
+}
+
+export function countAuditEventsByKind(
+  events: readonly AuditEvent[],
+): Partial<Record<AuditEventKind, number>> {
+  const counts: Partial<Record<AuditEventKind, number>> = {}
+  for (const e of events) {
+    counts[e.kind] = (counts[e.kind] ?? 0) + 1
+  }
+  return counts
+}
+
+export function filterAuditEvents(
+  events: readonly AuditEvent[],
+  botId: string,
+  kind: EventFilter,
+  query: string,
+): AuditEvent[] {
+  const q = query.trim().toLowerCase()
+  return events.filter((e) => {
+    if (botId && e.botId !== botId) return false
+    if (kind !== 'all' && e.kind !== kind) return false
+    if (!q) return true
+    return (
+      e.summary.toLowerCase().includes(q) ||
+      (e.chatName ?? '').toLowerCase().includes(q) ||
+      (e.chatId ?? '').toLowerCase().includes(q) ||
+      (e.botName ?? '').toLowerCase().includes(q) ||
+      e.botId.toLowerCase().includes(q)
+    )
+  })
+}
+
 function triageActionTag(t: TriageSession) {
   if (t.fallback) return <Tag tone="warning">回退</Tag>
   if (t.action === 'silent') return <Tag tone="neutral">静默</Tag>
@@ -69,6 +148,7 @@ export function SessionsView({
   dreamSessions,
   triageSessions = [],
   events,
+  bots = [],
   runtimes,
   models = [],
   onOpen,
@@ -82,6 +162,7 @@ export function SessionsView({
   dreamSessions: readonly DreamSession[]
   triageSessions?: readonly TriageSession[]
   events: readonly AuditEvent[]
+  bots?: readonly BotRecord[]
   runtimes: readonly RuntimeOption[]
   models?: readonly ModelGroup[]
   onOpen: (sessionId: string) => void
@@ -93,19 +174,48 @@ export function SessionsView({
 }) {
   const [pane, setPane] = useState<Pane>('sessions')
   const [sessionFilter, setSessionFilter] = useState<SessionFilter>('chat')
-  const [kind, setKind] = useState<'all' | AuditEventKind>('all')
+  const [kind, setKind] = useState<EventFilter>('all')
+  const [botId, setBotId] = useState('')
+  const [query, setQuery] = useState('')
+  const effectiveBotId = resolveEffectiveBotId(botId, bots)
+
+  const botBindings = useMemo(
+    () => (effectiveBotId ? bindings.filter((b) => b.botId === effectiveBotId) : bindings),
+    [bindings, effectiveBotId],
+  )
+  const botDreamSessions = useMemo(
+    () => (effectiveBotId ? dreamSessions.filter((d) => d.botId === effectiveBotId) : dreamSessions),
+    [dreamSessions, effectiveBotId],
+  )
+  const botTriageSessions = useMemo(
+    () => (effectiveBotId ? triageSessions.filter((t) => t.botId === effectiveBotId) : triageSessions),
+    [triageSessions, effectiveBotId],
+  )
+  const botEvents = useMemo(
+    () => (effectiveBotId ? events.filter((e) => e.botId === effectiveBotId) : events),
+    [events, effectiveBotId],
+  )
+
+  const eventCounts = useMemo(() => countAuditEventsByKind(botEvents), [botEvents])
+
   const filteredEvents = useMemo(
-    () => (kind === 'all' ? events : events.filter((e) => e.kind === kind)),
-    [events, kind],
+    () => filterAuditEvents(botEvents, '', kind, query),
+    [botEvents, kind, query],
   )
   const visibleSessions = useMemo(
-    () => mergeSessionRows(bindings, dreamSessions, sessionFilter, triageSessions),
-    [bindings, dreamSessions, sessionFilter, triageSessions],
+    () =>
+      filterSessionRows(
+        mergeSessionRows(botBindings, botDreamSessions, sessionFilter, botTriageSessions),
+        query,
+      ),
+    [botBindings, botDreamSessions, sessionFilter, botTriageSessions, query],
   )
-  const primarySessionCount = bindings.length + dreamSessions.length
+  const primarySessionCount = botBindings.length + botDreamSessions.length
+  const hasFilter = Boolean(effectiveBotId || query.trim())
 
-  const emptySessionText =
-    sessionFilter === 'chat'
+  const emptySessionText = hasFilter
+    ? '没有匹配的会话'
+    : sessionFilter === 'chat'
       ? '暂无活跃对话会话'
       : sessionFilter === 'triage'
         ? '暂无智能分流会话。开启智能分流并收到群消息后，每次分流判断过程会完整记录在这里'
@@ -113,9 +223,18 @@ export function SessionsView({
           ? '暂无 Dreaming 会话。智能体定时整理或点击「立即整理」后会自动显示在这里'
           : '暂无会话'
 
+  const searchPlaceholder =
+    pane === 'events'
+      ? '搜索日志内容、群聊或智能体'
+      : sessionFilter === 'triage'
+        ? '搜索群聊、成员、分流原因或智能体'
+        : sessionFilter === 'dreaming'
+          ? '搜索智能体、工作区或整理摘要'
+          : '搜索群聊、工作区或智能体'
+
   return (
     <>
-      <div className="fb-toolbar" style={{ justifyContent: 'space-between', flexWrap: 'wrap' }}>
+      <div className="fb-view-bar">
         <CountSegmentedSwitch
           label="会话与日志"
           value={pane}
@@ -123,17 +242,20 @@ export function SessionsView({
             { value: 'sessions', label: '会话', count: primarySessionCount },
             { value: 'events', label: '运行日志' },
           ]}
-          onChange={setPane}
+          onChange={(next) => {
+            setPane(next)
+            setQuery('')
+          }}
         />
         {pane === 'sessions' ? (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          <div className="fb-view-bar-right">
             <FilterTabs
               label="会话类型筛选"
               value={sessionFilter}
               options={[
-                { value: 'chat', label: '对话', count: bindings.length },
-                { value: 'triage', label: '智能分流', count: triageSessions.length },
-                { value: 'dreaming', label: 'Dreaming', count: dreamSessions.length },
+                { value: 'chat', label: '对话', count: botBindings.length },
+                { value: 'triage', label: '智能分流', count: botTriageSessions.length },
+                { value: 'dreaming', label: 'Dreaming', count: botDreamSessions.length },
               ]}
               onChange={setSessionFilter}
             />
@@ -149,9 +271,27 @@ export function SessionsView({
             )}
           </div>
         ) : (
-          <SelectMenu size="sm" value={kind} options={EVENT_FILTERS} onChange={setKind} />
+          <FilterTabs
+            label="运行日志事件筛选"
+            value={kind}
+            options={EVENT_FILTERS.map((opt) => ({
+              value: opt.value,
+              label: opt.label,
+              count: opt.value === 'all' ? botEvents.length : (eventCounts[opt.value] ?? 0),
+            }))}
+            onChange={setKind}
+          />
         )}
       </div>
+
+      <ListFilterBar
+        query={query}
+        onQueryChange={setQuery}
+        searchPlaceholder={searchPlaceholder}
+        bots={bots}
+        botId={effectiveBotId}
+        onBotIdChange={setBotId}
+      />
 
       {pane === 'sessions' ? (
         <div className="fb-card fb-list">
@@ -348,7 +488,11 @@ export function SessionsView({
         </div>
       ) : (
         <div className="fb-card fb-list">
-          {filteredEvents.length === 0 && <div className="fb-empty">暂无日志</div>}
+          {filteredEvents.length === 0 && (
+            <div className="fb-empty">
+              {hasFilter || kind !== 'all' ? '没有匹配的日志' : '暂无日志'}
+            </div>
+          )}
           {filteredEvents.map((e) => (
             <div key={e.id} className="fb-item">
               {eventTag(e.kind)}
