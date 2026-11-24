@@ -246,7 +246,7 @@ export class InboundPipeline {
     if (!sid) return { matched: false, allowSilent: false }
     for (const turn of this.activeTurns.values()) {
       if (turn.settled || turn.sessionId !== sid) continue
-      if (!turn.allowSilentEmptyReply) {
+      if (!turn.allowSilentEmptyReply && turn.trigger !== 'active-thread') {
         return { matched: true, turnId: turn.id, allowSilent: false }
       }
       turn.silencedByControl = true
@@ -831,7 +831,7 @@ export class InboundPipeline {
     const normalized = silencedByTool
       ? ''
       : normalizeReplyText(replyText, { allowSilentSentinel: true })
-    const isSilent = turn.allowSilentEmptyReply && (silencedByTool || !normalized)
+    const isSilent = silencedByTool || (turn.allowSilentEmptyReply && !normalized)
     if (turn.reactionId) {
       await transport.removeReaction(turn.messageId, turn.reactionId).catch(() => {})
     }
@@ -1414,8 +1414,7 @@ export class InboundPipeline {
         })
     const hasFinalText = normalizedReply.length > 0
     const isSilentSkip =
-      effectiveDecision.allowSilentEmptyReply &&
-      (Boolean(silencedItem) || !hasFinalText) &&
+      (Boolean(silencedItem) || (effectiveDecision.allowSilentEmptyReply && !hasFinalText)) &&
       intermediateSentCount === 0
 
     if (isSilentSkip) {

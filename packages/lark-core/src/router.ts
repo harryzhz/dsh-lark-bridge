@@ -565,8 +565,19 @@ export function decideLarkRouting(
       : existingThreadTrigger === 'listener'
         ? hasThreadReplied && mentionTriggerMode === 'mention_and_active_thread'
         : mentionTriggerMode === 'mention_and_active_thread'
+  const allowSenderInActiveThread =
+    msg.senderType !== 'bot' ||
+    (existingThreadTrigger === 'listener' &&
+      Boolean(group?.listener?.enabled) &&
+      isListenerSenderEnabled(group!.listener, msg.senderOpenId, 'bot'))
+  const isBarePeerMentionOnly =
+    msg.mentions.length > 0 &&
+    msg.imageKeys.length === 0 &&
+    stripBotMentions(msg.text, msg.mentions).length === 0
   if (
     allowThreadFollowup &&
+    allowSenderInActiveThread &&
+    !isBarePeerMentionOnly &&
     (msg.rootId || msg.threadId) &&
     (hasWorkerSession || hasEphemeralThread)
   ) {

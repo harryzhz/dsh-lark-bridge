@@ -187,7 +187,11 @@ export function shouldFastBypassTriage(
     return { bypass: true, reason: `消息类型 ${msg.msgType} 直通主运行时` }
   }
   if (bypass) {
-    if (msg.senderType && bypass.senderTypes.includes(msg.senderType)) {
+    if (
+      msg.senderType &&
+      bypass.senderTypes.includes(msg.senderType) &&
+      !(msg.senderType === 'bot' && decision?.trigger === 'active-thread')
+    ) {
       return {
         bypass: true,
         reason:

@@ -320,7 +320,8 @@ describe('Smart triage config, per-group overrides & protocol', () => {
       ).bypass,
     ).toBe(false)
 
-    // Default bypass: senderTypes=['bot'] routes bot/app alerts directly to main runtime
+    // Default bypass: senderTypes=['bot'] routes bot/app alerts directly to main runtime,
+    // except unmentioned active-thread follow-ups which still go through triage to prevent bot loops.
     const botHit = shouldFastBypassTriage(
       makeMsg({ senderType: 'bot', msgType: 'interactive' }),
       makeDecision({ trigger: 'listener', userText: '[P1] API 延迟飙升' }),
@@ -328,6 +329,14 @@ describe('Smart triage config, per-group overrides & protocol', () => {
     )
     expect(botHit.bypass).toBe(true)
     expect(botHit.reason).toContain('应用/机器人')
+
+    expect(
+      shouldFastBypassTriage(
+        makeMsg({ senderType: 'bot', msgType: 'interactive' }),
+        makeDecision({ trigger: 'active-thread', userText: '其他机器人回复卡片' }),
+        DEFAULT_BOT_ROUTER_CONFIG.bypass,
+      ).bypass,
+    ).toBe(false)
 
     // Clearing senderTypes lets bot messages go through triage
     expect(
