@@ -13,7 +13,6 @@ import {
   ListFilterBar,
   OverflowMenu,
   resolveEffectiveBotId,
-  ScheduleAutomationHint,
 } from '../components/fields.js'
 import { choiceLabel, SCHEDULE_NOTIFY_ON } from '../presets.js'
 import { formatIsoTime } from '../state.js'
@@ -213,10 +212,6 @@ export function SchedulesView({
           />
         )}
       </div>
-
-      {kind === 'schedules' && available && schedules.length > 0 && (
-        <ScheduleAutomationHint onOpenScheduleManager={onOpenScheduleManager} />
-      )}
 
       {(kind === 'reminders' || available) && (
         <ListFilterBar
