@@ -445,7 +445,7 @@ describe('LarkBridgeManager prompt injection, title hygiene & auto-archiving', (
     await manager.stop()
   })
 
-  it('resolves native provider/model and mounts preset plugins on create and cold resume for built-in standard preset, while keeping external cold resume untouched', async () => {
+  it('resolves native provider/model and mounts preset plugins on create and cold resume for built-in standard preset, while forwarding agentOptions on external cold resume without native setup', async () => {
     const dir = makeTempDir()
     const workDir = makeTempDir()
     const store = new LarkBridgeStore(dir)
@@ -678,7 +678,7 @@ describe('LarkBridgeManager prompt injection, title hygiene & auto-archiving', (
     expect(resumeCalls[0]?.hasSetup).toBe(true)
     expect(mountedPresets).toEqual(['standard', 'standard'])
 
-    // 3. External `codex` cold resume passes only `{ resumeSessionId }` without agentOptions override
+    // 3. External `codex` cold resume forwards launch agentOptions as fallback without native preset setup
     await handleInbound('codex-bot', fakeTransport, {
       messageId: 'om_cx_1',
       chatId: 'oc_p2p_cx',
@@ -699,7 +699,10 @@ describe('LarkBridgeManager prompt injection, title hygiene & auto-archiving', (
       imageKeys: [],
     })
     expect(resumeCalls).toHaveLength(2)
-    expect(resumeCalls[1]?.agentOptions).toBeUndefined()
+    expect(resumeCalls[1]?.agentOptions).toEqual({
+      provider: 'codex-cli',
+      model: 'gpt-6.1-sol',
+    })
     expect(resumeCalls[1]?.hasSetup).toBe(false)
 
     await manager.stop()
