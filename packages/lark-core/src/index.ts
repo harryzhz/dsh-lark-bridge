@@ -21,6 +21,7 @@ export {
   createLarkSdkLogger,
   explainLarkErrorCode,
   formatSdkLogArgs,
+  isLarkMessageRecalledError,
   type LarkSdkErrorRecord,
   type LarkSdkLoggerAdapter,
 } from './lark-logger.js'
@@ -244,6 +245,7 @@ export {
   type ListenerTemplate,
   type MentionTriggerMode,
   type ParsedSlashCommand,
+  type RecalledLarkMessageEvent,
   type ReminderCreationMode,
   type RoleDefinition,
   type RouterBypassConfig,

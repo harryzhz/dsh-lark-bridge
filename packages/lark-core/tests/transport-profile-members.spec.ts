@@ -1,6 +1,12 @@
 import * as lark from '@larksuiteoapi/node-sdk'
 import { describe, expect, it, vi } from 'vitest'
-import { LarkBotConfigSchema, LarkBotTransport, type LarkBotProfile } from '../src/index.js'
+import {
+  LarkBotConfigSchema,
+  LarkBotTransport,
+  isLarkMessageRecalledError,
+  type LarkBotProfile,
+  type RecalledLarkMessageEvent,
+} from '../src/index.js'
 
 function createBot() {
   return LarkBotConfigSchema.parse({
@@ -454,5 +460,78 @@ describe('LarkBotTransport profile description sync & member/bot avatar resoluti
     const chatMsgs = await transport.listMessages({ chatId: 'oc_demo', limit: 75 })
     expect(observedPageSizes).toEqual([50, 25])
     expect(chatMsgs).toHaveLength(75)
+  })
+
+  it('normalizes and dispatches im.message.recalled_v1 without blocking ACK and recognizes 230006 recall errors', async () => {
+    const recalledEvents: RecalledLarkMessageEvent[] = []
+    let releaseRecallHandler!: () => void
+    const transport = new LarkBotTransport(createBot(), {
+      onMessage: () => {},
+      onMessageRecalled: async (ev) => {
+        recalledEvents.push(ev)
+        await new Promise<void>((resolve) => {
+          releaseRecallHandler = resolve
+        })
+      },
+    })
+
+    const internalClient = (
+      transport as unknown as { client: { request: ReturnType<typeof vi.fn> } }
+    ).client
+    internalClient.request = vi.fn(async () => ({
+      bot: { open_id: 'ou_bot_self', app_name: 'AlphaBot' },
+    }))
+
+    let capturedDispatcher: lark.EventDispatcher | undefined
+    const wsStartSpy = vi
+      .spyOn(lark.WSClient.prototype, 'start')
+      .mockImplementation(async function (this: lark.WSClient, params: { eventDispatcher: lark.EventDispatcher }) {
+        capturedDispatcher = params.eventDispatcher
+      })
+    const wsCloseSpy = vi
+      .spyOn(lark.WSClient.prototype, 'close')
+      .mockImplementation(function () {})
+
+    try {
+      await transport.start()
+      expect(capturedDispatcher).toBeDefined()
+
+      const invokePromise = capturedDispatcher!.invoke(
+        {
+          schema: '2.0',
+          header: { event_id: 'evt_recall_1', event_type: 'im.message.recalled_v1' },
+          event: {
+            message_id: 'om_recalled_1',
+            chat_id: 'oc_demo',
+            recall_time: '1730000000000',
+            recall_type: 'message_owner',
+          },
+        },
+        { needCheck: false },
+      )
+      await expect(invokePromise).resolves.toBeUndefined()
+      await vi.waitFor(() => expect(recalledEvents).toHaveLength(1))
+      expect(recalledEvents[0]).toMatchObject({
+        botId: 'bot-alpha',
+        larkAppId: 'cli_alpha_001',
+        messageId: 'om_recalled_1',
+        chatId: 'oc_demo',
+        recallTimeMs: 1730000000000,
+        recallType: 'message_owner',
+      })
+      releaseRecallHandler()
+      await transport.stop()
+    } finally {
+      wsStartSpy.mockRestore()
+      wsCloseSpy.mockRestore()
+    }
+
+    expect(
+      isLarkMessageRecalledError(
+        Object.assign(new Error('400'), { response: { data: { code: 230006, msg: 'recalled' } } }),
+      ),
+    ).toBe(true)
+    expect(isLarkMessageRecalledError('code=230006 message recalled')).toBe(true)
+    expect(isLarkMessageRecalledError(new Error('code=230002 not in chat'))).toBe(false)
   })
 })
