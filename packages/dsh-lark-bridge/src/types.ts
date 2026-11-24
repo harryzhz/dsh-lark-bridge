@@ -101,6 +101,8 @@ export interface LarkManagedSession {
 
 export type PendingTurnStatus = 'running' | 'interrupted' | 'recovering'
 
+export type PendingTurnInterruptKind = 'graceful_shutdown' | 'crash'
+
 export interface LarkPendingTurn {
   readonly id: string
   readonly botId: string
@@ -120,8 +122,12 @@ export interface LarkPendingTurn {
   readonly senderName?: string
   readonly intermediateSentCount?: number
   readonly recoveryAttempts?: number
+  readonly gracefulRecoveryAttempts?: number
   readonly handoffTurns?: readonly RouterHandoffTurn[]
   readonly updatedAtMs?: number
+  readonly interruptedAtMs?: number
+  readonly lastActivityAtMs?: number
+  readonly interruptKind?: PendingTurnInterruptKind
 }
 
 export type BridgeLifecyclePhase = 'starting' | 'running' | 'draining' | 'stopping' | 'stopped'
@@ -136,6 +142,9 @@ export interface ActiveTurnSummary {
   readonly sessionId?: string
   readonly trigger: string
   readonly startedAtMs: number
+  readonly lastActivityAtMs: number
+  readonly idleSec: number
+  readonly willAutoResume: boolean
 }
 
 export interface BridgeLifecycleStatus {

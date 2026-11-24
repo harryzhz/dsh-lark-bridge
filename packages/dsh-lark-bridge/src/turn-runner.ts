@@ -176,6 +176,7 @@ function releaseSessionTurn(sessionId: string, turn: number | undefined): void {
 
 export interface RunTurnOptions {
   readonly onIntermediate?: (text: string) => void | Promise<void>
+  readonly onActivity?: (timestampMs: number) => void
   readonly signal?: AbortSignal
 }
 
@@ -264,6 +265,7 @@ export function runTurnAndCollectReply(
             targetTurnConfirmed = false
             lastStepEndAtMs = undefined
             lastAssistantMessageAtMs = undefined
+            options.onActivity?.(Date.now())
             return
           }
           if (targetTurn === undefined) return
@@ -290,14 +292,25 @@ export function runTurnAndCollectReply(
             event.data.turn === targetTurn
           ) {
             targetTurnConfirmed = true
+            const nowMs = Date.now()
             if (event.type === 'assistant/message') {
-              lastAssistantMessageAtMs = Date.now()
+              lastAssistantMessageAtMs = nowMs
             }
+            options.onActivity?.(nowMs)
             tracker.onEvent(event)
             return
           }
+          if (
+            (event.type === 'step/start' || event.type === 'tool/result') &&
+            (event.data as { turn?: number }).turn === targetTurn
+          ) {
+            options.onActivity?.(Date.now())
+            return
+          }
           if (event.type === 'step/end' && event.data.turn === targetTurn) {
-            lastStepEndAtMs = Date.now()
+            const nowMs = Date.now()
+            lastStepEndAtMs = nowMs
+            options.onActivity?.(nowMs)
             return
           }
           if (event.type === 'turn/end' && event.data.turn === targetTurn) {

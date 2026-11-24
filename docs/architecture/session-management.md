@@ -395,12 +395,12 @@ sequenceDiagram
      lark-bridge lifecycle resume-intake
      ```
 2. **非计划重启 / 热重载 / 崩溃自动续跑（Durable Pending Turns）**：
-   - 每个在途回合在 `pending_turns` 持久化完整可重放的入站消息快照（`inbound_msg_json`）、`sessionId`、`reactionId`、`intermediate_sent_count`、`handoff_turns_json` 与 `recovery_attempts`；
-   - 发生停机或 HMR 重载时，不再草率删除 `pending_turns`、删 `OnIt` 表情并向群里刷屏报错，而是将可恢复回合标记为 `interrupted` 落盘，并在 `2.5s` 并行停机预算内完成句柄释放、SQLite WAL checkpoint 与 `bridge.lock` 释放；
+   - 每个在途回合在 `pending_turns` 持久化完整可重放的入站消息快照（`inbound_msg_json`）、`sessionId`、`reactionId`、`intermediate_sent_count`、`handoff_turns_json`、事件流活跃心跳（`last_activity_at_ms`，每 15s 节流落盘）、停机冻结时刻与中断类型（`interrupted_at_ms` / `interrupt_kind`）以及分离的崩溃/优雅重启恢复计数（`recovery_attempts` / `graceful_recovery_attempts`）；同时 `lifecycle status / drain` 的 `activeTurns` 实时暴露 `lastActivityAtMs`、`idleSec` 与 `willAutoResume`，便于运维区分活跃长任务与静默卡死任务；
+   - 发生停机或 HMR 重载时，不再因单轮已运行超过 15 分钟就误杀在途长任务，而是只要未超绝对安全上限（6 小时）与恢复配额，一律将可恢复回合标记为 `interrupted`（`interrupt_kind = 'graceful_shutdown'` + `interrupted_at_ms`）落盘，并在 `2.5s` 并行停机预算内完成句柄释放、SQLite WAL checkpoint 与 `bridge.lock` 释放；
    - 新进程启动并连上飞书后自动按三步恢复：
-     1. **先查已完成未送达**：核对持久化 DSH 会话中匹配该 `messageId` 的 turn 是否已 `turn/end (completed)`，若已完成直接补发最终回复并移除原 `OnIt` 表情（零重复执行）；
-     2. **自动续跑护栏**：15 分钟有效窗口内且 `recoveryAttempts < 1` 时，沿用原 `reactionId` 自动恢复——已有 `sessionId` 则复用原会话并注入 `<restart_recovery>` 避免重复副作用，未建会话则按原消息重投；
-     3. **防循环兜底**：超窗、超过自动恢复上限、缺快照（老版本记录）或 Bot/群已禁用时，才清理表情、记 `error` 审计并按需通知交互用户。
+     1. **先查已完成未送达**：从持久化 DSH 会话**尾部 2000 条事件滑窗**（兼容超长复用会话）核对匹配该 `messageId` 的 turn 是否已 `turn/end (completed)`，若已完成直接补发最终回复并移除原 `OnIt` 表情（零重复执行）；
+     2. **自动续跑护栏**：按**停机中断距今时长**（`now - (interruptedAtMs ?? lastActivityAtMs ?? startedAtMs) <= 15 分钟`，而非单轮总耗时）且满足总时长上限（6 小时）与配额（计划内优雅重启允许最多连续 `3` 次续跑，异常崩溃严格限制 `1` 次防毒丸循环）时，沿用原 `reactionId` 自动恢复——已有 `sessionId` 则复用原会话并注入 `<restart_recovery>` 避免重复副作用，未建会话则按原消息重投；
+     3. **防循环兜底**：停机超窗、超过恢复上限、缺快照（老版本记录）或 Bot/群已禁用时，才清理表情、记 `error` 审计并按需通知交互用户。
 3. **快速重启防撞锁（`InstanceLock.acquireAsync`）**：
    - 启动时若发现同主机旧 PID 仍短暂持有 `bridge.lock`（正处于 5s 停机释放窗口），自动退避等待最多 `6s` 无缝接管；跨主机锁冲突仍立即拒绝以杜绝双脑。
 
