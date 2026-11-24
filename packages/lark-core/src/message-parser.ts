@@ -90,6 +90,9 @@ function collectInteractiveText(node: unknown, texts: string[]): void {
 }
 
 export function parseLarkMessageContent(msgType: string, rawContent: string): ParsedLarkContent {
+  if (msgType === 'sticker') {
+    return { text: '[表情包]', imageKeys: [] }
+  }
   let parsed: unknown
   try {
     parsed = JSON.parse(rawContent)

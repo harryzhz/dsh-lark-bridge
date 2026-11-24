@@ -624,6 +624,10 @@ export function decideLarkRouting(
     msg.mentions.length > 0 &&
     msg.imageKeys.length === 0 &&
     stripBotMentions(msg.text, msg.mentions).length === 0
+  if (isActiveThreadContext && msg.msgType === 'sticker') {
+    // Standalone Feishu stickers carry no text or @mention; ignore zero-cost in unmentioned threads.
+    return { action: 'ignore', reason: 'no_matching_rule' }
+  }
   if (isActiveThreadContext && !allowSenderInActiveThread) {
     // Never fall through to passive listeners when a peer bot posts in an active thread
     // (otherwise a bot-enabled `scope: 'all'` listener would re-trigger a multi-bot loop).

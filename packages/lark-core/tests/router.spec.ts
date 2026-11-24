@@ -1655,5 +1655,55 @@ describe('decideLarkRouting, <user_message> format, memberOverrides & title inte
       action: 'agent',
       trigger: 'substitute',
     })
+
+    // 7. Standalone Feishu sticker parses cleanly as `[表情包]` and is ignored zero-cost in unmentioned active threads
+    const parsedSticker = parseLarkMessageContent('sticker', '{"file_key":"v2_demo_sticker"}')
+    expect(parsedSticker).toEqual({ text: '[表情包]', imageKeys: [] })
+    expect(parseLarkMessageContent('sticker', '')).toEqual({ text: '[表情包]', imageKeys: [] })
+
+    expect(
+      decideLarkRouting(
+        botWithSub,
+        createMessage({
+          chatId: 'oc_all_listener',
+          messageId: 'om_sticker_in_thread',
+          rootId: 'om_root_1',
+          threadId: 'omt_topic_1',
+          senderOpenId: 'ou_member_1',
+          senderType: 'user',
+          msgType: 'sticker',
+          text: parsedSticker.text,
+          rawContent: '{"file_key":"v2_demo_sticker"}',
+        }),
+        {
+          groupConfig: allScopeListenerGroup,
+          hasActiveSessionForRoute: () => true,
+          getRouteTrigger: () => 'mention',
+          hasRouteReplied: () => true,
+        },
+      ),
+    ).toEqual({ action: 'ignore', reason: 'no_matching_rule' })
+
+    // P2P sticker from an allowed user still reaches agent with readable `[表情包]` instead of raw JSON
+    expect(
+      decideLarkRouting(
+        botWithSub,
+        createMessage({
+          chatId: 'oc_p2p_1',
+          chatType: 'p2p',
+          messageId: 'om_sticker_p2p',
+          senderOpenId: 'ou_owner',
+          senderType: 'user',
+          msgType: 'sticker',
+          text: parsedSticker.text,
+          rawContent: '{"file_key":"v2_demo_sticker"}',
+        }),
+        { hasActiveSessionForRoute: () => false },
+      ),
+    ).toMatchObject({
+      action: 'agent',
+      trigger: 'p2p',
+      userText: '[表情包]',
+    })
   })
 })

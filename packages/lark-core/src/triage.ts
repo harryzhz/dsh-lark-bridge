@@ -54,6 +54,7 @@ export interface TriagePromptInput {
   readonly systemPromptTemplate?: string
   readonly senderName?: string
   readonly senderType: 'user' | 'bot'
+  readonly msgType?: string
   readonly userText: string
   readonly quotedMessage?: TriageQuotedMessage
   readonly attachedImageCount?: number
@@ -383,6 +384,7 @@ export function buildTriageUserMessage(input: TriagePromptInput): string {
     ...(input.listenerName ? [`listener="${input.listenerName}"`] : []),
     `sender_type=${input.senderType}`,
     ...(input.senderName ? [`sender="${input.senderName}"`] : []),
+    ...(input.msgType ? [`msg_type=${input.msgType}`] : []),
     ...(input.attachedImageCount && input.attachedImageCount > 0
       ? [`images=${input.attachedImageCount}`]
       : []),

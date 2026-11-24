@@ -616,6 +616,7 @@ describe('Smart triage config, per-group overrides & protocol', () => {
       botName: 'TriageBot',
       trigger: 'listener',
       senderType: 'user',
+      msgType: 'post',
       userText: '帮我看下这张报错图',
       quotedMessage: {
         messageId: 'om_quoted_1',
@@ -628,6 +629,7 @@ describe('Smart triage config, per-group overrides & protocol', () => {
       hasActiveWorker: false,
       recentMessages: [],
     })
+    expect(triageUser).toContain('msg_type=post')
     expect(triageUser).toContain('images=2')
     expect(triageUser).toContain('<quoted_message message_id="om_quoted_1" msg_type="post" sender="Alex" images=2>')
     expect(triageUser).toContain('线上接口返回 502')
