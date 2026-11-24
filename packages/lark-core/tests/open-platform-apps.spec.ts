@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { LarkPlatformManager, slugifyBotId } from '../src/open-platform.js'
+import { LarkPlatformManager, normalizeVisibleSuggest, slugifyBotId } from '../src/open-platform.js'
 
 const tempDirs: string[] = []
 afterEach(() => {
@@ -227,5 +227,138 @@ describe('LarkPlatformManager Open Platform existing apps listing & credential i
     )
     expect(slugifyBotId('研发助手', 'cli_ab12cd34')).toBe('bot-ab12cd')
     expect(slugifyBotId('Release Bot', 'cli_ab12cd34')).toBe('release-bot')
+  })
+
+  it('normalizes visible/online rich objects into string ID arrays when syncBotBaseInfo creates a new app version', async () => {
+    expect(
+      normalizeVisibleSuggest({
+        Head: { RespFormat: 0 },
+        departments: [{ id: 'dept_1', name: 'Engineering' }, 'dept_1', 'dept_2'],
+        members: [{ id: 'u_1001', name: 'Alex', avatar: 'https://example.com/a.png' }, { id: 'u_1002' }],
+        groups: [{ groupId: 'grp_9', name: 'Core' }],
+        isAll: 0,
+      }),
+    ).toEqual({
+      departments: ['dept_1', 'dept_2'],
+      members: ['u_1001', 'u_1002'],
+      groups: ['grp_9'],
+      isAll: 0,
+    })
+    expect(normalizeVisibleSuggest({ Head: { RespFormat: 0 } })).toBeUndefined()
+
+    const dir = makeTempDir()
+    writeFakeSession(dir)
+
+    const postedBodies = new Map<string, Record<string, unknown>>()
+    const fetcher = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      const target = String(url)
+      const pathname = new URL(target).pathname
+      if (init?.method === 'POST' && typeof init.body === 'string' && init.body) {
+        postedBodies.set(pathname, JSON.parse(init.body) as Record<string, unknown>)
+      }
+      if (pathname === '/app') {
+        return new Response(makeConsoleHtml(), { status: 200 })
+      }
+      if (pathname === '/developers/v1/app/cli_demo_sync') {
+        return new Response(
+          JSON.stringify({
+            code: 0,
+            data: {
+              primaryLang: 'zh_cn',
+              langs: ['zh_cn'],
+              name: 'Old Name',
+              desc: 'Old desc',
+              avatar: 'https://example.com/icon.png',
+              i18n: { zh_cn: { name: 'Old Name', description: 'Old desc' } },
+            },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        )
+      }
+      if (pathname === '/developers/v1/visible/online/cli_demo_sync') {
+        return new Response(
+          JSON.stringify({
+            code: 0,
+            data: {
+              Head: { RespFormat: 0 },
+              whiteList: {
+                departments: [{ id: 'dept_a', name: 'Platform' }],
+                members: [
+                  {
+                    id: '6900000000000000001',
+                    name: 'Alex Chen',
+                    avatar: 'https://example.com/u1.png',
+                    displayName: { value: 'Alex Chen' },
+                  },
+                ],
+                groups: [{ id: 'grp_a', name: 'Beta' }],
+                isAll: 0,
+              },
+              blackList: {
+                departments: [],
+                members: [{ id: '6900000000000000002', name: 'Blocked User' }],
+                groups: [],
+                isAll: 0,
+              },
+            },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        )
+      }
+      if (pathname === '/developers/v1/base_info/cli_demo_sync') {
+        return new Response(JSON.stringify({ code: 0, data: {} }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        })
+      }
+      if (pathname === '/developers/v1/app_version/list/cli_demo_sync') {
+        return new Response(
+          JSON.stringify({
+            code: 0,
+            data: {
+              versions: [{ versionId: 'ver_1', appVersion: '1.0.9', versionStatus: 2 }],
+            },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        )
+      }
+      if (pathname === '/developers/v1/app_version/create/cli_demo_sync') {
+        return new Response(
+          JSON.stringify({ code: 0, data: { versionId: 'ver_2' } }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        )
+      }
+      if (pathname === '/developers/v1/publish/commit/cli_demo_sync/ver_2') {
+        return new Response(JSON.stringify({ code: 0, data: {} }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        })
+      }
+      return new Response('not found', { status: 404 })
+    })
+
+    const mgr = new LarkPlatformManager(dir, fetcher as unknown as typeof fetch)
+    const res = await mgr.syncBotBaseInfo('cli_demo_sync', {
+      name: 'New Bot Name',
+      description: 'Updated description',
+    })
+
+    expect(res).toEqual({ synced: true })
+    expect(postedBodies.get('/developers/v1/app_version/create/cli_demo_sync')).toMatchObject({
+      appVersion: '1.0.10',
+      visibleSuggest: {
+        departments: ['dept_a'],
+        members: ['6900000000000000001'],
+        groups: ['grp_a'],
+        isAll: 0,
+      },
+      blackVisibleSuggest: {
+        departments: [],
+        members: ['6900000000000000002'],
+        groups: [],
+        isAll: 0,
+      },
+    })
+    expect(postedBodies.has('/developers/v1/publish/commit/cli_demo_sync/ver_2')).toBe(true)
   })
 })

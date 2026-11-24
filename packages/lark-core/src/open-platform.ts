@@ -501,6 +501,58 @@ function collectScopeEntries(
   }
 }
 
+export interface OpenPlatformVisibleSuggest {
+  readonly departments: readonly string[]
+  readonly members: readonly string[]
+  readonly groups: readonly string[]
+  readonly isAll: number
+}
+
+function extractVisibleIds(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return []
+  const ids: string[] = []
+  const seen = new Set<string>()
+  for (const entry of raw) {
+    let id: string | undefined
+    if (typeof entry === 'string') {
+      id = entry.trim() || undefined
+    } else if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
+      id = pickStr(entry as Record<string, unknown>, [
+        'id',
+        'memberId',
+        'userId',
+        'departmentId',
+        'groupId',
+      ])
+    }
+    if (id && !seen.has(id)) {
+      seen.add(id)
+      ids.push(id)
+    }
+  }
+  return ids
+}
+
+/**
+ * Normalizes a visibility scope block returned by `/developers/v1/visible/online/*`
+ * (where `members`/`departments`/`groups` are rich objects `{ id, name, avatar, ... }`)
+ * into the string-ID array shape required by `/developers/v1/app_version/create/*`.
+ */
+export function normalizeVisibleSuggest(raw: unknown): OpenPlatformVisibleSuggest | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined
+  const rec = raw as Record<string, unknown>
+  if (!('departments' in rec || 'members' in rec || 'groups' in rec || 'isAll' in rec)) {
+    return undefined
+  }
+  const isAll = typeof rec.isAll === 'number' ? rec.isAll : rec.isAll === true ? 1 : 0
+  return {
+    departments: extractVisibleIds(rec.departments),
+    members: extractVisibleIds(rec.members),
+    groups: extractVisibleIds(rec.groups),
+    isAll,
+  }
+}
+
 function nextSemanticVersion(versionListPayload: Record<string, unknown>): string {
   const data = asRecord(versionListPayload.data)
   const versions = Array.isArray(data.versions) ? data.versions : []
@@ -888,11 +940,12 @@ export class LarkPlatformManager {
     try {
       const appPayload = await client.postJson(`/developers/v1/app/${larkAppId}`, {})
       const base = asRecord(appPayload.data)
+      const localized = extractLocalizedAppFields(base)
       const primaryLang = pickStr(base, ['primaryLang']) ?? 'zh_cn'
       const rawLangs = Array.isArray(base.langs) ? base.langs.filter((l): l is string => typeof l === 'string' && Boolean(l)) : [primaryLang]
       const langs = rawLangs.length > 0 ? rawLangs : [primaryLang]
-      const currentName = pickStr(base, ['name']) ?? ''
-      const currentDesc = typeof base.desc === 'string' ? base.desc : ''
+      const currentName = pickStr(base, ['name']) ?? localized.name ?? ''
+      const currentDesc = (typeof base.desc === 'string' && base.desc) ? base.desc : (localized.description ?? '')
       const nextName = desired.name.trim() || currentName
       const nextDesc = desired.description.trim()
 
@@ -905,9 +958,14 @@ export class LarkPlatformManager {
 
       const visPayload = await client.postJson(`/developers/v1/visible/online/${larkAppId}`, {})
       const visData = asRecord(visPayload.data)
-      const whiteList = visData.whiteList ?? visData
-      const blackList = visData.blackList ?? { departments: [], members: [], groups: [], isAll: 0 }
-      if (!whiteList || typeof whiteList !== 'object') {
+      const whiteList = normalizeVisibleSuggest(visData.whiteList ?? visData)
+      const blackList = normalizeVisibleSuggest(visData.blackList) ?? {
+        departments: [],
+        members: [],
+        groups: [],
+        isAll: 0,
+      }
+      if (!whiteList) {
         return { synced: false, message: '无法读取线上应用可见范围，已跳过平台同步' }
       }
 
