@@ -7,7 +7,7 @@ import {
   ENTITY_TABLE_NAMES,
   type EntityTableName,
   type SqlMigration,
-} from './migrations/001-initial.js'
+} from './migrations/index.js'
 
 export const DB_FILENAME = 'lark-bridge.db'
 export const LEGACY_STATE_FILENAME = 'lark-bridge-state.json'

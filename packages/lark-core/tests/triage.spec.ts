@@ -2,15 +2,19 @@ import { describe, expect, it } from 'vitest'
 import {
   DEFAULT_BOT_ROUTER_CONFIG,
   DEFAULT_GROUP_ROUTER_CONFIG,
+  DEFAULT_TRIAGE_SYSTEM_PROMPT,
   LarkBotConfigSchema,
   LarkGroupConfigSchema,
+  TRIAGE_PROMPT_VARIABLES,
   buildRouteKey,
   buildTriageSystemPrompt,
+  buildTriageSystemPromptVars,
   buildTriageUserMessage,
   composeCoalescedUserText,
   composeRouterHandoffReminder,
   decideLarkRouting,
   parseTriageVerdict,
+  renderTriageSystemPrompt,
   resolveEffectiveRouterConfig,
   shouldFastBypassTriage,
   shouldRunTriage,
@@ -76,7 +80,7 @@ describe('Smart triage config, per-group overrides & protocol', () => {
     const defaultBot = makeBot({ experimental: { dreaming: { enabled: false } } })
     expect(defaultBot.router).toEqual(DEFAULT_BOT_ROUTER_CONFIG)
 
-    // Seamless migration from earlier experimental.router placement
+    // Seamless migration from earlier experimental.router placement + legacy customPrompt
     const migratedBot = makeBot({
       experimental: {
         dreaming: { enabled: false },
@@ -86,6 +90,7 @@ describe('Smart triage config, per-group overrides & protocol', () => {
           model: 'deepseek-chat',
           scope: 'all_group',
           timeoutMs: 3500,
+          customPrompt: '旧版补充规则',
         },
       },
     })
@@ -94,6 +99,8 @@ describe('Smart triage config, per-group overrides & protocol', () => {
     expect(migratedBot.router.model).toBe('deepseek-chat')
     expect(migratedBot.router.scope).toBe('all_group')
     expect(migratedBot.router.timeoutMs).toBe(3500)
+    expect(migratedBot.router.systemPrompt).toContain(DEFAULT_TRIAGE_SYSTEM_PROMPT)
+    expect(migratedBot.router.systemPrompt).toContain('旧版补充规则')
 
     const bot = makeBot({
       router: {
@@ -102,7 +109,10 @@ describe('Smart triage config, per-group overrides & protocol', () => {
         model: 'deepseek-chat',
         scope: 'passive_only',
         timeoutMs: 3500,
-        customPrompt: 'Bot 默认规则',
+        systemPrompt: '你是 {{bot_name}}，群聊 {{chat_name}}。{{active_session_rule}}',
+        recentMessageCount: 10,
+        contextTtlMinutes: 45,
+        includeLastReply: false,
         coalesceQueuedMessages: true,
       },
     })
@@ -118,10 +128,13 @@ describe('Smart triage config, per-group overrides & protocol', () => {
     expect(effDefault.source).toBe('bot')
     expect(effDefault.enabled).toBe(true)
     expect(effDefault.scope).toBe('passive_only')
-    expect(effDefault.customPrompt).toBe('Bot 默认规则')
+    expect(effDefault.systemPrompt).toBe('你是 {{bot_name}}，群聊 {{chat_name}}。{{active_session_rule}}')
+    expect(effDefault.recentMessageCount).toBe(10)
+    expect(effDefault.contextTtlMinutes).toBe(45)
+    expect(effDefault.includeLastReply).toBe(false)
     expect(effDefault.coalesceQueuedMessages).toBe(true)
 
-    // Full per-group override (model, scope, timeout, coalescing, customPrompt)
+    // Full per-group override (model, scope, timeout, coalescing, systemPrompt & context params)
     const customGroup = LarkGroupConfigSchema.parse({
       key: 'bot-triage:oc_custom',
       botId: 'bot-triage',
@@ -132,7 +145,10 @@ describe('Smart triage config, per-group overrides & protocol', () => {
         model: 'doubao-seed-2.1-lite',
         scope: 'all_group',
         timeoutMs: 5000,
-        customPrompt: '本群仅处理告警与发布',
+        systemPrompt: '本群仅处理告警与发布 {{trigger_guide}}',
+        recentMessageCount: 12,
+        contextTtlMinutes: 60,
+        includeLastReply: true,
         coalesceQueuedMessages: false,
       },
     })
@@ -144,11 +160,14 @@ describe('Smart triage config, per-group overrides & protocol', () => {
       model: 'doubao-seed-2.1-lite',
       scope: 'all_group',
       timeoutMs: 5000,
-      customPrompt: '本群仅处理告警与发布',
+      systemPrompt: '本群仅处理告警与发布 {{trigger_guide}}',
+      recentMessageCount: 12,
+      contextTtlMinutes: 60,
+      includeLastReply: true,
       coalesceQueuedMessages: false,
     })
 
-    // Group override leaving provider/model blank inherits Bot router model
+    // Group override leaving provider/model blank inherits Bot router model; explicit fields keep schema defaults
     const partialOverrideGroup = LarkGroupConfigSchema.parse({
       key: 'bot-triage:oc_partial',
       botId: 'bot-triage',
@@ -159,6 +178,19 @@ describe('Smart triage config, per-group overrides & protocol', () => {
     expect(effPartial.provider).toBe('deepseek')
     expect(effPartial.model).toBe('deepseek-chat')
     expect(effPartial.scope).toBe('all_group')
+    expect(effPartial.recentMessageCount).toBe(6)
+    expect(effPartial.contextTtlMinutes).toBe(30)
+    expect(effPartial.includeLastReply).toBe(true)
+
+    // Legacy group customPrompt migration
+    const legacyPromptGroup = LarkGroupConfigSchema.parse({
+      key: 'bot-triage:oc_legacy_prompt',
+      botId: 'bot-triage',
+      chatId: 'oc_legacy_prompt',
+      router: { mode: 'override', customPrompt: '群级旧补充规则' },
+    })
+    expect(legacyPromptGroup.router.systemPrompt).toContain(DEFAULT_TRIAGE_SYSTEM_PROMPT)
+    expect(legacyPromptGroup.router.systemPrompt).toContain('群级旧补充规则')
 
     // Legacy group routerMode migration
     const migratedGroup = LarkGroupConfigSchema.parse({
@@ -210,7 +242,7 @@ describe('Smart triage config, per-group overrides & protocol', () => {
     expect(shouldRunTriage(makeDecision({ trigger: 'substitute' }), allGroupCfg)).toBe(true)
   })
 
-  it('bypasses triage for images, files, and long/code non-listener payloads while keeping listener cards triaged', () => {
+  it('bypasses triage ONLY for non-text rich media (images/files/media/merge_forward) and never bypasses long text or code blocks', () => {
     expect(
       shouldFastBypassTriage(makeMsg({ imageKeys: ['img_1'] }), makeDecision({ trigger: 'mention' })).bypass,
     ).toBe(true)
@@ -218,11 +250,24 @@ describe('Smart triage config, per-group overrides & protocol', () => {
       shouldFastBypassTriage(makeMsg({ msgType: 'file' }), makeDecision({ trigger: 'listener' })).bypass,
     ).toBe(true)
     expect(
+      shouldFastBypassTriage(makeMsg({ msgType: 'media' }), makeDecision({ trigger: 'mention' })).bypass,
+    ).toBe(true)
+    expect(
+      shouldFastBypassTriage(makeMsg({ msgType: 'merge_forward' }), makeDecision({ trigger: 'mention' })).bypass,
+    ).toBe(true)
+    // Long text and fenced code blocks are NO LONGER bypassed
+    expect(
       shouldFastBypassTriage(
         makeMsg(),
         makeDecision({ trigger: 'mention', userText: '看下报错：\n```ts\nthrow new Error()\n```' }),
       ).bypass,
-    ).toBe(true)
+    ).toBe(false)
+    expect(
+      shouldFastBypassTriage(
+        makeMsg({ msgType: 'text' }),
+        makeDecision({ trigger: 'mention', userText: 'A'.repeat(2500) }),
+      ).bypass,
+    ).toBe(false)
     expect(
       shouldFastBypassTriage(
         makeMsg({ msgType: 'interactive' }),
@@ -231,7 +276,53 @@ describe('Smart triage config, per-group overrides & protocol', () => {
     ).toBe(false)
   })
 
-  it('parses tool calls and JSON fallback, enforces 2-state invariant for active workers, and fails open on malformed output', () => {
+  it('renders customizable System Prompt {{variables}}, preserves unknown placeholders, and falls back to default when empty', () => {
+    expect(TRIAGE_PROMPT_VARIABLES.map((v) => v.key)).toEqual([
+      'bot_name',
+      'bot_role',
+      'chat_name',
+      'trigger',
+      'trigger_guide',
+      'active_session_rule',
+      'listener_name',
+      'listener_prompt',
+    ])
+
+    const vars = buildTriageSystemPromptVars({
+      botName: 'TriageBot',
+      botRoleName: '值班架构师',
+      botRoleSummary: '专注稳定性与发布护航，不遗漏关键告警',
+      chatName: '稳定性告警群',
+      hasActiveWorker: true,
+      trigger: 'listener',
+      listenerName: '核心告警监听',
+      listenerPrompt: '仅在 P0/P1 故障时介入，P3 提醒静默',
+    })
+
+    const custom = renderTriageSystemPrompt(
+      'Bot={{bot_name}} Chat={{ chat_name }} Trigger={{trigger}} Rule={{listener_name}}\n\n{{listener_prompt}}\n\n{{bot_role}}\n\n{{active_session_rule}}\n\n{{trigger_guide}}\n\n保留={{unknown_var}}',
+      vars,
+    )
+    expect(custom).toContain('Bot=TriageBot Chat=稳定性告警群 Trigger=群主动监听 Rule=核心告警监听')
+    expect(custom).toContain('<listener_rule>\n仅在 P0/P1 故障时介入，P3 提醒静默\n</listener_rule>')
+    expect(custom).toContain('值班架构师')
+    expect(custom).toContain('has_active_session=true')
+    expect(custom).toContain('触发信号：群主动监听（旁听）')
+    expect(custom).toContain('保留={{unknown_var}}')
+
+    // Empty template falls back to DEFAULT_TRIAGE_SYSTEM_PROMPT and collapses blank lines from empty vars
+    const fallbackVars = buildTriageSystemPromptVars({
+      botName: 'TriageBot',
+      hasActiveWorker: false,
+      trigger: 'mention',
+    })
+    const renderedDefault = renderTriageSystemPrompt('   ', fallbackVars)
+    expect(renderedDefault).toContain('「TriageBot」')
+    expect(renderedDefault).toContain('has_active_session=false')
+    expect(renderedDefault).not.toMatch(/\n{3,}/)
+  })
+
+  it('parses tool calls and JSON fallback, enforces 2-state invariant for active sessions, and fails open on malformed output', () => {
     // 1. Structured tool call
     const v1 = parseTriageVerdict({
       toolCalls: [{ name: 'route_message', arguments: '{"action":"silent","reason":"纯确认语"}' }],
@@ -239,7 +330,7 @@ describe('Smart triage config, per-group overrides & protocol', () => {
     })
     expect(v1).toEqual({ action: 'silent', reason: '纯确认语' })
 
-    // 2. Active worker forbids quick_reply -> upgrades to handoff
+    // 2. Active session forbids quick_reply -> upgrades to handoff
     const v2 = parseTriageVerdict({
       toolCalls: [
         {
@@ -279,16 +370,20 @@ describe('Smart triage config, per-group overrides & protocol', () => {
     ).toMatchObject({ action: 'handoff', fallback: true })
   })
 
-  it('renders active-worker context, handoff context, and coalesced batch prompts cleanly', () => {
+  it('builds untruncated UserMessage with configurable recentMessageCount & includeLastReply, plus handoff & coalesced prompts', () => {
     const sys = buildTriageSystemPrompt({
       botName: 'TriageBot',
       hasActiveWorker: true,
       trigger: 'active-thread',
-      customPrompt: '涉及发布必须移交',
+      systemPromptTemplate: `${DEFAULT_TRIAGE_SYSTEM_PROMPT}\n\n涉及发布必须移交`,
     })
-    expect(sys).toContain('has_active_worker=true')
+    expect(sys).toContain('has_active_session=true')
     expect(sys).toContain('禁止使用 `quick_reply`')
     expect(sys).toContain('涉及发布必须移交')
+
+    const longIncoming = `超长日志正文-${'X'.repeat(4000)}-TAIL_MARKER`
+    const longLastReply = `上一轮完整回复-${'Y'.repeat(1200)}-LAST_REPLY_END`
+    const longHistory = `历史长消息-${'Z'.repeat(1000)}-HISTORY_END`
 
     const user = buildTriageUserMessage({
       botName: 'TriageBot',
@@ -296,20 +391,49 @@ describe('Smart triage config, per-group overrides & protocol', () => {
       trigger: 'active-thread',
       senderName: 'Alex',
       senderType: 'user',
-      userText: '好的，按方案 B 改',
+      userText: longIncoming,
       hasActiveWorker: true,
       workerBusy: false,
-      lastWorkerReplyExcerpt: '确认一下：你要按方案 A 还是方案 B 修改？',
-      recentMessages: [{ role: 'user', senderName: 'Alex', text: '登录偶发超时', timestampMs: 1 }],
+      lastWorkerReply: longLastReply,
+      recentMessages: [
+        { role: 'user', senderName: 'Sam', text: '较早消息 1', timestampMs: 1 },
+        { role: 'worker', text: '主回复 2', timestampMs: 2 },
+        { role: 'user', senderName: 'Alex', text: longHistory, timestampMs: 3 },
+      ],
+      recentMessageCount: 2,
+      includeLastReply: true,
     })
-    expect(user).toContain('<last_worker_reply>')
-    expect(user).toContain('方案 B')
-    expect(user).toContain('<recent_context>')
+    expect(user).toContain('has_active_session=true')
+    expect(user).toContain('session_busy=false')
+    expect(user).toContain('<last_reply>')
+    expect(user).toContain('LAST_REPLY_END')
+    expect(user).toContain('HISTORY_END')
+    expect(user).toContain('TAIL_MARKER')
+    expect(user).toContain('- [智能体] 主回复 2')
+    expect(user).not.toContain('较早消息 1')
+
+    // Disable recent context and last reply via config
+    const strippedUser = buildTriageUserMessage({
+      botName: 'TriageBot',
+      chatName: '研发群',
+      trigger: 'active-thread',
+      senderName: 'Alex',
+      senderType: 'user',
+      userText: '短回复',
+      hasActiveWorker: true,
+      lastWorkerReply: longLastReply,
+      recentMessages: [{ role: 'user', senderName: 'Alex', text: '历史', timestampMs: 1 }],
+      recentMessageCount: 0,
+      includeLastReply: false,
+    })
+    expect(strippedUser).not.toContain('<last_reply>')
+    expect(strippedUser).not.toContain('<recent_context>')
+    expect(strippedUser).toContain('<incoming_message>\n短回复\n</incoming_message>')
 
     const handoff = composeRouterHandoffReminder([
       { senderName: 'Alex', userText: '在吗', routerReply: '在的，有什么需要帮忙？', timestampMs: 1 },
     ])
-    expect(handoff).toContain('<router_handoff_context>')
+    expect(handoff).toContain('<triage_handoff_context>')
     expect(handoff).toContain('在吗')
 
     const batch = composeCoalescedUserText([

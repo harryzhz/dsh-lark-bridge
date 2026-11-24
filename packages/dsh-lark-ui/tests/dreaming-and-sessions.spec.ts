@@ -21,7 +21,7 @@ vi.mock('@deepseek-ai/dsh-client-ui-primitives', () => {
 
 import { buildDreamStatusPresentation } from '../src/components/ExperimentalSection.js'
 import { mergeSessionRows } from '../src/views/SessionsView.js'
-import type { DreamRunState, DreamSession, SessionBinding } from '../src/types.js'
+import type { DreamRunState, DreamSession, SessionBinding, TriageSession } from '../src/types.js'
 
 describe('Dreaming status presentation & unified SessionsView merging', () => {
   it('splits legacy and structured Dreaming summaries into a clear header and note', () => {
@@ -128,22 +128,45 @@ describe('Dreaming status presentation & unified SessionsView merging', () => {
       },
     ]
 
-    const all = mergeSessionRows(bindings, dreams, 'all')
-    expect(all.map((r) => (r.kind === 'chat' ? r.binding.sessionId : r.dream.sessionId))).toEqual([
+    const triages: TriageSession[] = [
+      {
+        sessionId: 'sess-triage-1',
+        botId: 'bot-1',
+        botName: '研发助手',
+        chatId: 'oc_team',
+        chatName: '研发协作群',
+        workspaceName: 'demo',
+        workingDir: '/Users/demo/project',
+        routeKey: 'bot-1:oc_team:om_1',
+        trigger: 'listener',
+        action: 'silent',
+        reason: '日常确认语',
+        provider: 'deepseek',
+        model: 'deepseek-chat',
+        durationMs: 320,
+        createdAtMs: 2400,
+        lastActivityMs: 2500,
+      },
+    ]
+
+    const rowId = (r: ReturnType<typeof mergeSessionRows>[number]) =>
+      r.kind === 'chat' ? r.binding.sessionId : r.kind === 'triage' ? r.triage.sessionId : r.dream.sessionId
+
+    const all = mergeSessionRows(bindings, dreams, 'all', triages)
+    expect(all.map(rowId)).toEqual([
       'sess-dream-new',
+      'sess-triage-1',
       'sess-chat-1',
       'sess-dream-old',
     ])
 
-    const chatOnly = mergeSessionRows(bindings, dreams, 'chat')
-    expect(chatOnly.map((r) => (r.kind === 'chat' ? r.binding.sessionId : r.dream.sessionId))).toEqual([
-      'sess-chat-1',
-    ])
+    const chatOnly = mergeSessionRows(bindings, dreams, 'chat', triages)
+    expect(chatOnly.map(rowId)).toEqual(['sess-chat-1'])
 
-    const dreamOnly = mergeSessionRows(bindings, dreams, 'dreaming')
-    expect(dreamOnly.map((r) => (r.kind === 'chat' ? r.binding.sessionId : r.dream.sessionId))).toEqual([
-      'sess-dream-new',
-      'sess-dream-old',
-    ])
+    const triageOnly = mergeSessionRows(bindings, dreams, 'triage', triages)
+    expect(triageOnly.map(rowId)).toEqual(['sess-triage-1'])
+
+    const dreamOnly = mergeSessionRows(bindings, dreams, 'dreaming', triages)
+    expect(dreamOnly.map(rowId)).toEqual(['sess-dream-new', 'sess-dream-old'])
   })
 })

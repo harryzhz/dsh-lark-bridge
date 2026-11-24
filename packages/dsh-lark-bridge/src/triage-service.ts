@@ -1,5 +1,16 @@
 import type { Context } from '@deepseek-ai/cordis'
-import type { ReasoningEffortId, ToolSchema } from '@deepseek-ai/dsh-llm'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import {
+  AssistantStreamAccumulator,
+  BlockAssembler,
+  type AssistantStreamRecord,
+  type ContentBlock,
+  type ReasoningEffortId,
+  type StreamChunk,
+  type TokenUsage,
+  type ToolCallId,
+  type ToolSchema,
+} from '@deepseek-ai/dsh-llm'
 import {
   ROUTE_MESSAGE_TOOL_SCHEMA,
   buildTriageSystemPrompt,
@@ -15,20 +26,21 @@ import {
   type TriageVerdict,
 } from '@dsh-lark/lark-core'
 import type { RuntimeCatalog } from './runtime-catalog.js'
+import type { TriageSessionRecorder } from './triage-session-recorder.js'
 
-const CONTEXT_TTL_MS = 30 * 60_000
+const DEFAULT_CONTEXT_TTL_MS = 30 * 60_000
+const MAX_RETAINED_CONTEXT_TTL_MS = 24 * 60 * 60_000
 const MAX_SCOPE_ENTRIES = 200
-const MAX_MESSAGES_PER_SCOPE = 8
-const MAX_EPHEMERAL_TURNS = 6
-const MAX_WORKER_EXCERPT_CHARS = 400
+const MAX_MESSAGES_PER_SCOPE = 50
+const MAX_EPHEMERAL_TURNS = 12
 
 interface ScopedHistoryBucket {
   readonly entries: TriageHistoryEntry[]
   updatedAtMs: number
 }
 
-interface WorkerReplySummary {
-  readonly excerpt: string
+interface WorkerReplyRecord {
+  readonly text: string
   readonly updatedAtMs: number
 }
 
@@ -59,16 +71,17 @@ export interface TriageEvaluationResult {
   readonly provider?: string
   readonly model?: string
   readonly durationMs: number
+  readonly triageSessionId?: string
 }
 
 /**
- * Bounded in-memory sliding context and ephemeral Router quick-reply thread store.
- * Keeps zero disk overhead while providing enough recent context for accurate triage
- * and lossless handoff when a quick-reply thread escalates to a Worker.
+ * Bounded in-memory sliding context and ephemeral quick-reply thread store.
+ * Retains full, untruncated recent messages up to `MAX_MESSAGES_PER_SCOPE` per scope
+ * so configurable `recentMessageCount` and `contextTtlMinutes` slice cleanly without loss.
  */
 export class TriageContextStore {
   private readonly recentByScope = new Map<string, ScopedHistoryBucket>()
-  private readonly workerSummaryByRoute = new Map<string, WorkerReplySummary>()
+  private readonly workerSummaryByRoute = new Map<string, WorkerReplyRecord>()
   private readonly ephemeralThreads = new Map<string, EphemeralRouterThread>()
   private readonly ephemeralAliases = new Map<string, string>()
 
@@ -76,7 +89,7 @@ export class TriageContextStore {
     const primaryKey = this.ephemeralAliases.get(routeKey) ?? routeKey
     const thread = this.ephemeralThreads.get(primaryKey)
     if (!thread) return undefined
-    if (now - thread.updatedAtMs > CONTEXT_TTL_MS) {
+    if (now - thread.updatedAtMs > DEFAULT_CONTEXT_TTL_MS) {
       this.deleteEphemeralThread(primaryKey)
       return undefined
     }
@@ -171,36 +184,46 @@ export class TriageContextStore {
   recordWorkerReply(routeKey: string, replyText: string, now = Date.now()): void {
     const trimmed = replyText.trim()
     if (!trimmed) return
-    const excerpt =
-      trimmed.length > MAX_WORKER_EXCERPT_CHARS
-        ? `…${trimmed.slice(trimmed.length - MAX_WORKER_EXCERPT_CHARS)}`
-        : trimmed
-    this.workerSummaryByRoute.set(routeKey, { excerpt, updatedAtMs: now })
-    this.appendHistory(routeKey, { role: 'worker', text: excerpt, timestampMs: now }, now)
+    this.workerSummaryByRoute.set(routeKey, { text: trimmed, updatedAtMs: now })
+    this.appendHistory(routeKey, { role: 'worker', text: trimmed, timestampMs: now }, now)
     this.enforceBounds()
   }
 
-  getRecentMessages(routeKey: string, chatScopeKey: string, now = Date.now()): readonly TriageHistoryEntry[] {
+  getRecentMessages(
+    routeKey: string,
+    chatScopeKey: string,
+    options: { readonly ttlMs?: number; readonly maxCount?: number; readonly now?: number } = {},
+  ): readonly TriageHistoryEntry[] {
+    const now = options.now ?? Date.now()
+    const ttlMs = options.ttlMs ?? DEFAULT_CONTEXT_TTL_MS
+    const maxCount = options.maxCount ?? MAX_MESSAGES_PER_SCOPE
+    if (maxCount <= 0) return []
+
     const resolvedRoute = this.resolveEphemeralPrimary(routeKey, now) ?? routeKey
-    const routeBucket = this.recentByScope.get(resolvedRoute)
-    if (routeBucket && now - routeBucket.updatedAtMs <= CONTEXT_TTL_MS && routeBucket.entries.length > 0) {
-      return [...routeBucket.entries]
+    const pickFrom = (scopeKey: string): TriageHistoryEntry[] => {
+      const bucket = this.recentByScope.get(scopeKey)
+      if (!bucket) return []
+      const fresh = bucket.entries.filter((e) => now - e.timestampMs <= ttlMs)
+      return fresh.slice(-maxCount)
     }
-    const chatBucket = this.recentByScope.get(chatScopeKey)
-    if (chatBucket && now - chatBucket.updatedAtMs <= CONTEXT_TTL_MS && chatBucket.entries.length > 0) {
-      return [...chatBucket.entries]
-    }
-    return []
+
+    const fromRoute = pickFrom(resolvedRoute)
+    if (fromRoute.length > 0) return fromRoute
+    return pickFrom(chatScopeKey)
   }
 
-  getLastWorkerReplyExcerpt(routeKey: string, now = Date.now()): string | undefined {
+  getLastWorkerReply(
+    routeKey: string,
+    options: { readonly ttlMs?: number; readonly now?: number } = {},
+  ): string | undefined {
+    const now = options.now ?? Date.now()
+    const ttlMs = options.ttlMs ?? DEFAULT_CONTEXT_TTL_MS
     const summary = this.workerSummaryByRoute.get(routeKey)
     if (!summary) return undefined
-    if (now - summary.updatedAtMs > CONTEXT_TTL_MS) {
-      this.workerSummaryByRoute.delete(routeKey)
+    if (now - summary.updatedAtMs > ttlMs) {
       return undefined
     }
-    return summary.excerpt
+    return summary.text
   }
 
   clearRoute(routeKey: string): void {
@@ -212,7 +235,7 @@ export class TriageContextStore {
 
   private appendHistory(scopeKey: string, entry: TriageHistoryEntry, now: number): void {
     let bucket = this.recentByScope.get(scopeKey)
-    if (!bucket || now - bucket.updatedAtMs > CONTEXT_TTL_MS) {
+    if (!bucket || now - bucket.updatedAtMs > MAX_RETAINED_CONTEXT_TTL_MS) {
       bucket = { entries: [], updatedAtMs: now }
       this.recentByScope.set(scopeKey, bucket)
     }
@@ -236,13 +259,15 @@ export class TriageContextStore {
 
   private pruneExpired(now: number): void {
     for (const [key, bucket] of this.recentByScope) {
-      if (now - bucket.updatedAtMs > CONTEXT_TTL_MS) this.recentByScope.delete(key)
+      if (now - bucket.updatedAtMs > MAX_RETAINED_CONTEXT_TTL_MS) this.recentByScope.delete(key)
     }
     for (const [key, summary] of this.workerSummaryByRoute) {
-      if (now - summary.updatedAtMs > CONTEXT_TTL_MS) this.workerSummaryByRoute.delete(key)
+      if (now - summary.updatedAtMs > MAX_RETAINED_CONTEXT_TTL_MS) {
+        this.workerSummaryByRoute.delete(key)
+      }
     }
     for (const [key, thread] of this.ephemeralThreads) {
-      if (now - thread.updatedAtMs > CONTEXT_TTL_MS) this.deleteEphemeralThread(key)
+      if (now - thread.updatedAtMs > DEFAULT_CONTEXT_TTL_MS) this.deleteEphemeralThread(key)
     }
   }
 
@@ -265,9 +290,19 @@ export class TriageContextStore {
   }
 }
 
+function normalizeChunkForRecording(chunk: StreamChunk, fallbackCallId: () => ToolCallId): StreamChunk {
+  if (chunk.type === 'block-end' && chunk.block.type === 'tool-call' && !chunk.block.id) {
+    return {
+      ...chunk,
+      block: { ...chunk.block, id: fallbackCallId() },
+    }
+  }
+  return chunk
+}
+
 /**
  * Stateless, concurrent, Fail-Open fast triage gate backed by DSH native `ctx.llm.stream()`.
- * Never creates DSH sessions, never attaches workspaces, and never blocks on Worker queues.
+ * Optionally persists each invocation as a standard archived DSH v4 inspection session.
  */
 export class LlmTriageService {
   readonly context = new TriageContextStore()
@@ -275,6 +310,7 @@ export class LlmTriageService {
   constructor(
     private readonly ctx: Context,
     private readonly runtimes: RuntimeCatalog,
+    private readonly recorder?: TriageSessionRecorder,
   ) {}
 
   async evaluate(input: EvaluateTriageInput): Promise<TriageEvaluationResult> {
@@ -282,11 +318,13 @@ export class LlmTriageService {
     const failOpen = (
       reason: string,
       resolved?: { readonly provider?: string; readonly model?: string },
+      triageSessionId?: string,
     ): TriageEvaluationResult => ({
       verdict: { action: 'handoff', reason, fallback: true },
       ...(resolved?.provider ? { provider: resolved.provider } : {}),
       ...(resolved?.model ? { model: resolved.model } : {}),
       durationMs: Date.now() - startedAtMs,
+      ...(triageSessionId ? { triageSessionId } : {}),
     })
 
     if (!this.ctx.llm || typeof this.ctx.llm.stream !== 'function') {
@@ -304,11 +342,124 @@ export class LlmTriageService {
     }
 
     const reasoningPlan = await this.resolveTriageReasoningPlan(target.provider, target.model)
+    const { system, userText } = this.buildTriagePrompts(input)
+    const toolSchema: ToolSchema = {
+      name: ROUTE_MESSAGE_TOOL_SCHEMA.name,
+      description: ROUTE_MESSAGE_TOOL_SCHEMA.description,
+      parameters: ROUTE_MESSAGE_TOOL_SCHEMA.parameters,
+    }
+    const maxTokens = reasoningPlan.reasoningActive ? 1024 : 256
+    const temperature = reasoningPlan.reasoningActive ? undefined : 0.1
+
+    if (input.signal?.aborted) {
+      return failOpen('服务正在关闭，跳过分流', target)
+    }
+
+    const run = await this.executeTriageStream({
+      target,
+      reasoningEffort: reasoningPlan.effort,
+      system,
+      userText,
+      toolSchema,
+      maxTokens,
+      temperature,
+      timeoutMs: input.routerConfig.timeoutMs,
+      parentSignal: input.signal,
+    })
+
+    const finishedAtMs = Date.now()
+    const durationMs = finishedAtMs - startedAtMs
+
+    if (run.errorMessage) {
+      this.ctx.logger.warn(
+        `[lark-bridge][trace=${input.traceId}][bot=${input.bot.id}] triage fail-open (${target.provider}/${target.model}): ${run.errorMessage}`,
+      )
+      const fallbackReason = run.timedOut
+        ? '分流超时，自动直通主运行时'
+        : '分流异常，自动直通主运行时'
+      const fallbackVerdict: TriageVerdict = {
+        action: 'handoff',
+        reason: fallbackReason,
+        fallback: true,
+      }
+      const triageSessionId = await this.recorder?.record({
+        bot: input.bot,
+        msg: input.msg,
+        decision: input.decision,
+        ...(input.senderName ? { senderName: input.senderName } : {}),
+        ...(input.resolvedChatName ? { chatName: input.resolvedChatName } : {}),
+        provider: target.provider,
+        model: target.model,
+        ...(reasoningPlan.effort ? { reasoningEffort: reasoningPlan.effort } : {}),
+        maxTokens,
+        ...(temperature !== undefined ? { temperature } : {}),
+        toolSchema,
+        systemPrompt: system,
+        userMessage: userText,
+        blocks: run.blocks,
+        stream: run.stream,
+        ...(run.usage ? { usage: run.usage } : {}),
+        verdict: fallbackVerdict,
+        errorMessage: run.errorMessage,
+        timedOut: run.timedOut,
+        startedAtMs,
+        finishedAtMs,
+        durationMs,
+      })
+      return failOpen(fallbackReason, target, triageSessionId)
+    }
+
+    const verdict = parseTriageVerdict({
+      toolCalls: run.toolCalls,
+      text: run.assembledText,
+      hasActiveWorker: input.hasActiveWorker,
+    })
+    const triageSessionId = await this.recorder?.record({
+      bot: input.bot,
+      msg: input.msg,
+      decision: input.decision,
+      ...(input.senderName ? { senderName: input.senderName } : {}),
+      ...(input.resolvedChatName ? { chatName: input.resolvedChatName } : {}),
+      provider: target.provider,
+      model: target.model,
+      ...(reasoningPlan.effort ? { reasoningEffort: reasoningPlan.effort } : {}),
+      maxTokens,
+      ...(temperature !== undefined ? { temperature } : {}),
+      toolSchema,
+      systemPrompt: system,
+      userMessage: userText,
+      blocks: run.blocks,
+      stream: run.stream,
+      ...(run.usage ? { usage: run.usage } : {}),
+      verdict,
+      startedAtMs,
+      finishedAtMs,
+      durationMs,
+    })
+
+    return {
+      verdict,
+      provider: target.provider,
+      model: target.model,
+      durationMs,
+      ...(triageSessionId ? { triageSessionId } : {}),
+    }
+  }
+
+  private buildTriagePrompts(input: EvaluateTriageInput): {
+    readonly system: string
+    readonly userText: string
+  } {
     const chatScopeKey = `chat:${input.bot.id}:${input.msg.chatId}`
-    const recentMessages = this.context.getRecentMessages(input.decision.routeKey, chatScopeKey)
-    const lastWorkerReplyExcerpt = input.hasActiveWorker
-      ? this.context.getLastWorkerReplyExcerpt(input.decision.routeKey)
-      : undefined
+    const ttlMs = input.routerConfig.contextTtlMinutes * 60_000
+    const recentMessages = this.context.getRecentMessages(input.decision.routeKey, chatScopeKey, {
+      ttlMs,
+      maxCount: input.routerConfig.recentMessageCount,
+    })
+    const lastWorkerReply =
+      input.hasActiveWorker && input.routerConfig.includeLastReply
+        ? this.context.getLastWorkerReply(input.decision.routeKey, { ttlMs })
+        : undefined
 
     const roleName =
       input.group?.role?.mode === 'override'
@@ -325,12 +476,16 @@ export class LlmTriageService {
       botName: input.bot.name,
       ...(roleName ? { botRoleName: roleName } : {}),
       ...(roleSummary ? { botRoleSummary: roleSummary } : {}),
+      ...(input.resolvedChatName ? { chatName: input.resolvedChatName } : {}),
       hasActiveWorker: input.hasActiveWorker,
       trigger: input.decision.trigger,
+      ...(input.decision.listenerName ? { listenerName: input.decision.listenerName } : {}),
       ...(input.decision.trigger === 'listener' && input.group?.listener?.prompt
         ? { listenerPrompt: input.group.listener.prompt }
         : {}),
-      ...(input.routerConfig.customPrompt ? { customPrompt: input.routerConfig.customPrompt } : {}),
+      ...(input.routerConfig.systemPrompt
+        ? { systemPromptTemplate: input.routerConfig.systemPrompt }
+        : {}),
     })
 
     const userText = buildTriageUserMessage({
@@ -345,50 +500,80 @@ export class LlmTriageService {
       userText: input.decision.userText,
       hasActiveWorker: input.hasActiveWorker,
       workerBusy: input.workerBusy,
-      ...(lastWorkerReplyExcerpt ? { lastWorkerReplyExcerpt } : {}),
+      ...(lastWorkerReply ? { lastWorkerReply } : {}),
       recentMessages,
+      recentMessageCount: input.routerConfig.recentMessageCount,
+      includeLastReply: input.routerConfig.includeLastReply,
     })
 
+    return { system, userText }
+  }
+
+  private async executeTriageStream(params: {
+    readonly target: { readonly provider: string; readonly model: string }
+    readonly reasoningEffort?: ReasoningEffortId
+    readonly system: string
+    readonly userText: string
+    readonly toolSchema: ToolSchema
+    readonly maxTokens: number
+    readonly temperature?: number
+    readonly timeoutMs: number
+    readonly parentSignal?: AbortSignal
+  }): Promise<{
+    readonly toolCalls: ReadonlyArray<{ readonly name: string; readonly arguments: string }>
+    readonly assembledText: string
+    readonly blocks: readonly ContentBlock[]
+    readonly stream: readonly AssistantStreamRecord[]
+    readonly usage?: TokenUsage
+    readonly errorMessage?: string
+    readonly timedOut: boolean
+  }> {
     const controller = new AbortController()
     let timedOut = false
     const onParentAbort = () => controller.abort()
-    if (input.signal) {
-      if (input.signal.aborted) {
-        return failOpen('服务正在关闭，跳过分流', target)
-      }
-      input.signal.addEventListener('abort', onParentAbort, { once: true })
-    }
+    params.parentSignal?.addEventListener('abort', onParentAbort, { once: true })
     const timeoutTimer = setTimeout(() => {
       timedOut = true
       controller.abort()
-    }, input.routerConfig.timeoutMs)
+    }, params.timeoutMs)
     timeoutTimer.unref?.()
 
+    const accumulator = new AssistantStreamAccumulator()
+    const assembler = new BlockAssembler()
+    let usage: TokenUsage | undefined
+    let syntheticCallSeq = 0
+    const nextCallId = () => brandString<ToolCallId>(`triage_call_${++syntheticCallSeq}`)
+
+    const textChunks: string[] = []
+    const blockTexts: string[] = []
+    const finalizedToolCalls: Array<{ name: string; arguments: string }> = []
+    const pendingToolCalls = new Map<number, { name: string; arguments: string }>()
+
     try {
-      const toolSchema: ToolSchema = {
-        name: ROUTE_MESSAGE_TOOL_SCHEMA.name,
-        description: ROUTE_MESSAGE_TOOL_SCHEMA.description,
-        parameters: ROUTE_MESSAGE_TOOL_SCHEMA.parameters,
-      }
       const stream = this.ctx.llm.stream({
-        provider: target.provider,
-        model: target.model,
-        ...(reasoningPlan.effort ? { reasoningEffort: reasoningPlan.effort } : {}),
-        system,
-        messages: [{ role: 'user', content: [{ type: 'text', text: userText }] }],
-        tools: [toolSchema],
-        maxTokens: reasoningPlan.reasoningActive ? 1024 : 256,
-        ...(reasoningPlan.reasoningActive ? {} : { temperature: 0.1 }),
+        provider: params.target.provider,
+        model: params.target.model,
+        ...(params.reasoningEffort ? { reasoningEffort: params.reasoningEffort } : {}),
+        system: params.system,
+        messages: [{ role: 'user', content: [{ type: 'text', text: params.userText }] }],
+        tools: [params.toolSchema],
+        maxTokens: params.maxTokens,
+        ...(params.temperature !== undefined ? { temperature: params.temperature } : {}),
         signal: controller.signal,
       })
 
-      const textChunks: string[] = []
-      const blockTexts: string[] = []
-      const finalizedToolCalls: Array<{ name: string; arguments: string }> = []
-      const pendingToolCalls = new Map<number, { name: string; arguments: string }>()
+      for await (const rawChunk of stream) {
+        const chunk = normalizeChunkForRecording(rawChunk, nextCallId)
+        try {
+          accumulator.push({ time: Date.now(), chunk })
+          assembler.push(chunk)
+        } catch {
+          // Never break triage parsing if a provider emits non-standard stream ordering.
+        }
 
-      for await (const chunk of stream) {
-        if (chunk.type === 'text-delta') {
+        if (chunk.type === 'usage') {
+          usage = chunk.usage
+        } else if (chunk.type === 'text-delta') {
           textChunks.push(chunk.text)
         } else if (chunk.type === 'tool-call-delta') {
           const entry = pendingToolCalls.get(chunk.index) ?? { name: '', arguments: '' }
@@ -397,10 +582,7 @@ export class LlmTriageService {
           pendingToolCalls.set(chunk.index, entry)
         } else if (chunk.type === 'block-end') {
           if (chunk.block.type === 'tool-call') {
-            finalizedToolCalls.push({
-              name: chunk.block.name,
-              arguments: chunk.block.arguments,
-            })
+            finalizedToolCalls.push({ name: chunk.block.name, arguments: chunk.block.arguments })
             pendingToolCalls.delete(chunk.index)
           } else if (chunk.block.type === 'text' && chunk.block.text) {
             blockTexts.push(chunk.block.text)
@@ -418,32 +600,57 @@ export class LlmTriageService {
       for (const leftover of pendingToolCalls.values()) {
         if (leftover.name) finalizedToolCalls.push(leftover)
       }
-
       const assembledText = textChunks.join('') || blockTexts.join('')
-      const verdict = parseTriageVerdict({
-        toolCalls: finalizedToolCalls,
-        text: assembledText,
-        hasActiveWorker: input.hasActiveWorker,
-      })
+      const blocks = this.collectRecordedBlocks(assembler, finalizedToolCalls, assembledText, nextCallId)
       return {
-        verdict,
-        provider: target.provider,
-        model: target.model,
-        durationMs: Date.now() - startedAtMs,
+        toolCalls: finalizedToolCalls,
+        assembledText,
+        blocks,
+        stream: accumulator.snapshot(),
+        ...(usage ? { usage } : {}),
+        timedOut: false,
       }
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      this.ctx.logger.warn(
-        `[lark-bridge][trace=${input.traceId}][bot=${input.bot.id}] triage fail-open (${target.provider}/${target.model}): ${msg}`,
-      )
-      return failOpen(
-        timedOut ? '分流超时，自动直通主运行时' : '分流异常，自动直通主运行时',
-        target,
-      )
+      return {
+        toolCalls: finalizedToolCalls,
+        assembledText: textChunks.join('') || blockTexts.join(''),
+        blocks: assembler.blocks(),
+        stream: accumulator.snapshot(),
+        ...(usage ? { usage } : {}),
+        errorMessage: err instanceof Error ? err.message : String(err),
+        timedOut,
+      }
     } finally {
       clearTimeout(timeoutTimer)
-      input.signal?.removeEventListener('abort', onParentAbort)
+      params.parentSignal?.removeEventListener('abort', onParentAbort)
     }
+  }
+
+  private collectRecordedBlocks(
+    assembler: BlockAssembler,
+    finalizedToolCalls: ReadonlyArray<{ readonly name: string; readonly arguments: string }>,
+    assembledText: string,
+    nextCallId: () => ToolCallId,
+  ): ContentBlock[] {
+    const assembled = assembler.blocks()
+    if (assembled.length > 0) {
+      return assembled.map((block) =>
+        block.type === 'tool-call' && !block.id ? { ...block, id: nextCallId() } : block,
+      )
+    }
+    const fallbackBlocks: ContentBlock[] = []
+    if (assembledText.trim()) {
+      fallbackBlocks.push({ type: 'text', text: assembledText })
+    }
+    for (const tc of finalizedToolCalls) {
+      fallbackBlocks.push({
+        type: 'tool-call',
+        id: nextCallId(),
+        name: tc.name,
+        arguments: tc.arguments,
+      })
+    }
+    return fallbackBlocks
   }
 
   private async resolveTriageReasoningPlan(

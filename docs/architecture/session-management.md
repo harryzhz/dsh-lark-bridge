@@ -336,18 +336,25 @@ sequenceDiagram
 
 ## 7. 智能分流与忙碌队列合批
 
-当群聊消息高频且混杂闲聊、确认语与正式研发任务时，可在智能体「Agent 运行时 → 智能分流」开启无状态前置分流，也可在单个群聊「Agent 运行时 → 智能分流」中独立覆盖（支持 `跟随智能体` / `独立配置` / `关闭`，涵盖分流模型、生效范围、分流超时、忙碌队列合批与群级补充判断规则），以消除高思考主运行时的冷启动与排队阻塞：
+当群聊消息高频且混杂闲聊、确认语与正式研发任务时，可在智能体「Agent 运行时 → 智能分流」开启无状态前置分流，也可在单个群聊「Agent 运行时 → 智能分流」中独立覆盖（支持 `跟随智能体` / `独立配置` / `关闭`，涵盖分流模型、生效范围、分流超时、上下文条数与有效窗口、上一轮回复开关、忙碌队列合批与完整自定义 System Prompt），以消除高思考主运行时的冷启动与排队阻塞：
 
-- **无状态轻量分流闸门（`LlmTriageService`）**：直接调用 DSH 原生或自定义配置的 `ctx.llm.stream()`（自动选择模型最低推理强度、思考模型自动省略 `temperature` 并放宽 `maxTokens`、不创建 DSH Session、不挂载工作区、并发不阻塞主运行时），通过结构化 `route_message` 工具调用（兼容 JSON 回退）输出三态裁决：
-  - `silent`：闲聊或无需回应的纯确认语，零飞书写入（不贴 `OnIt` 表情）、零会话创建；
-  - `quick_reply`：**仅在当前路由尚无活跃主会话时允许**，直接以简洁纯文本回复并在内存记录临时轻回复话题（TTL 30 分钟）；若群友随后在该话题下免 `@` 追问并升级为正式任务，自动将前序问答拼装为 `<router_handoff_context>` 注入主运行时首轮并承接话题别名；
-  - `handoff`：安静贴上 `OnIt` 表情并直接交由当前 Agent 主运行时接管处理，后续由主运行时直接回复飞书，不再经分流层转发。
-- **已接管话题防误杀不变量**：当 `routeKey` 已存在活跃主会话绑定时，裁决空间强制收敛为 `silent | handoff`（禁止 `quick_reply`），并向分流模型喂入主运行时当前运行状态与上一轮回复末尾摘要，避免把对反问的“好的 / 选 B”误判为普通确认吞掉。
+- **可定制 System Prompt 与固定工具契约**：
+  - 支持在配置页编辑完整 System Prompt，并通过 `{{bot_name}}`、`{{bot_role}}`、`{{chat_name}}`、`{{trigger}}`、`{{trigger_guide}}`、`{{active_session_rule}}`、`{{listener_name}}`、`{{listener_prompt}}` 占位注入运行时上下文（空变量自动折叠多余空行；留空回退内置默认模板；存量旧版 `customPrompt` 读取时自动合并迁移）；
+  - `route_message` 工具定义（`silent` / `quick_reply` / `handoff`）固定下发，不可被用户修改；
+  - `UserMessage` 与监听/角色规则**全文透传不截断**，近期群聊或话题消息条数由 `recentMessageCount`（0–50，默认 6）、有效时间窗由 `contextTtlMinutes`（1–1440 分钟，默认 30）、是否附带上一轮主回复全文由 `includeLastReply`（默认开启）控制。
+- **轻量分流闸门与可查看特殊会话（`LlmTriageService` + `TriageSessionRecorder`）**：
+  - 热路径直接调用 DSH 原生或自定义配置的 `ctx.llm.stream()`（自动选择模型最低推理强度、思考模型自动省略 `temperature` 并放宽 `maxTokens`、不启动 Agent 循环、不阻塞主运行时队列）；
+  - 每次模型调用完成后通过 `ctx.sessionPersistence` 落盘为标准 DSH v4 特殊会话（完整保留 `system/message`、`request/header`、`user/message`、模型 `reasoning` / `tool-call` / `usage` 与 `tool/call` + `tool/result`），挂载对应工作区并**立即自动归档**（不污染左侧主栏），同时写入 SQLite `triage_sessions`（默认保留最近 200 条，支持单删与清空），可在控制台「会话 → 智能分流」及「运行日志」一键打开复盘：
+    - `silent`：闲聊或无需回应的纯确认语，零飞书写入（不贴 `OnIt` 表情），运行日志 `静默` 记录关联该分流会话；
+    - `quick_reply`：**仅在当前路由尚无活跃主会话时允许**，直接以简洁纯文本回复并在内存记录临时轻回复话题（TTL 30 分钟），运行日志 `回复` 记录关联该分流会话；若群友随后在该话题下免 `@` 追问并升级为正式任务，自动将前序问答拼装为 `<triage_handoff_context>` 注入主运行时首轮并承接话题别名；
+    - `handoff` / 回退直通：记录 `分流` 审计事件关联该分流会话并回填转交后的主会话 ID，随后安静贴上 `OnIt` 表情由主运行时接管处理。
+- **已接管话题防误杀不变量**：当 `routeKey` 已存在活跃主会话绑定时，裁决空间强制收敛为 `silent | handoff`（禁止 `quick_reply`），并在启用 `includeLastReply` 时喂入上一轮主回复全文，避免把对反问的“好的 / 选 B”误判为普通确认吞掉。
 - **两种生效范围与 Fail-Open 安全网**：
   - `passive_only`（推荐默认）：仅拦截 `listener` 与 `active-thread`，显式 `@Bot` 直达主运行时；
   - `all_group`：覆盖全部群聊消息（含显式 `@Bot`），私聊 `p2p` 始终直达主运行时；
-  - 含图片/文件附件、非监听长文本或代码块、原生模型未配置、分流超时（默认 4s）或异常时均自动安静 Fail-Open 直通主运行时。
+  - 含图片 / 文件 / 媒体 / 合并转发附件（轻量文本通道无法读取内容）、原生模型未配置、分流超时（默认 4s）或异常时均自动安静 Fail-Open 直通主运行时（文本长度与代码块不再硬编码跳过）。
 - **忙碌队列合批（`coalesceQueuedMessages`）**：当目标 `SessionActor` 正在 `running` 时，期间通过分流进入等待区的多条有效消息自动合并为一个增量批次，在当前回合结束后作为单轮 Turn 提交给主运行时，统一清理全部批次表情与待完成记录；空闲会话首条消息零等待直发。
+- **冷会话与归档会话可靠跳转（`activateDshSessionDetailed`）**：当 `per_message`、未回复监听静默、Dreaming、空闲归档或智能分流会话释放内存句柄时，DSH 会将其从浏览器内存目录 `sessions.list.byId` 移出但保留磁盘持久化日志；控制台在点击「查看 / 打开」或触发深链接时若发现目标不在内存目录，会自动触发 `sessions.refresh()` 重新冷拉并等待投影同步、按需取消归档并等待状态同步后再打开，若磁盘记录确已清理则以 toast 明确提示用户。
 
 ---
 

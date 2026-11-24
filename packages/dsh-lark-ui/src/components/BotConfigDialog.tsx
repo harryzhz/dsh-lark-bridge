@@ -37,6 +37,7 @@ import type {
   QrJobView,
   RuntimeOption,
   SubstituteTarget,
+  TriageDefaultsPayload,
 } from '../types.js'
 import { AgentRuntimeFields } from './AgentRuntimeFields.js'
 import { ConfigDialog, type ConfigSection } from './ConfigDialog.js'
@@ -95,7 +96,10 @@ export const DEFAULT_ROUTER_CONFIG: BotRouterConfig = {
   model: '',
   scope: 'passive_only',
   timeoutMs: 4000,
-  customPrompt: '',
+  systemPrompt: '',
+  recentMessageCount: 6,
+  contextTtlMinutes: 30,
+  includeLastReply: true,
   coalesceQueuedMessages: true,
 }
 
@@ -203,6 +207,7 @@ export function BotConfigDialog({
   bots,
   runtimes,
   models,
+  triageDefaults,
   auth,
   onClose,
   onSave,
@@ -218,6 +223,7 @@ export function BotConfigDialog({
   bots: readonly BotRecord[]
   runtimes: readonly RuntimeOption[]
   models: readonly ModelGroup[]
+  triageDefaults?: TriageDefaultsPayload
   auth: AuthStatusPayload | null
   onClose: () => void
   onSave: (config: BotConfig, existingId: string | null) => Promise<void>
@@ -251,6 +257,7 @@ export function BotConfigDialog({
       target={target}
       runtimes={runtimes}
       models={models}
+      triageDefaults={triageDefaults}
       auth={auth}
       onClose={onClose}
       onSave={onSave}
@@ -800,6 +807,7 @@ function EditBotDialog({
   target,
   runtimes,
   models,
+  triageDefaults,
   auth,
   onClose,
   onSave,
@@ -811,6 +819,7 @@ function EditBotDialog({
   target: BotRecord
   runtimes: readonly RuntimeOption[]
   models: readonly ModelGroup[]
+  triageDefaults?: TriageDefaultsPayload
   auth: AuthStatusPayload | null
   onClose: () => void
   onSave: (config: BotConfig, existingId: string | null) => Promise<void>
@@ -1068,6 +1077,7 @@ function EditBotDialog({
                 value={draft.router}
                 runtimes={runtimes}
                 models={models}
+                triageDefaults={triageDefaults}
                 onChange={(next) => patch({ router: { ...draft.router, ...next } })}
               />
             </NestedSettings>

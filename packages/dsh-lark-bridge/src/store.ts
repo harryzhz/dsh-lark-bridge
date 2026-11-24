@@ -32,6 +32,7 @@ import type {
   LarkPendingTurn,
   LarkScheduleBinding,
   LarkSessionBinding,
+  LarkTriageSession,
 } from './types.js'
 
 /**
@@ -276,6 +277,26 @@ export class LarkBridgeStore {
 
   deleteDreamSession(sessionId: string): boolean {
     return this.runtimeRepo.deleteDreamSession(sessionId)
+  }
+
+  listTriageSessions(botId?: string): LarkTriageSession[] {
+    return this.projector.listTriageSessions(botId)
+  }
+
+  upsertTriageSession(entry: LarkTriageSession): LarkTriageSession {
+    return this.runtimeRepo.upsertTriageSession(entry)
+  }
+
+  linkTriageHandoffSession(triageSessionId: string, handoffSessionId: string): boolean {
+    return this.runtimeRepo.linkTriageHandoffSession(triageSessionId, handoffSessionId)
+  }
+
+  deleteTriageSession(sessionId: string): boolean {
+    return this.runtimeRepo.deleteTriageSession(sessionId)
+  }
+
+  clearTriageSessions(botId?: string): number {
+    return this.runtimeRepo.clearTriageSessions(botId)
   }
 
   listReminders(filter: 'active' | 'archived' | 'all' = 'all'): LarkReminderItem[] {

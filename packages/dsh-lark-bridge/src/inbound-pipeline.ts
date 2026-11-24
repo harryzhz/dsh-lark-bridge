@@ -346,6 +346,7 @@ export class InboundPipeline {
     const senderName = await this.resolveSenderName(transport, msg)
     const chatScopeKey = `chat:${bot.id}:${msg.chatId}`
     let triageNote: string | undefined
+    let triageSessionId: string | undefined
 
     if (this.host.triage && shouldRunTriage(decision, routerConfig)) {
       const triageOutcome = await this.evaluateAndHandleTriage({
@@ -363,6 +364,7 @@ export class InboundPipeline {
       })
       if (triageOutcome.handled || this.host.isDisposed()) return
       triageNote = triageOutcome.triageNote
+      triageSessionId = triageOutcome.triageSessionId
     } else if (this.host.triage && msg.chatType === 'group') {
       this.host.triage.context.recordInboundMessage(chatScopeKey, decision.routeKey, {
         role: 'user',
@@ -418,6 +420,9 @@ export class InboundPipeline {
       trackedSessionId = acquired.sessionId
       activeTurn.sessionId = trackedSessionId
       this.persistActiveTurn(activeTurn)
+      if (triageSessionId) {
+        this.host.store.linkTriageHandoffSession?.(triageSessionId, acquired.sessionId)
+      }
 
       const handoff = this.host.triage?.context.consumeEphemeralHandoff(decision.routeKey)
       if (handoff && decision.sessionMode === 'thread') {
@@ -842,7 +847,11 @@ export class InboundPipeline {
     readonly chatScopeKey: string
     readonly traceId: string
     readonly startedMs: number
-  }): Promise<{ readonly handled: boolean; readonly triageNote?: string }> {
+  }): Promise<{
+    readonly handled: boolean
+    readonly triageNote?: string
+    readonly triageSessionId?: string
+  }> {
     const {
       bot,
       transport,
@@ -905,6 +914,7 @@ export class InboundPipeline {
         chatId: msg.chatId,
         ...chatName,
         routeKey: decision.routeKey,
+        ...(result.triageSessionId ? { sessionId: result.triageSessionId } : {}),
         traceId,
         durationMs: result.durationMs,
         kind: 'silent_skip',
@@ -946,6 +956,7 @@ export class InboundPipeline {
           chatId: msg.chatId,
           ...chatName,
           routeKey: decision.routeKey,
+          ...(result.triageSessionId ? { sessionId: result.triageSessionId } : {}),
           traceId,
           durationMs: latencyMs,
           kind: 'reply',
@@ -956,9 +967,23 @@ export class InboundPipeline {
     }
 
     const prefix = result.verdict.fallback ? '分流回退直通' : '分流转交'
+    if (result.triageSessionId) {
+      this.host.store.recordEvent({
+        botId: bot.id,
+        chatId: msg.chatId,
+        ...chatName,
+        routeKey: decision.routeKey,
+        sessionId: result.triageSessionId,
+        traceId,
+        durationMs: result.durationMs,
+        kind: 'triage',
+        summary: `${prefix}：${result.verdict.reason}`,
+      })
+    }
     return {
       handled: false,
       triageNote: `${prefix}：${result.verdict.reason}（${result.durationMs}ms）`,
+      ...(result.triageSessionId ? { triageSessionId: result.triageSessionId } : {}),
     }
   }
 

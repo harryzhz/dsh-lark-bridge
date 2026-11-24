@@ -3,6 +3,8 @@ import type {
   LarkBotStatus,
   LarkGroupConfig,
   ListenerTemplate,
+  TriageAction,
+  TriagePromptVariable,
 } from '@dsh-lark/lark-core'
 
 export const LARK_ORIGIN_RECORD_TYPE = 'plugin:lark-bridge/origin'
@@ -137,6 +139,30 @@ export interface LarkDreamSession {
   readonly durationMs?: number
 }
 
+export interface LarkTriageSession {
+  readonly sessionId: string
+  readonly botId: string
+  readonly botName?: string
+  readonly chatId: string
+  readonly chatName?: string
+  readonly workspaceName: string
+  readonly workingDir: string
+  readonly routeKey: string
+  readonly trigger: string
+  readonly listenerName?: string
+  readonly senderName?: string
+  readonly action: TriageAction
+  readonly fallback?: boolean
+  readonly reason: string
+  readonly replyText?: string
+  readonly provider?: string
+  readonly model?: string
+  readonly durationMs: number
+  readonly handoffSessionId?: string
+  readonly createdAtMs: number
+  readonly lastActivityMs: number
+}
+
 export interface LarkAuditEvent {
   readonly id: string
   readonly timestampMs: number
@@ -150,6 +176,7 @@ export interface LarkAuditEvent {
   readonly durationMs?: number
   readonly kind:
     | 'inbound'
+    | 'triage'
     | 'command'
     | 'reply'
     | 'silent_skip'
@@ -322,4 +349,9 @@ export interface LarkCockpitPayload {
   readonly bindings: readonly (LarkSessionBinding & { readonly sessionUrl: string })[]
   readonly recentEvents: readonly LarkAuditEvent[]
   readonly listenerTemplates?: readonly ListenerTemplate[]
+  readonly triageDefaults?: {
+    readonly defaultSystemPrompt: string
+    readonly variables: readonly TriagePromptVariable[]
+    readonly toolName: string
+  }
 }

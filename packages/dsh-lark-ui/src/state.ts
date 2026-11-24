@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { bridgeApi } from './api.js'
-import { FALLBACK_LISTENER_TEMPLATES } from './presets.js'
+import { FALLBACK_LISTENER_TEMPLATES, FALLBACK_TRIAGE_DEFAULTS } from './presets.js'
 import { updateSessionFilterRuntimes } from './session-model-filter.js'
 import type {
   AuditEvent,
@@ -15,6 +15,8 @@ import type {
   RuntimeOption,
   ScheduleView,
   SessionBinding,
+  TriageDefaultsPayload,
+  TriageSession,
 } from './types.js'
 
 export interface BridgeData {
@@ -26,10 +28,12 @@ export interface BridgeData {
   reminders: ReminderItem[]
   bindings: SessionBinding[]
   dreamSessions: DreamSession[]
+  triageSessions: TriageSession[]
   events: AuditEvent[]
   runtimes: RuntimeOption[]
   models: ModelGroup[]
   listenerTemplates: ListenerTemplate[]
+  triageDefaults: TriageDefaultsPayload
   auth: AuthStatusPayload | null
 }
 
@@ -42,10 +46,12 @@ const EMPTY: BridgeData = {
   reminders: [],
   bindings: [],
   dreamSessions: [],
+  triageSessions: [],
   events: [],
   runtimes: [],
   models: [],
   listenerTemplates: [...FALLBACK_LISTENER_TEMPLATES],
+  triageDefaults: FALLBACK_TRIAGE_DEFAULTS,
   auth: null,
 }
 const POLL_MS = 6000
@@ -107,10 +113,12 @@ export function useBridgeData(): BridgeData & {
         reminders,
         bindings: sessionOverview.bindings,
         dreamSessions: sessionOverview.dreamSessions,
+        triageSessions: sessionOverview.triageSessions,
         events,
         listenerTemplates: cockpit.listenerTemplates?.length
           ? [...cockpit.listenerTemplates]
           : prev.listenerTemplates,
+        triageDefaults: cockpit.triageDefaults ?? prev.triageDefaults,
       }))
       setError('')
     } catch (err) {

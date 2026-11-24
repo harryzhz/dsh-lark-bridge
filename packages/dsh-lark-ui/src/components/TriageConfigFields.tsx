@@ -1,16 +1,17 @@
+import { useRef } from 'react'
 import { Switch } from '@deepseek-ai/dsh-client-ui-primitives'
-import { choiceLabel, ROUTER_SCOPE_MODES } from '../presets.js'
+import { choiceLabel, FALLBACK_TRIAGE_DEFAULTS, ROUTER_SCOPE_MODES } from '../presets.js'
 import type {
   BotRouterConfig,
   ModelGroup,
   RouterScopeMode,
   RuntimeOption,
+  TriageDefaultsPayload,
 } from '../types.js'
 import {
   NumberField,
   SelectMenu,
   SettingRow,
-  TextArea,
   type SelectOption,
 } from './fields.js'
 
@@ -19,7 +20,10 @@ export interface TriageFieldsValue {
   readonly model: string
   readonly scope: RouterScopeMode
   readonly timeoutMs: number
-  readonly customPrompt: string
+  readonly systemPrompt: string
+  readonly recentMessageCount: number
+  readonly contextTtlMinutes: number
+  readonly includeLastReply: boolean
   readonly coalesceQueuedMessages: boolean
 }
 
@@ -71,15 +75,18 @@ export function TriageConfigFields({
   value,
   runtimes,
   models,
+  triageDefaults = FALLBACK_TRIAGE_DEFAULTS,
   emptyModelLabel = '跟随 DSH 默认原生模型',
   onChange,
 }: {
   value: TriageFieldsValue
   runtimes: readonly RuntimeOption[]
   models: readonly ModelGroup[]
+  triageDefaults?: TriageDefaultsPayload
   emptyModelLabel?: string
   onChange: (patch: Partial<TriageFieldsValue>) => void
 }) {
+  const promptRef = useRef<HTMLTextAreaElement | null>(null)
   const nativeGroups = listNativeModelGroups(models, runtimes)
   const modelValue =
     value.provider && value.model ? `${value.provider}::${value.model}` : value.model || ''
@@ -98,6 +105,37 @@ export function TriageConfigFields({
     modelOptions.push({
       value: modelValue,
       label: value.provider ? `${value.provider} / ${value.model}` : value.model,
+    })
+  }
+
+  const defaultPrompt = triageDefaults.defaultSystemPrompt
+  const effectivePromptText = value.systemPrompt.trim() ? value.systemPrompt : defaultPrompt
+  const isPromptCustomized =
+    Boolean(value.systemPrompt.trim()) && value.systemPrompt.trim() !== defaultPrompt.trim()
+
+  const updatePrompt = (nextText: string) => {
+    if (!nextText.trim() || nextText.trim() === defaultPrompt.trim()) {
+      onChange({ systemPrompt: '' })
+      return
+    }
+    onChange({ systemPrompt: nextText })
+  }
+
+  const insertToken = (token: string) => {
+    const el = promptRef.current
+    const current = effectivePromptText
+    if (!el) {
+      updatePrompt(`${current}${current.endsWith('\n') || !current ? '' : '\n'}${token}`)
+      return
+    }
+    const start = el.selectionStart ?? current.length
+    const end = el.selectionEnd ?? start
+    const next = `${current.slice(0, start)}${token}${current.slice(end)}`
+    updatePrompt(next)
+    const caret = start + token.length
+    requestAnimationFrame(() => {
+      el.focus()
+      el.setSelectionRange(caret, caret)
     })
   }
 
@@ -148,6 +186,33 @@ export function TriageConfigFields({
           suffix="秒"
         />
       </SettingRow>
+      <SettingRow title="最近上下文条数" desc="传给分流模型的最近群聊或话题消息条数（0 表示不带入）">
+        <NumberField
+          value={value.recentMessageCount}
+          min={0}
+          onChange={(count) =>
+            onChange({ recentMessageCount: Math.min(50, Math.max(0, Math.round(count))) })
+          }
+          suffix="条"
+        />
+      </SettingRow>
+      <SettingRow title="上下文有效窗口" desc="仅带入该时间窗口内的近期消息">
+        <NumberField
+          value={value.contextTtlMinutes}
+          min={1}
+          onChange={(mins) =>
+            onChange({ contextTtlMinutes: Math.min(1440, Math.max(1, Math.round(mins))) })
+          }
+          suffix="分钟"
+        />
+      </SettingRow>
+      <SettingRow title="携带上一轮主回复" desc="话题已有活跃主会话时附带上一轮回复全文">
+        <Switch
+          label="携带上一轮主回复"
+          checked={value.includeLastReply}
+          onChange={(includeLastReply) => onChange({ includeLastReply })}
+        />
+      </SettingRow>
       <SettingRow
         title="忙碌队列合批"
         desc="主运行时处理期间堆积的多条有效消息自动合并为一轮增量提交"
@@ -158,13 +223,46 @@ export function TriageConfigFields({
           onChange={(coalesceQueuedMessages) => onChange({ coalesceQueuedMessages })}
         />
       </SettingRow>
-      <SettingRow title="补充判断规则" desc="可选，追加团队特定的静默或转交约定" stack>
-        <TextArea
-          value={value.customPrompt}
-          onChange={(customPrompt) => onChange({ customPrompt })}
-          rows={4}
-          placeholder="例如：涉及发版审批、数据库变更或线上报错的消息一律交由主运行时处理；打卡和日常问候静默跳过"
+      <SettingRow
+        title="System Prompt"
+        desc={`完整可自定义，支持点击下方占位变量插入；工具定义 ${triageDefaults.toolName} 固定注入`}
+        stack
+      >
+        <div className="fb-prompt-bar">
+          <div className="fb-var-chips" aria-label="可用占位变量">
+            {triageDefaults.variables.map((v) => (
+              <button
+                key={v.key}
+                type="button"
+                className="fb-var-chip"
+                title={`${v.label}：${v.desc}`}
+                onClick={() => insertToken(v.token)}
+              >
+                {v.token}
+              </button>
+            ))}
+          </div>
+          {isPromptCustomized && (
+            <button
+              type="button"
+              className="fb-link-btn"
+              style={{ flex: 'none' }}
+              onClick={() => onChange({ systemPrompt: '' })}
+            >
+              恢复默认
+            </button>
+          )}
+        </div>
+        <textarea
+          ref={promptRef}
+          className="fb-textarea fb-mono"
+          rows={11}
+          value={effectivePromptText}
+          onChange={(e) => updatePrompt(e.target.value)}
         />
+        <div className="fb-row-desc">
+          UserMessage 全文透传不截断；工具定义 <code>{triageDefaults.toolName}</code>（<code>silent</code> / <code>quick_reply</code> / <code>handoff</code>）固定下发，不可修改。
+        </div>
       </SettingRow>
     </>
   )

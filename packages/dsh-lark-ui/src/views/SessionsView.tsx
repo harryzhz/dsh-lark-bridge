@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react'
 import { Button, StateDot, Tag } from '@deepseek-ai/dsh-client-ui-primitives'
 import { CountSegmentedSwitch, FilterTabs, OverflowMenu, SelectMenu } from '../components/fields.js'
 import { resolveModelDisplayName, resolveRuntimeDisplayName } from '../components/options.js'
+import { resolveNativeModelLabel } from '../components/TriageConfigFields.js'
 import { formatDuration, formatTime } from '../state.js'
 import type {
   AuditEvent,
@@ -10,18 +11,21 @@ import type {
   ModelGroup,
   RuntimeOption,
   SessionBinding,
+  TriageSession,
 } from '../types.js'
 import { eventTag } from './OverviewView.js'
 
 type Pane = 'sessions' | 'events'
-type SessionFilter = 'all' | 'chat' | 'dreaming'
+export type SessionFilter = 'all' | 'chat' | 'triage' | 'dreaming'
 
-type UnifiedSessionRow =
+export type UnifiedSessionRow =
   | { readonly kind: 'chat'; readonly lastActivityMs: number; readonly binding: SessionBinding }
+  | { readonly kind: 'triage'; readonly lastActivityMs: number; readonly triage: TriageSession }
   | { readonly kind: 'dreaming'; readonly lastActivityMs: number; readonly dream: DreamSession }
 
 const EVENT_FILTERS: ReadonlyArray<{ value: 'all' | AuditEventKind; label: string }> = [
   { value: 'all', label: '全部事件' },
+  { value: 'triage', label: '分流' },
   { value: 'reply', label: '回复' },
   { value: 'inbound', label: '收到' },
   { value: 'silent_skip', label: '静默' },
@@ -32,11 +36,17 @@ export function mergeSessionRows(
   bindings: readonly SessionBinding[],
   dreamSessions: readonly DreamSession[],
   filter: SessionFilter,
+  triageSessions: readonly TriageSession[] = [],
 ): UnifiedSessionRow[] {
   const rows: UnifiedSessionRow[] = []
   if (filter === 'all' || filter === 'chat') {
     for (const binding of bindings) {
       rows.push({ kind: 'chat', lastActivityMs: binding.lastActivityMs, binding })
+    }
+  }
+  if (filter === 'all' || filter === 'triage') {
+    for (const triage of triageSessions) {
+      rows.push({ kind: 'triage', lastActivityMs: triage.lastActivityMs, triage })
     }
   }
   if (filter === 'all' || filter === 'dreaming') {
@@ -47,46 +57,61 @@ export function mergeSessionRows(
   return rows.sort((a, b) => b.lastActivityMs - a.lastActivityMs)
 }
 
+function triageActionTag(t: TriageSession) {
+  if (t.fallback) return <Tag tone="warning">回退</Tag>
+  if (t.action === 'silent') return <Tag tone="neutral">静默</Tag>
+  if (t.action === 'quick_reply') return <Tag tone="success">快回</Tag>
+  return <Tag tone="info">转交</Tag>
+}
+
 export function SessionsView({
   bindings,
   dreamSessions,
+  triageSessions = [],
   events,
   runtimes,
   models = [],
   onOpen,
   onUnbind,
   onDeleteDreamSession,
+  onDeleteTriageSession,
+  onClearTriageSessions,
   onRotateViewerSecret,
 }: {
   bindings: readonly SessionBinding[]
   dreamSessions: readonly DreamSession[]
+  triageSessions?: readonly TriageSession[]
   events: readonly AuditEvent[]
   runtimes: readonly RuntimeOption[]
   models?: readonly ModelGroup[]
   onOpen: (sessionId: string) => void
   onUnbind: (binding: SessionBinding) => void
   onDeleteDreamSession?: (session: DreamSession) => void
+  onDeleteTriageSession?: (session: TriageSession) => void
+  onClearTriageSessions?: () => void
   onRotateViewerSecret?: () => void
 }) {
   const [pane, setPane] = useState<Pane>('sessions')
-  const [sessionFilter, setSessionFilter] = useState<SessionFilter>('all')
+  const [sessionFilter, setSessionFilter] = useState<SessionFilter>('chat')
   const [kind, setKind] = useState<'all' | AuditEventKind>('all')
   const filteredEvents = useMemo(
     () => (kind === 'all' ? events : events.filter((e) => e.kind === kind)),
     [events, kind],
   )
   const visibleSessions = useMemo(
-    () => mergeSessionRows(bindings, dreamSessions, sessionFilter),
-    [bindings, dreamSessions, sessionFilter],
+    () => mergeSessionRows(bindings, dreamSessions, sessionFilter, triageSessions),
+    [bindings, dreamSessions, sessionFilter, triageSessions],
   )
-  const totalSessions = bindings.length + dreamSessions.length
+  const primarySessionCount = bindings.length + dreamSessions.length
 
   const emptySessionText =
     sessionFilter === 'chat'
       ? '暂无活跃对话会话'
-      : sessionFilter === 'dreaming'
-        ? '暂无 Dreaming 会话。智能体定时整理或点击「立即整理」后会自动显示在这里'
-        : '暂无会话'
+      : sessionFilter === 'triage'
+        ? '暂无智能分流会话。开启智能分流并收到群消息后，每次分流判断过程会完整记录在这里'
+        : sessionFilter === 'dreaming'
+          ? '暂无 Dreaming 会话。智能体定时整理或点击「立即整理」后会自动显示在这里'
+          : '暂无会话'
 
   return (
     <>
@@ -95,7 +120,7 @@ export function SessionsView({
           label="会话与日志"
           value={pane}
           options={[
-            { value: 'sessions', label: '会话', count: totalSessions },
+            { value: 'sessions', label: '会话', count: primarySessionCount },
             { value: 'events', label: '运行日志' },
           ]}
           onChange={setPane}
@@ -106,13 +131,18 @@ export function SessionsView({
               label="会话类型筛选"
               value={sessionFilter}
               options={[
-                { value: 'all', label: '全部' },
                 { value: 'chat', label: '对话', count: bindings.length },
+                { value: 'triage', label: '智能分流', count: triageSessions.length },
                 { value: 'dreaming', label: 'Dreaming', count: dreamSessions.length },
               ]}
               onChange={setSessionFilter}
             />
-            {onRotateViewerSecret && (
+            {sessionFilter === 'triage' && triageSessions.length > 0 && onClearTriageSessions && (
+              <Button size="sm" variant="ghost" onClick={onClearTriageSessions}>
+                清空记录
+              </Button>
+            )}
+            {sessionFilter !== 'triage' && onRotateViewerSecret && (
               <Button size="sm" variant="ghost" onClick={onRotateViewerSecret}>
                 重置只读链接
               </Button>
@@ -160,6 +190,73 @@ export function SessionsView({
                           danger: true,
                           onSelect: () => onUnbind(b),
                         },
+                      ]}
+                    />
+                  </div>
+                </div>
+              )
+            }
+
+            if (row.kind === 'triage') {
+              const t = row.triage
+              const modelLabel = t.model
+                ? resolveNativeModelLabel(t.provider ?? '', t.model, models)
+                : ''
+              const metaText = [
+                t.botName || t.botId,
+                t.listenerName ? `监听「${t.listenerName}」` : null,
+                t.senderName || null,
+                modelLabel || null,
+                t.durationMs ? formatDuration(t.durationMs) : null,
+                t.reason || null,
+              ]
+                .filter(Boolean)
+                .join(' · ')
+
+              return (
+                <div key={`triage:${t.sessionId}`} className="fb-item">
+                  <div className="fb-item-main">
+                    <div className="fb-item-title">
+                      <span>{t.chatName || t.chatId}</span>
+                      {triageActionTag(t)}
+                    </div>
+                    <div className="fb-item-meta" title={t.reason || metaText}>
+                      {metaText}
+                    </div>
+                  </div>
+                  <span className="fb-item-time">{formatTime(t.lastActivityMs)}</span>
+                  <div className="fb-item-side">
+                    <Button size="sm" variant="outline" onClick={() => onOpen(t.sessionId)}>
+                      查看
+                    </Button>
+                    <OverflowMenu
+                      label="分流会话更多操作"
+                      items={[
+                        ...(t.handoffSessionId
+                          ? [
+                              {
+                                id: 'open-handoff',
+                                label: '打开转交的主会话',
+                                onSelect: () => onOpen(t.handoffSessionId!),
+                              },
+                            ]
+                          : []),
+                        {
+                          id: 'copy',
+                          label: '复制会话 ID',
+                          onSelect: () => void navigator.clipboard?.writeText(t.sessionId),
+                        },
+                        ...(onDeleteTriageSession
+                          ? [
+                              { type: 'separator' as const, id: 'sep' },
+                              {
+                                id: 'delete',
+                                label: '移除记录',
+                                danger: true,
+                                onSelect: () => onDeleteTriageSession(t),
+                              },
+                            ]
+                          : []),
                       ]}
                     />
                   </div>

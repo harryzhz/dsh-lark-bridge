@@ -538,6 +538,29 @@ const CSS = `
   padding: 2px 6px; border: none; border-radius: 4px; background: transparent;
   color: var(--dsw-alias-label-secondary); font: inherit; font-size: 12px; cursor: pointer;
 }
+.fb-prompt-bar {
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 8px;
+}
+.fb-var-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; flex: 1; min-width: 0; }
+.fb-var-chip {
+  display: inline-flex; align-items: center; gap: 4px; height: 24px; padding: 0 8px;
+  border: none; border-radius: var(--dsw-radius-sm);
+  background: var(--dsw-alias-bg-module-platform);
+  box-shadow: inset 0 0 0 0.5px var(--dsw-alias-border-l2);
+  color: var(--dsw-alias-label-secondary);
+  font-family: var(--ds-font-family-code); font-size: 11.5px; line-height: 16px;
+  cursor: pointer; transition: background 120ms ease, color 120ms ease;
+}
+.fb-var-chip:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));
+}
+@media (hover: hover) {
+  .fb-var-chip:hover {
+    background: var(--dsw-alias-interactive-bg-hover);
+    color: var(--dsw-alias-label-primary);
+  }
+}
 
 /* QR code & auto-create box */
 .fb-qr-panel {

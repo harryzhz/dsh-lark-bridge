@@ -34,6 +34,7 @@ import type {
   ListenerTemplate,
   ModelGroup,
   RuntimeOption,
+  TriageDefaultsPayload,
 } from '../types.js'
 import { AgentRuntimeFields } from './AgentRuntimeFields.js'
 import { ConfigDialog, type ConfigSection } from './ConfigDialog.js'
@@ -70,7 +71,10 @@ const DEFAULT_GROUP_ROUTER: GroupRouterConfig = {
   model: '',
   scope: 'passive_only',
   timeoutMs: 4000,
-  customPrompt: '',
+  systemPrompt: '',
+  recentMessageCount: 6,
+  contextTtlMinutes: 30,
+  includeLastReply: true,
   coalesceQueuedMessages: true,
 }
 
@@ -107,6 +111,7 @@ export function GroupConfigDialog({
   runtimes,
   models,
   listenerTemplates,
+  triageDefaults,
   onClose,
   onSave,
   onProfilesChanged,
@@ -116,6 +121,7 @@ export function GroupConfigDialog({
   runtimes: readonly RuntimeOption[]
   models: readonly ModelGroup[]
   listenerTemplates: readonly ListenerTemplate[]
+  triageDefaults?: TriageDefaultsPayload
   onClose: () => void
   onSave: (config: GroupConfig) => Promise<void>
   onProfilesChanged?: () => Promise<void>
@@ -422,7 +428,13 @@ export function GroupConfigDialog({
                             model: currentRouter.model || base?.model || '',
                             scope: base?.scope ?? currentRouter.scope,
                             timeoutMs: base?.timeoutMs ?? currentRouter.timeoutMs,
-                            customPrompt: currentRouter.customPrompt || base?.customPrompt || '',
+                            systemPrompt: currentRouter.systemPrompt || base?.systemPrompt || '',
+                            recentMessageCount:
+                              base?.recentMessageCount ?? currentRouter.recentMessageCount,
+                            contextTtlMinutes:
+                              base?.contextTtlMinutes ?? currentRouter.contextTtlMinutes,
+                            includeLastReply:
+                              base?.includeLastReply ?? currentRouter.includeLastReply,
                             coalesceQueuedMessages:
                               base?.coalesceQueuedMessages ?? currentRouter.coalesceQueuedMessages,
                           },
@@ -439,6 +451,7 @@ export function GroupConfigDialog({
                       value={currentRouter}
                       runtimes={runtimes}
                       models={models}
+                      triageDefaults={triageDefaults}
                       emptyModelLabel={emptyGroupModelLabel}
                       onChange={(next) =>
                         patch({ router: { ...currentRouter, mode: 'override', ...next } })

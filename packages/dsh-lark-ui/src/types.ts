@@ -46,13 +46,31 @@ export interface BotProactiveConfig {
   branchPrefix: string
 }
 
+export type TriageAction = 'silent' | 'quick_reply' | 'handoff'
+
+export interface TriagePromptVariable {
+  key: string
+  token: string
+  label: string
+  desc: string
+}
+
+export interface TriageDefaultsPayload {
+  defaultSystemPrompt: string
+  variables: TriagePromptVariable[]
+  toolName: string
+}
+
 export interface BotRouterConfig {
   enabled: boolean
   provider: string
   model: string
   scope: RouterScopeMode
   timeoutMs: number
-  customPrompt: string
+  systemPrompt: string
+  recentMessageCount: number
+  contextTtlMinutes: number
+  includeLastReply: boolean
   coalesceQueuedMessages: boolean
 }
 
@@ -62,7 +80,10 @@ export interface GroupRouterConfig {
   model: string
   scope: RouterScopeMode
   timeoutMs: number
-  customPrompt: string
+  systemPrompt: string
+  recentMessageCount: number
+  contextTtlMinutes: number
+  includeLastReply: boolean
   coalesceQueuedMessages: boolean
 }
 
@@ -98,6 +119,31 @@ export interface DreamSession {
   createdAtMs: number
   lastActivityMs: number
   durationMs?: number
+  sessionUrl?: string
+}
+
+export interface TriageSession {
+  sessionId: string
+  botId: string
+  botName?: string
+  chatId: string
+  chatName?: string
+  workspaceName: string
+  workingDir: string
+  routeKey: string
+  trigger: string
+  listenerName?: string
+  senderName?: string
+  action: TriageAction
+  fallback?: boolean
+  reason: string
+  replyText?: string
+  provider?: string
+  model?: string
+  durationMs: number
+  handoffSessionId?: string
+  createdAtMs: number
+  lastActivityMs: number
   sessionUrl?: string
 }
 
@@ -433,7 +479,7 @@ export interface SessionBinding {
   lastActivityMs: number
 }
 
-export type AuditEventKind = 'inbound' | 'command' | 'reply' | 'silent_skip' | 'ignored' | 'error' | 'lifecycle'
+export type AuditEventKind = 'inbound' | 'triage' | 'command' | 'reply' | 'silent_skip' | 'ignored' | 'error' | 'lifecycle'
 
 export interface AuditEvent {
   id: string
@@ -511,6 +557,7 @@ export interface CockpitPayload {
   }>
   recentEvents: AuditEvent[]
   listenerTemplates?: ListenerTemplate[]
+  triageDefaults?: TriageDefaultsPayload
 }
 
 export interface RuntimeProfileAuthMethod {

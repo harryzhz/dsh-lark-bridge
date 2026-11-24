@@ -101,13 +101,17 @@ export {
   type ReminderTriggerPromptInput,
 } from './proactive.js'
 export {
+  DEFAULT_TRIAGE_SYSTEM_PROMPT,
   ROUTE_MESSAGE_TOOL_SCHEMA,
+  TRIAGE_PROMPT_VARIABLES,
   TRIAGE_TOOL_NAME,
   buildTriageSystemPrompt,
+  buildTriageSystemPromptVars,
   buildTriageUserMessage,
   composeCoalescedUserText,
   composeRouterHandoffReminder,
   parseTriageVerdict,
+  renderTriageSystemPrompt,
   shouldFastBypassTriage,
   shouldRunTriage,
   type AgentRoutingDecision,
@@ -116,6 +120,8 @@ export {
   type TriageAction,
   type TriageHistoryEntry,
   type TriagePromptInput,
+  type TriagePromptVariable,
+  type TriageSystemPromptVars,
   type TriageToolSchema,
   type TriageVerdict,
 } from './triage.js'
