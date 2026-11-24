@@ -60,20 +60,33 @@ export function SettingRow({
   title,
   desc,
   stack,
+  headerAction,
   children,
 }: {
-  title: string
+  title: ReactNode
   desc?: ReactNode
   /** Put the control below the text (long text areas, tag lists). */
   stack?: boolean
+  /** Optional compact right-aligned action on the header line of a stacked row. */
+  headerAction?: ReactNode
   children: ReactNode
 }) {
   return (
     <div className="fb-row" data-stack={stack ? '' : undefined}>
-      <div className="fb-row-text">
-        <div className="fb-row-title">{title}</div>
-        {desc ? <div className="fb-row-desc">{desc}</div> : null}
-      </div>
+      {stack && headerAction ? (
+        <div className="fb-row-head">
+          <div className="fb-row-text" style={{ paddingRight: 0 }}>
+            <div className="fb-row-title">{title}</div>
+            {desc ? <div className="fb-row-desc">{desc}</div> : null}
+          </div>
+          <div className="fb-row-head-actions">{headerAction}</div>
+        </div>
+      ) : (
+        <div className="fb-row-text">
+          <div className="fb-row-title">{title}</div>
+          {desc ? <div className="fb-row-desc">{desc}</div> : null}
+        </div>
+      )}
       {stack ? children : <div className="fb-row-control">{children}</div>}
     </div>
   )

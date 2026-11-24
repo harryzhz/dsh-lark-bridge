@@ -5,6 +5,7 @@ import type {
   ListenerTemplate,
   TriageAction,
   TriagePromptVariable,
+  TriageToolSchema,
 } from '@dsh-lark/lark-core'
 
 export const LARK_ORIGIN_RECORD_TYPE = 'plugin:lark-bridge/origin'
@@ -353,5 +354,6 @@ export interface LarkCockpitPayload {
     readonly defaultSystemPrompt: string
     readonly variables: readonly TriagePromptVariable[]
     readonly toolName: string
+    readonly toolSchema: TriageToolSchema
   }
 }

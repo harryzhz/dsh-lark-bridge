@@ -109,6 +109,33 @@ export const ROUTER_SCOPE_MODES: readonly Choice<RouterScopeMode>[] = [
 
 export const FALLBACK_TRIAGE_DEFAULTS: TriageDefaultsPayload = {
   toolName: 'route_message',
+  toolSchema: {
+    name: 'route_message',
+    description:
+      'Decide how to route the incoming group chat message: silent (ignore chatter/acks), quick_reply (brief reply without invoking the main runtime, ONLY allowed when has_active_session=false), or handoff (transfer directly to the main runtime agent).',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['silent', 'quick_reply', 'handoff'],
+          description:
+            'Routing decision. Use "handoff" whenever tools, codebase/doc inspection, memory lookup, multi-step reasoning, or follow-up to an active session is needed, or whenever uncertain.',
+        },
+        reason: {
+          type: 'string',
+          description: 'Brief Simplified Chinese reason for audit logs (<= 40 chars).',
+        },
+        reply_text: {
+          type: 'string',
+          description:
+            'Required only when action is "quick_reply". Concise, natural Simplified Chinese reply text (1-2 sentences, no fabrication of codebase/internal facts).',
+        },
+      },
+      required: ['action', 'reason'],
+      additionalProperties: false,
+    },
+  },
   variables: [
     { key: 'bot_name', token: '{{bot_name}}', label: '智能体名称', desc: '当前响应的智能体显示名称' },
     { key: 'bot_role', token: '{{bot_role}}', label: '角色设定', desc: '当前生效的角色名称与说明全文（未配置时为空）' },

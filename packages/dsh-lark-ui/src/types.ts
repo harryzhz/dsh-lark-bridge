@@ -55,10 +55,17 @@ export interface TriagePromptVariable {
   desc: string
 }
 
+export interface TriageToolSchema {
+  name: string
+  description: string
+  parameters: Record<string, unknown>
+}
+
 export interface TriageDefaultsPayload {
   defaultSystemPrompt: string
   variables: TriagePromptVariable[]
   toolName: string
+  toolSchema?: TriageToolSchema
 }
 
 export interface BotRouterConfig {

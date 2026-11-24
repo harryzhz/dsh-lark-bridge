@@ -1,6 +1,7 @@
 import {
   DEFAULT_TRIAGE_SYSTEM_PROMPT,
   LarkGroupConfigSchema,
+  ROUTE_MESSAGE_TOOL_SCHEMA,
   TRIAGE_PROMPT_VARIABLES,
   TRIAGE_TOOL_NAME,
   buildGroupKey,
@@ -349,6 +350,7 @@ export class CockpitProjector {
         defaultSystemPrompt: DEFAULT_TRIAGE_SYSTEM_PROMPT,
         variables: TRIAGE_PROMPT_VARIABLES,
         toolName: TRIAGE_TOOL_NAME,
+        toolSchema: ROUTE_MESSAGE_TOOL_SCHEMA,
       },
     }
   }

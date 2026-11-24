@@ -1057,13 +1057,10 @@ function EditBotDialog({
           />
 
           <GroupTitle>智能分流</GroupTitle>
-          <div className="fb-banner" style={{ margin: '6px 0 2px' }}>
-            <div className="fb-row-desc" style={{ minWidth: 0, flex: 1 }}>
-              使用轻量原生模型先判断群聊消息意图：闲聊与确认语直接静默或轻文本回应，不创建会话也不阻塞队列；正式任务安静贴上表情并直接交由主运行时接管处理，超时或异常自动直通主运行时。各群聊也可在群配置中单独覆盖。
-            </div>
-          </div>
-
-          <SettingRow title="启用智能分流">
+          <SettingRow
+            title="启用智能分流"
+            desc="用轻量模型前置判断群消息意图，闲聊静默或轻回复，正式任务直通主运行时，各群可单独覆盖"
+          >
             <Switch
               label="启用智能分流"
               checked={draft.router.enabled}
@@ -1078,6 +1075,7 @@ function EditBotDialog({
                 runtimes={runtimes}
                 models={models}
                 triageDefaults={triageDefaults}
+                previewContext={{ botName: draft.name || existingId }}
                 onChange={(next) => patch({ router: { ...draft.router, ...next } })}
               />
             </NestedSettings>

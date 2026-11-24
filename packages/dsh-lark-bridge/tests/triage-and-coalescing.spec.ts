@@ -984,11 +984,14 @@ describe('Smart Triage Gate, Per-Group Overrides & Busy-Queue Coalescing', () =>
       triageDefaults?: {
         defaultSystemPrompt: string
         toolName: string
+        toolSchema?: { name: string; parameters?: { properties?: Record<string, unknown> } }
         variables: Array<{ key: string }>
       }
     }
     expect(cockpitPayload.triageDefaults?.defaultSystemPrompt).toContain('{{bot_name}}')
     expect(cockpitPayload.triageDefaults?.toolName).toBe('route_message')
+    expect(cockpitPayload.triageDefaults?.toolSchema?.name).toBe('route_message')
+    expect(cockpitPayload.triageDefaults?.toolSchema?.parameters?.properties).toHaveProperty('action')
     expect(cockpitPayload.triageDefaults?.variables.length).toBeGreaterThanOrEqual(8)
 
     const bindingsRes = await dispatchLarkApiRequest(h.ctx, h.manager, {
