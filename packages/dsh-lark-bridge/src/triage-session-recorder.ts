@@ -163,6 +163,7 @@ export class TriageSessionRecorder {
       createdAt: Math.max(0, Math.floor(input.startedAtMs)),
       cwd,
       isSeeded: false,
+      delegationDepth: 0,
     }
     const session = Session.create(sessionId, undefined, header)
 
@@ -197,6 +198,7 @@ export class TriageSessionRecorder {
     }
 
     session.append('turn/start', { turn: 1 })
+    session.append('step/start', { turn: 1, step: 1 })
     session.append(
       'system/message',
       { turn: 1, step: 1, message: createSystemMessage(input.systemPrompt) },
@@ -210,7 +212,6 @@ export class TriageSessionRecorder {
       }),
       { surfaceOp: 'append' },
     )
-    session.append('step/start', { turn: 1, step: 1 })
 
     if (input.provider && input.model) {
       session.append('request/header', {

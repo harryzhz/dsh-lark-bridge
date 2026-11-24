@@ -941,21 +941,27 @@ describe('Smart Triage Gate, Per-Group Overrides & Busy-Queue Coalescing', () =>
       stopActivity: true,
     })
 
-    // Inspect persisted DSH v4 event sequence on silent session
+    // Inspect persisted DSH v4 event sequence on silent session (strict lifecycle ordering & header contract)
     const silentLog = h.persistedSessions.get(silentRow.sessionId)!
     expect(silentLog.flushed).toBe(true)
     expect(silentLog.closed).toBe(true)
+    expect(silentLog.header.delegationDepth).toBe(0)
     const types = silentLog.events.map((e) => e.type)
-    expect(types).toContain('plugin:lark-bridge/origin')
-    expect(types).toContain('session/title')
-    expect(types).toContain('model/selection')
-    expect(types).toContain('system/message')
-    expect(types).toContain('user/message')
-    expect(types).toContain('request/header')
-    expect(types).toContain('assistant/message')
-    expect(types).toContain('tool/call')
-    expect(types).toContain('tool/result')
-    expect(types).toContain('turn/end')
+    expect(types).toEqual([
+      'plugin:lark-bridge/origin',
+      'session/title',
+      'model/selection',
+      'turn/start',
+      'step/start',
+      'system/message',
+      'user/message',
+      'request/header',
+      'assistant/message',
+      'tool/call',
+      'tool/result',
+      'step/end',
+      'turn/end',
+    ])
 
     // Verify untruncated 3500-char payload & recentMessageCount=1 in Call 2
     const handoffUserContent = h.triageCalls[1]?.messages[0]?.content
