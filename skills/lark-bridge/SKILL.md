@@ -15,7 +15,7 @@ description: DSH 飞书桥接（dsh-lark-bridge）辅助技能与 CLI。用于�
 2. **输出与主动发送分工**：
    - 常规文字/Markdown 回复直接作为当轮最终响应输出即可，不要再用 `lark-bridge send` 重复发送同一份正文。
    - 仅在发送本地图片/文件附件、原始飞书 Schema 2.0 卡片 JSON、中途阶段播报或跨群/跨人推送时调用 `lark-bridge send`。
-   - 旁听监听或主动提醒轮次判断**无需向飞书群发送任何消息**时，优先运行 `lark-bridge silence --reason "<简要原因>"`（结构化静默控制面，即便末尾伴随总结说明也不会误发到群），纯文本环境可输出 `<no_reply/>` 或 `<no_reminder_needed/>` 兜底。
+   - 仅在旁听监听（`<listener>`）或主动提醒/定时巡检轮次判断**无需向飞书群发送任何消息**时，优先运行 `lark-bridge silence --reason "<简要原因>"`（结构化静默控制面，即便末尾伴随总结说明也不会误发到群），纯文本环境可输出 `<no_reply/>` 或 `<no_reminder_needed/>` 兜底；当用户显式 `@` 提及（`trigger="mention"`）或私聊时禁止静默或输出 `<no_reply/>`，若问题超出角色职责范围请简短礼貌说明职责边界并拒答。
 
 ## 二、常用命令速查
 

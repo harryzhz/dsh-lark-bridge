@@ -12,6 +12,7 @@ export { MessageDeduplicator, type SeenMessageEntry } from './dedup.js'
 export {
   SILENT_REPLY_SENTINEL,
   hasVisibleText,
+  isSilentReplySentinel,
   normalizeReplyText,
   trimInvisibleText,
   type NormalizeReplyTextOptions,

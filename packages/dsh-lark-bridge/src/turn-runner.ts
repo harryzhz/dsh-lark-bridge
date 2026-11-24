@@ -151,6 +151,7 @@ export class TurnFinalReplyTracker {
 }
 
 const claimedTurnsBySession = new Map<string, Set<number>>()
+const POST_STEP_STALL_WARN_MS = 3_000
 
 function claimSessionTurn(sessionId: string, turn: number): boolean {
   let set = claimedTurnsBySession.get(sessionId)
@@ -203,6 +204,8 @@ export function runTurnAndCollectReply(
     })
     let targetTurn: number | undefined
     let targetTurnConfirmed = false
+    let lastStepEndAtMs: number | undefined
+    let lastAssistantMessageAtMs: number | undefined
     let phase: 'running' | 'flushing' | 'settled' = 'running'
     let offEvent: (() => void) | undefined
     let offDispose: (() => void) | undefined
@@ -259,6 +262,8 @@ export function runTurnAndCollectReply(
             if (!claimSessionTurn(sessionId, event.data.turn)) return
             targetTurn = event.data.turn
             targetTurnConfirmed = false
+            lastStepEndAtMs = undefined
+            lastAssistantMessageAtMs = undefined
             return
           }
           if (targetTurn === undefined) return
@@ -272,6 +277,8 @@ export function runTurnAndCollectReply(
               // Turn belongs to another caller (e.g. Web UI or scheduled run); release and wait for ours.
               releaseSessionTurn(sessionId, targetTurn)
               targetTurn = undefined
+              lastStepEndAtMs = undefined
+              lastAssistantMessageAtMs = undefined
               tracker = new TurnFinalReplyTracker({
                 ...(options.onIntermediate ? { onIntermediate: options.onIntermediate } : {}),
               })
@@ -283,10 +290,26 @@ export function runTurnAndCollectReply(
             event.data.turn === targetTurn
           ) {
             targetTurnConfirmed = true
+            if (event.type === 'assistant/message') {
+              lastAssistantMessageAtMs = Date.now()
+            }
             tracker.onEvent(event)
             return
           }
+          if (event.type === 'step/end' && event.data.turn === targetTurn) {
+            lastStepEndAtMs = Date.now()
+            return
+          }
           if (event.type === 'turn/end' && event.data.turn === targetTurn) {
+            const stallAnchorMs = lastStepEndAtMs ?? lastAssistantMessageAtMs
+            if (stallAnchorMs !== undefined) {
+              const postStepGapMs = Date.now() - stallAnchorMs
+              if (postStepGapMs >= POST_STEP_STALL_WARN_MS) {
+                ctx.logger?.warn?.(
+                  `[lark-bridge][session=${sessionId}][turn=${targetTurn}] post-step turn-stopping stall detected: ${postStepGapMs}ms between step completion and turn/end (check DSH workspace-changes git snapshot or turn-stopping hooks)`,
+                )
+              }
+            }
             const reason = event.data.reason
             if (reason.kind === 'error') {
               fail(new Error(reason.error.message || 'Agent turn failed'))

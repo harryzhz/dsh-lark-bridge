@@ -32,6 +32,7 @@ import {
   generateDefaultBotIconPng,
   hasInjectedPromptMarkup,
   hasVisibleText,
+  isSilentReplySentinel,
   leafDirectoryName,
   normalizeReplyText,
   parseLarkMessageContent,
@@ -177,6 +178,29 @@ describe('Workspace name, ~ expansion, card images & <system_reminder> compositi
       includeFullGuide: false,
     })
     expect(compactCtx).toMatch(/^<lark_context\b[^>]*\/>$/)
+
+    const mentionCtx = composeLarkContextReminder({
+      bot,
+      botOpenId: 'ou_bot',
+      msg: createMessage(),
+      trigger: 'mention',
+      allowSilentEmptyReply: false,
+      includeFullGuide: false,
+    })
+    expect(mentionCtx).toContain('trigger="mention"')
+    expect(mentionCtx).toContain('本轮禁止静默')
+    expect(mentionCtx).toContain('简短礼貌说明职责边界并拒答')
+
+    const listenerCtx = composeLarkContextReminder({
+      bot,
+      botOpenId: 'ou_bot',
+      msg: createMessage(),
+      trigger: 'listener',
+      allowSilentEmptyReply: true,
+      includeFullGuide: false,
+    })
+    expect(listenerCtx).toContain('trigger="listener"')
+    expect(listenerCtx).not.toContain('本轮禁止静默')
 
     const schedSection = composeScheduleContextReminder({
       scheduleId: 'schedule-1',
@@ -1297,6 +1321,13 @@ describe('decideLarkRouting, <user_message> format, memberOverrides & title inte
     expect(trimInvisibleText('\u200b  你好\u200b\uFEFF ')).toBe('你好')
     // Preserves interior ZWJ inside compound emoji
     expect(trimInvisibleText('\u200b👨‍👩‍👧‍👦\u200b')).toBe('👨‍👩‍👧‍👦')
+
+    expect(isSilentReplySentinel('')).toBe(false)
+    expect(isSilentReplySentinel('\u200b')).toBe(false)
+    expect(isSilentReplySentinel(SILENT_REPLY_SENTINEL)).toBe(true)
+    expect(isSilentReplySentinel(` \u200b\`${SILENT_REPLY_SENTINEL}\`\u200b `)).toBe(true)
+    expect(isSilentReplySentinel(REMINDER_SILENT_SENTINEL)).toBe(true)
+    expect(isSilentReplySentinel('请使用 `<no_reply/>` 表示静默')).toBe(false)
 
     expect(normalizeReplyText('\u200b', { allowSilentSentinel: true })).toBe('')
     expect(normalizeReplyText(SILENT_REPLY_SENTINEL, { allowSilentSentinel: true })).toBe('')

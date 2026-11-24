@@ -163,6 +163,8 @@ export interface LarkConversationContextInput {
   readonly msg: InboundLarkMessage
   readonly chatName?: string
   readonly senderName?: string
+  readonly trigger?: 'p2p' | 'mention' | 'active-thread' | 'substitute' | 'listener'
+  readonly allowSilentEmptyReply?: boolean
   readonly replyMode?: GroupReplyMode
   readonly useCard?: boolean
   readonly includeFullGuide?: boolean
@@ -178,6 +180,7 @@ export function composeLarkContextReminder(input: LarkConversationContextInput):
     `chat_type="${escapeXmlAttr(msg.chatType)}"`,
     `chat_id="${escapeXmlAttr(msg.chatId)}"`,
     ...(input.chatName ? [`chat_name="${escapeXmlAttr(input.chatName)}"`] : []),
+    ...(input.trigger ? [`trigger="${escapeXmlAttr(input.trigger)}"`] : []),
     `message_id="${escapeXmlAttr(msg.messageId)}"`,
     ...(msg.rootId || msg.threadId
       ? [`thread_id="${escapeXmlAttr((msg.rootId || msg.threadId)!)}"`]
@@ -201,6 +204,11 @@ export function composeLarkContextReminder(input: LarkConversationContextInput):
   if (msg.parentId) {
     bodyLines.push(
       `引用消息：${msg.parentId}（查看全文或下载附件：\`lark-bridge message ${msg.parentId}\`）`,
+    )
+  }
+  if (input.trigger === 'mention' && input.allowSilentEmptyReply !== true) {
+    bodyLines.push(
+      `回复约束：用户已显式 @ 提及你，本轮禁止静默、调用 \`lark-bridge silence\` 或输出 \`${SILENT_REPLY_SENTINEL}\`；若问题超出角色职责范围，请用一句话简短礼貌说明职责边界并拒答。`,
     )
   }
   if (input.includeFullGuide !== false) {

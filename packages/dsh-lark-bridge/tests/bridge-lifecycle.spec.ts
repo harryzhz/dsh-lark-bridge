@@ -2076,4 +2076,251 @@ describe('LarkBridgeManager prompt injection, title hygiene & auto-archiving', (
     expect(sentReplies).toHaveLength(0)
     await restartedManager.stop()
   })
+
+  it('instructs @Bot turns not to stay silent and intercepts literal <no_reply/> sentinels before Feishu delivery', async () => {
+    const dir = makeTempDir()
+    const workDir = makeTempDir()
+    const store = new LarkBridgeStore(dir)
+    store.upsertBot({
+      id: 'oncall-bot',
+      name: 'OncallBot',
+      enabled: true,
+      larkAppId: 'cli_oncall',
+      larkAppSecret: 'sec_oncall',
+      defaultWorkingDir: workDir,
+      agentPreset: 'codex',
+      groupReplyMode: 'new-topic',
+      groupSessionMode: 'thread',
+      mentionTriggerMode: 'mention_and_active_thread',
+      useInteractiveCard: false,
+      sendIntermediateMessages: true,
+    })
+    store.upsertGroup({
+      botId: 'oncall-bot',
+      chatId: 'oc_alert_demo',
+      chatName: '告警排查测试群',
+      enabled: true,
+      replyMode: 'new-topic',
+      sessionMode: 'thread',
+      role: {
+        mode: 'override',
+        name: 'Demo Oncall',
+        systemPrompt: '只负责处理服务告警，不要回复任何无关问题。',
+      },
+    })
+
+    const listeners = new Map<string, Array<(...args: unknown[]) => void>>()
+    const emit = (event: string, ...args: unknown[]) => {
+      for (const fn of [...(listeners.get(event) ?? [])]) fn(...args)
+    }
+    const receivedPrompts: string[] = []
+    const liveAgents = new Map<string, unknown>()
+    const queuedTurns: Array<{ intermediate?: string; reply: string }> = [
+      { intermediate: '<no_reply/>', reply: '<no_reply/>' },
+      { reply: '`<no_reply/>`' },
+      { reply: '请使用 `<no_reply/>` 表示旁听静默' },
+    ]
+    let turnCounter = 0
+    const warnSpy = vi.fn()
+
+    const fakeCtx = {
+      logger: { info: vi.fn(), warn: warnSpy, error: vi.fn() },
+      on(event: string, fn: (...args: unknown[]) => void) {
+        const list = listeners.get(event) ?? []
+        list.push(fn)
+        listeners.set(event, list)
+        return () => {
+          listeners.set(event, (listeners.get(event) ?? []).filter((f) => f !== fn))
+        }
+      },
+      sessions: { get: () => undefined },
+      agents: {
+        get: (id: string) => liveAgents.get(id),
+        create: vi.fn(async ({ sessionId }: { sessionId: string }) => {
+          const sessionObj = {
+            id: sessionId,
+            header: { cwd: workDir, agentPreset: 'codex' },
+            append: vi.fn(),
+            snapshotEvents: () => [],
+          } as unknown as Session
+          const agent = {
+            session: sessionObj,
+            followup: (userMsg: { id?: string; content: Array<{ type: string; text?: string }> }) => {
+              receivedPrompts.push(userMsg.content.map((c) => c.text ?? '').join('\n'))
+              const turn = ++turnCounter
+              const spec = queuedTurns.shift() ?? { reply: 'ok' }
+              setTimeout(() => {
+                emit('session/event', sessionObj, { type: 'turn/start', data: { turn } })
+                emit('session/event', sessionObj, {
+                  type: 'user/message',
+                  data: { id: userMsg.id, source: { kind: 'user' } },
+                })
+                if (spec.intermediate) {
+                  emit('session/event', sessionObj, {
+                    type: 'assistant/message',
+                    data: {
+                      turn,
+                      step: 1,
+                      message: {
+                        content: [
+                          { type: 'text', text: spec.intermediate },
+                          { type: 'tool-call', id: `tc_${turn}`, name: 'bash', arguments: '{}' },
+                        ],
+                      },
+                    },
+                  })
+                  emit('session/event', sessionObj, {
+                    type: 'tool/call',
+                    data: { turn, step: 1, callId: `tc_${turn}`, name: 'bash', arguments: '{}' },
+                  })
+                }
+                emit('session/event', sessionObj, {
+                  type: 'assistant/message',
+                  data: { turn, step: 2, message: { content: [{ type: 'text', text: spec.reply }] } },
+                })
+                emit('session/event', sessionObj, {
+                  type: 'turn/end',
+                  data: { turn, reason: { kind: 'completed' } },
+                })
+              }, 10)
+            },
+          }
+          liveAgents.set(sessionId, agent)
+          return {
+            agent,
+            dispose: vi.fn(async () => {
+              liveAgents.delete(sessionId)
+            }),
+          }
+        }),
+      },
+      get(service: string) {
+        if (service === 'workspaceRegistry') {
+          return {
+            list: () => [],
+            create: async (_d: string, title?: string) => ({
+              title: title ?? 'ws',
+              setTitle: vi.fn(),
+              attachSession: vi.fn(),
+            }),
+            archiveSession: vi.fn(async () => {}),
+          }
+        }
+        return undefined
+      },
+    } as unknown as Context
+
+    const manager = new LarkBridgeManager(
+      fakeCtx,
+      {
+        dataDir: dir,
+        publicBaseUrl: 'http://127.0.0.1:3880',
+        idleSweepIntervalMs: 0,
+        maxAuditEvents: 100,
+        autoInstallCliAndSkill: false,
+      },
+      store,
+    )
+    const sentReplies: Array<{ replyToMessageId?: string; text?: string }> = []
+    const fakeTransport = {
+      state: { botOpenId: 'ou_bot', connected: true },
+      resolveUserSummary: vi.fn().mockResolvedValue({ openId: 'ou_u1', name: 'Alex' }),
+      addReaction: vi.fn().mockResolvedValue('r1'),
+      removeReaction: vi.fn().mockResolvedValue(undefined),
+      sendReply: vi.fn(async (opts: { replyToMessageId?: string; text?: string }) => {
+        sentReplies.push(opts)
+        return { messageId: `om_out_${sentReplies.length}`, rootId: 'om_m1', threadId: 'omt_t1' }
+      }),
+      downloadImageAsBase64: vi.fn().mockResolvedValue(undefined),
+      stop: vi.fn().mockResolvedValue(undefined),
+    }
+    const handleInbound = (
+      manager as unknown as { handleInbound: (b: string, t: unknown, m: unknown) => Promise<void> }
+    ).handleInbound.bind(manager)
+
+    // Turn 1: explicit @Bot asking off-topic question -> model emits <no_reply/> in both intermediate and final
+    await handleInbound('oncall-bot', fakeTransport, {
+      botId: 'oncall-bot',
+      larkAppId: 'cli_oncall',
+      botOpenId: 'ou_bot',
+      messageId: 'om_m1',
+      chatId: 'oc_alert_demo',
+      chatType: 'group',
+      msgType: 'text',
+      senderOpenId: 'ou_u1',
+      senderType: 'user',
+      text: '@_b 你是啥模型？',
+      rawContent: '{}',
+      mentions: [{ key: '@_b', openId: 'ou_bot', name: 'OncallBot' }],
+      imageKeys: [],
+      createTimeMs: Date.now(),
+    })
+
+    // Turn 2: follow-up @Bot inside the same thread -> model emits backticked `<no_reply/>`
+    await handleInbound('oncall-bot', fakeTransport, {
+      botId: 'oncall-bot',
+      larkAppId: 'cli_oncall',
+      botOpenId: 'ou_bot',
+      messageId: 'om_m2',
+      rootId: 'om_m1',
+      parentId: 'om_m1',
+      threadId: 'omt_t1',
+      chatId: 'oc_alert_demo',
+      chatType: 'group',
+      msgType: 'text',
+      senderOpenId: 'ou_u1',
+      senderType: 'user',
+      text: '@_b 背后是啥模型？',
+      rawContent: '{}',
+      mentions: [{ key: '@_b', openId: 'ou_bot', name: 'OncallBot' }],
+      imageKeys: [],
+      createTimeMs: Date.now(),
+    })
+
+    // Turn 3: normal prose discussing `<no_reply/>` must pass through intact
+    await handleInbound('oncall-bot', fakeTransport, {
+      botId: 'oncall-bot',
+      larkAppId: 'cli_oncall',
+      botOpenId: 'ou_bot',
+      messageId: 'om_m3',
+      rootId: 'om_m1',
+      parentId: 'om_m1',
+      threadId: 'omt_t1',
+      chatId: 'oc_alert_demo',
+      chatType: 'group',
+      msgType: 'text',
+      senderOpenId: 'ou_u1',
+      senderType: 'user',
+      text: '@_b 静默标记是什么？',
+      rawContent: '{}',
+      mentions: [{ key: '@_b', openId: 'ou_bot', name: 'OncallBot' }],
+      imageKeys: [],
+      createTimeMs: Date.now(),
+    })
+
+    // Prompt on both turn 1 and turn 2 explicitly surfaces trigger="mention" & polite-refusal rule
+    expect(receivedPrompts[0]).toContain('trigger="mention"')
+    expect(receivedPrompts[0]).toContain('本轮禁止静默')
+    expect(receivedPrompts[1]).toContain('trigger="mention"')
+    expect(receivedPrompts[1]).toContain('简短礼貌说明职责边界并拒答')
+
+    // Raw `<no_reply/>` NEVER leaks to Feishu (neither intermediate nor final); fallback is delivered instead
+    expect(sentReplies).toHaveLength(3)
+    expect(sentReplies[0]?.text).not.toContain('<no_reply/>')
+    expect(sentReplies[0]?.text).toContain('职责范围')
+    expect(sentReplies[1]?.text).not.toContain('<no_reply/>')
+    expect(sentReplies[1]?.text).toContain('职责范围')
+    // Normal prose discussing the sentinel is preserved untouched
+    expect(sentReplies[2]?.text).toBe('请使用 `<no_reply/>` 表示旁听静默')
+
+    // Warning & audit event record the interception
+    expect(warnSpy).toHaveBeenCalledTimes(2)
+    const interceptedAudits = store
+      .listEvents(20)
+      .filter((e) => e.kind === 'reply' && e.summary.includes('已拦截非静默轮次的 <no_reply/>'))
+    expect(interceptedAudits).toHaveLength(2)
+
+    await manager.stop()
+    store.close()
+  })
 })
