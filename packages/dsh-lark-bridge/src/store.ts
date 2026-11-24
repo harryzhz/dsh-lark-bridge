@@ -4,6 +4,7 @@ import type {
   LarkBotConfig,
   LarkBotStatus,
   LarkGroupConfig,
+  LarkMemoryEntry,
   LarkReminderItem,
   ListenerTemplate,
   SeenMessageEntry,
@@ -20,6 +21,14 @@ import {
   migrateLegacyJsonToSqlite,
   type MigrationVerificationReport,
 } from './storage/legacy-migrator.js'
+import {
+  MemoryRepo,
+  type MemoryQueryOptions,
+  type MemorySupersedeOutcome,
+  type MemoryUpdateInput,
+  type MemoryUpsertInput,
+  type MemoryUpsertOutcome,
+} from './storage/memory-repo.js'
 import { RuntimeRepo } from './storage/runtime-repo.js'
 import { TelemetryRepo } from './storage/telemetry-repo.js'
 import type {
@@ -44,6 +53,7 @@ export class LarkBridgeStore {
   readonly db: BridgeDatabase
   readonly configRepo: ConfigRepo
   readonly runtimeRepo: RuntimeRepo
+  readonly memoryRepo: MemoryRepo
   readonly telemetryRepo: TelemetryRepo
   readonly projector: CockpitProjector
   private lastMigrationReport?: MigrationVerificationReport
@@ -58,6 +68,7 @@ export class LarkBridgeStore {
     this.db = new BridgeDatabase(join(dataDir, DB_FILENAME))
     this.configRepo = new ConfigRepo(this.db, dataDir)
     this.runtimeRepo = new RuntimeRepo(this.db)
+    this.memoryRepo = new MemoryRepo(this.db)
     this.telemetryRepo = new TelemetryRepo(this.db, this.configRepo, maxAuditEvents)
     this.projector = new CockpitProjector(this.configRepo, this.runtimeRepo, this.telemetryRepo)
     this.runtimeRepo.recoverInterruptedDreamSessions()
@@ -325,6 +336,59 @@ export class LarkBridgeStore {
 
   deletePendingTurn(id: string): boolean {
     return this.runtimeRepo.deletePendingTurn(id)
+  }
+
+  // ── Bridge Memory (Runtime-Agnostic Long-Term Memory) ────────────────────
+
+  getMemoryEntry(id: string): LarkMemoryEntry | undefined {
+    return this.memoryRepo.get(id)
+  }
+
+  listMemoryEntries(options: MemoryQueryOptions = {}): LarkMemoryEntry[] {
+    return this.memoryRepo.list(options)
+  }
+
+  countActiveMemoryByBot(): Map<string, number> {
+    return this.memoryRepo.countActiveByBot()
+  }
+
+  countActiveMemoryForBot(botId: string): number {
+    return this.memoryRepo.countActiveForBot(botId)
+  }
+
+  upsertMemoryEntry(input: MemoryUpsertInput, nowMs = Date.now()): MemoryUpsertOutcome {
+    return this.memoryRepo.upsert(input, nowMs)
+  }
+
+  updateMemoryEntry(
+    id: string,
+    patch: MemoryUpdateInput,
+    nowMs = Date.now(),
+  ): LarkMemoryEntry | undefined {
+    return this.memoryRepo.update(id, patch, nowMs)
+  }
+
+  supersedeMemoryEntry(
+    oldId: string,
+    input: {
+      readonly reason: string
+      readonly replacement?: Omit<MemoryUpsertInput, 'botId' | 'supersedesId' | 'supersedeReason'>
+    },
+    nowMs = Date.now(),
+  ): MemorySupersedeOutcome | undefined {
+    return this.memoryRepo.supersede(oldId, input, nowMs)
+  }
+
+  archiveMemoryEntry(id: string, reason?: string, nowMs = Date.now()): LarkMemoryEntry | undefined {
+    return this.memoryRepo.archive(id, reason, nowMs)
+  }
+
+  deleteMemoryEntryHard(id: string): LarkMemoryEntry | undefined {
+    return this.memoryRepo.deleteHard(id)
+  }
+
+  recordMemoryRecalls(ids: readonly string[], nowMs = Date.now()): void {
+    this.memoryRepo.recordRecalls(ids, nowMs)
   }
 
   // ── Telemetry, Audit & View Projections ──────────────────────────────────

@@ -269,6 +269,14 @@ export function SessionsView({
             const modelLabel = resolveModelDisplayName(s.agentPreset, s.model, runtimes, models)
             const dotState =
               s.status === 'running' ? 'ongoing' : s.status === 'failed' ? 'error' : 'done'
+            const memParts = s.memoryStats
+              ? [
+                  s.memoryStats.created > 0 ? `新增 ${s.memoryStats.created}` : null,
+                  s.memoryStats.updated > 0 ? `更新 ${s.memoryStats.updated}` : null,
+                  s.memoryStats.superseded > 0 ? `纠偏 ${s.memoryStats.superseded}` : null,
+                  s.memoryStats.archived > 0 ? `归档 ${s.memoryStats.archived}` : null,
+                ].filter(Boolean)
+              : []
             const statusProgress =
               s.status === 'running'
                 ? s.processedCount > 0
@@ -296,6 +304,12 @@ export function SessionsView({
                     <Tag tone="info">Dreaming</Tag>
                     {s.status === 'running' && <Tag tone="neutral">整理中</Tag>}
                     {s.status === 'failed' && <Tag tone="danger">失败</Tag>}
+                    {s.status === 'succeeded' && memParts.length > 0 && (
+                      <Tag tone="success">{memParts.join(' · ')}</Tag>
+                    )}
+                    {s.status === 'succeeded' && s.outcome === 'no_change' && (
+                      <Tag tone="neutral">无新增记忆</Tag>
+                    )}
                   </div>
                   <div className="fb-item-meta" title={s.summary || metaText}>
                     {metaText}

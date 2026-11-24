@@ -138,6 +138,15 @@ export {
   type CliAuthEndpoint,
 } from './cli-support.js'
 export { DreamingService, type DreamingHost } from './dreaming-service.js'
+export { BridgeMemoryService, type MemoryMutationTracker } from './memory-service.js'
+export {
+  MemoryRepo,
+  type MemoryQueryOptions,
+  type MemorySupersedeOutcome,
+  type MemoryUpdateInput,
+  type MemoryUpsertInput,
+  type MemoryUpsertOutcome,
+} from './storage/memory-repo.js'
 export {
   browseHostDirectories,
   createHostSubdirectory,

@@ -814,7 +814,9 @@ describe('decideLarkRouting, <user_message> format, memberOverrides & title inte
     expect(dreamPrompt).toContain('<system_reminder>\n<dream_job ')
     expect(dreamPrompt).not.toContain('lark_dream_job')
     expect(dreamPrompt).toContain('核心链路发布红线')
-    expect(dreamPrompt).toContain('直接调用并维护你自身内置的长期记忆（Memory）机制')
+    expect(dreamPrompt).toContain('lark-bridge memory upsert')
+    expect(dreamPrompt).toContain('lark-bridge memory supersede')
+    expect(dreamPrompt).toContain('lark-bridge memory forget')
     expect(dreamPrompt).toContain(`${workDir}/.worktrees/`)
     expect(dreamPrompt).toContain('lark-bridge reminder create')
 

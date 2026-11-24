@@ -113,6 +113,41 @@ export interface DreamRunState {
   processedSessionIds: string[]
 }
 
+export type MemoryType = 'feedback' | 'user' | 'project' | 'reference'
+export type MemoryScope = 'bot' | 'chat' | 'workspace'
+export type MemoryStatus = 'active' | 'superseded' | 'archived'
+export type MemoryConfidence = 'high' | 'medium'
+
+export interface MemoryEntry {
+  id: string
+  botId: string
+  scope: MemoryScope
+  scopeId: string
+  type: MemoryType
+  title: string
+  content: string
+  tags: string[]
+  confidence: MemoryConfidence
+  pinned: boolean
+  status: MemoryStatus
+  sourceSessionId?: string
+  supersededBy?: string
+  supersededAtMs?: number
+  supersedeReason?: string
+  createdAtMs: number
+  updatedAtMs: number
+  lastVerifiedAtMs: number
+  lastRecalledAtMs?: number
+  recallCount: number
+}
+
+export interface MemoryMutationStats {
+  created: number
+  updated: number
+  superseded: number
+  archived: number
+}
+
 export interface DreamSession {
   sessionId: string
   botId: string
@@ -123,6 +158,8 @@ export interface DreamSession {
   runtimeProfileId?: string
   model?: string
   status: 'running' | 'succeeded' | 'failed'
+  outcome?: 'memory_updated' | 'no_change' | 'failed'
+  memoryStats?: MemoryMutationStats
   dateKey: string
   processedCount: number
   summary?: string
@@ -278,6 +315,7 @@ export interface BotRecord extends BotConfig {
   hasSecret: boolean
   effectiveWorkspaceName: string
   configuredGroupCount: number
+  activeMemoryCount?: number
   status?: BotStatusView
   dreamState?: DreamRunState
 }

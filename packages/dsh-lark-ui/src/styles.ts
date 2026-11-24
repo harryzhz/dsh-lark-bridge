@@ -872,6 +872,43 @@ body > [role='presentation']:has(> [role='dialog'][aria-modal='true'])
   cursor: pointer;
 }
 .fb-advanced-section { padding-top: 12px; }
+.fb-memory-nav-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 4px 0 6px;
+}
+.fb-memory-search {
+  width: 100%;
+  height: 30px;
+  font-size: 12.5px;
+}
+.fb-memory-nav-empty {
+  padding: 16px 8px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--dsw-alias-label-tertiary);
+}
+.fb-memory-meta-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+  padding: 8px 12px;
+  margin-bottom: 6px;
+  border-radius: var(--dsw-radius-md);
+  background: var(--dsw-alias-bg-module-platform);
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-secondary);
+}
+.fb-memory-path-hint {
+  margin-top: 10px;
+  font-size: 11.5px;
+  line-height: 17px;
+  color: var(--dsw-alias-label-tertiary);
+  word-break: break-all;
+}
 .fb-schedule-dialog.fb-schedule-dialog {
   display: flex; flex-direction: column;
   width: 580px; max-width: calc(100vw - 48px);

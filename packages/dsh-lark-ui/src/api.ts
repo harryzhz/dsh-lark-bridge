@@ -15,6 +15,11 @@ import type {
   GroupView,
   ImportExistingBotInput,
   ListenerTemplate,
+  MemoryConfidence,
+  MemoryEntry,
+  MemoryScope,
+  MemoryStatus,
+  MemoryType,
   ModelGroup,
   OpenPlatformAppsPayload,
   QrJobView,
@@ -190,6 +195,49 @@ export const bridgeApi = {
   syncBotChats: async (id: string) => (await post<{ count: number }>(`/bots/${seg(id)}/sync-chats`)).count,
   runBotDream: async (id: string, force = true) =>
     (await post<{ dreamState: DreamRunState }>(`/bots/${seg(id)}/dream`, { force })).dreamState,
+  memories: async (params: {
+    botId: string
+    status?: MemoryStatus | 'all'
+    type?: MemoryType
+    q?: string
+    limit?: number
+  }) => {
+    const qs = new URLSearchParams({ botId: params.botId })
+    if (params.status) qs.set('status', params.status)
+    if (params.type) qs.set('type', params.type)
+    if (params.q?.trim()) qs.set('q', params.q.trim())
+    if (params.limit) qs.set('limit', String(params.limit))
+    return request<{ entries: MemoryEntry[]; markdownPath?: string }>(`/memory?${qs.toString()}`)
+  },
+  upsertMemory: async (input: {
+    id?: string
+    botId: string
+    scope: MemoryScope
+    scopeId?: string
+    type: MemoryType
+    title: string
+    content: string
+    tags?: string[]
+    confidence?: MemoryConfidence
+    pinned?: boolean
+  }) => (await post<{ action: 'created' | 'updated'; entry: MemoryEntry }>('/memory', input)).entry,
+  updateMemory: async (
+    id: string,
+    patch: {
+      scope?: MemoryScope
+      scopeId?: string
+      type?: MemoryType
+      title?: string
+      content?: string
+      tags?: string[]
+      confidence?: MemoryConfidence
+      pinned?: boolean
+      status?: MemoryStatus
+    },
+  ) => (await put<{ entry: MemoryEntry }>(`/memory/${seg(id)}`, patch)).entry,
+  archiveMemory: (id: string, reason?: string) =>
+    del(`/memory/${seg(id)}${reason ? `?reason=${seg(reason)}` : ''}`),
+  deleteMemory: (id: string) => del(`/memory/${seg(id)}?hard=1`),
   searchUsers: async (botId: string, q: string) =>
     (await request<{ users: UserSearchHit[] }>(`/bots/${seg(botId)}/users/search?q=${seg(q)}`)).users,
 

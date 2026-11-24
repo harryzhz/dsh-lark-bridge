@@ -170,7 +170,7 @@ stateDiagram-v2
 | **变更 `agentPreset` 或 `workingDir`** | 调用 `unbindRoute(existing.routeKey, { archive: false })`，以新运行时/目录新建会话 | 新建（旧会话待超时归档） |
 | **同话题多消息并发到达** | `pendingAcquires` 按主 `routeKey` 串行合并首轮创建：第一条创建（`isNew: true`），后续等待并直接复用同一会话（`isNew: false`） | 共享同一会话 |
 | **服务重启后内存无句柄** | `ctx.agents.resume(sessionId)` 恢复持久化会话；恢复失败才清理 binding 并新建 | 保留 |
-| **首轮 vs 续轮提示词** | 首轮（`isNew: true`）注入 `<role>`、`<proactive>` 与完整 `lark-bridge` 工具指引；续轮只注入本轮 `<lark_context>` 与 `turnReminders` | 续轮共享会话上下文 |
+| **首轮 vs 续轮提示词** | 首轮（`isNew: true`）注入 `<role>`、`<proactive>`、有界 `<bridge_memory>` 核心记忆索引与完整 `lark-bridge` 工具指引；续轮只注入本轮 `<lark_context>` 与 `turnReminders` | 续轮共享会话上下文 |
 
 ### 5.2 四条关闭与归档路径
 

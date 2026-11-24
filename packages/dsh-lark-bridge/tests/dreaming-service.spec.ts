@@ -19,6 +19,7 @@ import type { LarkBridgeManager } from '../src/bridge-manager.js'
 import { ensureCliAuthEndpoint } from '../src/cli-support.js'
 import { DreamingService } from '../src/dreaming-service.js'
 import { createLarkHttpHandler, type ConnectionAdmitter } from '../src/http-api.js'
+import { BridgeMemoryService } from '../src/memory-service.js'
 import { RuntimeCatalog } from '../src/runtime-catalog.js'
 import { LarkBridgeStore } from '../src/store.js'
 import type { WorkspaceGrouping } from '../src/workspace-grouping.js'
@@ -594,5 +595,129 @@ describe('DreamingService dual-gate scheduling, product dataDir isolation & nati
     // Prompt directs git inspection specifically to active subRepoDir instead of blindly scanning parentDir
     expect(runPrompts[0]).toContain(subRepoDir)
     expect(runPrompts[0]).toContain('勿盲目遍历无关仓库')
+  })
+
+  it('tracks real Bridge Memory mutations during Auto-Dream and rejects false-positive succeeded status when runtime reports memory write failure', async () => {
+    const dataDir = makeTempDir()
+    const workDir = makeTempDir()
+    const store = new LarkBridgeStore(dataDir)
+    const memory = new BridgeMemoryService(dataDir, store)
+
+    store.upsertBot({
+      id: 'dream-mem-bot',
+      name: '记忆整理助手',
+      enabled: true,
+      larkAppId: 'cli_dream_mem',
+      larkAppSecret: 'sec_dream_mem',
+      defaultWorkingDir: workDir,
+      experimental: {
+        dreaming: {
+          enabled: true,
+          scheduleTime: '02:00',
+          minNewSessions: 1,
+          scopes: ['踩坑与排障经验'],
+          cleanupAndCorrect: true,
+        },
+      },
+    })
+
+    const oldEntry = memory.upsert({
+      botId: 'dream-mem-bot',
+      type: 'project',
+      title: '旧限流阈值',
+      content: '默认限流 100 QPS',
+    }).entry
+
+    store.upsertManagedSession({
+      sessionId: 'sess-dream-src-1',
+      botId: 'dream-mem-bot',
+      chatId: 'oc_team',
+      trigger: 'mention',
+      createdAtMs: 1000,
+      lastActivityMs: 2000,
+    })
+
+    const sessionEvents: SessionEvent[] = [
+      {
+        type: 'user/message',
+        data: { content: [{ type: 'text', text: '<user_message>\n接口限流已调整为 500 QPS\n</user_message>' }] },
+      } as unknown as SessionEvent,
+      {
+        type: 'assistant/message',
+        data: { message: { content: [{ type: 'text', text: '收到，已记录限流改为 500 QPS。' }] } },
+      } as unknown as SessionEvent,
+    ]
+
+    const fakeCtx = {
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      sessions: {
+        get: (id: string) =>
+          id === 'sess-dream-src-1'
+            ? ({ id, snapshotEvents: () => sessionEvents } as unknown as Session)
+            : undefined,
+      },
+      agents: {
+        create: vi.fn(async ({ sessionId, setup }: { sessionId: string; setup?: (c: unknown, a: unknown) => void }) => {
+          const agent = { session: { id: sessionId, header: { cwd: workDir, agentPreset: 'codex' } } }
+          setup?.({}, agent)
+          return { agent, dispose: vi.fn().mockResolvedValue(undefined) }
+        }),
+      },
+      get: () => undefined,
+    } as unknown as Context
+
+    let runMode: 'fail_write' | 'real_write' = 'fail_write'
+    const capturedPrompts: string[] = []
+    const dreaming = new DreamingService({
+      ctx: fakeCtx,
+      dataDir,
+      store,
+      memory,
+      runtimes: new RuntimeCatalog(fakeCtx),
+      workspaces: {
+        attachSession: vi.fn().mockResolvedValue(undefined),
+        archiveSession: vi.fn().mockResolvedValue(true),
+      } as unknown as WorkspaceGrouping,
+      runTurn: vi.fn(async (_agent, content) => {
+        capturedPrompts.push(content.map((b) => ('text' in b ? b.text : '')).join('\n'))
+        if (runMode === 'fail_write') {
+          return '当前运行时未暴露可写内置 Memory 接口，记忆写入与历史清理未完成。'
+        }
+        memory.supersede(oldEntry.id, {
+          reason: '2026-11-24 已调高至 500 QPS',
+          replacement: {
+            type: 'project',
+            title: '新限流阈值 500 QPS',
+            content: '2026-11-24 起核心接口默认限流提升至 500 QPS。',
+          },
+        })
+        return '已完成 1 条记忆纠偏，将限流阈值更新为 500 QPS。'
+      }),
+    })
+
+    // 1. When runtime reports inability to write memory with 0 real mutations -> MUST mark failed & NOT advance watermark!
+    const failedState = await dreaming.runForBot('dream-mem-bot', {
+      force: false,
+      now: new Date(2026, 10, 24, 2, 5, 0),
+    })
+    expect(failedState.status).toBe('failed')
+    expect(failedState.processedSessionIds).not.toContain('sess-dream-src-1')
+    expect(capturedPrompts[0]).toContain('lark-bridge memory upsert')
+    expect(capturedPrompts[0]).toContain(memory.memoryMarkdownPath('dream-mem-bot'))
+
+    // 2. Retry with real Bridge Memory writes -> succeeds, records exact memoryStats & advances watermark!
+    runMode = 'real_write'
+    const okState = await dreaming.runForBot('dream-mem-bot', {
+      force: true,
+      now: new Date(2026, 10, 24, 2, 10, 0),
+    })
+    expect(okState.status).toBe('succeeded')
+    expect(okState.processedSessionIds).toContain('sess-dream-src-1')
+    expect(okState.lastSummary).toContain('新增 1')
+    expect(okState.lastSummary).toContain('纠偏 1')
+
+    const latestDream = store.listDreamSessions('dream-mem-bot')[0]
+    expect(latestDream?.outcome).toBe('memory_updated')
+    expect(latestDream?.memoryStats).toMatchObject({ created: 1, superseded: 1 })
   })
 })
