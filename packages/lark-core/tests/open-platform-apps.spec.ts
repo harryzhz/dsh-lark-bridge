@@ -361,4 +361,119 @@ describe('LarkPlatformManager Open Platform existing apps listing & credential i
     })
     expect(postedBodies.has('/developers/v1/publish/commit/cli_demo_sync/ver_2')).toBe(true)
   })
+
+  it('idempotently syncs missing baseline events & publishes a patch version, and skips publish when already complete', async () => {
+    const dir = makeTempDir()
+    writeFakeSession(dir)
+
+    let currentEvents = [
+      'im.message.receive_v1',
+      'im.chat.member.bot.added_v1',
+      'im.chat.member.bot.deleted_v1',
+      'im.message.reaction.created_v1',
+      'im.message.reaction.deleted_v1',
+    ]
+    let currentCallbacks = ['card.action.trigger']
+    const postedBodies: Array<{ pathname: string; body: Record<string, unknown> }> = []
+
+    const fetcher = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      const pathname = new URL(String(url)).pathname
+      const body =
+        init?.method === 'POST' && typeof init.body === 'string' && init.body
+          ? (JSON.parse(init.body) as Record<string, unknown>)
+          : {}
+      if (init?.method === 'POST') {
+        postedBodies.push({ pathname, body })
+      }
+      if (pathname === '/app') {
+        return new Response(makeConsoleHtml(), { status: 200 })
+      }
+      if (pathname === '/developers/v1/event/cli_existing_1') {
+        return new Response(
+          JSON.stringify({ code: 0, data: { eventMode: 4, events: currentEvents } }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        )
+      }
+      if (pathname === '/developers/v1/callback/cli_existing_1') {
+        return new Response(
+          JSON.stringify({ code: 0, data: { callbackMode: 4, callbacks: currentCallbacks } }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        )
+      }
+      if (pathname === '/developers/v1/event/update/cli_existing_1') {
+        const added = Array.isArray(body.appEvents) ? (body.appEvents as string[]) : []
+        currentEvents = [...new Set([...currentEvents, ...added])]
+        return new Response(JSON.stringify({ code: 0, data: {} }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        })
+      }
+      if (pathname === '/developers/v1/visible/online/cli_existing_1') {
+        return new Response(
+          JSON.stringify({
+            code: 0,
+            data: {
+              whiteList: { departments: [], members: [{ id: 'u_demo_1' }], groups: [], isAll: 0 },
+              blackList: { departments: [], members: [], groups: [], isAll: 0 },
+            },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        )
+      }
+      if (pathname === '/developers/v1/app_version/list/cli_existing_1') {
+        return new Response(
+          JSON.stringify({
+            code: 0,
+            data: { versions: [{ appVersion: '1.0.2', versionId: 'ver_old', versionStatus: 2 }] },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        )
+      }
+      if (pathname === '/developers/v1/app_version/create/cli_existing_1') {
+        return new Response(
+          JSON.stringify({ code: 0, data: { versionId: 'ver_next_3' } }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        )
+      }
+      if (pathname === '/developers/v1/publish/commit/cli_existing_1/ver_next_3') {
+        return new Response(JSON.stringify({ code: 0, data: {} }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        })
+      }
+      return new Response('not found', { status: 404 })
+    })
+
+    const mgr = new LarkPlatformManager(dir, fetcher as unknown as typeof fetch)
+
+    // 1. Missing im.message.recalled_v1 -> adds only missing event and publishes 1.0.3
+    const first = await mgr.syncAppBaselineEvents('cli_existing_1')
+    expect(first).toEqual({
+      synced: true,
+      addedEvents: ['im.message.recalled_v1'],
+      addedCallbacks: [],
+      version: '1.0.3',
+    })
+    const eventUpdate = postedBodies.find((p) => p.pathname === '/developers/v1/event/update/cli_existing_1')
+    expect(eventUpdate?.body).toMatchObject({
+      operation: 'add',
+      appEvents: ['im.message.recalled_v1'],
+      eventMode: 4,
+    })
+    expect(postedBodies.some((p) => p.pathname === '/developers/v1/publish/commit/cli_existing_1/ver_next_3')).toBe(
+      true,
+    )
+
+    // 2. Second run when already subscribed -> idempotently skips update & publish
+    postedBodies.length = 0
+    const second = await mgr.syncAppBaselineEvents('cli_existing_1')
+    expect(second).toEqual({
+      synced: true,
+      skipped: true,
+      addedEvents: [],
+      addedCallbacks: [],
+    })
+    expect(postedBodies.some((p) => p.pathname.includes('/event/update/'))).toBe(false)
+    expect(postedBodies.some((p) => p.pathname.includes('/app_version/create/'))).toBe(false)
+  })
 })

@@ -57,6 +57,7 @@ export {
   slugifyBotId,
   type AutoCreateBotRequest,
   type AutoCreatedBotCredentials,
+  type LarkBaselineEventSyncResult,
   type LarkOpenPlatformAppCredentials,
   type LarkOpenPlatformAppSummary,
   type LarkOpenPlatformIdentity,

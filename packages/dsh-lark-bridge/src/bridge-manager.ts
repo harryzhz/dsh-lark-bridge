@@ -4,6 +4,7 @@ import {
   LarkPlatformManager,
   type DiscoveredLarkChat,
   type InboundLarkMessage,
+  type LarkBaselineEventSyncResult,
   type LarkBotConfig,
   type LarkBotProfile,
   type LarkBotStatus,
@@ -559,7 +560,9 @@ export class LarkBridgeManager {
     return this.connections.startAutoCreateBot(rawBody)
   }
 
-  importExistingOpenPlatformBot(rawBody: Record<string, unknown>): Promise<LarkBotConfig> {
+  importExistingOpenPlatformBot(
+    rawBody: Record<string, unknown>,
+  ): Promise<{ readonly bot: LarkBotConfig; readonly eventSync?: LarkBaselineEventSyncResult }> {
     return this.connections.importExistingOpenPlatformBot(rawBody)
   }
 

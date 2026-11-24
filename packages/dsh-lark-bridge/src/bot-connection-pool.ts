@@ -5,6 +5,7 @@ import {
   type CardActionEvent,
   type DiscoveredLarkChat,
   type InboundLarkMessage,
+  type LarkBaselineEventSyncResult,
   type LarkBotConfig,
   type LarkBotProfile,
   type LarkBotStatus,
@@ -318,7 +319,9 @@ export class BotConnectionPool {
     )
   }
 
-  async importExistingOpenPlatformBot(rawBody: Record<string, unknown>): Promise<LarkBotConfig> {
+  async importExistingOpenPlatformBot(
+    rawBody: Record<string, unknown>,
+  ): Promise<{ readonly bot: LarkBotConfig; readonly eventSync?: LarkBaselineEventSyncResult }> {
     const larkAppId = typeof rawBody.larkAppId === 'string' ? rawBody.larkAppId.trim() : ''
     if (!larkAppId) throw new Error('请选择要接入的飞书应用')
     const existing = this.host.store.listBots().find((b) => b.larkAppId === larkAppId)
@@ -331,10 +334,15 @@ export class BotConnectionPool {
     const requestedName = typeof rawBody.name === 'string' ? rawBody.name.trim() : ''
     const requestedDescription =
       typeof rawBody.description === 'string' ? rawBody.description.trim() : ''
+    const shouldSyncEvents = rawBody.syncBaselineEvents === true
     const name = requestedName || creds.name || larkAppId
     const description = requestedDescription || creds.description || ''
     const baseId = requestedId || slugifyBotId(name, larkAppId)
     const finalId = this.allocateUniqueBotId(baseId, creds.appId)
+
+    const eventSync = shouldSyncEvents
+      ? await this.host.platform.syncAppBaselineEvents(creds.appId)
+      : undefined
 
     const saved = this.host.store.upsertBot({
       id: finalId,
@@ -351,11 +359,21 @@ export class BotConnectionPool {
       ...(defaults.model ? { model: defaults.model } : {}),
       ...(defaults.reasoningEffort ? { reasoningEffort: defaults.reasoningEffort } : {}),
     })
+    if (eventSync?.synced && !eventSync.skipped) {
+      this.host.store.recordEvent({
+        botId: saved.id,
+        kind: 'lifecycle',
+        summary: `接入时已补齐基线事件${eventSync.addedEvents.length > 0 ? `（新增 ${eventSync.addedEvents.length} 项）` : ''}${eventSync.version ? `并发布版本 ${eventSync.version}` : ''}`,
+      })
+    }
     await this.syncBot(saved.id)
     if (!saved.description.trim() || !saved.avatarUrl.trim()) {
       await this.ensureBotProfileHydrated(saved.id)
     }
-    return this.host.store.getBot(saved.id) ?? saved
+    return {
+      bot: this.host.store.getBot(saved.id) ?? saved,
+      ...(eventSync ? { eventSync } : {}),
+    }
   }
 
   private async syncBotSerialized(

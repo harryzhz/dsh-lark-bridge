@@ -2,6 +2,7 @@ import type {
   AuditEvent,
   AuthStatusPayload,
   AutoCreateBotInput,
+  BaselineEventSyncResult,
   BotConfig,
   BotRecord,
   CatalogModelItem,
@@ -182,7 +183,8 @@ export const bridgeApi = {
 
   createBot: (bot: BotConfig) => post<{ bot: BotConfig; platformSync?: { synced: boolean; message?: string } }>('/bots', bot),
   autoCreateBot: async (input: AutoCreateBotInput) => (await post<{ job: QrJobView }>('/bots/auto-create', input)).job,
-  importExistingBot: (input: ImportExistingBotInput) => post<{ bot: BotConfig }>('/bots/import-existing', input),
+  importExistingBot: (input: ImportExistingBotInput) =>
+    post<{ bot: BotConfig; eventSync?: BaselineEventSyncResult }>('/bots/import-existing', input),
   updateBot: (id: string, bot: BotConfig) =>
     put<{ bot: BotConfig; platformSync?: { synced: boolean; message?: string } }>(`/bots/${seg(id)}`, bot),
   toggleBot: (id: string) => post(`/bots/${seg(id)}/toggle`),
