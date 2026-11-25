@@ -13,7 +13,7 @@ import {
   type LarkMemoryEntry,
 } from '@dsh-lark/lark-core'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { LarkBridgeManager } from '../src/bridge-manager.js'
+import { LarkBridgeManager } from '../src/bridge-manager.js'
 import { ensureCliAuthEndpoint } from '../src/cli-support.js'
 import { createLarkHttpHandler, type ConnectionAdmitter } from '../src/http-api.js'
 import { MemoryService } from '../src/memory-service.js'
@@ -468,5 +468,208 @@ describe('MemoryService: SOTA typed memory, scope isolation, FTS5 search, bi-tem
     expect(memory.get(createdId, { recordRecall: false })).toBeUndefined()
 
     store.close()
+  })
+
+  it('derives workingDir from real AgentToolFacade across executingTurn/binding/reminder/schedule and enforces upsert supersede & bot isolation', async () => {
+    const dataDir = makeTempDir('lark-mem-ctx-')
+    const repoMain = makeTempDir('repo-main-')
+    const repoOther = makeTempDir('repo-other-')
+    const repoReminder = makeTempDir('repo-rem-')
+    const store = new LarkBridgeStore(dataDir)
+
+    store.upsertBot({
+      id: 'bot-a',
+      name: '助手 A',
+      enabled: false,
+      larkAppId: 'cli_mem_a',
+      larkAppSecret: 'sec_a',
+      defaultWorkingDir: repoMain,
+    })
+    store.upsertBot({
+      id: 'bot-b',
+      name: '助手 B',
+      enabled: false,
+      larkAppId: 'cli_mem_b',
+      larkAppSecret: 'sec_b',
+      defaultWorkingDir: repoOther,
+    })
+    store.upsertBinding({
+      routeKey: 'cli_mem_a:oc_team:om_root_1',
+      botId: 'bot-a',
+      botName: '助手 A',
+      larkAppId: 'cli_mem_a',
+      chatId: 'oc_team',
+      chatName: '研发群',
+      workspaceName: 'repo-main',
+      sessionId: 'sess-binding-1',
+      agentPreset: 'standard',
+      workingDir: repoMain,
+      trigger: 'mention',
+      createdAtMs: 1000,
+      lastActivityMs: 1000,
+    })
+    store.upsertReminder({
+      id: 'rem-ctx-1',
+      title: '核查任务',
+      prompt: '核查状态',
+      scheduledAt: '2026-11-26T01:00:00.000Z',
+      status: 'running',
+      workingDir: repoReminder,
+      lastSessionId: 'sess-rem-1',
+      origin: {
+        botId: 'bot-a',
+        botName: '助手 A',
+        larkAppId: 'cli_mem_a',
+        chatType: 'group',
+        chatId: 'oc_team',
+        deliveryMode: 'thread',
+      },
+      mentions: [{ openId: 'ou_owner', name: 'Alex' }],
+      createdAtMs: 1000,
+      updatedAtMs: 1000,
+    })
+
+    const fakeCtx = {
+      logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn() },
+      sessions: {
+        get: (sid: string) =>
+          sid === 'sess-sched-1' ? { id: sid, header: { cwd: repoOther } } : undefined,
+      },
+      llm: { listProviders: () => [] },
+      on: () => () => {},
+      get: () => undefined,
+    } as unknown as Context
+
+    const manager = new LarkBridgeManager(
+      fakeCtx,
+      {
+        dataDir,
+        publicBaseUrl: 'http://127.0.0.1:3880',
+        idleSweepIntervalMs: 0,
+        maxAuditEvents: 50,
+        autoInstallCliAndSkill: false,
+      },
+      store,
+    )
+
+    // Inject active executing turn (PR #43 highest-priority path) and schedule context
+    vi.spyOn(manager.inbound, 'getExecutingTurnContext').mockImplementation((sid: string) =>
+      sid === 'sess-exec-1'
+        ? {
+            botId: 'bot-a',
+            larkAppId: 'cli_mem_a',
+            chatId: 'oc_team',
+            chatType: 'group',
+            chatName: '研发群',
+            workingDir: repoMain,
+            routeKey: 'cli_mem_a:oc_team:om_exec_1',
+            messageId: 'om_exec_1',
+            replyMode: 'new-topic',
+            replyToMessageId: 'om_exec_1',
+            replyInThread: true,
+          }
+        : undefined,
+    )
+    vi.spyOn(manager.schedules, 'getActiveSessionContext').mockImplementation((sid: string) =>
+      sid === 'sess-sched-1'
+        ? {
+            scheduleId: 'sched-1',
+            title: '每日巡检',
+            deliveryMode: 'chat',
+            notifyOn: 'non_empty',
+            targets: [{ botId: 'bot-a', chatId: 'oc_team' }],
+          }
+        : undefined,
+    )
+
+    // 1. Real resolveAgentContext returns workingDir across all 4 bound paths
+    expect(manager.resolveAgentContext('sess-exec-1').workingDir).toBe(repoMain)
+    expect(manager.resolveAgentContext('sess-binding-1').workingDir).toBe(repoMain)
+    expect(manager.resolveAgentContext('sess-rem-1').workingDir).toBe(repoReminder)
+    expect(manager.resolveAgentContext('sess-sched-1').workingDir).toBe(repoOther)
+
+    // 2. HTTP /memory with scope=workspace derives scopeId automatically via executingTurn
+    const admitter: ConnectionAdmitter = { admit: () => ({ peer: { principal: { kind: 'owner' } } }) }
+    const handler = createLarkHttpHandler(fakeCtx, admitter, manager)
+    const cliHeaders = { authorization: `Bearer ${manager.cliAuth.token}` }
+
+    const otherWsMem = manager.memory.upsert({
+      botId: 'bot-a',
+      scope: 'workspace',
+      scopeId: repoOther,
+      type: 'project',
+      title: '其他仓库规范',
+      content: '仅属于 repoOther。',
+    })
+    const createdWs = await invokeHandler(handler, {
+      method: 'POST',
+      url: '/api/lark-bridge/memory',
+      headers: cliHeaders,
+      body: {
+        sessionId: 'sess-exec-1',
+        scope: 'workspace',
+        type: 'project',
+        title: '主仓库测试规范',
+        content: '必须通过全量单元测试。',
+      },
+    })
+    expect(createdWs.status).toBe(201)
+    expect((createdWs.json.entry as { scopeId: string }).scopeId).toBe(repoMain)
+
+    const listedWs = await invokeHandler(handler, {
+      url: '/api/lark-bridge/memory?sessionId=sess-exec-1&scope=workspace',
+      headers: cliHeaders,
+    })
+    expect(listedWs.status).toBe(200)
+    const ids = (listedWs.json.entries as Array<{ id: string }>).map((e) => e.id)
+    expect(ids).toContain((createdWs.json.entry as { id: string }).id)
+    expect(ids).not.toContain(otherWsMem.entry.id)
+
+    // 3. Upsert updating an existing id WITH supersedesId still transitions old entry to superseded
+    const oldFact = manager.memory.upsert({
+      botId: 'bot-a',
+      scope: 'bot',
+      type: 'reference',
+      title: '旧版接口地址',
+      content: '使用 v1 端点。',
+    })
+    const targetFact = manager.memory.upsert({
+      botId: 'bot-a',
+      scope: 'bot',
+      type: 'reference',
+      title: '新版接口地址',
+      content: '使用 v2 端点。',
+    })
+    const updatedWithSupersede = manager.memory.upsert({
+      id: targetFact.entry.id,
+      botId: 'bot-a',
+      scope: 'bot',
+      type: 'reference',
+      title: '新版接口地址（最终）',
+      content: '全量切换至 v2 端点。',
+      supersedesId: oldFact.entry.id,
+      supersedeReason: 'v1 已下线',
+    })
+    expect(updatedWithSupersede.action).toBe('updated')
+    expect(updatedWithSupersede.supersededEntry?.id).toBe(oldFact.entry.id)
+    expect(updatedWithSupersede.supersededEntry?.status).toBe('superseded')
+    expect(manager.memory.get(oldFact.entry.id, { recordRecall: false })?.supersededBy).toBe(
+      targetFact.entry.id,
+    )
+
+    // 4. Cross-bot overwrite via explicit id is rejected
+    expect(() =>
+      manager.memory.upsert({
+        id: targetFact.entry.id,
+        botId: 'bot-b',
+        scope: 'bot',
+        type: 'reference',
+        title: '越权篡改',
+        content: '尝试覆写其他智能体的记忆。',
+      }),
+    ).toThrow(/禁止跨智能体修改/)
+    expect(manager.memory.get(targetFact.entry.id, { recordRecall: false })?.botId).toBe('bot-a')
+
+    await manager.stop()
   })
 })
