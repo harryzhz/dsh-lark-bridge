@@ -23,6 +23,9 @@ import type {
   MemoryType,
   ModelGroup,
   OpenPlatformAppsPayload,
+  ManagedPluginId,
+  PluginUpdateOperation,
+  PluginUpdatesOverview,
   QrJobView,
   ReminderItem,
   RuntimeCatalogPayload,
@@ -316,4 +319,25 @@ export const bridgeApi = {
   diagnostics: () => request<Record<string, unknown>>('/diagnostics'),
   clearSplitBrainAlert: (botId: string) =>
     post<{ ok: boolean; cleared: boolean }>(`/diagnostics/split-brain/${seg(botId)}/clear`),
+
+  pluginUpdates: (options: { check?: boolean; force?: boolean } = {}) => {
+    const qs = new URLSearchParams()
+    if (options.check) qs.set('check', '1')
+    if (options.force) qs.set('force', '1')
+    const suffix = qs.toString()
+    return request<PluginUpdatesOverview>(`/plugins/updates${suffix ? `?${suffix}` : ''}`)
+  },
+  checkPluginUpdates: (force = true) => post<PluginUpdatesOverview>('/plugins/check', { force }),
+  startPluginUpdate: async (options: {
+    target?: ManagedPluginId | 'all'
+    version?: string
+    force?: boolean
+    allowMigrateLocal?: boolean
+  } = {}) => (await post<{ operation: PluginUpdateOperation }>('/plugins/update', options)).operation,
+  pluginUpdateStatus: async (operationId?: string) =>
+    (
+      await request<{ operation?: PluginUpdateOperation }>(
+        `/plugins/update-status${operationId ? `?operationId=${seg(operationId)}` : ''}`,
+      )
+    ).operation,
 }

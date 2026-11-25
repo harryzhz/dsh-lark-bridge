@@ -36,6 +36,7 @@ import { DreamingService } from './dreaming-service.js'
 import { InboundPipeline } from './inbound-pipeline.js'
 import { InstanceLock } from './instance-lock.js'
 import { MemoryService } from './memory-service.js'
+import { PluginUpdateService } from './plugin-updater.js'
 import { ProactiveReminderService } from './reminder-service.js'
 import { RuntimeCatalog } from './runtime-catalog.js'
 import { ScheduleNotifier, type ScheduleCreateInputLike } from './schedule-notifier.js'
@@ -106,6 +107,7 @@ export class LarkBridgeManager {
   readonly facade: AgentToolFacade
   readonly titleGuard: SessionTitleGuard
   readonly splitBrain: SplitBrainDetector
+  readonly pluginUpdater: PluginUpdateService
 
   private readonly instanceLock: InstanceLock
   private readonly directoryEnricher: LarkDirectoryEnricher
@@ -276,6 +278,53 @@ export class LarkBridgeManager {
       patchOriginCard: (botId, messageId, card) =>
         this.facade.patchOriginCard(botId, messageId, card),
       deliverReminderOutput: (input) => this.facade.deliverReminderOutput(input),
+    })
+
+    this.pluginUpdater = new PluginUpdateService({
+      ctx,
+      dataDir: config.dataDir,
+      lifecycle: {
+        getLifecycleStatus: () => this.getLifecycleStatus(),
+        beginDrain: (opts) => this.beginDrain(opts),
+        waitForDrain: (timeoutMs, signal) => this.waitForDrain(timeoutMs, signal),
+        cancelDrain: () => this.cancelDrain(),
+        countActiveExternalAgents: () => {
+          try {
+            const extSvc = this.ctx.get('externalRuntimes' as never) as
+              | {
+                  list?: () => readonly { id: string }[]
+                  listExposedPresets?: () => readonly { presetId: string }[]
+                }
+              | undefined
+            if (!extSvc) return 0
+            const externalIds = new Set<string>([
+              ...(extSvc.list?.().map((r) => r.id) ?? []),
+              ...(extSvc.listExposedPresets?.().map((p) => p.presetId) ?? []),
+            ])
+            if (externalIds.size === 0) return 0
+            const agents = this.ctx.agents?.list?.() ?? []
+            return agents.filter((agent) => {
+              if (agent.status === 'idle') return false
+              const preset = (agent.session?.header as { agentPreset?: string } | undefined)
+                ?.agentPreset
+              return typeof preset === 'string' && externalIds.has(preset)
+            }).length
+          } catch {
+            return 0
+          }
+        },
+        recordUpdateEvent: (summary, isError) => {
+          try {
+            this.store.recordEvent({
+              botId: 'system',
+              kind: isError ? 'error' : 'lifecycle',
+              summary,
+            })
+          } catch {
+            // Ignore audit error during teardown/reload.
+          }
+        },
+      },
     })
   }
 

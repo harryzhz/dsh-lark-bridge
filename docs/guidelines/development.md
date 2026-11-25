@@ -33,22 +33,21 @@
    ```
    - 在 PR 描述中说明变更动机、核心改动、UI 影响（如有）与验证情况，并确保 GitHub CI（`check:privacy`、`build`、`typecheck`、`test`、`pack-bundle`）全部通过。
 4. **完成本地端到端真实验证**（见下方第 2 节：优先在独立隔离的本地 E2E 实例挂载当前 PR worktree 产物完成真实浏览器与飞书双机器人实测，未配置隔离 E2E 环境时再回退至飞书触发群或指定验收群；严禁把任何真实群信息、测试机器人 ID 或宿主机路径写入文档、代码或 PR）。
-5. **验证与 CI 全通过后自动合入 `main`、同步构建、清理 Worktree 并优雅重启服务**：
-   - 满足自动合入条件（全量门禁、GitHub CI、飞书端到端实测与浏览器真实验证全部通过；纯文档变更则仅需门禁与 CI 通过）时，**直接自动合入 `main`**，无需反复向用户二次确认：
+5. **验证与 CI 全通过后合入 `main` 并清理 Worktree（不直接替换正式服务）**：
+   - 满足自动合入条件（全量门禁、GitHub CI、飞书端到端实测与浏览器真实验证全部通过；纯文档变更则仅需门禁与 CI 通过）时，**直接合入 `main` 并清理 Worktree**：
    ```bash
    gh pr merge <pr-number> --squash --delete-branch
    cd <主仓库根目录>
    git fetch origin && git checkout main && git pull --ff-only origin main
-   pnpm build
    git worktree remove .worktrees/<slug>
    git branch -d feat/<slug> 2>/dev/null || true
    git worktree prune
    ```
-   - 代码或运行时变更在主干构建完成后，按第 2.4 节自动执行**优雅排空重启**并自检健康状态（纯文档变更无需重启服务）。
+   - **严禁在日常迭代合入后直接替换或重启正式 DSH Web 服务**；正式环境统一通过 GitHub Release `.tgz` 安装，并在发版后于凌晨低峰或用户显式要求时执行免重启热更新（见第 2.4 节）。
 
-## 2. 交付前端到端真实验证与自动合入重启规范
+## 2. 交付前端到端真实验证与发布更新规范
 
-单元测试与静态检查不能替代真实运行环境的联调验收。除纯文档修改外，所有需求开发与缺陷修复在交付闭环前，均须在本地运行的 DSH 环境中完成端到端真实验证，并在全部通过后自动完成 `main` 合入与优雅重启：
+单元测试与静态检查不能替代真实运行环境的联调验收。除纯文档修改外，所有需求开发与缺陷修复在交付闭环前，均须在独立隔离的本地 E2E 环境中完成端到端真实验证，通过后再合入 `main`：
 
 ### 2.1 隔离 E2E 环境与自动验收群脱敏原则
 - **优先使用独立隔离的本地 E2E 实例（推荐）**：在本机维护与正式实例（默认 `~/.dsh`）完全隔离的常驻 E2E DSH Web 实例（独立 `DSH_HOME` 如 `~/.dsh-e2e`、独立端口、独立测试机器人与专用测试群）。`dsh-lark-bridge` 会自动为非默认 `DSH_HOME` 实例隔离私有 `<dataDir>/bin/lark-bridge` 而不覆写宿主机全局 `~/.local/bin/lark-bridge` 与 Skill。PR 验收时直接将 E2E 实例挂载到当前 PR worktree 的构建产物并重启 E2E 服务，全程不中断或污染正式实例；多个并行 worktree 同时进入验收或合入主干阶段时，应通过本机互斥租约锁排队串行占用 E2E 实例与主干构建重启流程（支持崩溃按 PID/TTL 自动回收死锁，避免相互抢占覆盖）。
@@ -69,24 +68,23 @@
 - **配置项真实生效核验**：针对本次新增或改动的每个配置项（如自定义 System Prompt、占位变量替换、上下文条数/窗口开关、群级覆盖/继承/关闭、权限与模型切换等），实际核验保存、回显及在验收群触发时的生效表现，并通过运行日志或落盘会话「轨迹」交叉确认。
 - **验证后现场清理**：临时脚本、测试日志与截图统一存于 `.local/`，避免残留无效测试记录或污染日常工作区。
 
-### 2.4 自动合入后的优雅排空重启与自检
-- 全量门禁、GitHub CI、飞书端到端实测与真实浏览器验证全部通过并自动合入 `main`、在主仓库重新执行 `pnpm build` 后，立即执行优雅排空重启，避免中断在途会话：
-  - **宿主机运维终端发起**：直接同步执行排空与重启（默认排空超时 `120` 秒，可用 `--timeout <秒>` 覆盖）：
+### 2.4 正式环境 GitHub Release 安装与免重启热更新
+- 正式 DSH Web 服务应从 GitHub Release `.tgz` 安装并保持 DSH 原生 `hmr` 启用，不再挂载本地开发源码目录：
+  - 日常迭代 PR 合入 `main` 后**不直接替换或重启正式 Web**；待发布新 GitHub Release（推送 `vX.Y.Z` tag 触发 `Release Plugin` workflow）后，在凌晨低峰自动检查或由负责人显式要求时执行免重启热更新。
+  - **UI 一键更新**：在「飞书桥接」工作台顶栏点击版本/更新按钮（或概览页新版本提示），点击「更新」即可原地完成 SHA256 校验、在途任务排空、旧版卸载、新版安装与热重载，无需重启 DSH Web。
+  - **CLI 免重启更新**：
     ```bash
-    # 先排空在途任务（退出码 0=已排空，2=超时仍有在途任务将走断点续跑，1=调用失败）
-    lark-bridge lifecycle drain --wait --reason "auto-deploy-main"
-    rc=$?
-    if [ "$rc" -eq 0 ] || [ "$rc" -eq 2 ]; then
-      # 通过宿主机托管工具重启（如 macOS launchctl kickstart -k / Linux systemctl --user restart）
-      launchctl kickstart -k "gui/$(id -u)/com.example.dsh-web"
-    fi
-    # 若中止部署，执行 lark-bridge lifecycle resume-intake 恢复入站
+    # 查看状态与检测 GitHub Release 新版本
+    lark-bridge plugin status --check
+    lark-bridge plugin check
+
+    # 宿主机终端直接执行免重启热更新（可指定 bridge | external-agents | all）
+    lark-bridge plugin update all
+
+    # 在活跃飞书/Agent 会话内触发时必须追加 --detached 防止自中断
+    lark-bridge plugin update all --detached
     ```
-  - **飞书会话内发起（防自中断）**：若当前任务本身运行于本地 DSH 托管的飞书会话中，同步重启会中断当前回复回合。须在 `.local/` 下生成脱离进程组（如 `nohup ... </dev/null >/dev/null 2>&1 &`）的后台脚本，短暂延迟等待本轮回复送达后再依次执行：
-    1. `lark-bridge lifecycle drain --wait --timeout 120 --allow-in-session --reason "<reason>"`（仅 `rc=0` 或 `rc=2` 时继续；否则中止并报错）；
-    2. 重启本地 DSH 托管服务；
-    3. 轮询 `lark-bridge doctor` 与 `lark-bridge lifecycle status` 确认服务与飞书长连接就绪，并向验收群回报重启生效结果。
-- 重启完成后核对启动日志无报错、SQLite Schema 迁移与既有数据完好、新增或变更的 `/api/lark-bridge/*` 接口返回符合预期。
+- 仅在升级 DSH 本体或修改底层 `cordis.patch.yml` 确需重启正式服务且经负责人确认时，先执行 `lark-bridge lifecycle drain --wait --reason "<reason>"`，排空（`rc=0` 或 `rc=2`）后再重启托管服务并运行 `lark-bridge doctor` 自检。
 
 ### 2.5 阻断与边界说明
 - **任一环节不通过即阻断**：若 CI 失败、飞书端到端实测失败、浏览器发现 UI/控制台报错，或 `lifecycle drain` 返回非 `0/2` 异常退出码，必须立即中止自动合入或重启，先修复问题或如实向用户回报失败点。

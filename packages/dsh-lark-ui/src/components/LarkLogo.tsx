@@ -93,3 +93,28 @@ export function ShieldAuthIcon({ size = 16, className }: { size?: number; classN
     </svg>
   )
 }
+
+/**
+ * Monochrome circular-upward arrow outline icon for the plugin update action.
+ */
+export function PluginUpdateIcon({ size = 16, className }: { size?: number; className?: string }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.15}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      style={{ display: 'block', flexShrink: 0 }}
+      aria-hidden="true"
+    >
+      <circle cx="8" cy="8" r="5.85" />
+      <path d="M8 10.8V5.35" />
+      <path d="M5.65 7.55L8 5.2L10.35 7.55" />
+    </svg>
+  )
+}

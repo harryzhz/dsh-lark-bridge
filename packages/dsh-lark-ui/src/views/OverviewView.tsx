@@ -4,7 +4,14 @@ import { bridgeApi } from '../api.js'
 import { Avatar } from '../components/fields.js'
 import { resolveModelDisplayName, resolveRuntimeDisplayName } from '../components/options.js'
 import { formatDuration, formatTime } from '../state.js'
-import type { AuditEventKind, CockpitPayload, DiagnosticAlert, ModelGroup, RuntimeOption } from '../types.js'
+import type {
+  AuditEventKind,
+  CockpitPayload,
+  DiagnosticAlert,
+  ModelGroup,
+  PluginUpdatesOverview,
+  RuntimeOption,
+} from '../types.js'
 
 const EVENT_TONE: Record<AuditEventKind, { label: string; tone: 'neutral' | 'success' | 'info' | 'warning' | 'danger' | 'quiet' }> = {
   inbound: { label: '收到', tone: 'info' },
@@ -26,10 +33,14 @@ export function OverviewView({
   cockpit,
   runtimes,
   models,
+  pluginUpdates,
+  onOpenPluginUpdates,
 }: {
   cockpit: CockpitPayload | null
   runtimes: readonly RuntimeOption[]
   models: readonly ModelGroup[]
+  pluginUpdates?: PluginUpdatesOverview | null
+  onOpenPluginUpdates?: () => void
 }) {
   const [hoveredHourKey, setHoveredHourKey] = useState<string | null>(null)
   const [dismissedAlertIds, setDismissedAlertIds] = useState<Record<string, boolean>>({})
@@ -39,6 +50,7 @@ export function OverviewView({
   const visibleAlerts = (cockpit.alerts ?? []).filter(
     (a) => a.severity !== 'info' && !dismissedAlertIds[a.id],
   )
+  const updatablePlugins = (pluginUpdates?.plugins ?? []).filter((p) => p.updateAvailable)
   const handleAckAlert = async (alert: DiagnosticAlert) => {
     setDismissedAlertIds((prev) => ({ ...prev, [alert.id]: true }))
     if (alert.code === 'split_brain' && alert.botId) {
@@ -56,6 +68,32 @@ export function OverviewView({
 
   return (
     <>
+      {updatablePlugins.length > 0 && onOpenPluginUpdates && (
+        <section className="fb-section">
+          <div className="fb-card fb-alert-card">
+            <div className="fb-alert-row">
+              <div className="fb-alert-main">
+                <div className="fb-alert-head">
+                  <Tag tone="info">发现新版本</Tag>
+                  <span>
+                    {updatablePlugins
+                      .map((p) => `${p.displayName} ${p.latest?.tagName ?? ''}`)
+                      .join('、')}
+                  </span>
+                </div>
+                <div className="fb-alert-detail">
+                  {pluginUpdates?.hotReloadSupported
+                    ? '支持原地免重启热更新，点击即可校验发布包并自动排空切换'
+                    : pluginUpdates?.hotReloadUnavailableReason || '点击查看插件更新详情'}
+                </div>
+              </div>
+              <Button size="sm" variant="primary" onClick={onOpenPluginUpdates}>
+                查看并更新
+              </Button>
+            </div>
+          </div>
+        </section>
+      )}
       {visibleAlerts.length > 0 && (
         <section className="fb-section">
           <div className="fb-card fb-alert-card">
