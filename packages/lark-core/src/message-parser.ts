@@ -7,6 +7,7 @@ const SLASH_COMMANDS = new Set([
   'status',
   'model',
   'agent',
+  'console',
   'help',
 ])
 

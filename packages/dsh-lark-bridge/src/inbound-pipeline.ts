@@ -32,6 +32,7 @@ import {
   type TriageHistoryEntry,
 } from '@dsh-lark/lark-core'
 import type { BotConnectionPool } from './bot-connection-pool.js'
+import type { IssuedConsoleLoginLink } from './console-login.js'
 import {
   InboundMediaCache,
   type ImageRefTarget,
@@ -185,6 +186,11 @@ export interface InboundPipelineHost {
   readonly isDraining?: () => boolean
   readonly onActivityChange?: () => void
   readonly sessionWebUrl: (sessionId: string) => string
+  readonly issueConsoleLoginLink?: (input: {
+    readonly botId: string
+    readonly botName: string
+    readonly adminOpenId: string
+  }) => IssuedConsoleLoginLink | undefined
 }
 
 interface RecoveryRunContext {
@@ -577,6 +583,9 @@ export class InboundPipeline {
           runtimes: this.host.runtimes,
           unbindRoute: (key, opts) => this.host.sessions.unbindRoute(key, opts),
           sessionWebUrl: (sid) => this.host.sessionWebUrl(sid),
+          ...(this.host.issueConsoleLoginLink
+            ? { issueConsoleLoginLink: (req) => this.host.issueConsoleLoginLink!(req) }
+            : {}),
           runTurn: (agent, content) =>
             runTurnAndCollectReply(this.host.ctx, agent, content, {
               signal: this.host.shutdownSignal,
@@ -587,12 +596,21 @@ export class InboundPipeline {
           ...(groupConfig ? { group: groupConfig } : {}),
           chatType: msg.chatType,
           ...(msg.senderOpenId ? { senderOpenId: msg.senderOpenId } : {}),
+          senderType: msg.senderType,
           command: decision.command,
           routeKey: decision.routeKey,
           workingDir: decision.workingDir,
           workspaceName: decision.workspaceName,
           reply: async (text) => {
             await reply(text)
+          },
+          sendDirectMessage: async (openId, text) => {
+            await transport.sendProactiveMessage({
+              receiveIdType: 'open_id',
+              receiveId: openId,
+              msgType: 'text',
+              content: JSON.stringify({ text }),
+            })
           },
         },
       )

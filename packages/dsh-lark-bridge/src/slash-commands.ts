@@ -9,6 +9,7 @@ import {
   type LarkGroupConfig,
   type ParsedSlashCommand,
 } from '@dsh-lark/lark-core'
+import type { IssuedConsoleLoginLink } from './console-login.js'
 import type { RuntimeCatalog } from './runtime-catalog.js'
 import type { LarkBridgeStore } from './store.js'
 
@@ -19,6 +20,11 @@ export interface SlashCommandHost {
   readonly runtimes: RuntimeCatalog
   unbindRoute(routeKey: string, options?: { archive?: boolean }): Promise<boolean>
   sessionWebUrl(sessionId: string): string
+  issueConsoleLoginLink?(input: {
+    readonly botId: string
+    readonly botName: string
+    readonly adminOpenId: string
+  }): IssuedConsoleLoginLink | undefined
   runTurn(agent: Agent, content: ContentBlock[]): Promise<string>
 }
 
@@ -27,16 +33,19 @@ export interface SlashCommandInput {
   readonly group?: LarkGroupConfig
   readonly chatType?: 'p2p' | 'group' | string
   readonly senderOpenId?: string
+  readonly senderType?: 'user' | 'bot'
   readonly command: ParsedSlashCommand
   readonly routeKey: string
   readonly workingDir: string
   readonly workspaceName: string
   readonly reply: (text: string) => Promise<void>
+  readonly sendDirectMessage?: (openId: string, text: string) => Promise<void>
 }
 
 const P2P_HELP_TEXT = [
   '可用命令：',
   '/status - 查看当前会话、工作区与接管链接',
+  '/console - 获取 DSH 管理面一次性登录链接（仅限管理员）',
   '/new - 归档当前会话并开启新会话',
   '/close - 关闭并归档当前会话',
   '/cancel - 中断执行中的任务',
@@ -47,6 +56,7 @@ const P2P_HELP_TEXT = [
 const GROUP_HELP_TEXT = [
   '可用命令：',
   '/status - 查看当前会话、工作区与会话链接',
+  '/console - 私聊获取 DSH 管理面一次性登录链接（仅限管理员）',
   '/new - 归档当前会话并开启新会话',
   '/close - 关闭并归档当前会话',
   '/cancel - 中断执行中的任务',
@@ -110,6 +120,9 @@ export async function handleSlashCommand(host: SlashCommandHost, input: SlashCom
       liveAgent.cancel({ kind: 'user' })
       await reply('已发送中断信号。')
       return
+    case 'console':
+      await handleConsoleCommand(host, input, isGroupChat)
+      return
     case 'agent':
       if (isGroupChat) {
         await reply(GROUP_CONFIG_COMMAND_DENIED_TEXT)
@@ -124,6 +137,110 @@ export async function handleSlashCommand(host: SlashCommandHost, input: SlashCom
       }
       await switchModel(host, input, liveAgent)
       return
+  }
+}
+
+async function handleConsoleCommand(
+  host: SlashCommandHost,
+  input: SlashCommandInput,
+  isGroupChat: boolean,
+): Promise<void> {
+  const { bot, reply } = input
+  const senderOpenId = input.senderOpenId?.trim() || ''
+  if ((input.senderType && input.senderType !== 'user') || !senderOpenId) {
+    host.store.recordEvent({
+      botId: bot.id,
+      routeKey: input.routeKey,
+      kind: 'command',
+      summary: '/console 已拒绝（仅支持人类管理员）',
+    })
+    await reply('安全限制：/console 仅支持管理员本人触发。')
+    return
+  }
+
+  const admins = bot.adminUsers ?? []
+  if (admins.length === 0) {
+    host.store.recordEvent({
+      botId: bot.id,
+      routeKey: input.routeKey,
+      kind: 'command',
+      summary: '/console 已拒绝（未配置 adminUsers）',
+    })
+    await reply(
+      `安全限制：尚未为智能体「${bot.name}」配置管理员，请先在 DSH 控制台 → 飞书桥接 → 智能体配置中添加管理员后再使用 /console。`,
+    )
+    return
+  }
+
+  if (!admins.includes(senderOpenId)) {
+    host.store.recordEvent({
+      botId: bot.id,
+      routeKey: input.routeKey,
+      kind: 'command',
+      summary: '/console 已拒绝（非管理员用户）',
+    })
+    await reply(`安全限制：仅智能体「${bot.name}」配置的管理员可使用 /console 获取管理面登录链接。`)
+    return
+  }
+
+  const issued = host.issueConsoleLoginLink?.({
+    botId: bot.id,
+    botName: bot.name,
+    adminOpenId: senderOpenId,
+  })
+  if (!issued) {
+    await reply('当前 DSH 服务未检测到可用的 Web 管理面入口，请确认 dsh web 已启动。')
+    return
+  }
+
+  const dmBody = [
+    `DSH 管理面一次性登录链接（${issued.expiresInSec} 秒内有效，单次使用）：`,
+    issued.url,
+    '',
+    '使用说明：',
+    '1. 在目标设备浏览器打开上方链接并点击「确认并登录管理面」；',
+    `2. 登录成功后浏览器将保存 30 天登录态，后续直接访问 ${issued.origin} 即可；`,
+    '3. 该链接仅限管理员本人使用，请勿转发。',
+  ].join('\n')
+
+  if (!isGroupChat) {
+    host.store.recordEvent({
+      botId: bot.id,
+      routeKey: input.routeKey,
+      kind: 'command',
+      summary: `/console 已向管理员签发一次性登录链接（${issued.expiresInSec}s）`,
+    })
+    await reply(dmBody)
+    return
+  }
+
+  if (!input.sendDirectMessage) {
+    await reply(`安全限制：管理面登录链接不会发送到群聊，请打开与「${bot.name}」的私聊发送 /console 获取。`)
+    return
+  }
+
+  try {
+    await input.sendDirectMessage(senderOpenId, dmBody)
+    host.store.recordEvent({
+      botId: bot.id,
+      routeKey: input.routeKey,
+      kind: 'command',
+      summary: `/console 已通过私聊向管理员签发一次性登录链接（${issued.expiresInSec}s）`,
+    })
+    await reply(
+      `已通过私聊向你发送一次性管理面登录链接（${issued.expiresInSec} 秒有效，单次使用），请前往与「${bot.name}」的私聊查看。`,
+    )
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err)
+    host.store.recordEvent({
+      botId: bot.id,
+      routeKey: input.routeKey,
+      kind: 'command',
+      summary: `/console 私聊投递失败：${reason}`,
+    })
+    await reply(
+      `安全限制：管理面登录链接不可发送到群聊，且私聊发送失败（${reason}）。请直接打开与「${bot.name}」的私聊发送 /console 获取。`,
+    )
   }
 }
 

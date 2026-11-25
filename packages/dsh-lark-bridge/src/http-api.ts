@@ -4,6 +4,7 @@ import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
 import { resolveEffectiveWorkspaceName, toPublicBotView } from '@dsh-lark/lark-core'
 import type { AgentCliSendInput, LarkBridgeManager } from './bridge-manager.js'
 import { OPERATOR_TOKEN_HEADER } from './cli-support.js'
+import { LARK_CONSOLE_LOGIN_PATH, handleConsoleLogin } from './console-login.js'
 import {
   assertExistingWorkingDirectory,
   browseHostDirectories,
@@ -1052,6 +1053,22 @@ export function createLarkHttpHandler(
         connection,
         handoff: manager.sessionHandoff,
         ...(manager.sessionViewer ? { viewer: manager.sessionViewer } : {}),
+      })
+      return
+    }
+    if (requestPath === LARK_CONSOLE_LOGIN_PATH) {
+      await handleConsoleLogin(req, res, {
+        liveOrigin: manager.getLiveWebOrigin?.() ?? '',
+        advertisedOrigin,
+        connection,
+        handoff: manager.consoleLogin,
+        onAudit: (ev) => {
+          manager.store.recordEvent({
+            botId: ev.botId,
+            kind: 'lifecycle',
+            summary: ev.summary,
+          })
+        },
       })
       return
     }

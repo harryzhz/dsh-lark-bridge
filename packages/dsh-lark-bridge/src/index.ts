@@ -193,6 +193,16 @@ export {
 } from './runtime-catalog.js'
 export { ScheduleNotifier, formatScheduleRuleSummary } from './schedule-notifier.js'
 export {
+  DEFAULT_CONSOLE_LOGIN_TTL_MS,
+  LARK_CONSOLE_LOGIN_PATH,
+  ConsoleLoginHandoff,
+  handleConsoleLogin,
+  renderConsoleLoginConfirmHtml,
+  renderConsoleLoginDeniedHtml,
+  type ConsoleLoginTicket,
+  type IssuedConsoleLoginLink,
+} from './console-login.js'
+export {
   LARK_SESSION_OPEN_PATH,
   LoopbackSessionHandoff,
   focusDesktopApp,

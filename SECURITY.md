@@ -20,6 +20,7 @@
   - **纯 loopback（本机 Desktop / 本地 Web）**：`/api/lark-bridge/open` 使用进程级 32 字节随机密钥签发的 HMAC-SHA256 票据，优先唤起桌面端或经同源跳转完成 Owner 鉴权，绝不向飞书消息泄露 DSH 主 `launchToken`。
   - **非 loopback（局域网 / 服务器 / 反向代理）**：`/api/lark-bridge/open` 绝不签发 `launchToken`。已认证的 Owner 点击后直接跳转进入完整会话；未登录的群成员仅在持有对应会话的有效 HMAC 票据且对应智能体/群聊开启「允许群成员只读查看」时，通过 DSH 原生 `RemoteAccessService`（`lark-viewer` 只读策略）进入单会话只读视图（仅可见该单会话实时内容，无权发送消息、取消运行、查看其他会话/Dreaming 会话或修改任何 DSH/飞书桥接配置），管理员可随时在控制台一键重置签名密钥令全部历史分享链接立即失效。
   - **群内指令与卡片按钮权限收紧**：飞书群聊内禁止执行会修改全局/群运行时配置的 `/agent`、`/model` 指令；群内提醒事项卡片的确认/取消按钮默认 fail-closed，仅允许智能体配置的 `adminUsers` 点击（未配置管理员时提示在 DSH 控制台处理）。
+  - **管理面一次性登录指令（`/console`）**：仅允许 `bot.adminUsers` 中的人类管理员触发（未配置管理员或非管理员默认拒绝，禁止机器人账号触发），签发进程内存态 **2 分钟有效、单次使用** 的 256-bit 不透明登录码（`/api/lark-bridge/console-login?code=...`），**严禁向群聊发送登录链接**（群内触发时自动仅通过私聊发送给该管理员）且**绝不向飞书消息泄露主 `launchToken`**。`GET`/`HEAD` 仅渲染确认页而不消耗凭据（免疫链接预览误消费），仅在管理员浏览器点击确认发起同源 `POST`（校验 `Host`、`Origin` 与 `Sec-Fetch-Site`）时原子消费并由 DSH 宿主换取 30 天 `SameSite=Strict` Owner Cookie。
 
 ### 部署建议
 

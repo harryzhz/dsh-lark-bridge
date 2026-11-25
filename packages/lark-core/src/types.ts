@@ -741,7 +741,7 @@ export interface RecalledLarkMessageEvent {
 }
 
 export interface ParsedSlashCommand {
-  readonly name: 'new' | 'close' | 'cancel' | 'status' | 'model' | 'agent' | 'help'
+  readonly name: 'new' | 'close' | 'cancel' | 'status' | 'model' | 'agent' | 'console' | 'help'
   readonly args: string
 }
 

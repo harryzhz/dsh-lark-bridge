@@ -25,6 +25,11 @@ import {
   type CliAuthEndpoint,
   type OperatorAuthToken,
 } from './cli-support.js'
+import {
+  ConsoleLoginHandoff,
+  DEFAULT_CONSOLE_LOGIN_TTL_MS,
+  type IssuedConsoleLoginLink,
+} from './console-login.js'
 import { buildBridgeDiagnostics, type BridgeDiagnosticsPayload } from './diagnostics.js'
 import { LarkDirectoryEnricher } from './directory-enrichment.js'
 import { DreamingService } from './dreaming-service.js'
@@ -89,6 +94,7 @@ export class LarkBridgeManager {
   readonly cliAuth: CliAuthEndpoint
   readonly operatorAuth: OperatorAuthToken
   readonly sessionHandoff = new LoopbackSessionHandoff()
+  readonly consoleLogin = new ConsoleLoginHandoff()
   readonly sessionViewer: LarkSessionViewerService
   readonly connections: BotConnectionPool
   readonly sessions: SessionCoordinator
@@ -213,6 +219,7 @@ export class LarkBridgeManager {
       isDraining: () => this.phase === 'draining' || this.phase === 'stopping',
       onActivityChange: notifyActivityChange,
       sessionWebUrl: (sid) => this.sessionWebUrl(sid),
+      issueConsoleLoginLink: (input) => this.issueConsoleLoginLink(input),
     })
 
     this.facade = new AgentToolFacade({
@@ -456,6 +463,7 @@ export class LarkBridgeManager {
     await this.inbound.suspendActiveTurnsForShutdown()
     this.shutdownController.abort()
     this.sessionHandoff.dispose()
+    this.consoleLogin.dispose()
     this.sessionViewer.dispose()
     this.schedules.stop()
     this.dreaming.stop()
@@ -629,6 +637,29 @@ export class LarkBridgeManager {
       return this.sessionViewer.buildViewerUrl(base, sessionId)
     }
     return `${base}/#session=${encodeURIComponent(sessionId)}`
+  }
+
+  issueConsoleLoginLink(input: {
+    readonly botId: string
+    readonly botName: string
+    readonly adminOpenId: string
+  }): IssuedConsoleLoginLink | undefined {
+    const base = this.resolveWebBaseUrl()
+    if (!base) return undefined
+    const conn =
+      this.liveConnection ??
+      (this.ctx.get('connection' as never) as { authenticatedUrl?: (url: string) => string } | undefined)
+    if (typeof conn?.authenticatedUrl !== 'function') return undefined
+    const ticket = this.consoleLogin.issue({
+      ...input,
+      ttlMs: DEFAULT_CONSOLE_LOGIN_TTL_MS,
+    })
+    return {
+      url: this.consoleLogin.buildUrl(base, ticket.code),
+      origin: base,
+      expiresInSec: Math.round((ticket.expiresAtMs - ticket.createdAtMs) / 1000),
+      expiresAtMs: ticket.expiresAtMs,
+    }
   }
 
   // ── Agent CLI Tool Facade ────────────────────────────────────────────────
