@@ -68,7 +68,7 @@ export function composeDreamExecutionPrompt(input: DreamExecutionPromptInput): s
     '### Phase 3 · 沉淀、合并与双时态纠偏（Consolidate & Supersede）',
     scopeBlock,
     '- 使用运行时无关的 Memory CLI 持久化写入（4 类语义分类：`feedback` 纠偏/防踩坑规则、`user` 用户/团队偏好、`project` 项目决策与背景、`reference` 外部系统/文档指针）：',
-    `  - 新增或幂等更新：\`lark-bridge memory upsert --bot ${input.botId} --type <feedback|user|project|reference> --title "<精炼标题>" --content "<事实要点>" [--scope bot|chat|workspace] [--scope-id <chatId或目录>] [--tags "a,b"] [--pin]\``,
+    `  - 新增或幂等更新：\`lark-bridge memory upsert --bot ${input.botId} --type <feedback|user|project|reference> --title "<自包含触发标题(≤35字)>" --content "<事实要点>" [--scope bot|chat|workspace] [--scope-id <chatId或目录>] [--tags "a,b"] [--pin]\`（标题须直接写清核心结论或触发词，便于首轮索引一眼识别）`,
     config.cleanupAndCorrect
       ? `  - 事实纠偏与旧结论替代（优先 \`代码库与文档现状 > 最新用户明确反馈 > 历史旧记忆\`）：\`lark-bridge memory supersede <oldId> --bot ${input.botId} --reason "<纠偏依据>" --type <type> --title "<新标题>" --content "<新结论>"\``
       : '  - 合并重复条目时使用 `lark-bridge memory supersede <oldId> --bot ' + input.botId + ' --reason "合并重复条目"`。',

@@ -155,7 +155,7 @@ lark-bridge schedule run <scheduleId>
 
 ### 7. 跨运行时长期记忆（`memory`）
 
-Memory 为所有原生与外部运行时提供统一的长期记忆库（四类分类：`feedback` 纠偏规则、`user` 用户偏好、`project` 项目决策、`reference` 外部指针；三级作用域：`bot` 全局、`chat` 群聊、`workspace` 工作区；支持双时态纠偏 `supersede`）：
+Memory 为所有原生与外部运行时提供统一的长期记忆库（四类分类：`feedback` 纠偏规则、`user` 用户偏好、`project` 项目决策、`reference` 外部指针；三级作用域：`bot` 全局、`chat` 群聊、`workspace` 工作区；支持双时态纠偏 `supersede`）。新会话首轮 `<memory>` 仅注入极简标题目录、当前话题命中的高相关要点与只读镜像 `MEMORY.md` 路径；写入时请将 `--title` 写为自包含核心结论或触发词（建议 ≤ 35 字）：
 
 ```bash
 # 列出或检索记忆（默认按当前会话自动推断 --bot；支持中文与英文关键词）

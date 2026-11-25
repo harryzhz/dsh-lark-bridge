@@ -7,6 +7,11 @@ import { Readable } from 'node:stream'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import type { Context } from '@deepseek-ai/cordis'
+import {
+  MEMORY_LAYER1_MAX_CHARS,
+  composeMemoryReminder,
+  type LarkMemoryEntry,
+} from '@dsh-lark/lark-core'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { LarkBridgeManager } from '../src/bridge-manager.js'
 import { ensureCliAuthEndpoint } from '../src/cli-support.js'
@@ -176,34 +181,69 @@ describe('MemoryService: SOTA typed memory, scope isolation, FTS5 search, bi-tem
     const allEntries = memory.list({ botId: 'bot-main', status: 'all' })
     expect(allEntries.map((e) => e.id)).toContain(repoAEntry.entry.id)
 
-    // 5. Progressive Disclosure Layer 1 injection: strict scope isolation, pinned/type priority, recall telemetry
-    const reminder = memory.composeFirstTurnReminder({
+    // 5. Progressive Disclosure Layer 1 injection: compact Title-Only index + MEMORY.md pointer,
+    //    strict scope isolation, pinned/type priority, and calibrated recall telemetry
+    const mdPath = memory.memoryMarkdownPath('bot-main')
+    const indexReminder = memory.composeFirstTurnReminder({
       botId: 'bot-main',
       chatId: 'oc_group_alpha',
       workingDir: repoA,
     })
-    expect(reminder).toBeDefined()
-    expect(reminder).toContain('<memory bot_id="bot-main"')
-    expect(reminder).toContain('禁止在晚间自动合并 PR')
-    expect(reminder).toContain('存储层已升级至 SQLite WAL v3 + FTS5')
-    expect(reminder).toContain('发布监控看板入口')
+    expect(indexReminder).toBeDefined()
+    expect(indexReminder).toContain('<memory bot_id="bot-main" active="3"')
+    expect(indexReminder).toContain(`file="${mdPath}"`)
+    expect(indexReminder).toContain('禁止在晚间自动合并 PR')
+    expect(indexReminder).toContain('存储层已升级至 SQLite WAL v3 + FTS5')
+    expect(indexReminder).toContain('发布监控看板入口')
+    // Compact Title-Only index omits truncated body excerpts and redundant CLI flag tutorial
+    expect(indexReminder).not.toContain('22:00 后仅做检查')
+    expect(indexReminder).not.toContain('memory upsert --type')
+    expect(indexReminder!.length).toBeLessThan(450)
     // Must NEVER leak other group or other workspace memories or superseded facts
-    expect(reminder).not.toContain('Beta 群专属静默规则')
-    expect(reminder).not.toContain('RepoB 独立策略')
-    expect(reminder).not.toContain('存储层迁移至 SQLite WAL')
+    expect(indexReminder).not.toContain('Beta 群专属静默规则')
+    expect(indexReminder).not.toContain('RepoB 独立策略')
+    expect(indexReminder).not.toContain('存储层迁移至 SQLite WAL')
     // Pinned feedback appears before project and reference
-    expect(reminder!.indexOf('禁止在晚间自动合并 PR')).toBeLessThan(
-      reminder!.indexOf('存储层已升级至 SQLite WAL v3 + FTS5'),
+    expect(indexReminder!.indexOf('禁止在晚间自动合并 PR')).toBeLessThan(
+      indexReminder!.indexOf('存储层已升级至 SQLite WAL v3 + FTS5'),
     )
-    expect(reminder!.indexOf('存储层已升级至 SQLite WAL v3 + FTS5')).toBeLessThan(
-      reminder!.indexOf('发布监控看板入口'),
+    expect(indexReminder!.indexOf('存储层已升级至 SQLite WAL v3 + FTS5')).toBeLessThan(
+      indexReminder!.indexOf('发布监控看板入口'),
     )
-    // Recall counter incremented for surfaced entries
-    const recalled = memory.get(feedbackEntry.entry.id, { recordRecall: false })
-    expect(recalled?.recallCount).toBe(1)
+    // Passive Title-Only directory listing must NOT artificially inflate recallCount
+    expect(memory.get(feedbackEntry.entry.id, { recordRecall: false })?.recallCount).toBe(0)
+
+    // 5b. Unrelated query keeps Title-Only mode and zero false-positive expansion
+    const unrelatedReminder = memory.composeFirstTurnReminder(
+      { botId: 'bot-main', chatId: 'oc_group_alpha', workingDir: repoA },
+      { queryText: '帮我看下今天 prompt 长度怎么优化' },
+    )
+    expect(unrelatedReminder).toBeDefined()
+    expect(unrelatedReminder).not.toContain('相关记忆（命中当前话题')
+    // Word-boundary guard: `prompt` must never false-match short ASCII tag `PR`
+    expect(unrelatedReminder).not.toContain('22:00 后仅做检查')
+    expect(memory.get(feedbackEntry.entry.id, { recordRecall: false })?.recallCount).toBe(0)
+
+    // 5c. Query-Aware expansion: matching query expands top hits inline and records genuine recall
+    //     ONLY for expanded entries (never leaking out-of-scope Beta group entries even on exact match)
+    const matchedReminder = memory.composeFirstTurnReminder(
+      { botId: 'bot-main', chatId: 'oc_group_alpha', workingDir: repoA },
+      { queryText: '请问 SQLite FTS5 索引和 Beta 群专属静默规则 怎么看？' },
+    )
+    expect(matchedReminder).toBeDefined()
+    expect(matchedReminder).toContain('相关记忆（命中当前话题')
+    expect(matchedReminder).toContain('已新增 memory_entries 与 trigram FTS5 检索表')
+    expect(matchedReminder).toContain('其余记忆目录')
+    expect(matchedReminder).toContain('禁止在晚间自动合并 PR')
+    expect(matchedReminder).not.toContain('Beta 群专属静默规则')
+    // Expanded entry appears once (not duplicated in remaining directory)
+    expect(matchedReminder!.split(sup!.replacementEntry!.id).length - 1).toBe(1)
+    // Only the query-expanded entry gets its recallCount incremented
+    expect(memory.get(sup!.replacementEntry!.id, { recordRecall: false })?.recallCount).toBe(1)
+    expect(memory.get(feedbackEntry.entry.id, { recordRecall: false })?.recallCount).toBe(0)
+    expect(memory.get(refEntry.entry.id, { recordRecall: false })?.recallCount).toBe(0)
 
     // 6. Human-auditable Markdown mirror strictly under <dataDir>/memory/<botId>/MEMORY.md (never in workDir/.local)
-    const mdPath = memory.memoryMarkdownPath('bot-main')
     expect(existsSync(mdPath)).toBe(true)
     expect(existsSync(join(repoA, '.local'))).toBe(false)
     const mdText = readFileSync(mdPath, 'utf8')
@@ -213,6 +253,65 @@ describe('MemoryService: SOTA typed memory, scope isolation, FTS5 search, bi-tem
     expect(mdText).not.toContain('存储层迁移至 SQLite WAL')
 
     store.close()
+  })
+
+  it('keeps Layer 1 strictly budgeted with many entries and preserves high-priority title anchors when query hits expand', () => {
+    const now = Date.now()
+    const entries: LarkMemoryEntry[] = [
+      {
+        id: 'mem-pin0000001',
+        botId: 'bot-scale',
+        scope: 'workspace',
+        scopeId: '/Users/demo/repo',
+        type: 'feedback',
+        title: '配置控制面保持单一真相，避免跨面板冲突',
+        content: '同一行为控制逻辑收口在单一配置面。',
+        tags: ['config', 'ui'],
+        confidence: 'high',
+        pinned: true,
+        status: 'active',
+        createdAtMs: now,
+        updatedAtMs: now,
+        lastVerifiedAtMs: now,
+        recallCount: 0,
+      },
+      ...Array.from({ length: 18 }, (_, i) => ({
+        id: `mem-item${String(i).padStart(6, '0')}`,
+        botId: 'bot-scale',
+        scope: 'bot' as const,
+        scopeId: '',
+        type: (i % 2 === 0 ? 'project' : 'reference') as 'project' | 'reference',
+        title: i === 12 ? '隔离常驻 E2E 验收环境与工作流' : `常规长期记忆条目编号 ${i + 1}`,
+        content:
+          i === 12
+            ? '使用独立的 E2E 测试实例与专用验收群执行 browser-smoke 与 feishu-smoke，全绿后再合入主干并执行优雅排空重启。'
+            : `这是第 ${i + 1} 条用于测试预算控制的模拟长期记忆正文内容，包含足够多的字符以验证截断边界。`,
+        tags: i === 12 ? ['e2e', 'testing'] : [`tag-${i}`],
+        confidence: 'high' as const,
+        pinned: false,
+        status: 'active' as const,
+        createdAtMs: now - i * 1000,
+        updatedAtMs: now - i * 1000,
+        lastVerifiedAtMs: now - i * 1000,
+        recallCount: 0,
+      })),
+    ]
+
+    const result = composeMemoryReminder({
+      botId: 'bot-scale',
+      entries,
+      totalActiveCount: entries.length,
+      queryText: '请问 e2e 验收环境怎么运行 browser-smoke',
+      markdownPath: '/Users/demo/.dsh/lark-bridge/memory/bot-scale/MEMORY.md',
+    })
+    expect(result).toBeDefined()
+    expect(result!.reminder.length).toBeLessThanOrEqual(MEMORY_LAYER1_MAX_CHARS)
+    expect(result!.expandedEntryIds).toEqual(['mem-item000012'])
+    expect(result!.reminder).toContain('browser-smoke 与 feishu-smoke')
+    // Pinned feedback anchor is still preserved in remaining directory
+    expect(result!.reminder).toContain('配置控制面保持单一真相，避免跨面板冲突')
+    // Omitted count note appears when capped by maxEntries/maxChars
+    expect(result!.reminder).toMatch(/另有 \d+ 条/)
   })
 
   it('enforces HTTP auth boundaries (CLI soft-archive only, Owner hard-delete) and works end-to-end via lark-bridge memory CLI', async () => {
@@ -321,12 +420,22 @@ describe('MemoryService: SOTA typed memory, scope isolation, FTS5 search, bi-tem
       expect(upserted.ok).toBe(true)
       const memId = String((upserted.entry as { id: string }).id)
 
+      // Owner Web UI live search must NOT increment recallCount
+      const webSearch = await invokeHandler(handler, {
+        url: `/api/lark-bridge/memory?botId=cli-bot&q=${encodeURIComponent('模拟桩')}`,
+      })
+      expect(webSearch.status).toBe(200)
+      expect(memory.get(memId, { recordRecall: false })?.recallCount).toBe(0)
+
+      // CLI `memory search` DOES count as a real Agent recall
       const searched = await runCli(['memory', 'search', '模拟桩'])
       expect(searched.ok).toBe(true)
       expect((searched.entries as Array<{ id: string }>).map((e) => e.id)).toContain(memId)
+      expect(memory.get(memId, { recordRecall: false })?.recallCount).toBe(1)
 
       const got = await runCli(['memory', 'get', memId])
       expect((got.entry as { pinned: boolean }).pinned).toBe(true)
+      expect((got.entry as { recallCount: number }).recallCount).toBe(2)
 
       const superseded = await runCli([
         'memory',
