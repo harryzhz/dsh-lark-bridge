@@ -62,15 +62,24 @@ import { SessionsView } from './views/SessionsView.js'
 const PANEL_ID = 'lark-bridge'
 const SCHEDULE_PANEL_ID = 'schedules'
 
-type Tab = 'cockpit' | 'bots' | 'groups' | 'schedules' | 'sessions' | 'memory'
+type Tab = 'cockpit' | 'bots' | 'groups' | 'schedules' | 'memory' | 'sessions'
+
+export const HOMEPAGE_TAB_KEYS: readonly Tab[] = [
+  'cockpit',
+  'bots',
+  'groups',
+  'schedules',
+  'memory',
+  'sessions',
+]
 
 const TABS: ReadonlyArray<{ key: Tab; label: string; icon: ReactNode }> = [
   { key: 'cockpit', label: '驾驶舱', icon: <IconGaugeOutlineRegular size={16} /> },
   { key: 'bots', label: '智能体', icon: <RobotTabIcon size={16} /> },
   { key: 'groups', label: '群聊', icon: <IconUsersOutlineRegular size={16} /> },
   { key: 'schedules', label: '自动化', icon: <IconAlarmClockOutlineRegular size={16} /> },
-  { key: 'sessions', label: '会话', icon: <IconNewChatOutlineRegular size={16} /> },
   { key: 'memory', label: '记忆库', icon: <IconDatabaseOutlineRegular size={16} /> },
+  { key: 'sessions', label: '会话', icon: <IconNewChatOutlineRegular size={16} /> },
 ]
 
 let openDshSession: ((sessionId: string) => Promise<SessionActivationResult>) | undefined
@@ -80,14 +89,7 @@ let pendingPostSelfReloadTab: Tab | undefined
 let currentActiveTab: Tab = 'cockpit'
 let larkBridgePageMounted = false
 
-const VALID_TABS = new Set<Tab>([
-  'cockpit',
-  'bots',
-  'groups',
-  'schedules',
-  'sessions',
-  'memory',
-])
+const VALID_TABS = new Set<Tab>(HOMEPAGE_TAB_KEYS)
 
 function normalizeRestoredTab(raw: string | undefined): Tab | undefined {
   if (!raw) return undefined

@@ -180,6 +180,8 @@ function MemoryNavColumn({
         <div className="fb-mem-bot-select">
           <SelectMenu
             size="sm"
+            fullWidth
+            align="start"
             value={effectiveBotId}
             options={[
               { value: '', label: '全部智能体' },

@@ -426,4 +426,15 @@ describe('dsh-lark-ui client entry with real @deepseek-ai/cordis Context', () =>
     await fiber.dispose()
     await ctx.fiber.dispose()
   })
+
+  it('places the Memory Library tab directly to the left of Sessions in the homepage tab order', () => {
+    expect(clientPlugin.HOMEPAGE_TAB_KEYS).toEqual([
+      'cockpit',
+      'bots',
+      'groups',
+      'schedules',
+      'memory',
+      'sessions',
+    ])
+  })
 })

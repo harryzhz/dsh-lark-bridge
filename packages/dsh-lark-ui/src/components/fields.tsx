@@ -519,6 +519,8 @@ export function SelectMenu<T extends string>({
   footer,
   placeholder = '请选择',
   size = 'md',
+  align = 'end',
+  fullWidth = false,
   disabled,
 }: {
   value: T
@@ -528,6 +530,9 @@ export function SelectMenu<T extends string>({
   footer?: readonly SelectFooterAction[]
   placeholder?: string
   size?: 'md' | 'sm'
+  align?: 'start' | 'end'
+  /** Stretch trigger to fill its container width and truncate long labels cleanly. */
+  fullWidth?: boolean
   disabled?: boolean
 }) {
   const [open, setOpen] = useState(false)
@@ -558,20 +563,29 @@ export function SelectMenu<T extends string>({
         setOpen(false)
         if (id !== value) onChange(id as T)
       }}
-      align="end"
+      align={align}
       portal
       minWidthFromAnchor
+      className={fullWidth ? 'fb-select-anchor fb-select-anchor-full' : 'fb-select-anchor'}
       anchor={
         <button
           type="button"
           className="fb-select"
           data-size={size}
+          data-full={fullWidth ? '' : undefined}
+          title={selected && !selected.node ? selected.label : undefined}
           aria-haspopup="menu"
           aria-expanded={open}
           disabled={disabled}
           onClick={() => setOpen((v) => !v)}
         >
-          <span className="fb-select-label">{selected ? selected.node ?? selected.label : placeholder}</span>
+          {selected?.node ? (
+            <span className="fb-select-label" data-node="">
+              {selected.node}
+            </span>
+          ) : (
+            <span className="fb-select-label">{selected ? selected.label : placeholder}</span>
+          )}
           <IconChevronDownOutlineRegular size={14} className="fb-select-chevron" />
         </button>
       }
