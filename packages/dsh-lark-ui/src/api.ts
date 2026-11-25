@@ -197,19 +197,27 @@ export const bridgeApi = {
   syncBotChats: async (id: string) => (await post<{ count: number }>(`/bots/${seg(id)}/sync-chats`)).count,
   runBotDream: async (id: string, force = true) =>
     (await post<{ dreamState: DreamRunState }>(`/bots/${seg(id)}/dream`, { force })).dreamState,
-  memories: async (params: {
-    botId: string
-    status?: MemoryStatus | 'all'
-    type?: MemoryType
-    q?: string
-    limit?: number
-  }) => {
-    const qs = new URLSearchParams({ botId: params.botId })
+  memories: async (
+    params: {
+      botId?: string
+      scope?: MemoryScope
+      status?: MemoryStatus | 'all'
+      type?: MemoryType
+      q?: string
+      limit?: number
+    } = {},
+  ) => {
+    const qs = new URLSearchParams()
+    if (params.botId?.trim()) qs.set('botId', params.botId.trim())
+    if (params.scope) qs.set('scope', params.scope)
     if (params.status) qs.set('status', params.status)
     if (params.type) qs.set('type', params.type)
     if (params.q?.trim()) qs.set('q', params.q.trim())
     if (params.limit) qs.set('limit', String(params.limit))
-    return request<{ entries: MemoryEntry[]; markdownPath?: string }>(`/memory?${qs.toString()}`)
+    const suffix = qs.toString()
+    return request<{ entries: MemoryEntry[]; markdownPath?: string }>(
+      `/memory${suffix ? `?${suffix}` : ''}`,
+    )
   },
   upsertMemory: async (input: {
     id?: string
@@ -237,6 +245,24 @@ export const bridgeApi = {
       status?: MemoryStatus
     },
   ) => (await put<{ entry: MemoryEntry }>(`/memory/${seg(id)}`, patch)).entry,
+  supersedeMemory: async (
+    id: string,
+    input: {
+      reason: string
+      type?: MemoryType
+      scope?: MemoryScope
+      scopeId?: string
+      title?: string
+      content?: string
+      tags?: string[]
+      confidence?: MemoryConfidence
+      pinned?: boolean
+    },
+  ) =>
+    post<{ oldEntry: MemoryEntry; replacementEntry?: MemoryEntry }>(
+      `/memory/${seg(id)}/supersede`,
+      input,
+    ),
   archiveMemory: (id: string, reason?: string) =>
     del(`/memory/${seg(id)}${reason ? `?reason=${seg(reason)}` : ''}`),
   deleteMemory: (id: string) => del(`/memory/${seg(id)}?hard=1`),

@@ -43,7 +43,6 @@ import type {
   TriageDefaultsPayload,
 } from '../types.js'
 import { AgentRuntimeFields } from './AgentRuntimeFields.js'
-import { BotMemoryPanel } from './BotMemoryPanel.js'
 import { ConfigDialog, type ConfigSection } from './ConfigDialog.js'
 import { DirectoryField } from './DirectoryPickerModal.js'
 import { ExperimentalSection } from './ExperimentalSection.js'
@@ -859,22 +858,18 @@ function EditBotDialog({
   const [section, setSection] = useState<Section>('basic')
   const [draft, setDraft] = useState<BotConfig>(() => toBotConfig(target))
   const [localDreamState, setLocalDreamState] = useState<DreamRunState | undefined>(target.dreamState)
-  const [localMemoryCount, setLocalMemoryCount] = useState<number>(target.activeMemoryCount ?? 0)
   const [saving, setSaving] = useState(false)
   const [syncingProfile, setSyncingProfile] = useState(false)
   const [error, setError] = useState('')
   const [profileView, setProfileView] = useState<{ runtimeId: string; initialProfileId?: string } | null>(null)
-  const [memoryViewOpen, setMemoryViewOpen] = useState(false)
   const [profileRevision, setProfileRevision] = useState(0)
   const existingId = target.id
 
   useEffect(() => {
     setDraft(toBotConfig(target))
     setLocalDreamState(target.dreamState)
-    setLocalMemoryCount(target.activeMemoryCount ?? 0)
     setSection('basic')
     setProfileView(null)
-    setMemoryViewOpen(false)
     setError('')
 
     if (!target.avatarUrl?.trim() || !target.description?.trim()) {
@@ -978,49 +973,32 @@ function EditBotDialog({
       saving={saving}
       error={error}
       subview={
-        memoryViewOpen
+        profileViewRuntime
           ? {
-              title: `${draft.name || existingId} · Memory`,
-              onBack: () => setMemoryViewOpen(false),
+              title: `${profileViewRuntime.name} 启动配置`,
+              onBack: () => setProfileView(null),
               content: (
-                <BotMemoryPanel
-                  botId={existingId}
-                  botName={draft.name || existingId}
-                  onBack={() => setMemoryViewOpen(false)}
+                <RuntimeProfilePanel
+                  runtime={profileViewRuntime}
+                  initialProfileId={profileView?.initialProfileId}
+                  backLabel="Agent 运行时"
+                  onBack={() => setProfileView(null)}
                   onClose={onClose}
-                  onChanged={(count) => {
-                    setLocalMemoryCount(count)
-                    void onSynced()
+                  onChanged={async (nextProfileId) => {
+                    setProfileRevision((v) => v + 1)
+                    await onProfilesChanged?.()
+                    if (nextProfileId !== undefined) {
+                      const changed = nextProfileId !== (draft.runtimeProfileId ?? '')
+                      patch({
+                        runtimeProfileId: nextProfileId || undefined,
+                        ...(changed ? { model: undefined, reasoningEffort: undefined } : {}),
+                      })
+                    }
                   }}
                 />
               ),
             }
-          : profileViewRuntime
-            ? {
-                title: `${profileViewRuntime.name} 启动配置`,
-                onBack: () => setProfileView(null),
-                content: (
-                  <RuntimeProfilePanel
-                    runtime={profileViewRuntime}
-                    initialProfileId={profileView?.initialProfileId}
-                    backLabel="Agent 运行时"
-                    onBack={() => setProfileView(null)}
-                    onClose={onClose}
-                    onChanged={async (nextProfileId) => {
-                      setProfileRevision((v) => v + 1)
-                      await onProfilesChanged?.()
-                      if (nextProfileId !== undefined) {
-                        const changed = nextProfileId !== (draft.runtimeProfileId ?? '')
-                        patch({
-                          runtimeProfileId: nextProfileId || undefined,
-                          ...(changed ? { model: undefined, reasoningEffort: undefined } : {}),
-                        })
-                      }
-                    }}
-                  />
-                ),
-              }
-            : null
+          : null
       }
     >
       {section === 'basic' && (
@@ -1174,9 +1152,7 @@ function EditBotDialog({
           botId={existingId}
           experimental={draft.experimental}
           dreamState={localDreamState}
-          activeMemoryCount={localMemoryCount}
           onChange={(experimental) => patch({ experimental })}
-          onOpenMemory={() => setMemoryViewOpen(true)}
           onOpenSession={(sid) => {
             onClose()
             onOpenSession?.(sid)

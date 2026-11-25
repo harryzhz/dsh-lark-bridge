@@ -107,18 +107,14 @@ export function ExperimentalSection({
   botId,
   experimental,
   dreamState,
-  activeMemoryCount,
   onChange,
-  onOpenMemory,
   onOpenSession,
   onStateUpdated,
 }: {
   botId: string | null
   experimental: BotExperimentalConfig
   dreamState?: DreamRunState | undefined
-  activeMemoryCount?: number | undefined
   onChange: (next: BotExperimentalConfig) => void
-  onOpenMemory?: (() => void) | undefined
   onOpenSession?: ((sessionId: string) => void) | undefined
   onStateUpdated?: ((next: DreamRunState) => void) | undefined
 }) {
@@ -167,7 +163,7 @@ export function ExperimentalSection({
       <div className="fb-dream-card">
         <div className="fb-dream-head">
           <div className="fb-dream-desc">
-            定期回顾增量对话与代码变更，沉淀长期记忆并纠偏过期结论。
+            定期回顾增量对话与代码变更，将结论沉淀至「记忆库」并纠偏过期内容。
           </div>
           {botId && (
             <div className="fb-dream-actions">
@@ -216,23 +212,6 @@ export function ExperimentalSection({
           </div>
         )}
       </div>
-
-      {botId && onOpenMemory && (
-        <SettingRow
-          title="长期记忆库"
-          desc="跨会话持久化，新会话首轮按需召回"
-        >
-          <button
-            type="button"
-            className="fb-drill-btn"
-            aria-label={`打开长期记忆库（当前 ${activeMemoryCount ?? 0} 条）`}
-            onClick={onOpenMemory}
-          >
-            <span className="fb-drill-count fb-num">{`${activeMemoryCount ?? 0} 条`}</span>
-            <IconChevronRightOutlineRegular size={14} />
-          </button>
-        </SettingRow>
-      )}
 
       <SettingRow title="启用 Dreaming">
         <Switch
