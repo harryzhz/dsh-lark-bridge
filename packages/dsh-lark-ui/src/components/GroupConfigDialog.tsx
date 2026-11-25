@@ -40,7 +40,7 @@ import type {
 } from '../types.js'
 import { AgentRuntimeFields } from './AgentRuntimeFields.js'
 import { ConfigDialog, type ConfigSection } from './ConfigDialog.js'
-import { DirectoryField } from './DirectoryPickerModal.js'
+import { DirectoryField, DirectoryPickerPanel } from './DirectoryPickerModal.js'
 import {
   Avatar,
   ChipToggles,
@@ -137,6 +137,7 @@ export function GroupConfigDialog({
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
   const [profileView, setProfileView] = useState<{ runtimeId: string; initialProfileId?: string } | null>(null)
+  const [dirPickerOpen, setDirPickerOpen] = useState(false)
   const [profileRevision, setProfileRevision] = useState(0)
 
   useEffect(() => {
@@ -144,6 +145,7 @@ export function GroupConfigDialog({
     setDraft(structuredClone(target.config))
     setSection('basic')
     setProfileView(null)
+    setDirPickerOpen(false)
     setMembers([])
     setError('')
   }, [target])
@@ -312,7 +314,26 @@ export function GroupConfigDialog({
                 />
               ),
             }
-          : null
+          : dirPickerOpen
+            ? {
+                title: '选择本地工作目录',
+                onBack: () => setDirPickerOpen(false),
+                content: (
+                  <div className="fb-dialog-subview-single">
+                    <DirectoryPickerPanel
+                      initialPath={draft.workingDir.trim() || bot?.defaultWorkingDir || '~'}
+                      backLabel="基本信息"
+                      onBack={() => setDirPickerOpen(false)}
+                      onClose={onClose}
+                      onSelect={(selected) => {
+                        patch({ workingDir: selected })
+                        setDirPickerOpen(false)
+                      }}
+                    />
+                  </div>
+                ),
+              }
+            : null
       }
     >
       {section === 'basic' && (
@@ -326,6 +347,7 @@ export function GroupConfigDialog({
               onChange={(workingDir) => patch({ workingDir })}
               placeholder={bot?.defaultWorkingDir ?? ''}
               browseSeed={draft.workingDir || bot?.defaultWorkingDir}
+              onBrowse={() => setDirPickerOpen(true)}
             />
           </SettingRow>
           <SettingRow title="工作区" desc="留空默认使用工作目录末级名称">

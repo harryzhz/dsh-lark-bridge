@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   Button,
+  IconChevronLeftOutlineRegular,
   IconChevronRightOutlineRegular,
   IconCloseOutlineRegular,
   IconEyeOffOutlineRegular,
@@ -13,7 +14,19 @@ import {
   Modal,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { bridgeApi } from '../api.js'
-import type { DirectoryBrowseResult } from '../types.js'
+import type { DirectoryBrowseResult, DirectoryCrumb } from '../types.js'
+
+export function filterDirectoryEntries(
+  entries: readonly DirectoryCrumb[],
+  options: { showHidden: boolean; query: string },
+): DirectoryCrumb[] {
+  const q = options.query.trim().toLowerCase()
+  return entries.filter((entry) => {
+    if (!options.showHidden && entry.hidden) return false
+    if (q && !entry.name.toLowerCase().includes(q)) return false
+    return true
+  })
+}
 
 export function DirectoryField({
   value,
@@ -21,14 +34,25 @@ export function DirectoryField({
   placeholder,
   browseSeed,
   disabled,
+  onBrowse,
 }: {
   value: string
   onChange: (next: string) => void
   placeholder?: string
   browseSeed?: string | undefined
   disabled?: boolean
+  onBrowse?: (initialPath: string) => void
 }) {
   const [pickerOpen, setPickerOpen] = useState(false)
+  const resolvedInitialPath = value.trim() || browseSeed || '~'
+
+  const handleBrowse = () => {
+    if (onBrowse) {
+      onBrowse(resolvedInitialPath)
+      return
+    }
+    setPickerOpen(true)
+  }
 
   return (
     <>
@@ -49,14 +73,14 @@ export function DirectoryField({
           aria-label="选择本地目录"
           title="选择本地目录"
           disabled={disabled}
-          onClick={() => setPickerOpen(true)}
+          onClick={handleBrowse}
         >
           <IconFolderOpenOutlineRegular size={16} />
         </button>
       </span>
-      {pickerOpen && (
+      {!onBrowse && pickerOpen && (
         <DirectoryPickerModal
-          initialPath={value.trim() || browseSeed || '~'}
+          initialPath={resolvedInitialPath}
           onClose={() => setPickerOpen(false)}
           onSelect={(selected) => {
             onChange(selected)
@@ -68,12 +92,16 @@ export function DirectoryField({
   )
 }
 
-export function DirectoryPickerModal({
+export function DirectoryPickerPanel({
   initialPath,
+  backLabel,
+  onBack,
   onClose,
   onSelect,
 }: {
   initialPath?: string
+  backLabel?: string
+  onBack?: () => void
   onClose: () => void
   onSelect: (selectedPath: string) => void
 }) {
@@ -103,15 +131,10 @@ export function DirectoryPickerModal({
     void loadDir(initialPath)
   }, [initialPath, loadDir])
 
-  const visibleEntries = useMemo(() => {
-    if (!listing) return []
-    const q = filter.trim().toLowerCase()
-    return listing.entries.filter((entry) => {
-      if (!showHidden && entry.hidden) return false
-      if (q && !entry.name.toLowerCase().includes(q)) return false
-      return true
-    })
-  }, [listing, showHidden, filter])
+  const visibleEntries = useMemo(
+    () => (listing ? filterDirectoryEntries(listing.entries, { showHidden, query: filter }) : []),
+    [listing, showHidden, filter],
+  )
 
   const submitNewFolder = async () => {
     if (!listing || !newFolderName.trim()) return
@@ -126,13 +149,33 @@ export function DirectoryPickerModal({
     }
   }
 
+  const currentPath = listing?.path ?? initialPath ?? '~'
+
   return (
-    <Modal open onClose={onClose} title="选择本地工作目录" headless className="fb-schedule-dialog fb-nested-modal">
-      <div className="fb-schedule-dialog-head">
-        <div style={{ minWidth: 0 }}>
-          <div className="fb-schedule-dialog-title">选择本地工作目录</div>
-          <div className="fb-schedule-dialog-sub fb-mono" style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>
-            {listing?.path ?? initialPath ?? '~'}
+    <>
+      <div className="fb-schedule-dialog-head fb-dir-head">
+        <div className="fb-dir-head-main">
+          {onBack ? (
+            <div className="fb-dialog-header-main">
+              <button
+                type="button"
+                className="fb-dialog-back"
+                onClick={onBack}
+                aria-label={backLabel ? `返回${backLabel}` : '返回'}
+              >
+                <IconChevronLeftOutlineRegular size={15} />
+                <span>{backLabel || '返回'}</span>
+              </button>
+              <span className="fb-dialog-header-sep" aria-hidden="true">
+                /
+              </span>
+              <div className="fb-schedule-dialog-title">选择本地工作目录</div>
+            </div>
+          ) : (
+            <div className="fb-schedule-dialog-title">选择本地工作目录</div>
+          )}
+          <div className="fb-dir-path fb-mono" title={currentPath}>
+            {currentPath}
           </div>
         </div>
         <button type="button" className="fb-icon-btn" aria-label="关闭" onClick={onClose}>
@@ -140,9 +183,9 @@ export function DirectoryPickerModal({
         </button>
       </div>
 
-      <div className="fb-schedule-dialog-body">
+      <div className="fb-dir-body">
         <div className="fb-dir-toolbar">
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <div className="fb-dir-toolbar-left">
             <Button
               size="sm"
               variant="ghost"
@@ -154,6 +197,8 @@ export function DirectoryPickerModal({
             <Button
               size="sm"
               variant="ghost"
+              className="fb-dir-toggle"
+              aria-pressed={showHidden}
               icon={showHidden ? <IconEyeOutlineRegular size={14} /> : <IconEyeOffOutlineRegular size={14} />}
               onClick={() => setShowHidden((v) => !v)}
             >
@@ -196,6 +241,7 @@ export function DirectoryPickerModal({
           <div className="fb-scope-add" style={{ marginTop: 8 }}>
             <input
               autoFocus
+              data-fb-escape-local=""
               className="fb-field fb-mono"
               value={newFolderName}
               placeholder="新文件夹名称"
@@ -205,6 +251,8 @@ export function DirectoryPickerModal({
                   e.preventDefault()
                   void submitNewFolder()
                 } else if (e.key === 'Escape') {
+                  e.preventDefault()
+                  e.stopPropagation()
                   setCreating(false)
                 }
               }}
@@ -215,17 +263,24 @@ export function DirectoryPickerModal({
           </div>
         )}
 
-        {listing && listing.entries.length > 8 && (
-          <div style={{ marginTop: 8 }}>
-            <Input
-              className="fb-search"
-              icon={<IconSearchOutlineRegular size={15} />}
-              placeholder="筛选当前目录下的子文件夹…"
-              value={filter}
-              onChange={(e) => setFilter(e.target.value)}
-            />
-          </div>
-        )}
+        <div className="fb-dir-search">
+          <Input
+            className="fb-search"
+            icon={<IconSearchOutlineRegular size={15} />}
+            placeholder="筛选当前目录下的子文件夹…"
+            value={filter}
+            disabled={!listing}
+            data-fb-escape-local={filter ? '' : undefined}
+            onKeyDown={(e) => {
+              if (e.key === 'Escape' && filter) {
+                e.preventDefault()
+                e.stopPropagation()
+                setFilter('')
+              }
+            }}
+            onChange={(e) => setFilter(e.target.value)}
+          />
+        </div>
 
         <div className="fb-dir-list">
           {loading && <div className="fb-empty" style={{ padding: '32px 12px' }}>正在读取目录…</div>}
@@ -243,7 +298,7 @@ export function DirectoryPickerModal({
                 data-hidden={entry.hidden ? '' : undefined}
                 onClick={() => void loadDir(entry.path)}
               >
-                <IconFolderCloseRegular size={15} />
+                <IconFolderCloseRegular size={15} className="fb-dir-entry-icon" />
                 <span className="fb-dir-entry-name">{entry.name}</span>
                 <IconChevronRightOutlineRegular size={13} className="fb-select-chevron" />
               </button>
@@ -253,8 +308,8 @@ export function DirectoryPickerModal({
 
       <div className="fb-schedule-dialog-foot">
         {error ? <span className="fb-dialog-error">{error}</span> : null}
-        <Button variant="outline" onClick={onClose}>
-          取消
+        <Button variant="outline" onClick={onBack ?? onClose}>
+          {onBack ? '返回' : '取消'}
         </Button>
         <Button
           variant="primary"
@@ -264,6 +319,22 @@ export function DirectoryPickerModal({
           选择当前目录
         </Button>
       </div>
+    </>
+  )
+}
+
+export function DirectoryPickerModal({
+  initialPath,
+  onClose,
+  onSelect,
+}: {
+  initialPath?: string
+  onClose: () => void
+  onSelect: (selectedPath: string) => void
+}) {
+  return (
+    <Modal open onClose={onClose} title="选择本地工作目录" headless className="fb-schedule-dialog fb-dir-modal fb-nested-modal">
+      <DirectoryPickerPanel initialPath={initialPath} onClose={onClose} onSelect={onSelect} />
     </Modal>
   )
 }

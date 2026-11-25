@@ -10,7 +10,7 @@ import type {
   MemoryScope,
   MemoryType,
 } from '../types.js'
-import { DirectoryField } from './DirectoryPickerModal.js'
+import { DirectoryField, DirectoryPickerPanel } from './DirectoryPickerModal.js'
 import {
   NestedSettings,
   SelectMenu,
@@ -180,11 +180,13 @@ function MemoryScopeFields({
   botGroups,
   defaultWorkingDir,
   onPatch,
+  onBrowseDir,
 }: {
   draft: MemoryDraft
   botGroups: readonly GroupView[]
   defaultWorkingDir: string
   onPatch: (p: Partial<MemoryDraft>) => void
+  onBrowseDir: () => void
 }) {
   const [manualChat, setManualChat] = useState(false)
 
@@ -289,6 +291,8 @@ function MemoryScopeFields({
               value={draft.scopeId}
               onChange={(scopeId) => onPatch({ scopeId })}
               placeholder={defaultWorkingDir || '/path/to/workspace'}
+              browseSeed={draft.scopeId || defaultWorkingDir}
+              onBrowse={onBrowseDir}
             />
           </SettingRow>
         </NestedSettings>
@@ -302,11 +306,13 @@ function MemoryFormFields({
   botGroups,
   defaultWorkingDir,
   onPatch,
+  onBrowseDir,
 }: {
   draft: MemoryDraft
   botGroups: readonly GroupView[]
   defaultWorkingDir: string
   onPatch: (p: Partial<MemoryDraft>) => void
+  onBrowseDir: () => void
 }) {
   const titleLen = draft.title.trim().length
   const contentLen = draft.content.trim().length
@@ -326,6 +332,7 @@ function MemoryFormFields({
         botGroups={botGroups}
         defaultWorkingDir={defaultWorkingDir}
         onPatch={onPatch}
+        onBrowseDir={onBrowseDir}
       />
 
       <SettingRow
@@ -409,12 +416,14 @@ export function MemoryEditDialog({
   )
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
+  const [dirPickerOpen, setDirPickerOpen] = useState(false)
   const botsRef = useRef(bots)
   botsRef.current = bots
 
   useEffect(() => {
     if (!request) return
     setDraft(buildInitialDraft(request, botsRef.current))
+    setDirPickerOpen(false)
     setError('')
   }, [request])
 
@@ -468,80 +477,112 @@ export function MemoryEditDialog({
     <Modal
       open
       onClose={onClose}
-      title={dialogTitle}
+      title={dirPickerOpen ? '选择本地工作目录' : dialogTitle}
       headless
       className="fb-schedule-dialog fb-memory-dialog"
+      onKeyDownCapture={
+        dirPickerOpen
+          ? (event) => {
+              if (
+                event.key === 'Escape' &&
+                !event.shiftKey &&
+                !event.defaultPrevented &&
+                !(event.target instanceof Element && event.target.closest('[data-fb-escape-local]'))
+              ) {
+                event.preventDefault()
+                event.stopPropagation()
+                setDirPickerOpen(false)
+              }
+            }
+          : undefined
+      }
     >
-      <div className="fb-schedule-dialog-head">
-        <div style={{ minWidth: 0 }}>
-          <div className="fb-schedule-dialog-title">{dialogTitle}</div>
-          <div className="fb-schedule-dialog-sub">{dialogSubtitle}</div>
-        </div>
-        <button type="button" className="fb-icon-btn" aria-label="关闭" onClick={onClose}>
-          <IconCloseOutlineRegular size={14} />
-        </button>
-      </div>
-
-      <div className="fb-schedule-dialog-body">
-        {request.mode === 'create' && bots.length > 1 && (
-          <SettingRow title="所属智能体">
-            <SelectMenu
-              value={draft.botId}
-              options={bots.map((b) => ({ value: b.id, label: b.name }))}
-              onChange={(botId) => patch({ botId, ...(draft.scope === 'chat' ? { scopeId: '' } : {}) })}
-            />
-          </SettingRow>
-        )}
-
-        {request.mode === 'supersede' && (
-          <>
-            <div className="fb-mem-supersede-ref">
-              <div className="fb-mem-supersede-ref-label">原记忆（将标记为已纠偏并保留审计记录）</div>
-              <div className="fb-mem-supersede-ref-title">{request.entry.title}</div>
-              <div className="fb-mem-supersede-ref-body">{request.entry.content}</div>
+      {dirPickerOpen ? (
+        <DirectoryPickerPanel
+          initialPath={draft.scopeId.trim() || targetBot?.defaultWorkingDir || '~'}
+          backLabel={dialogTitle}
+          onBack={() => setDirPickerOpen(false)}
+          onClose={onClose}
+          onSelect={(selected) => {
+            patch({ scopeId: selected })
+            setDirPickerOpen(false)
+          }}
+        />
+      ) : (
+        <>
+          <div className="fb-schedule-dialog-head">
+            <div style={{ minWidth: 0 }}>
+              <div className="fb-schedule-dialog-title">{dialogTitle}</div>
+              <div className="fb-schedule-dialog-sub">{dialogSubtitle}</div>
             </div>
-            <SettingRow title="纠偏原因" desc="记录旧结论失效或被推翻的依据">
-              <TextField
-                value={draft.supersedeReason}
-                onChange={(supersedeReason) => patch({ supersedeReason })}
-                placeholder="例如 2026-11-25 架构调整后旧规范不再适用"
-              />
-            </SettingRow>
-            <SettingRow title="写入替代新记忆" desc="原子创建新条目并建立双时态替代关联">
-              <Switch
-                label="写入替代新记忆"
-                checked={draft.createReplacement}
-                onChange={(createReplacement) => patch({ createReplacement })}
-              />
-            </SettingRow>
-          </>
-        )}
+            <button type="button" className="fb-icon-btn" aria-label="关闭" onClick={onClose}>
+              <IconCloseOutlineRegular size={14} />
+            </button>
+          </div>
 
-        {(request.mode !== 'supersede' || draft.createReplacement) && (
-          <MemoryFormFields
-            draft={draft}
-            botGroups={botGroups}
-            defaultWorkingDir={targetBot?.defaultWorkingDir ?? ''}
-            onPatch={patch}
-          />
-        )}
-      </div>
+          <div className="fb-schedule-dialog-body">
+            {request.mode === 'create' && bots.length > 1 && (
+              <SettingRow title="所属智能体">
+                <SelectMenu
+                  value={draft.botId}
+                  options={bots.map((b) => ({ value: b.id, label: b.name }))}
+                  onChange={(botId) => patch({ botId, ...(draft.scope === 'chat' ? { scopeId: '' } : {}) })}
+                />
+              </SettingRow>
+            )}
 
-      <div className="fb-schedule-dialog-foot">
-        {error ? <span className="fb-dialog-error">{error}</span> : null}
-        <Button variant="outline" disabled={saving} onClick={onClose}>
-          取消
-        </Button>
-        <Button variant="primary" disabled={saving} onClick={() => void submit()}>
-          {saving
-            ? '保存中…'
-            : request.mode === 'supersede'
-              ? draft.createReplacement
-                ? '确认纠偏并保存'
-                : '标记已纠偏'
-              : '保存'}
-        </Button>
-      </div>
+            {request.mode === 'supersede' && (
+              <>
+                <div className="fb-mem-supersede-ref">
+                  <div className="fb-mem-supersede-ref-label">原记忆（将标记为已纠偏并保留审计记录）</div>
+                  <div className="fb-mem-supersede-ref-title">{request.entry.title}</div>
+                  <div className="fb-mem-supersede-ref-body">{request.entry.content}</div>
+                </div>
+                <SettingRow title="纠偏原因" desc="记录旧结论失效或被推翻的依据">
+                  <TextField
+                    value={draft.supersedeReason}
+                    onChange={(supersedeReason) => patch({ supersedeReason })}
+                    placeholder="例如 2026-11-25 架构调整后旧规范不再适用"
+                  />
+                </SettingRow>
+                <SettingRow title="写入替代新记忆" desc="原子创建新条目并建立双时态替代关联">
+                  <Switch
+                    label="写入替代新记忆"
+                    checked={draft.createReplacement}
+                    onChange={(createReplacement) => patch({ createReplacement })}
+                  />
+                </SettingRow>
+              </>
+            )}
+
+            {(request.mode !== 'supersede' || draft.createReplacement) && (
+              <MemoryFormFields
+                draft={draft}
+                botGroups={botGroups}
+                defaultWorkingDir={targetBot?.defaultWorkingDir ?? ''}
+                onPatch={patch}
+                onBrowseDir={() => setDirPickerOpen(true)}
+              />
+            )}
+          </div>
+
+          <div className="fb-schedule-dialog-foot">
+            {error ? <span className="fb-dialog-error">{error}</span> : null}
+            <Button variant="outline" disabled={saving} onClick={onClose}>
+              取消
+            </Button>
+            <Button variant="primary" disabled={saving} onClick={() => void submit()}>
+              {saving
+                ? '保存中…'
+                : request.mode === 'supersede'
+                  ? draft.createReplacement
+                    ? '确认纠偏并保存'
+                    : '标记已纠偏'
+                  : '保存'}
+            </Button>
+          </div>
+        </>
+      )}
     </Modal>
   )
 }
