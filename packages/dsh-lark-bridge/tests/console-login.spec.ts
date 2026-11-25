@@ -12,7 +12,11 @@ import {
   LARK_CONSOLE_LOGIN_PATH,
   handleConsoleLogin,
 } from '../src/console-login.js'
-import { createLarkHttpHandler, type ConnectionAdmitter } from '../src/http-api.js'
+import {
+  createLarkHttpHandler,
+  dispatchLarkApiRequest,
+  type ConnectionAdmitter,
+} from '../src/http-api.js'
 import { handleSlashCommand, type SlashCommandHost } from '../src/slash-commands.js'
 import { LarkBridgeStore } from '../src/store.js'
 
@@ -429,6 +433,26 @@ describe('/console slash command and single-use console-login handoff', () => {
     await handler(postTx.req, postTx.res)
     expect(postTx.result().status).toBe(303)
     expect(postTx.result().headers.location).toBe('/?token=secret-owner-token')
+
+    // CLI bearer token must be blocked from POST /console-login/issue, while Owner web session succeeds
+    const cliDenied = await dispatchLarkApiRequest(fakeCtx, manager, {
+      method: 'POST',
+      path: '/console-login/issue',
+      body: { botId: 'e2e-bot' },
+      isCliAuthenticated: true,
+      principalKind: 'cli',
+    })
+    expect(cliDenied.status).toBe(403)
+
+    const ownerIssued = await dispatchLarkApiRequest(fakeCtx, manager, {
+      method: 'POST',
+      path: '/console-login/issue',
+      body: { botId: 'e2e-bot', botName: 'E2EBot' },
+      isCliAuthenticated: false,
+      principalKind: 'owner',
+    })
+    expect(ownerIssued.status).toBe(200)
+    expect((ownerIssued.payload as { url?: string }).url).toContain(LARK_CONSOLE_LOGIN_PATH)
 
     store.close()
   })

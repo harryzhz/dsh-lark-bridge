@@ -220,6 +220,27 @@ export async function dispatchLarkApiRequest(
       return ok({ ok: true })
     }
 
+    // ── Short-lived single-use console login ticket issue (owner-only) ───
+    if (method === 'POST' && pathname === 'console-login/issue') {
+      if (principalKind !== 'owner' || isCliAuthenticated || isOperatorAuthenticated) {
+        return ok({ ok: false, error: 'owner_web_session_required' }, 403)
+      }
+      const body = bodyRecord(request.body)
+      const botId = typeof body.botId === 'string' && body.botId.trim() ? body.botId.trim() : 'owner'
+      const bot = manager.store.getBot(botId)
+      const botName =
+        bot?.name ?? (typeof body.botName === 'string' && body.botName.trim() ? body.botName.trim() : 'DSH 控制台')
+      const issued = manager.issueConsoleLoginLink({
+        botId: bot?.id ?? botId,
+        botName,
+        adminOpenId: 'owner_session',
+      })
+      if (!issued) {
+        return ok({ ok: false, error: 'console_login_unavailable' }, 503)
+      }
+      return ok({ ok: true, ...issued })
+    }
+
     // ── Agent CLI endpoints (never expose app secrets or OAuth tokens) ───
     if (segments[0] === 'agent') {
       if (method === 'GET' && segments[1] === 'context') {
