@@ -1135,11 +1135,11 @@ export function MemoryView({
     })
 
   if (loadError) {
-    return <div className="fb-mem-state-box">加载记忆库失败：{loadError}</div>
+    return <div className="fb-card fb-empty">加载记忆库失败：{loadError}</div>
   }
   if (bots.length === 0) {
     return (
-      <div className="fb-mem-state-box">
+      <div className="fb-card fb-empty">
         还没有智能体，请先在「智能体」页接入飞书应用后再管理记忆库
       </div>
     )
@@ -1152,66 +1152,68 @@ export function MemoryView({
     : undefined
 
   return (
-    <div className="fb-mem-workspace">
-      <MemoryNavColumn
-        bots={bots}
-        effectiveBotId={effectiveBotId}
-        onBotIdChange={handleBotChange}
-        nav={nav}
-        onSelectNav={(next) => {
-          setNav(next)
-          if (next.kind === 'history') setHistoryFilter('all')
-        }}
-        activeCount={activeScoped.length}
-        pinnedCount={pinnedCount}
-        historyCount={historyScoped.length}
-        typeCounts={typeCounts}
-        hierarchy={hierarchy}
-        topTags={topTags}
-      />
+    <div className="fb-mem-frame">
+      <div className="fb-mem-workspace">
+        <MemoryNavColumn
+          bots={bots}
+          effectiveBotId={effectiveBotId}
+          onBotIdChange={handleBotChange}
+          nav={nav}
+          onSelectNav={(next) => {
+            setNav(next)
+            if (next.kind === 'history') setHistoryFilter('all')
+          }}
+          activeCount={activeScoped.length}
+          pinnedCount={pinnedCount}
+          historyCount={historyScoped.length}
+          typeCounts={typeCounts}
+          hierarchy={hierarchy}
+          topTags={topTags}
+        />
 
-      <MemoryListColumn
-        heading={resolveNavHeading(nav, groups)}
-        nav={nav}
-        entries={visibleEntries}
-        selectedId={selectedEntry?.id ?? null}
-        onSelectId={setSelectedId}
-        query={query}
-        onQueryChange={setQuery}
-        sortBy={sortBy}
-        onSortByChange={setSortBy}
-        historyFilter={historyFilter}
-        onHistoryFilterChange={setHistoryFilter}
-        historyCounts={{
-          total: historyScoped.length,
-          superseded: historyStatusCounts.superseded,
-          archived: historyStatusCounts.archived,
-        }}
-        botsById={botsById}
-        showBotName={bots.length > 1 && !effectiveBotId}
-        groups={groups}
-        loading={loading}
-        hasActiveTotal={activeScoped.length > 0}
-        onClearToAll={() => {
-          setQuery('')
-          setHistoryFilter('all')
-          setNav({ kind: 'all' })
-        }}
-        onCreate={openCreate}
-      />
+        <MemoryListColumn
+          heading={resolveNavHeading(nav, groups)}
+          nav={nav}
+          entries={visibleEntries}
+          selectedId={selectedEntry?.id ?? null}
+          onSelectId={setSelectedId}
+          query={query}
+          onQueryChange={setQuery}
+          sortBy={sortBy}
+          onSortByChange={setSortBy}
+          historyFilter={historyFilter}
+          onHistoryFilterChange={setHistoryFilter}
+          historyCounts={{
+            total: historyScoped.length,
+            superseded: historyStatusCounts.superseded,
+            archived: historyStatusCounts.archived,
+          }}
+          botsById={botsById}
+          showBotName={bots.length > 1 && !effectiveBotId}
+          groups={groups}
+          loading={loading}
+          hasActiveTotal={activeScoped.length > 0}
+          onClearToAll={() => {
+            setQuery('')
+            setHistoryFilter('all')
+            setNav({ kind: 'all' })
+          }}
+          onCreate={openCreate}
+        />
 
-      <MemoryReaderColumn
-        entry={selectedEntry}
-        bot={selectedEntry ? botsById.get(selectedEntry.botId) : undefined}
-        groups={groups}
-        replacementEntry={replacementEntry}
-        predecessors={predecessors}
-        markdownPath={markdownPath}
-        mutating={Boolean(selectedEntry && mutatingId === selectedEntry.id)}
-        actions={readerActions}
-        onCreate={openCreate}
-        hasAnyEntries={scopedEntries.length > 0}
-      />
+        <MemoryReaderColumn
+          entry={selectedEntry}
+          bot={selectedEntry ? botsById.get(selectedEntry.botId) : undefined}
+          groups={groups}
+          replacementEntry={replacementEntry}
+          predecessors={predecessors}
+          markdownPath={markdownPath}
+          mutating={Boolean(selectedEntry && mutatingId === selectedEntry.id)}
+          actions={readerActions}
+          onCreate={openCreate}
+          hasAnyEntries={scopedEntries.length > 0}
+        />
+      </div>
     </div>
   )
 }
