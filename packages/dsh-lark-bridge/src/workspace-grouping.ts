@@ -1,39 +1,111 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { brandString } from '@deepseek-ai/dsh-brand'
-import type { SessionId } from '@deepseek-ai/dsh-session'
+import type { Session, SessionId } from '@deepseek-ai/dsh-session'
+import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
 import type { WorkspaceRegistry } from '@deepseek-ai/dsh-workspace'
 import { expandWorkingDir, type LarkBotConfig } from '@dsh-lark/lark-core'
 import type { LarkBridgeStore } from './store.js'
+import type { LarkManagedSession } from './types.js'
 
 type Workspace = Awaited<ReturnType<WorkspaceRegistry['create']>>
+
+interface PendingAttachment {
+  readonly workingDir: string
+  readonly title: string
+}
+
+interface HeaderCwdLookup {
+  readonly cwd?: string
+  readonly missing: boolean
+}
+
+const MAX_PENDING_QUEUE = 256
+const MAX_DEFERRED_WARNINGS = 5
 
 /**
  * Keeps Lark-originated sessions inside their configured DSH sidebar workspace
  * and archives expired sessions through DSH's durable `workspaceRegistry`.
+ *
+ * Because `dsh-workspace` initializes asynchronously (scanning stored session
+ * headers before Cordis marks `workspaceRegistry` active) and may be absent in
+ * headless profiles, attachments/archives requested before readiness are queued
+ * and flushed automatically once `workspaceRegistry` activates.
  */
 export class WorkspaceGrouping {
+  private readonly pendingAttachments = new Map<string, PendingAttachment>()
+  private readonly pendingArchives = new Set<string>()
+  private activeRegistry?: WorkspaceRegistry
+  private reconcileTail: Promise<void> = Promise.resolve()
+  private deferredWarnCount = 0
+  private disposed = false
+
   constructor(
     private readonly ctx: Context,
     private readonly store: LarkBridgeStore,
   ) {}
 
-  async attachSession(workingDir: string, title: string, sessionId: string): Promise<void> {
-    const ws = await this.open(workingDir, title)
-    if (!ws) return
-    try {
-      await ws.attachSession(brandString<SessionId>(sessionId))
-    } catch (err) {
-      this.warn(`attachSession(${sessionId}) to "${title}"`, err)
+  install(): () => void {
+    this.disposed = false
+    let localDisposed = false
+    const handle =
+      typeof this.ctx.inject === 'function'
+        ? this.ctx.inject(['workspaceRegistry' as never], (wsCtx) => {
+            if (localDisposed || this.disposed) return
+            const reg =
+              ((wsCtx as Context).get?.('workspaceRegistry' as never) as
+                | WorkspaceRegistry
+                | undefined) ??
+              (wsCtx as unknown as { workspaceRegistry?: WorkspaceRegistry }).workspaceRegistry
+            if (reg) {
+              this.activeRegistry = reg
+            }
+            if (typeof (wsCtx as Context).effect === 'function') {
+              ;(wsCtx as Context).effect(() => () => {
+                if (this.activeRegistry === reg) {
+                  this.activeRegistry = undefined
+                }
+              })
+            }
+            void this.onRegistryReady().catch((err) => {
+              this.warn('workspaceRegistry ready reconcile', err)
+            })
+          })
+        : undefined
+
+    return () => {
+      localDisposed = true
+      this.disposed = true
+      this.activeRegistry = undefined
+      const fiber = handle as { dispose?: () => void } | undefined
+      fiber?.dispose?.()
     }
+  }
+
+  async attachSession(workingDir: string, title: string, sessionId: string): Promise<void> {
+    const resolvedDir = expandWorkingDir(workingDir)
+    if (!resolvedDir) return
+    const registry = this.registry()
+    if (!registry) {
+      this.enqueuePendingAttachment(sessionId, resolvedDir, title)
+      return
+    }
+    await this.attachNow(registry, resolvedDir, title, sessionId)
   }
 
   async archiveSession(sessionId: string): Promise<boolean> {
     const registry = this.registry()
-    if (!registry) return false
+    if (!registry) {
+      this.enqueuePendingArchive(sessionId)
+      return false
+    }
     const branded = brandString<SessionId>(sessionId)
-    if (registry.archivedSessionIds?.includes(branded)) return false
+    if (registry.archivedSessionIds?.includes(branded)) {
+      this.pendingArchives.delete(sessionId)
+      return false
+    }
     try {
       await registry.archiveSession(branded, { stopActivity: true })
+      this.pendingArchives.delete(sessionId)
       return true
     } catch (err) {
       this.warn(`archiveSession(${sessionId})`, err)
@@ -79,18 +151,231 @@ export class WorkspaceGrouping {
     )
   }
 
-  async reconcileBindings(): Promise<void> {
+  reconcileBindings(): Promise<void> {
+    return this.enqueueReconcile(() => this.runReconcile())
+  }
+
+  private onRegistryReady(): Promise<void> {
+    return this.enqueueReconcile(async () => {
+      if (this.disposed || !this.registry()) return
+      for (const bot of this.store.listBots?.() ?? []) {
+        if (bot.enabled) {
+          await this.syncBot(bot)
+        }
+      }
+      await this.runReconcile()
+    })
+  }
+
+  private enqueueReconcile(task: () => Promise<void>): Promise<void> {
+    const next = this.reconcileTail.then(task, task)
+    this.reconcileTail = next.then(
+      () => {},
+      () => {},
+    )
+    return next
+  }
+
+  private async runReconcile(): Promise<void> {
+    if (this.disposed) return
+    const registry = this.registry()
+    if (!registry) return
+
+    const { attachedIds, archivedIds } = this.snapshotMembership(registry)
+
+    // 1. Flush attachments deferred before `workspaceRegistry` became ready.
+    const deferredAttachments = [...this.pendingAttachments.entries()]
+    this.pendingAttachments.clear()
+    for (const [sessionId, entry] of deferredAttachments) {
+      if (attachedIds.has(sessionId)) continue
+      const ok = await this.attachNow(registry, entry.workingDir, entry.title, sessionId)
+      if (ok) {
+        attachedIds.add(sessionId)
+      }
+    }
+
+    // 2. Reconcile active route bindings.
+    const seenSessionIds = new Set<string>()
     for (const binding of this.store.listBindings()) {
-      await this.attachSession(binding.workingDir, binding.workspaceName, binding.sessionId)
+      seenSessionIds.add(binding.sessionId)
+      const ok = await this.attachNow(
+        registry,
+        binding.workingDir,
+        binding.workspaceName,
+        binding.sessionId,
+      )
+      if (ok) {
+        attachedIds.add(binding.sessionId)
+      }
+    }
+
+    // 3. Repair unarchived managed sessions (reminders, ephemeral listeners, etc.)
+    //    that have no `session_bindings` row and are absent from every workspace.
+    const activeManaged = this.store.listActiveManagedSessions?.() ?? []
+    for (const ms of activeManaged) {
+      if (seenSessionIds.has(ms.sessionId)) continue
+      if (attachedIds.has(ms.sessionId) || archivedIds.has(ms.sessionId)) continue
+      const target = await this.resolveManagedSessionTarget(ms)
+      if (!target) continue
+      const ok = await this.attachNow(registry, target.workingDir, target.title, ms.sessionId)
+      if (ok) {
+        attachedIds.add(ms.sessionId)
+        this.ctx.logger?.info?.(
+          `[lark-bridge] reconciled ungrouped managed session ${ms.sessionId} (${ms.trigger ?? 'managed'}) -> "${target.title || target.workingDir}"`,
+        )
+      }
+    }
+
+    // 4. Flush archives deferred before `workspaceRegistry` became ready (after attaching
+    //    so archived sessions preserve their workspace slot).
+    const deferredArchives = [...this.pendingArchives]
+    this.pendingArchives.clear()
+    for (const sessionId of deferredArchives) {
+      await this.archiveSession(sessionId)
+    }
+  }
+
+  private snapshotMembership(registry: WorkspaceRegistry): {
+    attachedIds: Set<string>
+    archivedIds: Set<string>
+  } {
+    const attachedIds = new Set<string>()
+    for (const ws of registry.list?.() ?? []) {
+      for (const sid of ws.sessionIds ?? []) {
+        attachedIds.add(sid)
+      }
+    }
+    const archivedIds = new Set<string>(registry.archivedSessionIds ?? [])
+    return { attachedIds, archivedIds }
+  }
+
+  private async resolveManagedSessionTarget(
+    ms: LarkManagedSession,
+  ): Promise<PendingAttachment | undefined> {
+    const header = await this.readSessionHeaderCwd(ms.sessionId)
+    if (header.missing) return undefined
+
+    const bot = this.store.getBot?.(ms.botId)
+    const isP2p = ms.chatId.startsWith('p2p:')
+    const isGroupChat = Boolean(ms.chatId) && !isP2p && ms.chatId !== 'dream:internal'
+    const group = isGroupChat ? this.store.getGroup?.(ms.botId, ms.chatId) : undefined
+    const reminderId = ms.routeKey?.startsWith('reminder:')
+      ? ms.routeKey.slice('reminder:'.length)
+      : undefined
+    const reminder = reminderId ? this.store.getReminder?.(reminderId) : undefined
+
+    const defaultConfiguredRaw = group?.workingDir.trim() || bot?.defaultWorkingDir || ''
+    const defaultConfiguredDir = defaultConfiguredRaw ? expandWorkingDir(defaultConfiguredRaw) : ''
+    const reminderDir = reminder?.workingDir?.trim()
+      ? expandWorkingDir(reminder.workingDir)
+      : ''
+    const headerDir = header.cwd ? expandWorkingDir(header.cwd) : ''
+    const targetDir = headerDir || reminderDir || defaultConfiguredDir
+    if (!targetDir) return undefined
+
+    const matchesConfiguredWorkspace =
+      Boolean(bot) && Boolean(defaultConfiguredDir) && targetDir === defaultConfiguredDir
+    const title = matchesConfiguredWorkspace
+      ? isGroupChat
+        ? this.store.resolveGroupWorkspaceName(
+            bot!,
+            group,
+            this.store.resolveChatName?.(bot!.id, ms.chatId),
+          )
+        : this.store.resolveBotWorkspaceName(bot!)
+      : ''
+
+    return { workingDir: targetDir, title }
+  }
+
+  private async readSessionHeaderCwd(sessionId: string): Promise<HeaderCwdLookup> {
+    const branded = brandString<SessionId>(sessionId)
+    const live = (
+      this.ctx.sessions as unknown as { get?: (id: SessionId) => Session | undefined } | undefined
+    )?.get?.(branded)
+    if (live) {
+      const cwd = (live as unknown as { header?: { cwd?: string } }).header?.cwd
+      return { ...(cwd ? { cwd } : {}), missing: false }
+    }
+
+    const persistence = this.ctx.get('sessionPersistence' as never) as
+      | SessionPersistence
+      | undefined
+    if (!persistence?.open) {
+      return { missing: false }
+    }
+    try {
+      const handle = await persistence.open(branded, 'read')
+      try {
+        const cwd = handle.header?.cwd
+        return { ...(cwd ? { cwd } : {}), missing: false }
+      } finally {
+        await handle.close().catch(() => {})
+      }
+    } catch {
+      return { missing: true }
+    }
+  }
+
+  private async attachNow(
+    registry: WorkspaceRegistry,
+    workingDir: string,
+    title: string,
+    sessionId: string,
+  ): Promise<boolean> {
+    const ws = await this.open(workingDir, title, registry)
+    if (!ws) return false
+    try {
+      await ws.attachSession(brandString<SessionId>(sessionId))
+      this.pendingAttachments.delete(sessionId)
+      return true
+    } catch (err) {
+      this.warn(`attachSession(${sessionId}) to "${title}"`, err)
+      return false
+    }
+  }
+
+  private enqueuePendingAttachment(sessionId: string, workingDir: string, title: string): void {
+    if (!this.pendingAttachments.has(sessionId) && this.pendingAttachments.size >= MAX_PENDING_QUEUE) {
+      const oldest = this.pendingAttachments.keys().next().value
+      if (oldest !== undefined) this.pendingAttachments.delete(oldest)
+    }
+    this.pendingAttachments.set(sessionId, { workingDir, title })
+    if (this.deferredWarnCount < MAX_DEFERRED_WARNINGS) {
+      this.deferredWarnCount += 1
+      this.ctx.logger?.warn?.(
+        `[lark-bridge] workspaceRegistry not ready; deferred attachSession(${sessionId}) to "${title || workingDir}"`,
+      )
+    }
+  }
+
+  private enqueuePendingArchive(sessionId: string): void {
+    if (!this.pendingArchives.has(sessionId) && this.pendingArchives.size >= MAX_PENDING_QUEUE) {
+      const oldest = this.pendingArchives.values().next().value
+      if (oldest !== undefined) this.pendingArchives.delete(oldest)
+    }
+    this.pendingArchives.add(sessionId)
+    if (this.deferredWarnCount < MAX_DEFERRED_WARNINGS) {
+      this.deferredWarnCount += 1
+      this.ctx.logger?.warn?.(
+        `[lark-bridge] workspaceRegistry not ready; deferred archiveSession(${sessionId})`,
+      )
     }
   }
 
   private registry(): WorkspaceRegistry | undefined {
-    return this.ctx.get('workspaceRegistry') as WorkspaceRegistry | undefined
+    return (
+      this.activeRegistry ??
+      (this.ctx.get('workspaceRegistry') as WorkspaceRegistry | undefined)
+    )
   }
 
-  private async open(workingDir: string, title: string): Promise<Workspace | undefined> {
-    const registry = this.registry()
+  private async open(
+    workingDir: string,
+    title: string,
+    explicitRegistry?: WorkspaceRegistry,
+  ): Promise<Workspace | undefined> {
+    const registry = explicitRegistry ?? this.registry()
     const resolvedDir = expandWorkingDir(workingDir)
     if (!registry || !resolvedDir) return undefined
     const desired = title.trim()
@@ -107,7 +392,7 @@ export class WorkspaceGrouping {
   }
 
   private warn(subject: string, err: unknown): void {
-    this.ctx.logger.warn(
+    this.ctx.logger?.warn?.(
       `[lark-bridge] ${subject} skipped: ${err instanceof Error ? err.message : String(err)}`,
     )
   }
