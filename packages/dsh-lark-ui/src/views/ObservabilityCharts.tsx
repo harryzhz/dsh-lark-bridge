@@ -1,5 +1,6 @@
-import { useId, useState } from 'react'
+import { useId, useState, type ReactNode } from 'react'
 import type {
+  CockpitPayload,
   ObservabilityHeatmapCell,
   ObservabilityLatencyBucket,
   ObservabilitySeriesPoint,
@@ -15,6 +16,53 @@ import {
   resolveHeatmapLevel,
   WEEKDAY_LABELS,
 } from './observability-model.js'
+
+export function KpiCard({
+  label,
+  tag,
+  value,
+  unit,
+  foot,
+  delta,
+  spark,
+  sparkTone = 'primary',
+  visual,
+}: {
+  readonly label: string
+  readonly tag?: string
+  readonly value: string
+  readonly unit?: string
+  readonly foot: string
+  readonly delta?: { readonly text: string; readonly tone: 'good' | 'bad' | 'neutral' }
+  readonly spark?: readonly number[]
+  readonly sparkTone?: 'primary' | 'success' | 'warn' | 'danger'
+  readonly visual?: ReactNode
+}) {
+  return (
+    <div className="fb-card fb-obs-kpi">
+      <div className="fb-obs-kpi-head">
+        <span className="fb-obs-kpi-label">{label}</span>
+        {delta ? (
+          <span className="fb-obs-delta fb-mono" data-tone={delta.tone}>
+            {delta.text}
+          </span>
+        ) : tag ? (
+          <span className="fb-obs-kpi-tag fb-mono">{tag}</span>
+        ) : null}
+      </div>
+      <div className="fb-obs-kpi-mid">
+        <div className="fb-obs-kpi-val fb-num">
+          <span>{value}</span>
+          {unit && <span className="fb-obs-kpi-unit">{unit}</span>}
+        </div>
+        {visual ?? (spark ? <Sparkline values={spark} tone={sparkTone} /> : null)}
+      </div>
+      <div className="fb-obs-kpi-foot fb-num" title={foot}>
+        {foot}
+      </div>
+    </div>
+  )
+}
 
 export function Sparkline({
   values,
@@ -93,6 +141,247 @@ export function MiniStorageMeter({
       <span className="fb-obs-mini-meter-lbl fb-mono">
         DB {bridgePct}%
       </span>
+    </div>
+  )
+}
+
+export function MiniRatioMeter({
+  online,
+  total,
+  healthy,
+}: {
+  readonly online: number
+  readonly total: number
+  readonly healthy: boolean
+}) {
+  const pct = total > 0 ? Math.round((online / total) * 100) : 0
+  return (
+    <div
+      className="fb-obs-mini-meter"
+      title={`在线率 ${pct}% (${online}/${total})`}
+      aria-hidden="true"
+    >
+      <div className="fb-obs-mini-meter-track">
+        {pct > 0 && (
+          <span
+            className="fb-obs-mini-meter-seg"
+            data-kind={healthy ? 'cache' : 'error'}
+            style={{ width: `${Math.max(6, pct)}%` }}
+          />
+        )}
+      </div>
+      <span className="fb-obs-mini-meter-lbl fb-mono">
+        {total > 0 ? `${pct}%` : '—'}
+      </span>
+    </div>
+  )
+}
+
+export function OverviewHourlyChart({
+  hourlySeries,
+  inboundTotal,
+  repliedTotal,
+  silentTotal,
+  errorTotal,
+  peakCount,
+}: {
+  readonly hourlySeries: CockpitPayload['hourlySeries']
+  readonly inboundTotal: number
+  readonly repliedTotal: number
+  readonly silentTotal: number
+  readonly errorTotal: number
+  readonly peakCount: number
+}) {
+  const [hoverIdx, setHoverIdx] = useState<number | null>(null)
+  const W = 760
+  const H = 196
+  const padL = 42
+  const padR = 14
+  const padT = 14
+  const padB = 26
+  const plotW = W - padL - padR
+  const plotH = H - padT - padB
+
+  const rawMax = Math.max(
+    0,
+    ...hourlySeries.map((h) => Math.max(h.inbound, h.replied, h.errors)),
+  )
+  const yMax = computeNiceAxisMax(rawMax)
+  const yTicks = [0, yMax / 2, yMax]
+  const yFor = (val: number) => padT + plotH * (1 - Math.min(1, Math.max(0, val / yMax)))
+  const count = Math.max(1, hourlySeries.length)
+  const slotW = plotW / count
+  const barW = Math.max(4, Math.min(20, slotW * 0.62))
+  const halfW = Math.max(2.5, barW * 0.46)
+  const hovered = hoverIdx !== null ? hourlySeries[hoverIdx] : undefined
+  const firstHour = hourlySeries[0]?.label ?? ''
+  const lastHour = hourlySeries[hourlySeries.length - 1]?.label ?? ''
+
+  return (
+    <div className="fb-obs-chart-wrap">
+      <div className="fb-obs-hud fb-num">
+        {hovered ? (
+          <>
+            <strong className="fb-mono">
+              {hovered.label}–{hovered.label.slice(0, 2)}:59
+            </strong>
+            <span>收到 {hovered.inbound}</span>
+            <span>回复/推送 {hovered.replied}</span>
+            {(hovered.silentSkipped ?? 0) > 0 && <span>静默 {hovered.silentSkipped}</span>}
+            {hovered.errors > 0 && <span>异常 {hovered.errors}</span>}
+            {(hovered.avgLatencyMs ?? 0) > 0 && (
+              <span>均耗 {formatLatencyMs(hovered.avgLatencyMs!)}</span>
+            )}
+          </>
+        ) : rawMax === 0 ? (
+          <span>过去 24 小时暂无飞书消息或定时通知记录</span>
+        ) : (
+          <span>
+            统计窗口 <strong className="fb-mono">{firstHour}–{lastHour}</strong>（当前小时）· 小时峰值{' '}
+            <strong className="fb-mono">{peakCount}</strong> 条 · 移动光标至图内查看单小时明细
+          </span>
+        )}
+      </div>
+
+      <svg
+        className="fb-obs-svg"
+        viewBox={`0 0 ${W} ${H}`}
+        role="img"
+        aria-label="近 24 小时消息与通知趋势图"
+        onMouseLeave={() => setHoverIdx(null)}
+      >
+        {yTicks.map((tick, i) => {
+          const y = yFor(tick)
+          return (
+            <g key={i}>
+              <line
+                x1={padL}
+                x2={W - padR}
+                y1={y}
+                y2={y}
+                className="fb-obs-grid-line"
+                strokeDasharray={i === 0 ? undefined : '2 3'}
+              />
+              <text x={padL - 8} y={y + 3.5} textAnchor="end" className="fb-obs-axis-text">
+                {formatCompactNumber(tick)}
+              </text>
+            </g>
+          )
+        })}
+
+        {hourlySeries.map((h, idx) => {
+          const cx = padL + slotW * (idx + 0.5)
+          const active = hoverIdx === idx
+          const isCurrent = idx === hourlySeries.length - 1
+          const inY = yFor(h.inbound)
+          const repY = yFor(h.replied)
+          const errH = h.errors > 0 ? Math.max(2.5, padT + plotH - yFor(h.errors)) : 0
+          return (
+            <g key={h.hourKey}>
+              {isCurrent && (
+                <rect
+                  x={padL + slotW * idx + 2}
+                  y={padT}
+                  width={Math.max(4, slotW - 4)}
+                  height={plotH}
+                  rx={4}
+                  className="fb-obs-current-band"
+                />
+              )}
+              {active && (
+                <line
+                  x1={cx}
+                  x2={cx}
+                  y1={padT}
+                  y2={padT + plotH}
+                  className="fb-obs-crosshair"
+                />
+              )}
+              {h.inbound > 0 && (
+                <rect
+                  x={cx - halfW - 0.5}
+                  y={inY}
+                  width={halfW}
+                  height={Math.max(1.5, padT + plotH - inY)}
+                  rx={1.5}
+                  className="fb-obs-fill-primary"
+                  data-active={active ? '' : undefined}
+                />
+              )}
+              {h.replied > 0 && (
+                <rect
+                  x={cx + 0.5}
+                  y={repY}
+                  width={halfW}
+                  height={Math.max(1.5, padT + plotH - repY)}
+                  rx={1.5}
+                  className="fb-obs-fill-success"
+                  data-active={active ? '' : undefined}
+                />
+              )}
+              {errH > 0 && (
+                <rect
+                  x={cx - halfW}
+                  y={padT + plotH - errH}
+                  width={halfW * 2}
+                  height={errH}
+                  rx={1.5}
+                  className="fb-obs-fill-error"
+                />
+              )}
+              <rect
+                x={padL + slotW * idx}
+                y={padT}
+                width={slotW}
+                height={plotH}
+                fill="transparent"
+                onMouseEnter={() => setHoverIdx(idx)}
+              />
+            </g>
+          )
+        })}
+
+        {hourlySeries.map((h, idx) => {
+          const isLast = idx === hourlySeries.length - 1
+          const showLabel = idx === 0 || idx % 4 === 0 || isLast
+          if (!showLabel || (!isLast && idx >= hourlySeries.length - 2)) return null
+          const cx = padL + slotW * (idx + 0.5)
+          return (
+            <text
+              key={`lbl-${h.hourKey}`}
+              x={isLast ? W - padR : cx}
+              y={H - 6}
+              textAnchor={idx === 0 ? 'start' : isLast ? 'end' : 'middle'}
+              className="fb-obs-axis-text"
+            >
+              {h.label}
+            </text>
+          )
+        })}
+      </svg>
+
+      <div className="fb-obs-legend fb-num">
+        <span className="fb-obs-legend-item">
+          <i className="fb-obs-dot" data-kind="primary" />
+          收到消息 {inboundTotal}
+        </span>
+        <span className="fb-obs-legend-item">
+          <i className="fb-obs-dot" data-kind="success" />
+          回复/推送 {repliedTotal}
+        </span>
+        {silentTotal > 0 && (
+          <span className="fb-obs-legend-item">
+            <i className="fb-obs-dot" data-kind="muted" />
+            静默跳过 {silentTotal}
+          </span>
+        )}
+        {errorTotal > 0 && (
+          <span className="fb-obs-legend-item">
+            <i className="fb-obs-dot" data-kind="error" />
+            异常 {errorTotal}
+          </span>
+        )}
+      </div>
     </div>
   )
 }
