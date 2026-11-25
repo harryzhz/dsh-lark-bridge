@@ -491,6 +491,7 @@ export class LarkBotTransport {
       'im.message.reaction.created_v1': () => {},
       'im.message.reaction.deleted_v1': () => {},
       'im.message.updated_v1': () => {},
+      'im.message.message_read_v1': () => {},
       'im.chat.member.bot.added_v1': () => {
         if (epoch !== this.lifecycleEpoch) return
         this.lastEventAtMs = Date.now()

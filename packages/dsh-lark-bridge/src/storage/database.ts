@@ -38,6 +38,18 @@ export interface StorageStats {
   readonly tableCounts: Record<EntityTableName, number>
 }
 
+export type WalCheckpointMode = 'PASSIVE' | 'TRUNCATE'
+
+export interface WalCheckpointResult {
+  readonly mode: WalCheckpointMode
+  readonly busy: number
+  readonly log: number
+  readonly checkpointed: number
+  readonly beforeWalBytes: number
+  readonly afterWalBytes: number
+  readonly truncated: boolean
+}
+
 export interface BridgeDatabaseOptions {
   readonly readOnly?: boolean
   readonly migrations?: readonly SqlMigration[]
@@ -232,6 +244,82 @@ export class BridgeDatabase {
     return { beforeBytes, afterBytes }
   }
 
+  /**
+   * Flushes WAL frames into the main database file without blocking active readers/writers.
+   * When `truncateAboveBytes` is supplied and a PASSIVE checkpoint cleanly drains all WAL frames
+   * while the WAL file exceeds that threshold, attempts a zero-wait TRUNCATE to reclaim disk space.
+   */
+  checkpointWal(
+    options: {
+      readonly mode?: WalCheckpointMode
+      readonly truncateAboveBytes?: number
+    } = {},
+  ): WalCheckpointResult {
+    const mode: WalCheckpointMode = options.mode === 'TRUNCATE' ? 'TRUNCATE' : 'PASSIVE'
+    if (this.readOnly || this.closed || !this.db.isOpen || this.dbPath === ':memory:') {
+      return {
+        mode,
+        busy: 0,
+        log: 0,
+        checkpointed: 0,
+        beforeWalBytes: 0,
+        afterWalBytes: 0,
+        truncated: false,
+      }
+    }
+    const walPath = `${this.dbPath}-wal`
+    const beforeWalBytes = safeFileSize(walPath)
+    const row = this.db.prepare(`PRAGMA wal_checkpoint(${mode})`).get() as
+      | { busy?: number; log?: number; checkpointed?: number }
+      | undefined
+    let busy = Number(row?.busy ?? 0)
+    let log = Number(row?.log ?? 0)
+    let checkpointed = Number(row?.checkpointed ?? 0)
+    let truncated = mode === 'TRUNCATE' && busy === 0
+
+    if (
+      mode === 'PASSIVE' &&
+      busy === 0 &&
+      checkpointed === log &&
+      typeof options.truncateAboveBytes === 'number' &&
+      options.truncateAboveBytes >= 0 &&
+      safeFileSize(walPath) > options.truncateAboveBytes
+    ) {
+      try {
+        this.db.exec('PRAGMA busy_timeout = 0')
+        const truncRow = this.db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get() as
+          | { busy?: number; log?: number; checkpointed?: number }
+          | undefined
+        const truncBusy = Number(truncRow?.busy ?? 0)
+        if (truncBusy === 0) {
+          truncated = true
+        }
+      } catch {
+        // Ignore transient lock contention; PASSIVE checkpoint already completed safely.
+      } finally {
+        try {
+          this.db.exec('PRAGMA busy_timeout = 5000')
+        } catch {
+          // Ignore if DB was closed concurrently.
+        }
+      }
+    }
+
+    const afterWalBytes = safeFileSize(walPath)
+    if (afterWalBytes !== beforeWalBytes) {
+      this.tightenPermissions()
+    }
+    return {
+      mode,
+      busy,
+      log,
+      checkpointed,
+      beforeWalBytes,
+      afterWalBytes,
+      truncated,
+    }
+  }
+
   getStats(): StorageStats {
     const tableCounts = {} as Record<EntityTableName, number>
     for (const table of ENTITY_TABLE_NAMES) {
@@ -290,6 +378,7 @@ export class BridgeDatabase {
       this.db.exec('PRAGMA journal_mode = WAL')
       this.db.exec('PRAGMA synchronous = NORMAL')
       this.db.exec('PRAGMA wal_autocheckpoint = 1000')
+      this.db.exec('PRAGMA journal_size_limit = 4194304')
     }
   }
 

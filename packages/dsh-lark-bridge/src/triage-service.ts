@@ -79,8 +79,71 @@ export interface TriageEvaluationResult {
   readonly verdict: TriageVerdict
   readonly provider?: string
   readonly model?: string
+  readonly errorCode?: string
+  readonly errorMessage?: string
   readonly durationMs: number
   readonly triageSessionId?: string
+}
+
+const TRIAGE_ERROR_REDACT_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
+  [/Bearer\s+[A-Za-z0-9._-]+/gi, 'Bearer [REDACTED]'],
+  [
+    /"?(?:api_?key|app_secret|larkAppSecret|client_secret|access_token|refresh_token|authorization|token|secret)"?\s*[:=]\s*"?[^",\s}]+"?/gi,
+    '[REDACTED_SECRET]',
+  ],
+  [/\b(?:sk|t|u)-[A-Za-z0-9._-]{16,}\b/g, '[REDACTED_TOKEN]'],
+]
+
+export interface ClassifiedTriageError {
+  readonly errorCode: string
+  readonly errorMessage: string
+}
+
+export function classifyTriageError(
+  rawError: string | undefined,
+  timedOut = false,
+): ClassifiedTriageError {
+  let sanitized = (rawError ?? '').replace(/\s+/g, ' ').trim()
+  for (const [pattern, replacement] of TRIAGE_ERROR_REDACT_PATTERNS) {
+    sanitized = sanitized.replace(pattern, replacement)
+  }
+  if (sanitized.length > 200) {
+    sanitized = `${sanitized.slice(0, 200)}…`
+  }
+
+  let errorCode = 'llm_error'
+  if (timedOut || /\b(?:timeout|timed?\s*out|ETIMEDOUT)\b/i.test(sanitized)) {
+    errorCode = 'timeout'
+  } else if (/\b429\b|rate[\s_-]?limit|too\s+many\s+requests|quota/i.test(sanitized)) {
+    errorCode = 'rate_limited'
+  } else if (
+    /\b(?:401|403)\b|unauthoriz|forbidden|auth(?:entication)?[\s_-]*(?:required|failed|error)|invalid[\s_-]*api[\s_-]*key/i.test(
+      sanitized,
+    )
+  ) {
+    errorCode = 'auth_error'
+  } else if (
+    /\b5\d\d\b|service\s+unavailable|bad\s+gateway|gateway\s+timeout|overloaded|internal\s+server\s+error/i.test(
+      sanitized,
+    )
+  ) {
+    errorCode = 'upstream_5xx'
+  } else if (/\b4\d\d\b|bad\s+request|invalid_request/i.test(sanitized)) {
+    errorCode = 'upstream_4xx'
+  } else if (
+    /\b(?:ECONNREFUSED|ECONNRESET|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH)\b|fetch\s+failed|socket\s+hang\s+up|network/i.test(
+      sanitized,
+    )
+  ) {
+    errorCode = 'network_error'
+  } else if (/\babort(?:ed|error)?\b/i.test(sanitized)) {
+    errorCode = 'aborted'
+  }
+
+  return {
+    errorCode,
+    errorMessage: sanitized || (timedOut ? 'triage timeout' : 'unknown triage error'),
+  }
 }
 
 export interface TriageContextPersistence {
@@ -661,10 +724,13 @@ export class LlmTriageService {
       reason: string,
       resolved?: { readonly provider?: string; readonly model?: string },
       triageSessionId?: string,
+      diagnostic?: { readonly errorCode?: string; readonly errorMessage?: string },
     ): TriageEvaluationResult => ({
       verdict: { action: 'handoff', reason, fallback: true },
       ...(resolved?.provider ? { provider: resolved.provider } : {}),
       ...(resolved?.model ? { model: resolved.model } : {}),
+      ...(diagnostic?.errorCode ? { errorCode: diagnostic.errorCode } : {}),
+      ...(diagnostic?.errorMessage ? { errorMessage: diagnostic.errorMessage } : {}),
       durationMs: Date.now() - startedAtMs,
       ...(triageSessionId ? { triageSessionId } : {}),
     })
@@ -771,8 +837,9 @@ export class LlmTriageService {
     }
 
     if (run.errorMessage) {
+      const classified = classifyTriageError(run.errorMessage, run.timedOut)
       this.ctx.logger.warn(
-        `[lark-bridge][trace=${input.traceId}][bot=${input.bot.id}] triage fail-open (${target.provider}/${target.model}): ${run.errorMessage}`,
+        `[lark-bridge][trace=${input.traceId}][bot=${input.bot.id}] triage fail-open [${classified.errorCode}] (${target.provider}/${target.model}): ${classified.errorMessage}`,
       )
       const fallbackReason = run.timedOut
         ? '分流超时，自动直通主运行时'
@@ -801,13 +868,14 @@ export class LlmTriageService {
         stream: run.stream,
         ...(run.usage ? { usage: run.usage } : {}),
         verdict: fallbackVerdict,
-        errorMessage: run.errorMessage,
+        errorCode: classified.errorCode,
+        errorMessage: classified.errorMessage,
         timedOut: run.timedOut,
         startedAtMs,
         finishedAtMs,
         durationMs,
       })
-      return failOpen(fallbackReason, target, triageSessionId)
+      return failOpen(fallbackReason, target, triageSessionId, classified)
     }
 
     const verdict = parseTriageVerdict({

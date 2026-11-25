@@ -10,7 +10,12 @@ import {
   explainLarkErrorCode,
 } from '@dsh-lark/lark-core'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { buildBridgeDiagnostics, runOfflineDoctor } from '../src/diagnostics.js'
+import {
+  assessWalBloat,
+  buildBridgeDiagnostics,
+  buildDiagnosticAlerts,
+  runOfflineDoctor,
+} from '../src/diagnostics.js'
 import { dispatchLarkApiRequest } from '../src/http-api.js'
 import {
   INSTANCE_LOCK_FILENAME,
@@ -111,6 +116,17 @@ describe('InstanceLock, SplitBrainDetector, SDK Logger & Diagnostics/Doctor', ()
     expect(logs[1]?.message).not.toContain(fakeToken)
     expect(logs[1]?.message).not.toContain(fakeSecret)
     expect(logs[1]?.message).toContain('[REDACTED]')
+
+    // Unhandled Feishu SDK event warnings must be suppressed to keep stderr clean,
+    // while actionable non-matching warnings remain visible.
+    const countBefore = logs.length
+    logger.warn(['no im.message.reaction.created_v1 handle'])
+    logger.warn(['no im.message.message_read_v1 handle'])
+    expect(logs).toHaveLength(countBefore)
+
+    logger.warn('ws reconnect backoff 5000ms')
+    expect(logs).toHaveLength(countBefore + 1)
+    expect(logs[countBefore]?.message).toContain('ws reconnect backoff')
   })
 
   it('detects cross-host split-brain when receiving own botOpenId message not sent by this instance, without false positives on own replies', async () => {
@@ -342,6 +358,51 @@ describe('InstanceLock, SplitBrainDetector, SDK Logger & Diagnostics/Doctor', ()
       }
     } finally {
       lock.release()
+      store.close()
+    }
+  })
+
+  it('checkpoints SQLite WAL cleanly (PASSIVE + idle truncate) and raises wal_bloated diagnostic alerts only above thresholds', () => {
+    const dir = makeTempDir('dsh-lark-wal-')
+    const store = new LarkBridgeStore(dir)
+    try {
+      // Generate enough writes to grow the WAL file past a small threshold.
+      const filler = 'x'.repeat(2048)
+      for (let i = 0; i < 60; i += 1) {
+        store.recordEvent({
+          botId: 'bot-wal',
+          kind: 'inbound',
+          summary: `evt-${i}-${filler}`,
+        })
+      }
+      const beforeStats = store.getStorageStats()
+      expect(beforeStats.walBytes).toBeGreaterThan(0)
+
+      // PASSIVE checkpoint flushes frames without truncating when below truncateAboveBytes.
+      const passive = store.checkpointWal({ mode: 'PASSIVE' })
+      expect(passive.busy).toBe(0)
+      expect(passive.checkpointed).toBe(passive.log)
+
+      // PASSIVE + truncateAboveBytes=0 cleanly truncates WAL back to 0 bytes when idle.
+      const truncated = store.checkpointWal({ mode: 'PASSIVE', truncateAboveBytes: 0 })
+      expect(truncated.busy).toBe(0)
+      expect(truncated.truncated).toBe(true)
+      expect(truncated.afterWalBytes).toBe(0)
+
+      // Threshold checks: normal/small WAL does not alert; >16 MB or (>=4 MB && >2x DB) alerts.
+      expect(assessWalBloat({ dbBytes: 3 * 1024 * 1024, walBytes: 4 * 1024 * 1024 }).bloated).toBe(false)
+      expect(assessWalBloat({ dbBytes: 100 * 1024, walBytes: 500 * 1024 }).bloated).toBe(false)
+      expect(assessWalBloat({ dbBytes: 2 * 1024 * 1024, walBytes: 5 * 1024 * 1024 }).bloated).toBe(true)
+      expect(assessWalBloat({ dbBytes: 20 * 1024 * 1024, walBytes: 17 * 1024 * 1024 }).bloated).toBe(true)
+
+      const alerts = buildDiagnosticAlerts({
+        integrity: { ok: true, messages: ['ok'], foreignKeyErrors: 0 },
+        stats: { dbBytes: 2 * 1024 * 1024, walBytes: 6 * 1024 * 1024 },
+        splitBrainAlerts: [],
+        botStatuses: [],
+      })
+      expect(alerts.some((a) => a.code === 'wal_bloated' && a.severity === 'warning')).toBe(true)
+    } finally {
       store.close()
     }
   })

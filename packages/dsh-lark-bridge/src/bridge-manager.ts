@@ -58,6 +58,9 @@ import type {
 import { WorkspaceGrouping } from './workspace-grouping.js'
 
 const SHUTDOWN_DISPOSE_BUDGET_MS = 2_500
+const WAL_PASSIVE_CHECKPOINT_THRESHOLD_BYTES = 2 * 1024 * 1024
+const WAL_IDLE_TRUNCATE_THRESHOLD_BYTES = 4 * 1024 * 1024
+const WAL_PERIODIC_CHECKPOINT_INTERVAL_MS = 15 * 60_000
 
 export type { AgentCliSendInput } from './agent-tool-facade.js'
 
@@ -114,6 +117,7 @@ export class LarkBridgeManager {
   private liveWebOrigin = ''
   private liveConnection?: { authenticatedUrl?: (baseUrl: string) => string }
   private idleTimer: ReturnType<typeof setInterval> | null = null
+  private lastWalCheckpointAtMs = 0
   private phase: BridgeLifecyclePhase = 'starting'
   private drainRequestedAtMs?: number
   private drainReason?: string
@@ -348,7 +352,9 @@ export class LarkBridgeManager {
       this.idleTimer = setInterval(
         () => {
           if (this.phase === 'draining' || this.disposed) return
-          void this.sweepIdleBindings()
+          void this.sweepIdleBindings().finally(() => {
+            this.maybeCheckpointWal()
+          })
         },
         this.config.idleSweepIntervalMs,
       )
@@ -596,6 +602,41 @@ export class LarkBridgeManager {
 
   sweepIdleBindings(now = Date.now()): Promise<number> {
     return this.sessions.sweepIdleBindings(now)
+  }
+
+  /**
+   * Periodically flushes SQLite WAL frames in non-blocking PASSIVE mode during idle sweeps
+   * and opportunistically truncates bloated WAL files when zero turns/tasks are in flight.
+   */
+  maybeCheckpointWal(now = Date.now()): boolean {
+    if (this.disposed || this.phase === 'draining' || typeof this.store.checkpointWal !== 'function') {
+      return false
+    }
+    try {
+      const stats = this.store.getStorageStats()
+      const elapsedMs = now - this.lastWalCheckpointAtMs
+      const dueBySize = stats.walBytes >= WAL_PASSIVE_CHECKPOINT_THRESHOLD_BYTES
+      const dueByTime = stats.walBytes > 0 && elapsedMs >= WAL_PERIODIC_CHECKPOINT_INTERVAL_MS
+      if (!dueBySize && !dueByTime) return false
+
+      const isIdle = this.getLifecycleStatus().totalInFlight === 0
+      const result = this.store.checkpointWal({
+        mode: 'PASSIVE',
+        ...(isIdle ? { truncateAboveBytes: WAL_IDLE_TRUNCATE_THRESHOLD_BYTES } : {}),
+      })
+      this.lastWalCheckpointAtMs = now
+      if (result.truncated && result.beforeWalBytes > result.afterWalBytes) {
+        this.ctx.logger.info(
+          `[lark-bridge] periodic WAL checkpoint truncated ${Math.round(result.beforeWalBytes / 1024)} KB -> ${Math.round(result.afterWalBytes / 1024)} KB`,
+        )
+      }
+      return true
+    } catch (err) {
+      this.ctx.logger.warn(
+        `[lark-bridge] periodic WAL checkpoint warning: ${err instanceof Error ? err.message : String(err)}`,
+      )
+      return false
+    }
   }
 
   recoverStalePendingTurns(botId?: string, nowMs = Date.now()): Promise<number> {

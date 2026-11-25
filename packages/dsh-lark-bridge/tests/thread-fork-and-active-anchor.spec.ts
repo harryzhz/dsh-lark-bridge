@@ -52,6 +52,7 @@ function makeGroupMsg(overrides: Partial<InboundLarkMessage> = {}): InboundLarkM
 interface TurnGate {
   readonly sessionId: string
   readonly prompt: string
+  readonly emitIntermediate: (stepText: string) => void
   readonly resolve: (replyText: string) => void
 }
 
@@ -127,12 +128,28 @@ function createControllableRuntime() {
             } as unknown as SessionEvent)
           }
 
+          const emitIntermediate = (stepText: string) => {
+            emit(session, {
+              type: 'assistant/message',
+              data: {
+                turn,
+                message: {
+                  role: 'assistant',
+                  content: [
+                    { type: 'text', text: stepText },
+                    { type: 'tool-call', id: `tc_${turn}`, name: 'inspect', arguments: '{}' },
+                  ],
+                },
+              },
+            } as unknown as SessionEvent)
+          }
+
           if (autoReply) {
             const replyText = autoReply(sessionId, prompt)
             queueMicrotask(() => finish(replyText))
             return
           }
-          notifyGate({ sessionId, prompt, resolve: finish })
+          notifyGate({ sessionId, prompt, emitIntermediate, resolve: finish })
         },
       ),
       cancel: vi.fn(),
@@ -719,6 +736,108 @@ describe('Thread fork isolation & executing-turn reply anchor', () => {
 
     perMsgGate.resolve('完成')
     await perMsgTurn
+
+    await manager.stop()
+    store.close()
+  })
+
+  it('syncs executingTurnCtx routeKey, threadId, and rootId when an intermediate reply promotes the binding into a native thread', async () => {
+    const dir = makeTempDir()
+    const store = new LarkBridgeStore(dir)
+    const runtime = createControllableRuntime()
+    const manager = new LarkBridgeManager(
+      runtime.ctx,
+      {
+        dataDir: dir,
+        publicBaseUrl: 'http://127.0.0.1:3880',
+        idleSweepIntervalMs: 0,
+        maxAuditEvents: 200,
+        autoInstallCliAndSkill: false,
+      },
+      store,
+    )
+    await manager.start()
+
+    store.upsertBot({
+      id: 'bot-interm',
+      name: 'IntermBot',
+      enabled: true,
+      larkAppId: 'cli_interm_app',
+      larkAppSecret: 'mock-secret-value',
+      defaultWorkingDir: dir,
+      agentPreset: 'standard',
+      groupReplyMode: 'new-topic',
+      groupSessionMode: 'thread',
+      mentionTriggerMode: 'mention_and_active_thread',
+      receivedReactionEmoji: 'NONE',
+      useInteractiveCard: false,
+      sendIntermediateMessages: true,
+      router: { enabled: false },
+    })
+    store.upsertGroup({
+      botId: 'bot-interm',
+      chatId: 'oc_interm_group',
+      chatName: '中间进展群',
+      enabled: true,
+      replyMode: 'new-topic',
+      sessionMode: 'thread',
+      replyFormat: 'text',
+      sendIntermediateMessages: true,
+    })
+
+    const fakeTransport = {
+      state: { botOpenId: 'ou_bot_interm', connected: true },
+      resolveUserSummary: vi.fn().mockResolvedValue({ openId: 'ou_alice', name: 'Alice' }),
+      addReaction: vi.fn().mockResolvedValue(undefined),
+      removeReaction: vi.fn().mockResolvedValue(undefined),
+      sendReply: vi.fn(async () => ({
+        messageId: 'om_interm_out_1',
+        rootId: 'om_promoted_root',
+        threadId: 'omt_promoted_thread',
+      })),
+    } as unknown as LarkBotTransport
+
+    const turnPromise = manager.inbound.handleInbound(
+      'bot-interm',
+      fakeTransport,
+      makeGroupMsg({
+        botId: 'bot-interm',
+        larkAppId: 'cli_interm_app',
+        botOpenId: 'ou_bot_interm',
+        chatId: 'oc_interm_group',
+        messageId: 'om_quote_child',
+        parentId: 'om_main_parent',
+        text: '@_bot_1 帮忙看下这个话题',
+        mentions: [{ key: '@_bot_1', openId: 'ou_bot_interm', name: 'IntermBot' }],
+      }),
+    )
+
+    const gate = await runtime.waitForNextTurn()
+    const beforeCtx = manager.inbound.getExecutingTurnContext(gate.sessionId)
+    expect(beforeCtx?.routeKey).toBe('cli_interm_app:oc_interm_group:om_quote_child')
+    expect(beforeCtx?.threadId).toBeUndefined()
+
+    gate.emitIntermediate('正在查询日志，请稍候…')
+    // Wait for async onIntermediate delivery to complete.
+    await vi.waitFor(() => {
+      expect(manager.inbound.getExecutingTurnContext(gate.sessionId)?.threadId).toBe(
+        'omt_promoted_thread',
+      )
+    })
+
+    const afterExecCtx = manager.inbound.getExecutingTurnContext(gate.sessionId)
+    expect(afterExecCtx?.routeKey).toBe('cli_interm_app:oc_interm_group:om_promoted_root')
+    expect(afterExecCtx?.rootId).toBe('om_promoted_root')
+    expect(afterExecCtx?.replyToMessageId).toBe('om_promoted_root')
+    expect(afterExecCtx?.replyInThread).toBe(true)
+
+    const agentCtx = manager.resolveAgentContext(gate.sessionId)
+    expect(agentCtx.routeKey).toBe('cli_interm_app:oc_interm_group:om_promoted_root')
+    expect(agentCtx.threadId).toBe('omt_promoted_thread')
+    expect(agentCtx.replyToMessageId).toBe('om_promoted_root')
+
+    gate.resolve('排查完成')
+    await turnPromise
 
     await manager.stop()
     store.close()

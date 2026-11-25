@@ -196,6 +196,8 @@ export interface TriageSession {
   action: TriageAction
   fallback?: boolean
   reason: string
+  errorCode?: string
+  errorMessage?: string
   replyText?: string
   provider?: string
   model?: string
@@ -574,7 +576,12 @@ export interface AuditEvent {
 
 export interface DiagnosticAlert {
   id: string
-  code: 'split_brain' | 'storage_integrity' | 'bot_disconnected' | 'stale_lock_recovered'
+  code:
+    | 'split_brain'
+    | 'storage_integrity'
+    | 'wal_bloated'
+    | 'bot_disconnected'
+    | 'stale_lock_recovered'
   severity: 'info' | 'warning' | 'error'
   botId?: string
   title: string
