@@ -99,6 +99,7 @@ export class AgentToolFacade {
     readonly botOpenId?: string
     readonly chatId?: string
     readonly chatName?: string
+    readonly workingDir?: string
     readonly routeKey?: string
     readonly replyToMessageId?: string
     readonly replyInThread?: boolean
@@ -121,6 +122,11 @@ export class AgentToolFacade {
         const chatName =
           executingTurn.chatName ||
           this.host.store.resolveChatName(executingTurn.botId, executingTurn.chatId)
+        const workingDir = this.resolveContextWorkingDir(
+          executingTurn.botId,
+          executingTurn.chatId,
+          executingTurn.workingDir,
+        )
         return {
           sessionId: sid,
           bound: true,
@@ -131,6 +137,7 @@ export class AgentToolFacade {
           ...(botStatus?.botOpenId ? { botOpenId: botStatus.botOpenId } : {}),
           chatId: executingTurn.chatId,
           ...(chatName ? { chatName } : {}),
+          ...(workingDir ? { workingDir } : {}),
           routeKey: executingTurn.routeKey,
           ...(executingTurn.replyToMessageId
             ? { replyToMessageId: executingTurn.replyToMessageId }
@@ -149,6 +156,11 @@ export class AgentToolFacade {
         const threadAlias = (binding.aliasRouteKeys ?? [])
           .map((k) => k.split(':').slice(2).join(':'))
           .find((scope) => scope.startsWith('omt_'))
+        const workingDir = this.resolveContextWorkingDir(
+          binding.botId,
+          binding.chatId,
+          binding.workingDir,
+        )
         return {
           sessionId: sid,
           bound: true,
@@ -159,6 +171,7 @@ export class AgentToolFacade {
           ...(botStatus?.botOpenId ? { botOpenId: botStatus.botOpenId } : {}),
           chatId: binding.chatId,
           ...(binding.chatName ? { chatName: binding.chatName } : {}),
+          ...(workingDir ? { workingDir } : {}),
           routeKey: binding.routeKey,
           ...(replyToMessageId ? { replyToMessageId } : {}),
           ...(replyToMessageId ? { replyInThread: true } : {}),
@@ -176,6 +189,11 @@ export class AgentToolFacade {
         const chatName =
           reminder.origin.chatName ||
           (chatId ? this.host.store.resolveChatName(reminder.origin.botId, chatId) : undefined)
+        const workingDir = this.resolveContextWorkingDir(
+          reminder.origin.botId,
+          chatId,
+          reminder.workingDir,
+        )
         return {
           sessionId: sid,
           bound: true,
@@ -186,6 +204,7 @@ export class AgentToolFacade {
           ...(botStatus?.botOpenId ? { botOpenId: botStatus.botOpenId } : {}),
           ...(chatId ? { chatId } : {}),
           ...(chatName ? { chatName } : {}),
+          ...(workingDir ? { workingDir } : {}),
           routeKey: `reminder:${reminder.id}`,
           ...(reminder.origin.replyToMessageId
             ? { replyToMessageId: reminder.origin.replyToMessageId }
@@ -201,6 +220,14 @@ export class AgentToolFacade {
         const bot = this.host.store.getBot(primary.botId)
         const botStatus = bots.find((b) => b.botId === primary.botId)
         const chatName = this.host.store.resolveChatName(primary.botId, primary.chatId)
+        const liveSession = (
+          this.host.ctx.sessions as unknown as { get?: (id: SessionId) => Agent['session'] | undefined }
+        )?.get?.(brandString<SessionId>(sid))
+        const workingDir = this.resolveContextWorkingDir(
+          primary.botId,
+          primary.chatId,
+          liveSession?.header.cwd,
+        )
         return {
           sessionId: sid,
           bound: true,
@@ -210,6 +237,7 @@ export class AgentToolFacade {
           ...(botStatus?.botOpenId ? { botOpenId: botStatus.botOpenId } : {}),
           chatId: primary.chatId,
           ...(chatName ? { chatName } : {}),
+          ...(workingDir ? { workingDir } : {}),
           scheduleContext: schedCtx,
           bots,
           groups,
@@ -218,6 +246,9 @@ export class AgentToolFacade {
     }
 
     const defaultBot = bots.find((b) => b.enabled && b.connected) ?? bots[0]
+    const defaultWorkingDir = defaultBot
+      ? this.resolveContextWorkingDir(defaultBot.botId)
+      : undefined
     return {
       ...(sid ? { sessionId: sid } : {}),
       bound: false,
@@ -228,11 +259,27 @@ export class AgentToolFacade {
             botName: defaultBot.name,
             larkAppId: defaultBot.larkAppId,
             ...(defaultBot.botOpenId ? { botOpenId: defaultBot.botOpenId } : {}),
+            ...(defaultWorkingDir ? { workingDir: defaultWorkingDir } : {}),
           }
         : {}),
       bots,
       groups,
     }
+  }
+
+  private resolveContextWorkingDir(
+    botId?: string,
+    chatId?: string,
+    explicitWorkingDir?: string,
+  ): string | undefined {
+    const direct = explicitWorkingDir?.trim()
+    if (direct) return expandWorkingDir(direct) || direct
+    if (!botId) return undefined
+    const bot = this.host.store.getBot(botId)
+    if (!bot) return undefined
+    const group = chatId ? this.host.store.getGroup(bot.id, chatId) : undefined
+    const effective = resolveEffectiveWorkingDir(bot, group).trim()
+    return effective ? expandWorkingDir(effective) || effective : undefined
   }
 
   /**

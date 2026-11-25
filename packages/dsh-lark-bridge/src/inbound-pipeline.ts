@@ -149,6 +149,7 @@ export interface ExecutingTurnContext {
   readonly chatId: string
   readonly chatType: 'p2p' | 'group'
   readonly chatName?: string
+  readonly workingDir?: string
   readonly routeKey: string
   readonly messageId: string
   readonly rootId?: string
@@ -185,6 +186,7 @@ function buildExecutingTurnContext(
     chatId: msg.chatId,
     chatType,
     ...(chatName ? { chatName } : {}),
+    ...(decision.workingDir ? { workingDir: decision.workingDir } : {}),
     routeKey: decision.routeKey,
     messageId: msg.messageId,
     ...(msg.rootId ? { rootId: msg.rootId } : {}),
