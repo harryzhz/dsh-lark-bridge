@@ -17,9 +17,9 @@ const CSS = `
   line-height: 22px;
 }
 .fb-container {
-  max-width: calc(960px + 2 * clamp(24px, 4vw, 48px));
+  width: 100%;
   margin: 0 auto;
-  padding: calc(28px + var(--dsh-frame-top-clearance, 0px)) clamp(24px, 4vw, 48px) 48px;
+  padding: calc(28px + var(--dsh-frame-top-clearance, 0px)) clamp(24px, 3vw, 48px) 36px;
   box-sizing: border-box;
 }
 .fb-mono { font-family: var(--ds-font-family-code); font-size: 12.5px; }
@@ -986,7 +986,7 @@ body > [role='presentation']:has(> [role='dialog'][aria-modal='true'])
 }
 .fb-advanced-section { padding-top: 12px; }
 
-/* Three-column Memory Library inside unified 960px .fb-container (100% --dsw-* tokens) */
+/* Three-column Memory Library inside unified adaptive .fb-container (100% --dsw-* tokens) */
 .fb-mem-frame {
   container-type: inline-size;
   border-radius: var(--dsw-radius-lg);
@@ -996,10 +996,10 @@ body > [role='presentation']:has(> [role='dialog'][aria-modal='true'])
   box-sizing: border-box;
 }
 .fb-mem-workspace {
-  height: clamp(540px, calc(100vh - 196px - var(--dsh-frame-top-clearance, 0px)), 760px);
+  height: max(540px, calc(100vh - 180px - var(--dsh-frame-top-clearance, 0px)));
   min-height: 0;
   display: grid;
-  grid-template-columns: 204px 276px minmax(0, 1fr);
+  grid-template-columns: clamp(204px, 18cqi, 260px) clamp(280px, 28cqi, 420px) minmax(0, 1fr);
   background: var(--dsw-alias-bg-base);
 }
 
@@ -1520,10 +1520,10 @@ body > [role='presentation']:has(> [role='dialog'][aria-modal='true'])
   overflow-y: auto;
 }
 .fb-mem-paper {
-  max-width: 620px;
+  max-width: 780px;
   width: 100%;
   margin: 0 auto;
-  padding: 24px 26px 40px;
+  padding: 28px clamp(24px, 4cqi, 44px) 44px;
   box-sizing: border-box;
 }
 .fb-mem-paper-kicker {
@@ -2514,10 +2514,10 @@ body > [role='presentation']:has(> [role='dialog'][aria-modal='true'])
   flex-direction: column;
   gap: 1px;
   min-width: 0;
-  max-width: 220px;
+  max-width: 340px;
 }
 .fb-obs-cell-stack[data-wide] {
-  max-width: 280px;
+  max-width: 460px;
 }
 .fb-obs-cell-main {
   overflow: hidden;
@@ -2537,7 +2537,7 @@ body > [role='presentation']:has(> [role='dialog'][aria-modal='true'])
   align-items: center;
   gap: 8px;
   min-width: 0;
-  max-width: 180px;
+  max-width: 240px;
 }
 .fb-obs-pill {
   display: inline-block;
@@ -2753,7 +2753,7 @@ body > [role='presentation']:has(> [role='dialog'][aria-modal='true'])
   color: var(--dsw-alias-label-tertiary);
 }
 .fb-obs-heat-cell {
-  aspect-ratio: 1 / 1;
+  height: clamp(12px, 1.35vw, 22px);
   min-height: 11px;
   width: 100%;
   padding: 0;

@@ -1,4 +1,4 @@
-import { useId, useState, type ReactNode } from 'react'
+import { useEffect, useId, useState, type ReactNode } from 'react'
 import type {
   CockpitPayload,
   ObservabilityHeatmapCell,
@@ -16,6 +16,34 @@ import {
   resolveHeatmapLevel,
   WEEKDAY_LABELS,
 } from './observability-model.js'
+
+/**
+ * Measure the real pixel width of a chart wrapper so SVG `viewBox` renders at
+ * 1:1 CSS pixels across narrow laptops and ultrawide monitors (no bloated height or text).
+ */
+function useChartWidth(defaultWidth = 760): readonly [(node: HTMLDivElement | null) => void, number] {
+  const [node, setNode] = useState<HTMLDivElement | null>(null)
+  const [width, setWidth] = useState(defaultWidth)
+
+  useEffect(() => {
+    if (!node) return
+    const update = (next: number) => {
+      const clamped = Math.max(420, Math.round(next))
+      if (clamped > 0) setWidth((prev) => (Math.abs(prev - clamped) >= 2 ? clamped : prev))
+    }
+    const rect = node.getBoundingClientRect()
+    if (rect.width > 0) update(rect.width)
+    if (typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0]
+      if (entry && entry.contentRect.width > 0) update(entry.contentRect.width)
+    })
+    observer.observe(node)
+    return () => observer.disconnect()
+  }, [node])
+
+  return [setNode, width] as const
+}
 
 export function KpiCard({
   label,
@@ -193,7 +221,7 @@ export function OverviewHourlyChart({
   readonly peakCount: number
 }) {
   const [hoverIdx, setHoverIdx] = useState<number | null>(null)
-  const W = 760
+  const [wrapRef, W] = useChartWidth(760)
   const H = 196
   const padL = 42
   const padR = 14
@@ -211,14 +239,14 @@ export function OverviewHourlyChart({
   const yFor = (val: number) => padT + plotH * (1 - Math.min(1, Math.max(0, val / yMax)))
   const count = Math.max(1, hourlySeries.length)
   const slotW = plotW / count
-  const barW = Math.max(4, Math.min(20, slotW * 0.62))
+  const barW = Math.max(4, Math.min(24, slotW * 0.62))
   const halfW = Math.max(2.5, barW * 0.46)
   const hovered = hoverIdx !== null ? hourlySeries[hoverIdx] : undefined
   const firstHour = hourlySeries[0]?.label ?? ''
   const lastHour = hourlySeries[hourlySeries.length - 1]?.label ?? ''
 
   return (
-    <div className="fb-obs-chart-wrap">
+    <div ref={wrapRef} className="fb-obs-chart-wrap">
       <div className="fb-obs-hud fb-num">
         {hovered ? (
           <>
@@ -396,7 +424,7 @@ export function ProductTimeSeriesChart({
   readonly mode: ProductChartMode
 }) {
   const [hoverIdx, setHoverIdx] = useState<number | null>(null)
-  const W = 760
+  const [wrapRef, W] = useChartWidth(760)
   const H = 196
   const padL = 52
   const padR = 14
@@ -420,7 +448,7 @@ export function ProductTimeSeriesChart({
   const yFor = (val: number) => padT + plotH * (1 - Math.min(1, Math.max(0, val / yMax)))
   const count = Math.max(1, series.length)
   const slotW = plotW / count
-  const barW = Math.max(4, Math.min(20, slotW * 0.62))
+  const barW = Math.max(4, Math.min(24, slotW * 0.62))
   const hovered = hoverIdx !== null ? series[hoverIdx] : undefined
 
   const formatY = (val: number) =>
@@ -438,7 +466,7 @@ export function ProductTimeSeriesChart({
   }
 
   return (
-    <div className="fb-obs-chart-wrap">
+    <div ref={wrapRef} className="fb-obs-chart-wrap">
       <div className="fb-obs-hud fb-num">
         {hovered ? (
           mode === 'tokens' ? (
@@ -750,7 +778,7 @@ export function TechnicalTimeSeriesChart({
   readonly mode: TechChartMode
 }) {
   const [hoverIdx, setHoverIdx] = useState<number | null>(null)
-  const W = 760
+  const [wrapRef, W] = useChartWidth(760)
   const H = 196
   const padL = 54
   const padR = 44
@@ -781,7 +809,7 @@ export function TechnicalTimeSeriesChart({
     const slotW = plotW / count
 
     return (
-      <div className="fb-obs-chart-wrap">
+      <div ref={wrapRef} className="fb-obs-chart-wrap">
         <div className="fb-obs-hud fb-num">
           {hovered ? (
             <>
@@ -946,7 +974,7 @@ export function TechnicalTimeSeriesChart({
   }
 
   return (
-    <div className="fb-obs-chart-wrap">
+    <div ref={wrapRef} className="fb-obs-chart-wrap">
       <div className="fb-obs-hud fb-num">
         {hovered ? (
           <>
