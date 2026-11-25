@@ -7,7 +7,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { LarkPlatformManager } from '@dsh-lark/lark-core'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { LarkBridgeManager } from '../src/bridge-manager.js'
-import { ensureCliAuthEndpoint } from '../src/cli-support.js'
+import { OPERATOR_TOKEN_HEADER, ensureCliAuthEndpoint } from '../src/cli-support.js'
 import { createLarkHttpHandler, type ConnectionAdmitter } from '../src/http-api.js'
 import { RuntimeCatalog } from '../src/runtime-catalog.js'
 import { handleSlashCommand } from '../src/slash-commands.js'
@@ -833,6 +833,104 @@ describe('LarkBridgeStore, RuntimeCatalog, CLI Auth & HTTP API', () => {
     expect(
       store.listEvents(20).some((e) => e.kind === 'lifecycle' && e.summary.includes('已补齐基线事件')),
     ).toBe(true)
+
+    await manager.stop()
+  })
+
+  it('blocks operator-token and non-owner principals from owner-only endpoints while keeping lifecycle drain accessible to operator', async () => {
+    const dataDir = makeTempDir()
+    const validDir = makeTempDir()
+    const store = new LarkBridgeStore(dataDir)
+    store.upsertBot({
+      id: 'sec-bot',
+      name: 'Sec Bot',
+      enabled: false,
+      larkAppId: 'cli_sec_bot',
+      larkAppSecret: 'mock-secret-value',
+      defaultWorkingDir: validDir,
+    })
+
+    const fakeCtx = {
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      llm: { listProviders: () => [] },
+      on: () => () => {},
+      get: () => undefined,
+    } as unknown as Context
+    const manager = new LarkBridgeManager(
+      fakeCtx,
+      {
+        dataDir,
+        publicBaseUrl: 'http://127.0.0.1:3880',
+        idleSweepIntervalMs: 0,
+        maxAuditEvents: 50,
+        autoInstallCliAndSkill: false,
+      },
+      store,
+    )
+    const memEntry = manager.memory.upsert({
+      botId: 'sec-bot',
+      scope: 'bot',
+      type: 'feedback',
+      title: '仅 Owner 可物理删除',
+      content: '测试权限边界',
+    }).entry
+
+    const ownerAdmitter: ConnectionAdmitter = {
+      admit: () => ({ peer: { principal: { kind: 'owner' } } }),
+    }
+    const operatorHandler = createLarkHttpHandler(fakeCtx, ownerAdmitter, manager)
+    const operatorHeaders = { [OPERATOR_TOKEN_HEADER]: manager.operatorAuth.token }
+
+    // 1. Operator token CAN invoke lifecycle drain / resume-intake
+    const drainRes = await invokeHandler(operatorHandler, {
+      method: 'POST',
+      url: '/api/lark-bridge/lifecycle/drain',
+      headers: operatorHeaders,
+      body: { reason: 'maintenance-test' },
+    })
+    expect(drainRes.status).toBe(200)
+    const resumeRes = await invokeHandler(operatorHandler, {
+      method: 'POST',
+      url: '/api/lark-bridge/lifecycle/resume-intake',
+      headers: operatorHeaders,
+    })
+    expect(resumeRes.status).toBe(200)
+
+    // 2. Operator token MUST be rejected on every owner-only endpoint
+    const ownerOnlyCalls: Array<{ method?: string; url: string; body?: unknown }> = [
+      { method: 'GET', url: '/api/lark-bridge/fs/dirs' },
+      { method: 'POST', url: '/api/lark-bridge/fs/dirs', body: { parentPath: validDir, name: 'sub' } },
+      { method: 'GET', url: '/api/lark-bridge/auth/status' },
+      { method: 'POST', url: '/api/lark-bridge/bots/auto-create', body: {} },
+      { method: 'POST', url: '/api/lark-bridge/bots/import-existing', body: {} },
+      { method: 'POST', url: '/api/lark-bridge/bots', body: {} },
+      { method: 'PUT', url: '/api/lark-bridge/bots/sec-bot', body: {} },
+      { method: 'DELETE', url: '/api/lark-bridge/bots/sec-bot' },
+      { method: 'POST', url: '/api/lark-bridge/bots/sec-bot/dream', body: {} },
+      { method: 'DELETE', url: '/api/lark-bridge/triage-sessions' },
+      { method: 'DELETE', url: '/api/lark-bridge/triage-sessions/sess-1' },
+      { method: 'POST', url: '/api/lark-bridge/reminders/rem-1/approve' },
+      { method: 'DELETE', url: `/api/lark-bridge/memory/${encodeURIComponent(memEntry.id)}?hard=1` },
+    ]
+    for (const call of ownerOnlyCalls) {
+      const res = await invokeHandler(operatorHandler, {
+        ...call,
+        headers: operatorHeaders,
+      })
+      expect(res.status, `operator should be forbidden on ${call.method} ${call.url}`).toBe(403)
+      expect(res.json.error).toBe('owner_web_session_required')
+    }
+
+    // 3. Non-owner admitted principal (e.g. viewer) MUST also be rejected on owner-only endpoints
+    const viewerAdmitter: ConnectionAdmitter = {
+      admit: () => ({ peer: { principal: { kind: 'viewer' } } }),
+    }
+    const viewerHandler = createLarkHttpHandler(fakeCtx, viewerAdmitter, manager)
+    for (const call of ownerOnlyCalls) {
+      const res = await invokeHandler(viewerHandler, call)
+      expect(res.status, `viewer should be forbidden on ${call.method} ${call.url}`).toBe(403)
+      expect(res.json.error).toBe('owner_web_session_required')
+    }
 
     await manager.stop()
   })

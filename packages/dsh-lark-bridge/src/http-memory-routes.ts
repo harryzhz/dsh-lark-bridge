@@ -86,10 +86,12 @@ export async function dispatchMemoryApiRequest(
     readonly url: URL
     readonly body: unknown
     readonly isCliAuthenticated: boolean
+    readonly isOperatorAuthenticated?: boolean
     readonly principalKind: string
   },
 ): Promise<LarkApiResponse | undefined> {
-  const { method, segments, url, isCliAuthenticated, principalKind } = input
+  const { method, segments, url, isCliAuthenticated, isOperatorAuthenticated, principalKind } =
+    input
   if (segments[0] !== 'memory') return undefined
 
   const memory = manager.memory
@@ -295,7 +297,7 @@ export async function dispatchMemoryApiRequest(
   if (method === 'DELETE' && memoryId && segments.length === 2) {
     const hard = url.searchParams.get('hard') === '1'
     if (hard) {
-      if (principalKind !== 'owner' || isCliAuthenticated) {
+      if (principalKind !== 'owner' || isCliAuthenticated || isOperatorAuthenticated) {
         return { status: 403, payload: { ok: false, error: 'owner_web_session_required' } }
       }
       const deleted = memory.deleteHard(memoryId)
