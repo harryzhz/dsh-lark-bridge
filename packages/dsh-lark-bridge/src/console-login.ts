@@ -123,11 +123,17 @@ function sendPlainText(
   res.end(message)
 }
 
-function sendHtml(res: ServerResponse, method: string, html: string, status = 200): void {
+function sendHtml(
+  res: ServerResponse,
+  method: string,
+  html: string,
+  status = 200,
+  referrerPolicy: 'no-referrer' | 'same-origin' = 'no-referrer',
+): void {
   res.writeHead(status, {
     'content-type': 'text/html; charset=utf-8',
     'cache-control': 'no-store',
-    'referrer-policy': 'no-referrer',
+    'referrer-policy': referrerPolicy,
     'x-frame-options': 'DENY',
     'x-content-type-options': 'nosniff',
     'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'",
@@ -249,7 +255,7 @@ export function renderConsoleLoginConfirmHtml(input: {
     '<head>',
     '<meta charset="utf-8">',
     '<meta name="viewport" content="width=device-width, initial-scale=1">',
-    '<meta name="referrer" content="no-referrer">',
+    '<meta name="referrer" content="same-origin">',
     '<title>登录 DeepSeek Harness 管理面</title>',
     '<style>',
     ':root{color-scheme:light dark;--bg:#f8f9fb;--card:#fff;--fg:#111827;--muted:#6b7280;--border:#e5e7eb;--accent:#111827;--accent-fg:#fff;--pill-bg:#f3f4f6}',
@@ -380,6 +386,8 @@ export async function handleConsoleLogin(
       return
     }
 
+    // Use `same-origin` Referrer-Policy on the confirmation form page: under `no-referrer`,
+    // Chromium sends `Origin: null` even on same-origin `<form method="POST">` submissions.
     sendHtml(
       res,
       method,
@@ -391,6 +399,7 @@ export async function handleConsoleLogin(
         remainingSec: (ticket.expiresAtMs - nowMs) / 1000,
       }),
       200,
+      'same-origin',
     )
     return
   }

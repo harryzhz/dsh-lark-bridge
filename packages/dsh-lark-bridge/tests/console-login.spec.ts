@@ -265,6 +265,7 @@ describe('/console slash command and single-use console-login handoff', () => {
     })
     const getRes = getTx.result()
     expect(getRes.status).toBe(200)
+    expect(getRes.headers['referrer-policy']).toBe('same-origin')
     expect(getRes.body).toContain('确认并登录管理面')
     expect(getRes.body).toContain(ticket.code)
     expect(getRes.body).not.toContain('master-launch-token-xyz')
