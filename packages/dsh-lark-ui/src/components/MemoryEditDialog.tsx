@@ -214,7 +214,7 @@ function MemoryScopeFields({
 
   return (
     <>
-      <SettingRow title="作用域" desc="隔离群聊与工作区知识，防止跨群串味">
+      <SettingRow title="层级" desc="隔离全局、工作区与群聊记忆，防止跨群串味">
         <SelectMenu
           value={draft.scope}
           options={SCOPE_OPTIONS}
