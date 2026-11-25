@@ -471,6 +471,24 @@ export class AgentToolFacade {
     })
   }
 
+  async agentUpdateSchedule(
+    scheduleId: string,
+    input: {
+      readonly title?: string
+      readonly prompt?: string
+      readonly timing?: ScheduleCreateInputLike['timing']
+      readonly cwd?: string
+      readonly agentPreset?: string
+      readonly active?: boolean
+    },
+  ) {
+    return this.host.getSchedules().updateSchedule(scheduleId, input)
+  }
+
+  async agentDeleteSchedule(scheduleId: string) {
+    return this.host.getSchedules().deleteSchedule(scheduleId)
+  }
+
   async sendScheduleMessage(input: {
     readonly botId: string
     readonly chatId: string

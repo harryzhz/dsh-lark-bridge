@@ -78,10 +78,39 @@ export interface ScheduleCreateInputLike {
   }
 }
 
+export interface ScheduleUpdatePatchLike {
+  readonly title?: string
+  readonly prompt?: string
+  readonly timing?: ScheduleCreateInputLike['timing']
+  readonly target?: {
+    readonly kind: 'new' | 'new_once'
+    readonly create?: { readonly cwd?: string; readonly agentPreset?: string }
+  }
+  readonly active?: boolean
+}
+
+export type ScheduleEditRequestLike =
+  | {
+      readonly id: string
+      readonly action: 'update'
+      readonly patch: ScheduleUpdatePatchLike
+      readonly expectedUpdatedAt?: string | null
+    }
+  | {
+      readonly id: string
+      readonly action: 'delete'
+      readonly expectedUpdatedAt?: string | null
+    }
+
+export type ScheduleEditResultLike =
+  | ScheduleEntryLike
+  | { readonly id: string; readonly deleted: true }
+  | { readonly id?: string; readonly code: string }
+
 export interface HostScheduleService {
   catalog(): Promise<readonly ScheduleEntryLike[]>
   create?(request: ScheduleCreateInputLike): Promise<ScheduleEntryLike>
-  edit?(request: { readonly id: string; readonly action: 'update'; readonly patch: { readonly active?: boolean } }): Promise<unknown>
+  edit?(request: ScheduleEditRequestLike): Promise<ScheduleEditResultLike>
   view(request: { readonly id: string }): Promise<ScheduleEntryLike | { readonly code: string }>
   history?(request: { readonly id: string; readonly limit: number }): Promise<
     | { readonly records: readonly { readonly messageId: string; readonly targetSessionId: string }[] }
@@ -542,6 +571,137 @@ export class ScheduleNotifier {
       void this.refreshScheduleContextCache()
     }
     return { entry, ...(binding ? { binding } : {}) }
+  }
+
+  async updateSchedule(
+    scheduleId: string,
+    input: {
+      readonly title?: string
+      readonly prompt?: string
+      readonly timing?: ScheduleCreateInputLike['timing']
+      readonly cwd?: string
+      readonly agentPreset?: string
+      readonly active?: boolean
+    },
+  ): Promise<
+    | {
+        readonly ok: true
+        readonly entry: ScheduleEntryLike
+        readonly ruleSummary: string
+        readonly binding?: LarkScheduleBinding
+      }
+    | { readonly ok: false; readonly code: string; readonly error: string }
+  > {
+    const id = scheduleId.trim()
+    if (!id) throw new Error('scheduleId 不能为空')
+    const service = this.service()
+    if (!service?.edit) {
+      throw new Error('当前宿主未启用自动化任务编辑能力')
+    }
+
+    let title: string | undefined
+    if (input.title !== undefined) {
+      title = input.title.trim()
+      if (!title) throw new Error('标题不能为空')
+    }
+
+    let prompt: string | undefined
+    if (input.prompt !== undefined) {
+      prompt = input.prompt.trim()
+      if (!prompt) throw new Error('提示词不能为空')
+    }
+
+    let target: ScheduleUpdatePatchLike['target']
+    if (input.cwd !== undefined || input.agentPreset !== undefined) {
+      const current = await service.view({ id })
+      if ('code' in current) {
+        return {
+          ok: false,
+          code: current.code,
+          error: current.code === 'schedule_not_found' ? '未找到该自动化任务' : current.code,
+        }
+      }
+      if (current.target.kind === 'session') {
+        throw new Error('复用已有会话的自动化任务不支持直接修改 cwd 或 agentPreset')
+      }
+      const nextCwd =
+        input.cwd !== undefined
+          ? assertExistingWorkingDirectory(input.cwd)
+          : current.target.create?.cwd
+      const nextPreset =
+        input.agentPreset !== undefined
+          ? input.agentPreset.trim() || undefined
+          : current.target.create?.agentPreset
+      target = {
+        kind: current.target.kind,
+        create: {
+          ...(nextCwd ? { cwd: nextCwd } : {}),
+          ...(nextPreset ? { agentPreset: nextPreset } : {}),
+        },
+      }
+    }
+
+    const patch: ScheduleUpdatePatchLike = {
+      ...(title !== undefined ? { title } : {}),
+      ...(prompt !== undefined ? { prompt } : {}),
+      ...(input.timing !== undefined ? { timing: input.timing } : {}),
+      ...(target !== undefined ? { target } : {}),
+      ...(input.active !== undefined ? { active: input.active } : {}),
+    }
+    if (Object.keys(patch).length === 0) {
+      throw new Error('请至少指定一个要更新的字段（title、prompt、timing、active、cwd 或 agentPreset）')
+    }
+
+    const res = await service.edit({ id, action: 'update', patch })
+    if ('code' in res) {
+      const friendly =
+        res.code === 'schedule_not_found'
+          ? '未找到该自动化任务'
+          : res.code === 'schedule_conflict'
+            ? '自动化任务已被其他操作修改，请重试'
+            : res.code
+      return { ok: false, code: res.code, error: friendly }
+    }
+    if ('deleted' in res) {
+      throw new Error('意外的删除响应')
+    }
+    this.catalogById.set(res.id, res)
+    void this.refreshScheduleContextCache()
+    const binding = this.host.store.getScheduleBinding(res.id)
+    return {
+      ok: true,
+      entry: res,
+      ruleSummary: formatScheduleRuleSummary(res),
+      ...(binding ? { binding } : {}),
+    }
+  }
+
+  async deleteSchedule(
+    scheduleId: string,
+  ): Promise<
+    | { readonly ok: true; readonly id: string; readonly deleted: true; readonly bindingDeleted: boolean }
+    | { readonly ok: false; readonly code: string; readonly error: string }
+  > {
+    const id = scheduleId.trim()
+    if (!id) throw new Error('scheduleId 不能为空')
+    const service = this.service()
+    if (!service?.edit) {
+      throw new Error('当前宿主未启用自动化任务删除能力')
+    }
+    const res = await service.edit({ id, action: 'delete' })
+    if ('code' in res) {
+      const friendly =
+        res.code === 'schedule_not_found'
+          ? '未找到该自动化任务'
+          : res.code === 'schedule_conflict'
+            ? '自动化任务已被其他操作修改，请重试'
+            : res.code
+      return { ok: false, code: res.code, error: friendly }
+    }
+    this.catalogById.delete(id)
+    this.inferredOriginById.delete(id)
+    const bindingDeleted = this.host.store.deleteScheduleBinding(id)
+    return { ok: true, id, deleted: true, bindingDeleted }
   }
 
   async runNow(scheduleId: string): Promise<{ readonly ok: boolean; readonly error?: string }> {

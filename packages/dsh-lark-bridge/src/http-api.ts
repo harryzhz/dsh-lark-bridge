@@ -302,6 +302,61 @@ export async function dispatchLarkApiRequest(
         })
         return ok({ ok: true, ...created }, 201)
       }
+      if (
+        (method === 'PATCH' || method === 'PUT') &&
+        segments[1] === 'schedules' &&
+        segments[2] &&
+        segments.length === 3
+      ) {
+        if (isOperatorAuthenticated) {
+          return ok({ ok: false, error: 'owner_or_cli_required' }, 403)
+        }
+        const body = bodyRecord(request.body) as {
+          title?: unknown
+          prompt?: unknown
+          timing?: ScheduleCreateInputLike['timing']
+          cwd?: unknown
+          agentPreset?: unknown
+          active?: unknown
+        }
+        if (body.active !== undefined && typeof body.active !== 'boolean') {
+          return ok({ ok: false, error: 'active must be a boolean' }, 400)
+        }
+        const updated = await manager.agentUpdateSchedule(segments[2], {
+          ...(typeof body.title === 'string' ? { title: body.title } : {}),
+          ...(typeof body.prompt === 'string' ? { prompt: body.prompt } : {}),
+          ...(body.timing !== undefined ? { timing: body.timing } : {}),
+          ...(typeof body.cwd === 'string' ? { cwd: body.cwd } : {}),
+          ...(typeof body.agentPreset === 'string' ? { agentPreset: body.agentPreset } : {}),
+          ...(typeof body.active === 'boolean' ? { active: body.active } : {}),
+        })
+        if (!updated.ok) {
+          const status =
+            updated.code === 'schedule_not_found'
+              ? 404
+              : updated.code === 'schedule_conflict'
+                ? 409
+                : 400
+          return ok(updated, status)
+        }
+        return ok(updated)
+      }
+      if (method === 'DELETE' && segments[1] === 'schedules' && segments[2] && segments.length === 3) {
+        if (isOperatorAuthenticated) {
+          return ok({ ok: false, error: 'owner_or_cli_required' }, 403)
+        }
+        const deleted = await manager.agentDeleteSchedule(segments[2])
+        if (!deleted.ok) {
+          const status =
+            deleted.code === 'schedule_not_found'
+              ? 404
+              : deleted.code === 'schedule_conflict'
+                ? 409
+                : 400
+          return ok(deleted, status)
+        }
+        return ok(deleted)
+      }
     }
 
     // ── Auth & Open Platform endpoints (owner Web/Desktop session only) ──
