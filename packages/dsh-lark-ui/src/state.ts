@@ -11,6 +11,7 @@ import type {
   GroupView,
   ListenerTemplate,
   ModelGroup,
+  PluginUpdatesOverview,
   ReminderItem,
   RuntimeOption,
   ScheduleView,
@@ -35,6 +36,7 @@ export interface BridgeData {
   listenerTemplates: ListenerTemplate[]
   triageDefaults: TriageDefaultsPayload
   auth: AuthStatusPayload | null
+  pluginUpdates: PluginUpdatesOverview | null
 }
 
 const EMPTY: BridgeData = {
@@ -53,6 +55,7 @@ const EMPTY: BridgeData = {
   listenerTemplates: [...FALLBACK_LISTENER_TEMPLATES],
   triageDefaults: FALLBACK_TRIAGE_DEFAULTS,
   auth: null,
+  pluginUpdates: null,
 }
 const POLL_MS = 6000
 
@@ -61,10 +64,26 @@ export function useBridgeData(): BridgeData & {
   refresh: () => Promise<void>
   refreshAuth: () => Promise<void>
   refreshRuntimes: () => Promise<void>
+  refreshPluginUpdates: (options?: { check?: boolean; force?: boolean }) => Promise<PluginUpdatesOverview | null>
   error: string
 } {
   const [data, setData] = useState<BridgeData>(EMPTY)
   const [error, setError] = useState('')
+
+  const refreshPluginUpdates = useCallback(
+    async (options: { check?: boolean; force?: boolean } = {}): Promise<PluginUpdatesOverview | null> => {
+      try {
+        const pluginUpdates = options.force
+          ? await bridgeApi.checkPluginUpdates(true)
+          : await bridgeApi.pluginUpdates(options)
+        setData((prev) => ({ ...prev, pluginUpdates }))
+        return pluginUpdates
+      } catch {
+        return null
+      }
+    },
+    [],
+  )
 
   const refreshAuth = useCallback(async () => {
     try {
@@ -130,6 +149,7 @@ export function useBridgeData(): BridgeData & {
     void refresh()
     void refreshAuth()
     void refreshRuntimes()
+    void refreshPluginUpdates({ check: true })
     void bridgeApi
       .listenerTemplates()
       .then((listenerTemplates) => {
@@ -140,9 +160,9 @@ export function useBridgeData(): BridgeData & {
       .catch(() => {})
     const timer = window.setInterval(() => void refresh(), POLL_MS)
     return () => window.clearInterval(timer)
-  }, [refresh, refreshAuth, refreshRuntimes])
+  }, [refresh, refreshAuth, refreshRuntimes, refreshPluginUpdates])
 
-  return { ...data, refresh, refreshAuth, refreshRuntimes, error }
+  return { ...data, refresh, refreshAuth, refreshRuntimes, refreshPluginUpdates, error }
 }
 
 export function formatDuration(ms: number): string {

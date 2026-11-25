@@ -178,7 +178,62 @@ export async function dispatchLarkApiRequest(
       return ok(diagnostics)
     }
 
-    // Operator maintenance tokens are strictly scoped to health, lifecycle drain/resume, and diagnostics.
+    // ── Plugin release check & restart-free hot-update control plane ─────
+    if (segments[0] === 'plugins') {
+      const canOperateUpdates =
+        (principalKind === 'owner' && !isCliAuthenticated) || Boolean(isOperatorAuthenticated)
+      if (method === 'GET' && segments[1] === 'updates') {
+        const check = url.searchParams.get('check') === '1' || url.searchParams.get('check') === 'true'
+        const force = url.searchParams.get('force') === '1' || url.searchParams.get('force') === 'true'
+        const overview = await manager.pluginUpdater.getOverview({ check, force })
+        return ok(overview)
+      }
+      if (method === 'GET' && segments[1] === 'update-status') {
+        const operationId = url.searchParams.get('operationId')?.trim() || undefined
+        const operation = manager.pluginUpdater.getOperation(operationId)
+        return ok({ ok: true, ...(operation ? { operation } : {}) })
+      }
+      if (method === 'POST' && segments[1] === 'check') {
+        const body = bodyRecord(request.body)
+        const force = body.force !== false
+        const overview = await manager.pluginUpdater.getOverview({ check: true, force })
+        return ok(overview)
+      }
+      if (method === 'POST' && segments[1] === 'update') {
+        if (!canOperateUpdates) {
+          return ok({ ok: false, error: 'owner_or_operator_required' }, 403)
+        }
+        const body = bodyRecord(request.body)
+        const rawTarget = typeof body.target === 'string' ? body.target.trim().toLowerCase() : 'all'
+        const target =
+          rawTarget === 'bridge' || rawTarget === 'lark-bridge' || rawTarget === '@harryzhz/dsh-lark-bridge'
+            ? 'bridge'
+            : rawTarget === 'external-agents' || rawTarget === 'ext' || rawTarget === '@harryzhz/dsh-external-agents'
+              ? 'external-agents'
+              : rawTarget === 'all' || rawTarget === ''
+                ? 'all'
+                : undefined
+        if (!target) {
+          return ok({ ok: false, error: `不支持的插件目标：${rawTarget}` }, 400)
+        }
+        const version = typeof body.version === 'string' && body.version.trim() ? body.version.trim() : undefined
+        const drainTimeoutMs =
+          typeof body.drainTimeoutMs === 'number' && Number.isFinite(body.drainTimeoutMs)
+            ? body.drainTimeoutMs
+            : undefined
+        const operation = await manager.pluginUpdater.startUpdate({
+          target,
+          ...(version ? { version } : {}),
+          ...(drainTimeoutMs !== undefined ? { drainTimeoutMs } : {}),
+          force: body.force === true,
+          allowMigrateLocal: body.allowMigrateLocal === true,
+          allowRestartRequired: body.allowRestartRequired === true,
+        })
+        return ok({ ok: true, operation }, 202)
+      }
+    }
+
+    // Operator maintenance tokens are strictly scoped to health, lifecycle drain/resume, diagnostics, and plugin updates.
     if (isPureOperatorSession) {
       return ok({ ok: false, error: 'operator_scope_forbidden' }, 403)
     }

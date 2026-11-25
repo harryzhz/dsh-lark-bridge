@@ -1,4 +1,4 @@
-import { useState, type ComponentType, type ReactNode } from 'react'
+import { useEffect, useState, type ComponentType, type ReactNode } from 'react'
 import {
   Button,
   IconAlarmClockOutlineRegular,
@@ -16,8 +16,9 @@ import { ConfirmDialog, type ConfirmRequest } from './components/ConfirmDialog.j
 import { resolveEffectiveBotId } from './components/fields.js'
 import { GroupConfigDialog } from './components/GroupConfigDialog.js'
 import { LarkAuthDialog } from './components/LarkAuthDialog.js'
-import { LarkSidebarIcon, LarkTitleIcon, RobotTabIcon, ShieldAuthIcon } from './components/LarkLogo.js'
+import { LarkSidebarIcon, LarkTitleIcon, PluginUpdateIcon, RobotTabIcon, ShieldAuthIcon } from './components/LarkLogo.js'
 import { MemoryEditDialog, type MemoryDialogRequest } from './components/MemoryEditDialog.js'
+import { PENDING_SELF_RELOAD_STORAGE_KEY, PluginUpdateDialog } from './components/PluginUpdateDialog.js'
 import { ReminderEditDialog } from './components/ReminderEditDialog.js'
 import { ScheduleConfigDialog } from './components/ScheduleConfigDialog.js'
 import { installSessionModelFilter } from './session-model-filter.js'
@@ -32,7 +33,14 @@ import {
 } from './session-navigation.js'
 import { useBridgeData } from './state.js'
 import { ensureLarkUiStyles } from './styles.js'
-import type { BotConfig, BotRecord, GroupView, ReminderItem, ScheduleView } from './types.js'
+import type {
+  BotConfig,
+  BotRecord,
+  GroupView,
+  PluginUpdateOperation,
+  ReminderItem,
+  ScheduleView,
+} from './types.js'
 import { BotsView } from './views/BotsView.js'
 import { GroupsView } from './views/GroupsView.js'
 import { MemoryView } from './views/MemoryView.js'
@@ -56,6 +64,26 @@ const TABS: ReadonlyArray<{ key: Tab; label: string; icon: ReactNode }> = [
 
 let openDshSession: ((sessionId: string) => Promise<SessionActivationResult>) | undefined
 let openDshSchedules: (() => void) | undefined
+let pendingPostSelfReloadOpId: string | undefined
+
+function consumePendingSelfReloadMarker(): string | undefined {
+  try {
+    const raw = window.sessionStorage.getItem(PENDING_SELF_RELOAD_STORAGE_KEY)
+    if (!raw) return undefined
+    window.sessionStorage.removeItem(PENDING_SELF_RELOAD_STORAGE_KEY)
+    const parsed = JSON.parse(raw) as { operationId?: unknown; at?: unknown }
+    if (
+      typeof parsed.operationId === 'string' &&
+      typeof parsed.at === 'number' &&
+      Date.now() - parsed.at < 3 * 60_000
+    ) {
+      return parsed.operationId
+    }
+  } catch {
+    // Ignore storage error.
+  }
+  return undefined
+}
 
 function LarkBridgePage() {
   const data = useBridgeData()
@@ -69,9 +97,57 @@ function LarkBridgePage() {
   const [memoryRevision, setMemoryRevision] = useState(0)
   const [memoryFocusId, setMemoryFocusId] = useState<string | null>(null)
   const [authOpen, setAuthOpen] = useState(false)
+  const [updateOpen, setUpdateOpen] = useState(false)
   const [confirm, setConfirm] = useState<ConfirmRequest | null>(null)
   const [toast, setToast] = useState<{ text: string; ok: boolean } | null>(null)
   const [syncing, setSyncing] = useState(false)
+
+  useEffect(() => {
+    const opId = pendingPostSelfReloadOpId
+    if (!opId) return
+    pendingPostSelfReloadOpId = undefined
+    let cancelled = false
+    const activeStates = new Set([
+      'queued',
+      'verifying',
+      'draining',
+      'removing',
+      'installing',
+      'restoring',
+    ])
+    void (async () => {
+      const deadline = Date.now() + 20_000
+      let lastOp: PluginUpdateOperation | undefined
+      while (!cancelled && Date.now() < deadline) {
+        try {
+          const op = await bridgeApi.pluginUpdateStatus(opId)
+          if (cancelled) return
+          if (op) {
+            lastOp = op
+            if (!activeStates.has(op.status)) {
+              setToast({ text: op.message, ok: op.status === 'succeeded' })
+              await Promise.all([
+                data.refresh(),
+                data.refreshRuntimes(),
+                data.refreshPluginUpdates({ check: true }),
+              ])
+              return
+            }
+          }
+        } catch {
+          // Ignore transient RPC errors immediately after self-reload.
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 400))
+      }
+      if (!cancelled && lastOp?.message) {
+        setToast({ text: lastOp.message, ok: lastOp.status === 'succeeded' })
+        await data.refreshPluginUpdates({ check: true })
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   const act = async (task: () => Promise<unknown>, success?: string) => {
     try {
@@ -115,6 +191,9 @@ function LarkBridgePage() {
   }
 
   const opIdentity = data.auth?.openPlatform.authenticated ? data.auth.openPlatform.identity : undefined
+  const bridgePluginStatus = data.pluginUpdates?.plugins.find((p) => p.id === 'bridge')
+  const runningBridgeVer = bridgePluginStatus?.runningVersion ?? bridgePluginStatus?.installedVersion
+  const updatableCount = data.pluginUpdates?.updatableCount ?? 0
 
   return (
     <div className="fb-page">
@@ -125,6 +204,24 @@ function LarkBridgePage() {
             <span>飞书桥接</span>
           </h1>
           <div className="fb-actions">
+            <Button
+              variant="outline"
+              icon={<PluginUpdateIcon size={16} />}
+              onClick={() => {
+                setUpdateOpen(true)
+              }}
+            >
+              {updatableCount > 0 ? (
+                <>
+                  <span>有更新</span>
+                  <span className="fb-update-btn-dot" aria-hidden="true" />
+                </>
+              ) : runningBridgeVer ? (
+                `v${runningBridgeVer}`
+              ) : (
+                '检查更新'
+              )}
+            </Button>
             <Button
               variant="outline"
               icon={<ShieldAuthIcon size={16} />}
@@ -182,7 +279,15 @@ function LarkBridgePage() {
 
         {data.error && <div className="fb-card fb-empty">无法连接桥接服务：{data.error}</div>}
 
-        {tab === 'overview' && <OverviewView cockpit={data.cockpit} runtimes={data.runtimes} models={data.models} />}
+        {tab === 'overview' && (
+          <OverviewView
+            cockpit={data.cockpit}
+            runtimes={data.runtimes}
+            models={data.models}
+            pluginUpdates={data.pluginUpdates}
+            onOpenPluginUpdates={() => setUpdateOpen(true)}
+          />
+        )}
         {tab === 'bots' && (
           <BotsView
             bots={data.bots}
@@ -413,6 +518,16 @@ function LarkBridgePage() {
         onUpdated={async () => {
           await data.refreshAuth()
           await data.refresh()
+        }}
+      />
+      <PluginUpdateDialog
+        open={updateOpen}
+        overview={data.pluginUpdates}
+        onClose={() => setUpdateOpen(false)}
+        onCheck={(force) => data.refreshPluginUpdates({ check: true, ...(force ? { force: true } : {}) })}
+        onUpdated={async (message, ok) => {
+          setToast({ text: message, ok })
+          await Promise.all([data.refresh(), data.refreshRuntimes(), data.refreshPluginUpdates({ check: true })])
         }}
       />
       <ConfirmDialog request={confirm} onClose={() => setConfirm(null)} />
@@ -731,4 +846,25 @@ export function apply(ctx: ClientContext): void {
   ctx.slots.inject('sidebar.panellist', () =>
     ctx.slots.register({ name: 'sidebar.panellist', id: PANEL_ID, order: 25, label: '飞书桥接' }, LarkSidebarIcon),
   )
+
+  // After a restart-free self-update (`removeBundle` -> `installBundle`), DSH briefly unmounts the
+  // old panel back to Home; once the new client bundle registers, snap straight back to Lark Bridge.
+  const reloadedOpId = consumePendingSelfReloadMarker()
+  if (reloadedOpId) {
+    pendingPostSelfReloadOpId = reloadedOpId
+    const restorePanel = (layout: LayoutNavigationLike | undefined): boolean => {
+      if (!layout?.selectPanel) return false
+      if (layout.hasMainPanel && !layout.hasMainPanel(PANEL_ID)) return false
+      layout.selectPanel(PANEL_ID)
+      return true
+    }
+    const timer = window.setTimeout(() => {
+      if (!restorePanel(layoutRef ?? readOptionalService<LayoutNavigationLike>(ctx, 'layout'))) {
+        window.setTimeout(() => {
+          restorePanel(layoutRef ?? readOptionalService<LayoutNavigationLike>(ctx, 'layout'))
+        }, 350)
+      }
+    }, 120)
+    ctx.effect?.(() => () => window.clearTimeout(timer), 'dsh-lark-ui.post-self-reload-restore')
+  }
 }

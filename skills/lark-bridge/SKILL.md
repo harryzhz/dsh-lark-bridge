@@ -208,4 +208,9 @@ lark-bridge db compact
 
 # 一键离线+在线健康诊断（SQLite 完整性、实例锁、ACK 延迟、跨主机多实例冲突告警）
 lark-bridge doctor
+
+# 插件版本检查与免重启热更新（覆盖飞书桥接与外部 Agent 运行时；飞书会话内触发必传 --detached）
+lark-bridge plugin status [--check]
+lark-bridge plugin check [--force]
+lark-bridge plugin update [bridge|external-agents|all] [--version <vX.Y.Z>] [--timeout <秒>] [--detached [--notify-bot <botId> --notify-chat <chatId>]]
 ```

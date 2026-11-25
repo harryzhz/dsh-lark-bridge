@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { execFileSync, spawn } from 'node:child_process'
+import { existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 import { resolveDataDir, runDbCliCommand, runOfflineDoctor } from '@dsh-lark/dsh-lark-bridge/db-cli'
@@ -46,6 +46,9 @@ const HELP = `lark-bridge — DSH 飞书桥接辅助 CLI（零密钥暴露，自
   lark-bridge lifecycle status
   lark-bridge lifecycle drain [--wait] [--timeout <秒>] [--reason <原因>]
   lark-bridge lifecycle resume-intake
+  lark-bridge plugin status [--check] [--force]
+  lark-bridge plugin check [--force]
+  lark-bridge plugin update [bridge|external-agents|all] [--version <vX.Y.Z>] [--timeout <秒>] [--force] [--no-wait] [--detached [--delay <秒>] [--notify-bot <botId> --notify-chat <chatId>]]
   lark-bridge doctor [--data-dir <目录>] [--json]
 
 send 选项:
@@ -82,6 +85,11 @@ const BOOL_FLAGS = new Set([
   'json',
   'pin',
   'wait',
+  'no-wait',
+  'detached',
+  'check',
+  'allow-migrate-local',
+  'allow-restart-required',
   'allow-in-session',
   'pause',
   'resume',
@@ -296,6 +304,200 @@ function buildScheduleTiming(flags, options = {}) {
     return { kind: 'after', after_seconds: Math.round(sec) }
   }
   return undefined
+}
+
+function sleepMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function pollPluginUpdateOperation(endpoint, operationId, headers, maxWaitMs) {
+  const terminalStates = new Set(['succeeded', 'failed', 'rolled_back'])
+  const deadline = Date.now() + Math.max(30_000, maxWaitMs)
+  let lastStage = ''
+  let lastOp = null
+  let consecutiveErrors = 0
+
+  while (Date.now() < deadline) {
+    try {
+      const res = await apiRequest(
+        endpoint,
+        'GET',
+        `/plugins/update-status?operationId=${encodeURIComponent(operationId)}`,
+        undefined,
+        headers,
+      )
+      consecutiveErrors = 0
+      const op = res.operation
+      if (op) {
+        lastOp = op
+        const stageKey = `${op.status}:${op.message}`
+        if (stageKey !== lastStage) {
+          lastStage = stageKey
+          process.stderr.write(`[lark-bridge plugin] ${op.status}: ${op.message}\n`)
+        }
+        if (terminalStates.has(op.status)) {
+          return op
+        }
+      }
+    } catch {
+      consecutiveErrors += 1
+      if (consecutiveErrors === 1) {
+        process.stderr.write('[lark-bridge plugin] 插件正在热重载，等待服务恢复连接…\n')
+      }
+    }
+    await sleepMs(1500)
+  }
+
+  return (
+    lastOp || {
+      operationId,
+      status: 'failed',
+      message: '等待插件热更新完成超时',
+      error: 'poll_timeout',
+      hotReloaded: false,
+      restartRequired: false,
+      items: [],
+    }
+  )
+}
+
+async function handlePluginCommand(endpoint, positionals, flags) {
+  const sub = (positionals[1] || 'status').toLowerCase()
+
+  if (sub === 'status') {
+    const qs = new URLSearchParams()
+    if (flags.check) qs.set('check', '1')
+    if (flags.force) qs.set('force', '1')
+    const suffix = qs.toString()
+    printJson(await apiRequest(endpoint, 'GET', `/plugins/updates${suffix ? `?${suffix}` : ''}`))
+    return
+  }
+
+  if (sub === 'check') {
+    const force = flags.force !== undefined ? Boolean(flags.force) : true
+    printJson(await apiRequest(endpoint, 'POST', '/plugins/check', { force }))
+    return
+  }
+
+  if (sub === 'update') {
+    const target = String(positionals[2] || flags.target || 'all').trim()
+    const delaySecEnv = Number(process.env.DSH_LARK_DETACHED_DELAY_SEC || 0)
+    if (Number.isFinite(delaySecEnv) && delaySecEnv > 0) {
+      await sleepMs(delaySecEnv * 1000)
+    }
+
+    if (flags.detached) {
+      const dataDir = resolveDataDir(flags['data-dir'])
+      const logDir = join(dataDir, 'logs')
+      mkdirSync(logDir, { recursive: true })
+      const logPath = join(logDir, `plugin-update-${Date.now()}.log`)
+      const delaySec = flags.delay !== undefined ? Math.max(1, Number(flags.delay) || 6) : 6
+      const forwarded = ['plugin', 'update', target, '--allow-in-session']
+      if (flags.version) forwarded.push('--version', String(flags.version))
+      if (flags.timeout !== undefined) forwarded.push('--timeout', String(flags.timeout))
+      if (flags.force) forwarded.push('--force')
+      if (flags['allow-migrate-local']) forwarded.push('--allow-migrate-local')
+      if (flags['allow-restart-required']) forwarded.push('--allow-restart-required')
+      if (flags['data-dir']) forwarded.push('--data-dir', String(flags['data-dir']))
+      if (flags['notify-bot']) forwarded.push('--notify-bot', String(flags['notify-bot']))
+      if (flags['notify-chat']) forwarded.push('--notify-chat', String(flags['notify-chat']))
+
+      const childEnv = { ...process.env, DSH_LARK_DETACHED_DELAY_SEC: String(delaySec) }
+      delete childEnv.DSH_SESSION_ID
+      const outFd = openSync(logPath, 'a')
+      const child = spawn(process.execPath, [process.argv[1], ...forwarded], {
+        detached: true,
+        stdio: ['ignore', outFd, outFd],
+        env: childEnv,
+      })
+      child.unref()
+      printJson({
+        ok: true,
+        detached: true,
+        pid: child.pid,
+        target,
+        delaySec,
+        logPath,
+        message: `已派发后台免重启热更新进程（延迟 ${delaySec}s 启动）`,
+      })
+      return
+    }
+
+    if (process.env.DSH_SESSION_ID && !flags['allow-in-session']) {
+      throw new Error(
+        '拒绝在活跃 Agent 会话内直接热更新插件（会中断当前会话）；请使用 --detached 派发后台延迟热更新，或在宿主机终端执行。',
+      )
+    }
+
+    const operatorToken = loadOperatorToken(flags)
+    const headers = { 'x-lark-bridge-operator': operatorToken }
+    const timeoutSec = flags.timeout !== undefined ? Number(flags.timeout) : 90
+    const drainTimeoutMs = Number.isFinite(timeoutSec) ? Math.max(0, timeoutSec * 1000) : 90_000
+
+    const accepted = await apiRequest(
+      endpoint,
+      'POST',
+      '/plugins/update',
+      {
+        target,
+        ...(flags.version ? { version: String(flags.version).trim() } : {}),
+        drainTimeoutMs,
+        force: Boolean(flags.force),
+        allowMigrateLocal: Boolean(flags['allow-migrate-local']),
+        allowRestartRequired: Boolean(flags['allow-restart-required']),
+      },
+      headers,
+    )
+
+    if (flags['no-wait']) {
+      printJson(accepted)
+      return
+    }
+
+    const op = await pollPluginUpdateOperation(
+      endpoint,
+      accepted.operation.operationId,
+      headers,
+      drainTimeoutMs + 180_000,
+    )
+    const ok = op.status === 'succeeded'
+
+    const notifyBot = flags['notify-bot'] ? String(flags['notify-bot']).trim() : ''
+    const notifyChat = flags['notify-chat'] ? String(flags['notify-chat']).trim() : ''
+    if (notifyBot && notifyChat) {
+      const itemsText = (op.items || [])
+        .map(
+          (item) =>
+            `- **${item.displayName}** (\`${item.packageName}\`)：${item.fromVersion ? `v${item.fromVersion}` : '未安装'} → v${item.toVersion}（${item.status === 'succeeded' ? (item.hotReloaded ? '已免重启热重载' : '需重启生效') : item.status === 'rolled_back' ? '安装失败已自动回滚' : '失败'}）`,
+        )
+        .join('\n')
+      const text = [
+        ok ? '✅ **插件热更新完成**' : '⚠️ **插件热更新未完成**',
+        '',
+        op.message || '',
+        itemsText ? `\n${itemsText}` : '',
+      ]
+        .filter(Boolean)
+        .join('\n')
+      await apiRequest(endpoint, 'POST', '/agent/send', {
+        botId: notifyBot,
+        chatId: notifyChat,
+        replyInThread: false,
+        title: ok ? 'DSH 插件热更新完成' : 'DSH 插件热更新告警',
+        text,
+      }).catch(() => {})
+    }
+
+    printJson({ ok, operation: op })
+    if (!ok) {
+      process.exitCode = 1
+    }
+    return
+  }
+
+  throw new Error(
+    '用法：lark-bridge plugin status [--check] | check [--force] | update [bridge|external-agents|all] [--version <vX.Y.Z>] [--detached]',
+  )
 }
 
 function handleWorktreeCommand(positionals, flags) {
@@ -767,6 +969,11 @@ async function main() {
     throw new Error(
       '用法：lark-bridge lifecycle status | drain [--wait] [--timeout <秒>] [--reason <原因>] | resume-intake',
     )
+  }
+
+  if (cmd === 'plugin') {
+    await handlePluginCommand(endpoint, positionals, flags)
+    return
   }
 
   if (cmd === 'context') {

@@ -788,3 +788,99 @@ export interface ScheduleView {
   configured: boolean
   binding: ScheduleBinding
 }
+
+export type ManagedPluginId = 'bridge' | 'external-agents'
+
+export type PluginSourceKind =
+  | 'github-release'
+  | 'registry'
+  | 'local-link'
+  | 'local-file'
+  | 'git'
+  | 'unknown'
+  | 'not-installed'
+
+export interface PluginReleaseInfo {
+  version: string
+  tagName: string
+  publishedAt?: string
+  releaseUrl: string
+  tarballUrl: string
+  assetName: string
+  expectedSha256?: string
+  checksumUrl?: string
+  releaseNotes?: string
+  source: 'github-api' | 'github-redirect' | 'mirror'
+}
+
+export interface ManagedPluginStatus {
+  id: ManagedPluginId
+  displayName: string
+  packageName: string
+  installedPackageName?: string
+  githubRepo: string
+  installed: boolean
+  enabled: boolean
+  installedVersion?: string
+  runningVersion?: string
+  sourceKind: PluginSourceKind
+  sourceLabel: string
+  latest?: PluginReleaseInfo
+  updateAvailable: boolean
+  hotReloadSupported: boolean
+  updateBlockedReason?: string
+  checkError?: string
+  checkedAtMs?: number
+}
+
+export type PluginUpdateOpStatus =
+  | 'queued'
+  | 'verifying'
+  | 'draining'
+  | 'removing'
+  | 'installing'
+  | 'restoring'
+  | 'succeeded'
+  | 'failed'
+  | 'rolled_back'
+
+export interface PluginUpdateItemResult {
+  id: ManagedPluginId
+  displayName: string
+  packageName: string
+  fromVersion?: string
+  toVersion: string
+  status: 'pending' | 'running' | 'succeeded' | 'failed' | 'rolled_back'
+  hotReloaded: boolean
+  restartRequired: boolean
+  restartReason?: string
+  error?: string
+  rolledBack?: boolean
+}
+
+export interface PluginUpdateOperation {
+  operationId: string
+  status: PluginUpdateOpStatus
+  message: string
+  startedAtMs: number
+  updatedAtMs: number
+  finishedAtMs?: number
+  currentTarget?: ManagedPluginId
+  items: PluginUpdateItemResult[]
+  hotReloaded: boolean
+  restartRequired: boolean
+  error?: string
+}
+
+export interface PluginUpdatesOverview {
+  ok: true
+  profileName?: string
+  hmrAvailable: boolean
+  pluginManagerAvailable: boolean
+  hotReloadSupported: boolean
+  hotReloadUnavailableReason?: string
+  checkedAtMs?: number
+  updatableCount: number
+  plugins: ManagedPluginStatus[]
+  operation?: PluginUpdateOperation
+}
