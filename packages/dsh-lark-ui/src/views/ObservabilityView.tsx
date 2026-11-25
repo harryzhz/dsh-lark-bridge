@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   Button,
   IconRefreshOutlineRegular,
@@ -26,11 +26,11 @@ import type {
 } from '../types.js'
 import {
   ActivityHeatmap,
+  KpiCard,
   LatencyHistogram,
   MiniStorageMeter,
   ProductTimeSeriesChart,
   SegmentedBar,
-  Sparkline,
   TechnicalTimeSeriesChart,
   type ProductChartMode,
   type SegmentedBarItem,
@@ -56,53 +56,6 @@ type RankingTab = 'bots' | 'chats'
 
 const POLL_IDLE_MS = 15_000
 const POLL_BACKFILL_MS = 3_000
-
-function KpiCard({
-  label,
-  tag,
-  value,
-  unit,
-  foot,
-  delta,
-  spark,
-  sparkTone = 'primary',
-  visual,
-}: {
-  readonly label: string
-  readonly tag?: string
-  readonly value: string
-  readonly unit?: string
-  readonly foot: string
-  readonly delta?: { readonly text: string; readonly tone: 'good' | 'bad' | 'neutral' }
-  readonly spark?: readonly number[]
-  readonly sparkTone?: 'primary' | 'success' | 'warn' | 'danger'
-  readonly visual?: ReactNode
-}) {
-  return (
-    <div className="fb-card fb-obs-kpi">
-      <div className="fb-obs-kpi-head">
-        <span className="fb-obs-kpi-label">{label}</span>
-        {delta ? (
-          <span className="fb-obs-delta fb-mono" data-tone={delta.tone}>
-            {delta.text}
-          </span>
-        ) : tag ? (
-          <span className="fb-obs-kpi-tag fb-mono">{tag}</span>
-        ) : null}
-      </div>
-      <div className="fb-obs-kpi-mid">
-        <div className="fb-obs-kpi-val fb-num">
-          <span>{value}</span>
-          {unit && <span className="fb-obs-kpi-unit">{unit}</span>}
-        </div>
-        {visual ?? (spark ? <Sparkline values={spark} tone={sparkTone} /> : null)}
-      </div>
-      <div className="fb-obs-kpi-foot fb-num" title={foot}>
-        {foot}
-      </div>
-    </div>
-  )
-}
 
 function InsightsPane({
   payload,
@@ -1122,16 +1075,14 @@ export function ObservabilityView({
       </div>
 
       {pane === 'overview' && (
-        <div className="fb-obs-overview-pane">
-          <OverviewView
-            cockpit={cockpit}
-            runtimes={runtimes}
-            models={models}
-            pluginUpdates={pluginUpdates}
-            onOpenPluginUpdates={onOpenPluginUpdates}
-            onOpenObservability={() => setPane('insights')}
-          />
-        </div>
+        <OverviewView
+          cockpit={cockpit}
+          runtimes={runtimes}
+          models={models}
+          pluginUpdates={pluginUpdates}
+          onOpenPluginUpdates={onOpenPluginUpdates}
+          onOpenObservability={() => setPane('insights')}
+        />
       )}
 
       {pane !== 'overview' && error && (
