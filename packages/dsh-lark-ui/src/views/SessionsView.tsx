@@ -90,6 +90,8 @@ export function filterSessionRows(
         t.chatId.toLowerCase().includes(q) ||
         (t.senderName ?? '').toLowerCase().includes(q) ||
         t.reason.toLowerCase().includes(q) ||
+        (t.errorCode ?? '').toLowerCase().includes(q) ||
+        (t.errorMessage ?? '').toLowerCase().includes(q) ||
         (t.botName ?? '').toLowerCase().includes(q) ||
         t.botId.toLowerCase().includes(q) ||
         (t.listenerName ?? '').toLowerCase().includes(q)
@@ -342,13 +344,17 @@ export function SessionsView({
               const modelLabel = t.model
                 ? resolveNativeModelLabel(t.provider ?? '', t.model, models)
                 : ''
+              const errorTag =
+                t.fallback && (t.errorCode || t.errorMessage)
+                  ? `[${t.errorCode ?? 'error'}${t.errorMessage ? `: ${t.errorMessage}` : ''}]`
+                  : null
               const metaText = [
                 t.botName || t.botId,
                 t.listenerName ? `监听「${t.listenerName}」` : null,
                 t.senderName || null,
                 modelLabel || null,
                 t.durationMs ? formatDuration(t.durationMs) : null,
-                t.reason || null,
+                errorTag || t.reason || null,
               ]
                 .filter(Boolean)
                 .join(' · ')
@@ -360,7 +366,7 @@ export function SessionsView({
                       <span>{t.chatName || t.chatId}</span>
                       {triageActionTag(t)}
                     </div>
-                    <div className="fb-item-meta" title={t.reason || metaText}>
+                    <div className="fb-item-meta" title={errorTag ? `${t.reason} ${errorTag}` : t.reason || metaText}>
                       {metaText}
                     </div>
                   </div>

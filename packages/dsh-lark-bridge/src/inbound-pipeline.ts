@@ -150,13 +150,13 @@ export interface ExecutingTurnContext {
   readonly chatType: 'p2p' | 'group'
   readonly chatName?: string
   readonly workingDir?: string
-  readonly routeKey: string
+  routeKey: string
   readonly messageId: string
-  readonly rootId?: string
-  readonly threadId?: string
+  rootId?: string
+  threadId?: string
   readonly replyMode: GroupReplyMode
-  readonly replyToMessageId?: string
-  readonly replyInThread: boolean
+  replyToMessageId?: string
+  replyInThread: boolean
 }
 
 function buildExecutingTurnContext(
@@ -1605,6 +1605,17 @@ export class InboundPipeline {
                       if (intermediate.routeKey !== effectiveDecision.routeKey) {
                         latestItem.activeTurn.routeKey = intermediate.routeKey
                         trackedRouteKey = intermediate.routeKey
+                        executingTurnCtx.routeKey = intermediate.routeKey
+                      }
+                      if (intermediate.threadId) {
+                        executingTurnCtx.threadId = intermediate.threadId
+                        executingTurnCtx.replyInThread = true
+                      }
+                      if (intermediate.rootId) {
+                        executingTurnCtx.rootId = intermediate.rootId
+                        if (executingTurnCtx.replyInThread) {
+                          executingTurnCtx.replyToMessageId = intermediate.rootId
+                        }
                       }
                       this.persistActiveTurn(latestItem.activeTurn)
                       this.host.store.markBindingReplied(intermediate.routeKey)
@@ -2428,22 +2439,33 @@ export class InboundPipeline {
     }
 
     const prefix = result.verdict.fallback ? '分流回退直通' : '分流转交'
-    if (result.triageSessionId) {
+    const fallbackDiag = result.verdict.fallback
+      ? (() => {
+          const modelRef = [result.provider, result.model].filter(Boolean).join('/')
+          const head = [result.errorCode, modelRef].filter(Boolean).join(' · ')
+          const body = result.errorMessage?.trim()
+          if (head && body) return ` [${head}: ${body}]`
+          if (head) return ` [${head}]`
+          if (body) return ` [${body}]`
+          return ''
+        })()
+      : ''
+    if (result.triageSessionId || fallbackDiag) {
       this.host.store.recordEvent({
         botId: bot.id,
         chatId: msg.chatId,
         ...chatName,
         routeKey: decision.routeKey,
-        sessionId: result.triageSessionId,
+        ...(result.triageSessionId ? { sessionId: result.triageSessionId } : {}),
         traceId,
         durationMs: result.durationMs,
         kind: 'triage',
-        summary: `${prefix}：${result.verdict.reason}`,
+        summary: `${prefix}：${result.verdict.reason}${fallbackDiag}`,
       })
     }
     return {
       handled: false,
-      triageNote: `${prefix}：${result.verdict.reason}（${result.durationMs}ms）`,
+      triageNote: `${prefix}：${result.verdict.reason}${fallbackDiag}（${result.durationMs}ms）`,
       ...(result.triageSessionId ? { triageSessionId: result.triageSessionId } : {}),
     }
   }
@@ -3015,7 +3037,12 @@ export class InboundPipeline {
     msg: InboundLarkMessage,
     decision: AgentDecision,
     stepText: string,
-  ): Promise<{ readonly sent: boolean; readonly routeKey: string }> {
+  ): Promise<{
+    readonly sent: boolean
+    readonly routeKey: string
+    readonly rootId?: string
+    readonly threadId?: string
+  }> {
     const text = normalizeReplyText(stepText, {
       allowSilentSentinel: true,
     })
@@ -3033,7 +3060,12 @@ export class InboundPipeline {
       ...(card ? { card } : { text }),
     })
     const routeKey = this.syncReplyRouteAliases(bot, msg, decision, sent)
-    return { sent: true, routeKey }
+    return {
+      sent: true,
+      routeKey,
+      ...(sent?.rootId ? { rootId: sent.rootId } : {}),
+      ...(sent?.threadId ? { threadId: sent.threadId } : {}),
+    }
   }
 
   private async deliverReply(

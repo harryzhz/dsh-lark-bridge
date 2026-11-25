@@ -137,6 +137,11 @@ export function createLarkSdkLogger(options: {
   const handle = (level: 'info' | 'warn' | 'error', args: unknown[]) => {
     const formatted = formatSdkLogArgs(args)
     if (!formatted.text) return
+    // Suppress noisy SDK warnings for subscribed-but-unhandled Feishu events
+    // (e.g. "no im.message.reaction.created_v1 handle") that otherwise flood stderr.
+    if (level === 'warn' && /\bno\s+[a-z0-9_.]+\s+handle\b/i.test(formatted.text)) {
+      return
+    }
     const hint = explainLarkErrorCode(formatted.code)
     if (formatted.code) {
       options.onErrorCode?.(formatted.code, hint)

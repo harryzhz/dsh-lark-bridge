@@ -16,6 +16,8 @@ import {
   DB_FILENAME,
   type IntegrityCheckResult,
   type StorageStats,
+  type WalCheckpointMode,
+  type WalCheckpointResult,
 } from './storage/database.js'
 import {
   migrateLegacyJsonToSqlite,
@@ -87,6 +89,13 @@ export class LarkBridgeStore {
 
   getStorageStats(): StorageStats {
     return this.db.getStats()
+  }
+
+  checkpointWal(options?: {
+    readonly mode?: WalCheckpointMode
+    readonly truncateAboveBytes?: number
+  }): WalCheckpointResult {
+    return this.db.checkpointWal(options)
   }
 
   runIntegrityCheck(): IntegrityCheckResult {

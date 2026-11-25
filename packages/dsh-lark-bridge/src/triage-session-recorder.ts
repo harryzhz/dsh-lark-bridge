@@ -50,6 +50,7 @@ export interface RecordTriageSessionInput {
   readonly stream: readonly AssistantStreamRecord[]
   readonly usage?: TokenUsage
   readonly verdict: TriageVerdict
+  readonly errorCode?: string
   readonly errorMessage?: string
   readonly timedOut?: boolean
   readonly startedAtMs: number
@@ -159,6 +160,8 @@ export class TriageSessionRecorder {
         action: input.verdict.action,
         ...(input.verdict.fallback ? { fallback: true } : {}),
         reason: input.verdict.reason,
+        ...(input.errorCode ? { errorCode: input.errorCode } : {}),
+        ...(input.errorMessage ? { errorMessage: input.errorMessage } : {}),
         ...(input.verdict.replyText ? { replyText: input.verdict.replyText } : {}),
         ...(input.provider ? { provider: input.provider } : {}),
         ...(input.model ? { model: input.model } : {}),

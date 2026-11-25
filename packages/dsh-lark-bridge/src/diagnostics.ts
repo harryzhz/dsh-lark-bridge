@@ -87,8 +87,37 @@ export function isNodeVersionSqliteReady(version = process.version): boolean {
   return major > 22 || (major === 22 && minor >= 13)
 }
 
+export const WAL_BLOAT_HARD_BYTES = 16 * 1024 * 1024
+export const WAL_BLOAT_RATIO_MIN_BYTES = 4 * 1024 * 1024
+export const WAL_BLOAT_DB_RATIO = 2
+
+export interface WalBloatAssessment {
+  readonly bloated: boolean
+  readonly walMb: string
+  readonly dbMb: string
+  readonly detail: string
+}
+
+export function assessWalBloat(
+  stats: Pick<StorageStats, 'dbBytes' | 'walBytes'>,
+): WalBloatAssessment {
+  const walMb = (stats.walBytes / (1024 * 1024)).toFixed(1)
+  const dbMb = (stats.dbBytes / (1024 * 1024)).toFixed(1)
+  const overHardCap = stats.walBytes >= WAL_BLOAT_HARD_BYTES
+  const overRatio =
+    stats.walBytes >= WAL_BLOAT_RATIO_MIN_BYTES &&
+    stats.dbBytes > 0 &&
+    stats.walBytes > stats.dbBytes * WAL_BLOAT_DB_RATIO
+  const bloated = overHardCap || overRatio
+  const detail = overHardCap
+    ? `SQLite WAL 文件体积已达 ${walMb} MB（主库 ${dbMb} MB），超过 16 MB 告警阈值。`
+    : `SQLite WAL 文件体积为 ${walMb} MB，已超过主库（${dbMb} MB）的 ${WAL_BLOAT_DB_RATIO} 倍。`
+  return { bloated, walMb, dbMb, detail }
+}
+
 export function buildDiagnosticAlerts(input: {
   readonly integrity: IntegrityCheckResult
+  readonly stats?: Pick<StorageStats, 'dbBytes' | 'walBytes'>
   readonly splitBrainAlerts: readonly SplitBrainAlert[]
   readonly botStatuses: readonly LarkBotStatus[]
   readonly recoveredStaleLock?: { readonly pid: number; readonly host: string }
@@ -118,6 +147,21 @@ export function buildDiagnosticAlerts(input: {
       suggestion: '请先运行 `lark-bridge db backup` 备份当前库，再运行 `lark-bridge db verify` / `rollback` 排查修复。',
       timestampMs: Date.now(),
     })
+  }
+
+  if (input.stats) {
+    const walCheck = assessWalBloat(input.stats)
+    if (walCheck.bloated) {
+      alerts.push({
+        id: 'storage:wal-bloated',
+        code: 'wal_bloated',
+        severity: 'warning',
+        title: `SQLite WAL 文件体积偏大（${walCheck.walMb} MB）`,
+        detail: walCheck.detail,
+        suggestion: '系统会在空闲周期自动执行非阻塞 WAL checkpoint；若持续偏大，可在低峰期运行 `lark-bridge db compact` 回收空间。',
+        timestampMs: Date.now(),
+      })
+    }
   }
 
   for (const st of input.botStatuses) {
@@ -185,6 +229,7 @@ export function buildBridgeDiagnostics(input: {
 
   const alerts = buildDiagnosticAlerts({
     integrity,
+    stats,
     splitBrainAlerts: input.splitBrainAlerts,
     botStatuses: input.botStatuses,
     ...(input.instanceLock.recoveredStaleLock
@@ -256,8 +301,11 @@ export function runOfflineDoctor(dataDir: string): OfflineDoctorReport {
         if (!integrity.ok) {
           issues.push(`SQLite 完整性校验失败：${integrity.messages.join('; ')}`)
         }
-        if (stats.walBytes > 32 * 1024 * 1024) {
-          issues.push(`WAL 文件体积较大（${Math.round(stats.walBytes / 1024 / 1024)} MB），建议在低峰期运行 lark-bridge db compact`)
+        const walCheck = assessWalBloat(stats)
+        if (walCheck.bloated) {
+          issues.push(
+            `${walCheck.detail} 建议在低峰期运行 lark-bridge db compact`,
+          )
         }
       } finally {
         db.close({ checkpoint: false })

@@ -15,6 +15,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { LarkBridgeManager } from '../src/bridge-manager.js'
 import { dispatchLarkApiRequest } from '../src/http-api.js'
 import { LarkBridgeStore } from '../src/store.js'
+import { classifyTriageError } from '../src/triage-service.js'
 
 const tempDirs: string[] = []
 
@@ -1156,6 +1157,30 @@ describe('Smart Triage Gate, Per-Group Overrides & Busy-Queue Coalescing', () =>
     expect(errText).toContain('`handoff`（回退直通）')
     expect(errText).toContain('原因：分流异常，自动直通主运行时')
     expect(errText).toContain('异常：upstream 502')
+
+    // Structured fallback error classification & model info must be persisted on triage_sessions & audit_events.
+    expect(errRow.errorCode).toBe('upstream_5xx')
+    expect(errRow.errorMessage).toBe('upstream 502')
+    const fallbackAudit = h.store
+      .listEvents(50)
+      .find((e) => e.kind === 'triage' && e.sessionId === errRow.sessionId)
+    expect(fallbackAudit?.summary).toContain('分流回退直通')
+    expect(fallbackAudit?.summary).toContain('upstream_5xx')
+    expect(fallbackAudit?.summary).toContain('deepseek/deepseek-chat')
+    expect(fallbackAudit?.summary).toContain('upstream 502')
+
+    // Verify error classification and secret redaction across common upstream failure modes.
+    expect(classifyTriageError('HTTP 429 Too Many Requests', false)).toMatchObject({
+      errorCode: 'rate_limited',
+    })
+    expect(classifyTriageError('request aborted', true)).toMatchObject({
+      errorCode: 'timeout',
+    })
+    const fakeKey = `${'sk'}-${'secretkeymaterial1234567890'}`
+    const redacted = classifyTriageError(`401 Unauthorized Bearer ${fakeKey} api_key=${fakeKey}`, false)
+    expect(redacted.errorCode).toBe('auth_error')
+    expect(redacted.errorMessage).not.toContain(fakeKey)
+    expect(redacted.errorMessage).toContain('[REDACTED')
 
     await h.manager.stop()
     h.store.close()

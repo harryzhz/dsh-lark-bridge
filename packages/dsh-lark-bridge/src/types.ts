@@ -210,6 +210,8 @@ export interface LarkTriageSession {
   readonly action: TriageAction
   readonly fallback?: boolean
   readonly reason: string
+  readonly errorCode?: string
+  readonly errorMessage?: string
   readonly replyText?: string
   readonly provider?: string
   readonly model?: string
@@ -358,7 +360,12 @@ export interface LarkCockpitSummary {
 
 export interface LarkDiagnosticAlert {
   readonly id: string
-  readonly code: 'split_brain' | 'storage_integrity' | 'bot_disconnected' | 'stale_lock_recovered'
+  readonly code:
+    | 'split_brain'
+    | 'storage_integrity'
+    | 'wal_bloated'
+    | 'bot_disconnected'
+    | 'stale_lock_recovered'
   readonly severity: 'info' | 'warning' | 'error'
   readonly botId?: string
   readonly title: string
