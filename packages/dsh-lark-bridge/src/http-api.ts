@@ -128,17 +128,18 @@ export async function dispatchLarkApiRequest(
 ): Promise<LarkApiResponse> {
   const startedAt = performance.now()
   const method = request.method.toUpperCase()
-  const rawPath = request.path.startsWith('/') ? request.path : `/${request.path}`
-  const url = new URL(rawPath, 'http://127.0.0.1')
-  const pathname = url.pathname.replace(/^\/api\/lark-bridge\/?/, '').replace(/^\/+/, '')
-  const segments = pathname ? pathname.split('/').map(decodeURIComponent) : []
-  const routeLabel = normalizeApiRouteLabel(method, segments)
+  let routeLabel = `${method} /invalid`
   const { isCliAuthenticated, isOperatorAuthenticated, principalKind } = request
   const isOwnerWebSession =
     principalKind === 'owner' && !isCliAuthenticated && !isOperatorAuthenticated
   const isPureOperatorSession = Boolean(isOperatorAuthenticated) && !isCliAuthenticated
 
   try {
+    const rawPath = request.path.startsWith('/') ? request.path : `/${request.path}`
+    const url = new URL(rawPath, 'http://127.0.0.1')
+    const pathname = url.pathname.replace(/^\/api\/lark-bridge\/?/, '').replace(/^\/+/, '')
+    const segments = pathname ? pathname.split('/').map(decodeURIComponent) : []
+    routeLabel = normalizeApiRouteLabel(method, segments)
     if (method === 'GET' && (pathname === '' || pathname === 'health')) {
       const lifecycle = manager.getLifecycleStatus?.()
       return ok({
@@ -961,8 +962,12 @@ export async function dispatchLarkApiRequest(
         if (!manager.reminders) {
           return ok({ ok: false, error: 'reminder_service_unavailable' }, 400)
         }
-        const body = bodyRecord(request.body) as unknown as CreateReminderInput
-        const item = await manager.reminders.create(body)
+        const rawBody = bodyRecord(request.body)
+        // CLI callers must never override the bot's configured creationMode (e.g. bypassing `confirm`).
+        const createInput = (
+          isCliAuthenticated ? { ...rawBody, creationMode: undefined } : rawBody
+        ) as unknown as CreateReminderInput
+        const item = await manager.reminders.create(createInput)
         return ok({ ok: true, reminder: item }, 201)
       }
     }

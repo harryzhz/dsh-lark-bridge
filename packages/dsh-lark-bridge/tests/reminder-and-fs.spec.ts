@@ -1142,6 +1142,95 @@ describe('ProactiveReminderService one-shot lifecycle, origin auto-routing & con
 
     await reminders.stop()
   })
+
+  it('prevents CLI from overriding confirm creationMode, blocks running pending_confirm reminders, and returns 400 on malformed URL encoding', async () => {
+    const dataDir = makeTempDir()
+    const store = new LarkBridgeStore(dataDir)
+    const cliAuth = ensureCliAuthEndpoint(dataDir, 'http://127.0.0.1:3880')
+    store.upsertBot({
+      id: 'confirm-bot',
+      name: 'ConfirmBot',
+      larkAppId: 'cli_confirm_bot',
+      larkAppSecret: 'sec_confirm_bot',
+      defaultWorkingDir: dataDir,
+      experimental: {
+        proactive: {
+          reminderCreationMode: 'confirm',
+        },
+      },
+    })
+
+    const fakeCtx = {
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      get: () => undefined,
+    } as unknown as Context
+
+    const runTurn = vi.fn(async () => 'should not execute')
+    const reminders = new ProactiveReminderService({
+      ctx: fakeCtx,
+      store,
+      runtimes: new RuntimeCatalog(fakeCtx),
+      workspaces: {
+        attachSession: vi.fn().mockResolvedValue(undefined),
+        archiveSession: vi.fn().mockResolvedValue(true),
+      } as unknown as WorkspaceGrouping,
+      runTurn,
+      sendOriginCard: vi.fn(async () => ({ messageId: 'om_confirm_card_1' })),
+      patchOriginCard: vi.fn(async () => {}),
+      deliverReminderOutput: vi.fn(async () => ({ messageId: 'om_out_1' })),
+    })
+
+    const manager = {
+      store,
+      cliAuth,
+      reminders,
+      listBotStatuses: () => [],
+    } as unknown as LarkBridgeManager
+    const admitter: ConnectionAdmitter = { admit: () => ({ peer: { principal: { kind: 'owner' } } }) }
+    const handler = createLarkHttpHandler(fakeCtx, admitter, manager)
+
+    // 1. CLI trying to pass creationMode: 'silent' on a confirm-mode bot must NOT bypass pending_confirm
+    const cliCreate = await invokeHandler(handler, {
+      method: 'POST',
+      url: '/api/lark-bridge/reminders',
+      headers: { authorization: `Bearer ${cliAuth.token}` },
+      body: {
+        botId: 'confirm-bot',
+        chatId: 'oc_confirm_chat',
+        title: '高敏操作复核',
+        prompt: '检查状态',
+        mentions: [{ openId: 'ou_owner_test', name: 'Owner' }],
+        afterSeconds: 600,
+        creationMode: 'silent',
+      },
+    })
+    expect(cliCreate.status).toBe(201)
+    const created = (cliCreate.json.reminder as { id: string; status: string })
+    expect(created.status).toBe('pending_confirm')
+
+    // 2. Attempting to execute the unapproved reminder via /run (CLI or service) must be rejected
+    const cliRun = await invokeHandler(handler, {
+      method: 'POST',
+      url: `/api/lark-bridge/reminders/${encodeURIComponent(created.id)}/run`,
+      headers: { authorization: `Bearer ${cliAuth.token}` },
+      body: { async: true },
+    })
+    expect(cliRun.status).toBe(400)
+    expect(String(cliRun.json.error ?? '')).toContain('尚未确认')
+    await expect(reminders.runNow(created.id)).rejects.toThrow('尚未确认')
+    await expect(reminders.triggerNow(created.id)).rejects.toThrow('尚未确认')
+    expect(runTurn).not.toHaveBeenCalled()
+
+    // 3. Malformed percent-encoded path must return 400 cleanly instead of throwing unhandled URIError
+    const badPath = await invokeHandler(handler, {
+      method: 'GET',
+      url: '/api/lark-bridge/%E0%A4%A',
+    })
+    expect(badPath.status).toBe(400)
+    expect(badPath.json.ok).toBe(false)
+
+    await reminders.stop()
+  })
 })
 
 describe('Local directory picker HTTP API & lark-bridge worktree CLI', () => {
