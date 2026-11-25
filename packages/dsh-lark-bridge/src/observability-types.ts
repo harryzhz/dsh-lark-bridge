@@ -77,6 +77,7 @@ export interface ObservabilityModelBreakdown {
 export interface ObservabilityTriggerBreakdown {
   readonly trigger: string
   readonly count: number
+  readonly sessions: number
   readonly replied: number
   readonly errors: number
   readonly totalTokens: number

@@ -423,6 +423,16 @@ describe('ObservabilityRepo, ObservabilityService & HTTP endpoints', () => {
       getObservability: (opts: Record<string, unknown>) => svc.getPayload(opts),
     }
 
+    // Default window is 24h when omitted
+    const defaultWindowRes = await dispatchLarkApiRequest(fakeCtx, fakeManager as never, {
+      method: 'GET',
+      path: '/api/lark-bridge/observability',
+      isCliAuthenticated: false,
+      principalKind: 'owner',
+    })
+    expect(defaultWindowRes.status).toBe(200)
+    expect((defaultWindowRes.payload as { window: string }).window).toBe('24h')
+
     const obsRes = await dispatchLarkApiRequest(fakeCtx, fakeManager as never, {
       method: 'GET',
       path: '/api/lark-bridge/observability?window=24h',

@@ -184,7 +184,7 @@ export async function dispatchLarkApiRequest(
         const window =
           rawWindow === '24h' || rawWindow === '7d' || rawWindow === '30d' || rawWindow === '90d'
             ? rawWindow
-            : '7d'
+            : '24h'
         const botId = url.searchParams.get('botId')?.trim() || undefined
         const chatId = url.searchParams.get('chatId')?.trim() || undefined
         const refreshStorage =

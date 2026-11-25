@@ -24,14 +24,14 @@ export function Sparkline({
   readonly tone?: 'primary' | 'success' | 'warn' | 'danger'
 }) {
   const gradId = useId()
-  const { linePath, areaPath, hasData } = buildSparklineGeometry(values, 84, 28, 3)
+  const { linePath, areaPath, hasData } = buildSparklineGeometry(values, 68, 26, 3)
   return (
     <svg
       className="fb-obs-spark"
       data-tone={tone}
-      viewBox="0 0 84 28"
-      width={84}
-      height={28}
+      viewBox="0 0 68 26"
+      width={68}
+      height={26}
       aria-hidden="true"
     >
       {hasData && (
@@ -53,6 +53,47 @@ export function Sparkline({
         strokeLinejoin="round"
       />
     </svg>
+  )
+}
+
+export function MiniStorageMeter({
+  bridgeBytes,
+  dshBytes,
+  walBloated,
+}: {
+  readonly bridgeBytes: number
+  readonly dshBytes: number
+  readonly walBloated?: boolean
+}) {
+  const total = Math.max(1, bridgeBytes + dshBytes)
+  const bridgePct = Math.round((bridgeBytes / total) * 100)
+  const dshPct = Math.max(0, 100 - bridgePct)
+  return (
+    <div
+      className="fb-obs-mini-meter"
+      title={`桥接数据 ${bridgePct}% · DSH 会话/附件 ${dshPct}%`}
+      aria-hidden="true"
+    >
+      <div className="fb-obs-mini-meter-track">
+        {bridgePct > 0 && (
+          <span
+            className="fb-obs-mini-meter-seg"
+            data-kind={walBloated ? 'warn' : 'cache'}
+            style={{ width: `${Math.max(4, bridgePct)}%` }}
+          />
+        )}
+        {dshPct > 0 && (
+          <span
+            className="fb-obs-mini-meter-seg"
+            data-kind="primary"
+            style={{ width: `${Math.max(4, dshPct)}%` }}
+          />
+        )}
+      </div>
+      <span className="fb-obs-mini-meter-lbl fb-mono">
+        DB {bridgePct}%
+      </span>
+    </div>
   )
 }
 
@@ -762,7 +803,13 @@ export interface SegmentedBarItem {
   readonly kind: 'cache' | 'primary' | 'output' | 'warn' | 'muted' | 'error'
 }
 
-export function SegmentedBar({ items }: { readonly items: readonly SegmentedBarItem[] }) {
+export function SegmentedBar({
+  items,
+  layout = 'grid',
+}: {
+  readonly items: readonly SegmentedBarItem[]
+  readonly layout?: 'grid' | 'row' | 'list'
+}) {
   const nonZero = items.filter((item) => item.sharePct > 0)
   return (
     <div className="fb-obs-segbar-wrap">
@@ -781,12 +828,12 @@ export function SegmentedBar({ items }: { readonly items: readonly SegmentedBarI
           ))
         )}
       </div>
-      <div className="fb-obs-segbar-legend fb-num">
+      <div className="fb-obs-segbar-legend fb-num" data-layout={layout}>
         {items.map((item) => (
           <div key={item.id} className="fb-obs-segbar-row">
             <span className="fb-obs-legend-item">
               <i className="fb-obs-dot" data-kind={item.kind} />
-              <span>{item.label}</span>
+              <span className="fb-obs-segbar-lbl" title={item.label}>{item.label}</span>
             </span>
             <span className="fb-obs-segbar-val">
               <strong className="fb-mono">{item.valueText}</strong>
@@ -864,15 +911,18 @@ export function ActivityHeatmap({
       <div className="fb-obs-heat-grid" onMouseLeave={() => setHovered(null)}>
         <div className="fb-obs-heat-axis-row">
           <span />
-          {[0, 4, 8, 12, 16, 20, 23].map((h) => (
-            <span
-              key={h}
-              className="fb-obs-heat-hour fb-mono"
-              style={{ gridColumn: `${h + 2} / span 2` }}
-            >
-              {String(h).padStart(2, '0')}
-            </span>
-          ))}
+          {Array.from({ length: 24 }, (_, h) => {
+            const show = h === 0 || h === 4 || h === 8 || h === 12 || h === 16 || h === 20 || h === 23
+            return (
+              <span
+                key={h}
+                className="fb-obs-heat-hour fb-mono"
+                data-end={h === 23 ? '' : undefined}
+              >
+                {show ? String(h).padStart(2, '0') : ''}
+              </span>
+            )
+          })}
         </div>
         {WEEKDAY_LABELS.map((dayLabel, dow) => (
           <div key={dayLabel} className="fb-obs-heat-row">

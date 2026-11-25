@@ -71,6 +71,7 @@ describe('observability-model pure helpers', () => {
     expect(computeNiceAxisMax(73)).toBe(100)
 
     expect(resolveTriggerLabel('triage')).toBe('智能分流')
+    expect(resolveTriggerLabel('substitute')).toBe('代答模式')
     expect(resolveErrorCodeLabel('rate_limited')).toBe('上游限流 / 429')
     expect(resolveTableLabel('telemetry_usage_events')).toBe('遥测明细事件')
   })

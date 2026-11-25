@@ -165,7 +165,7 @@ export function OverviewView({
                 className="fb-inline-jump"
                 onClick={onOpenObservability}
               >
-                深入观测 →
+                查看洞察 →
               </button>
             )}
           </div>
