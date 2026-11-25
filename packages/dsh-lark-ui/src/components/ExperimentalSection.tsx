@@ -148,6 +148,19 @@ export function ExperimentalSection({
   const isRunning = runningNow || dreamState?.status === 'running'
   const statusView = buildDreamStatusPresentation(dreamState, runError, isRunning)
 
+  const defaultQuietWindowPatch = () => {
+    const isUntouchedLegacy =
+      !proactive.quietHoursEnabled &&
+      proactive.quietHoursStart === '23:00' &&
+      proactive.quietHoursEnd === '09:00'
+    return {
+      quietHoursStart:
+        !proactive.quietHoursStart || isUntouchedLegacy ? '00:00' : proactive.quietHoursStart,
+      quietHoursEnd:
+        !proactive.quietHoursEnd || isUntouchedLegacy ? '08:00' : proactive.quietHoursEnd,
+    }
+  }
+
   return (
     <>
       <GroupTitle>Dreaming 与长期记忆</GroupTitle>
@@ -309,8 +322,7 @@ export function ExperimentalSection({
                   ...(delegationFollowupEnabled && !proactive.quietHoursEnabled
                     ? {
                         quietHoursEnabled: true,
-                        quietHoursStart: proactive.quietHoursStart || '00:00',
-                        quietHoursEnd: proactive.quietHoursEnd || '08:00',
+                        ...defaultQuietWindowPatch(),
                       }
                     : {}),
                 })
@@ -327,8 +339,7 @@ export function ExperimentalSection({
               onChange={(quietHoursEnabled) =>
                 patchProactive({
                   quietHoursEnabled,
-                  ...(proactive.quietHoursStart ? {} : { quietHoursStart: '00:00' }),
-                  ...(proactive.quietHoursEnd ? {} : { quietHoursEnd: '08:00' }),
+                  ...(quietHoursEnabled ? defaultQuietWindowPatch() : {}),
                 })
               }
             />
