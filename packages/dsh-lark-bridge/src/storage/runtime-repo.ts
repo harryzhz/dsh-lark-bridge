@@ -1022,6 +1022,13 @@ export class RuntimeRepo {
     return Number(res.changes) > 0
   }
 
+  countPendingTurns(): number {
+    const row = this.db.prepare('SELECT COUNT(*) AS cnt FROM pending_turns').get() as
+      | { cnt?: number }
+      | undefined
+    return Number(row?.cnt ?? 0)
+  }
+
   // ── Smart Triage Context Persistence ────────────────────────────────────
 
   loadTriageContextScopes(minUpdatedAtMs = 0): Array<{

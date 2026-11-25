@@ -166,9 +166,13 @@ export interface TriageContextPersistence {
   pruneTriageContextScopes(cutoffMs: number): number
 }
 
+const DEFAULT_HISTORY_PERSIST_DEBOUNCE_MS = 1_500
+const MAX_HYDRATED_SCOPES = MAX_SCOPE_ENTRIES * 2
+
 export interface TriageContextStoreOptions {
   readonly persistence?: TriageContextPersistence
   readonly resolvePrimaryRouteKey?: (routeKey: string) => string
+  readonly historyPersistDebounceMs?: number
 }
 
 /**
@@ -183,12 +187,19 @@ export class TriageContextStore {
   private readonly ephemeralThreads = new Map<string, EphemeralRouterThread>()
   private readonly ephemeralAliases = new Map<string, string>()
   private readonly hydratedScopes = new Set<string>()
+  private readonly dirtyHistoryScopes = new Set<string>()
   private readonly persistence?: TriageContextPersistence
   private readonly resolveBindingPrimary?: (routeKey: string) => string
+  private readonly historyPersistDebounceMs: number
+  private historyFlushTimer: ReturnType<typeof setTimeout> | null = null
 
   constructor(options: TriageContextStoreOptions = {}) {
     this.persistence = options.persistence
     this.resolveBindingPrimary = options.resolvePrimaryRouteKey
+    this.historyPersistDebounceMs =
+      typeof options.historyPersistDebounceMs === 'number' && options.historyPersistDebounceMs >= 0
+        ? options.historyPersistDebounceMs
+        : DEFAULT_HISTORY_PERSIST_DEBOUNCE_MS
     this.hydrateFromPersistence()
   }
 
@@ -201,7 +212,14 @@ export class TriageContextStore {
   }
 
   markScopeHydrated(scopeKey: string): void {
-    if (scopeKey) this.hydratedScopes.add(scopeKey)
+    if (!scopeKey) return
+    this.hydratedScopes.delete(scopeKey)
+    this.hydratedScopes.add(scopeKey)
+    while (this.hydratedScopes.size > MAX_HYDRATED_SCOPES) {
+      const oldest = this.hydratedScopes.values().next().value
+      if (!oldest) break
+      this.hydratedScopes.delete(oldest)
+    }
   }
 
   resolveEphemeralPrimary(routeKey: string, now = Date.now()): string | undefined {
@@ -469,10 +487,12 @@ export class TriageContextStore {
       removed = true
       if (nextEntries.length === 0) {
         this.recentByScope.delete(scopeKey)
+        this.dirtyHistoryScopes.delete(scopeKey)
+        this.hydratedScopes.delete(scopeKey)
         this.deletePersistedScope(scopeKey, 'history')
       } else {
         bucket.entries.splice(0, bucket.entries.length, ...nextEntries)
-        this.persistScope(scopeKey, 'history', bucket, bucket.updatedAtMs)
+        this.scheduleHistoryPersist(scopeKey)
       }
     }
     return removed
@@ -487,13 +507,33 @@ export class TriageContextStore {
     this.workerSummaryByRoute.delete(normalized)
     this.recentByScope.delete(routeKey)
     this.recentByScope.delete(normalized)
+    this.dirtyHistoryScopes.delete(routeKey)
+    this.dirtyHistoryScopes.delete(normalized)
+    this.hydratedScopes.delete(routeKey)
+    this.hydratedScopes.delete(normalized)
     this.deletePersistedScope(routeKey)
     if (normalized !== routeKey) {
       this.deletePersistedScope(normalized)
     }
   }
 
+  flushPersisted(): void {
+    if (this.historyFlushTimer) {
+      clearTimeout(this.historyFlushTimer)
+      this.historyFlushTimer = null
+    }
+    if (this.dirtyHistoryScopes.size === 0) return
+    const pending = [...this.dirtyHistoryScopes]
+    this.dirtyHistoryScopes.clear()
+    for (const scopeKey of pending) {
+      const bucket = this.recentByScope.get(scopeKey)
+      if (!bucket || bucket.entries.length === 0) continue
+      this.persistScope(scopeKey, 'history', bucket, bucket.updatedAtMs)
+    }
+  }
+
   prunePersisted(now = Date.now()): void {
+    this.flushPersisted()
     this.pruneExpired(now)
     try {
       this.persistence?.pruneTriageContextScopes(now - MAX_RETAINED_CONTEXT_TTL_MS)
@@ -597,6 +637,23 @@ export class TriageContextStore {
     }
   }
 
+  private scheduleHistoryPersist(scopeKey: string): void {
+    if (!this.persistence || !scopeKey) return
+    if (this.historyPersistDebounceMs <= 0) {
+      const bucket = this.recentByScope.get(scopeKey)
+      if (bucket) this.persistScope(scopeKey, 'history', bucket, bucket.updatedAtMs)
+      return
+    }
+    this.dirtyHistoryScopes.add(scopeKey)
+    if (!this.historyFlushTimer) {
+      this.historyFlushTimer = setTimeout(() => {
+        this.historyFlushTimer = null
+        this.flushPersisted()
+      }, this.historyPersistDebounceMs)
+      this.historyFlushTimer.unref?.()
+    }
+  }
+
   private appendHistory(scopeKey: string, entry: TriageHistoryEntry, now: number): void {
     let bucket = this.recentByScope.get(scopeKey)
     if (!bucket || now - bucket.updatedAtMs > MAX_RETAINED_CONTEXT_TTL_MS) {
@@ -610,7 +667,7 @@ export class TriageContextStore {
         const existing = bucket.entries[existingIdx]!
         if (!existing.senderName && entry.senderName) {
           bucket.entries[existingIdx] = { ...existing, senderName: entry.senderName }
-          this.persistScope(scopeKey, 'history', bucket, bucket.updatedAtMs)
+          this.scheduleHistoryPersist(scopeKey)
         }
         return
       }
@@ -620,7 +677,7 @@ export class TriageContextStore {
       bucket.entries.splice(0, bucket.entries.length - MAX_MESSAGES_PER_SCOPE)
     }
     bucket.updatedAtMs = now
-    this.persistScope(scopeKey, 'history', bucket, now)
+    this.scheduleHistoryPersist(scopeKey)
   }
 
   private deleteEphemeralThread(primaryKey: string): void {
@@ -639,6 +696,8 @@ export class TriageContextStore {
     for (const [key, bucket] of this.recentByScope) {
       if (now - bucket.updatedAtMs > MAX_RETAINED_CONTEXT_TTL_MS) {
         this.recentByScope.delete(key)
+        this.dirtyHistoryScopes.delete(key)
+        this.hydratedScopes.delete(key)
         this.deletePersistedScope(key, 'history')
       }
     }
@@ -658,6 +717,8 @@ export class TriageContextStore {
       const oldest = this.recentByScope.keys().next().value
       if (!oldest) break
       this.recentByScope.delete(oldest)
+      this.dirtyHistoryScopes.delete(oldest)
+      this.hydratedScopes.delete(oldest)
       this.deletePersistedScope(oldest, 'history')
     }
     while (this.workerSummaryByRoute.size > MAX_SCOPE_ENTRIES) {
@@ -809,7 +870,12 @@ export class LlmTriageService {
         : input.routerConfig.timeoutMs
 
     if (input.signal?.aborted) {
-      return failOpen('服务正在关闭，跳过分流', target)
+      return {
+        verdict: { action: 'silent', reason: '原消息已撤回或服务正在关闭，已取消分流' },
+        provider: target.provider,
+        model: target.model,
+        durationMs: Date.now() - startedAtMs,
+      }
     }
 
     const run = await this.executeTriageStream({
@@ -942,9 +1008,12 @@ export class LlmTriageService {
     const roleSummary =
       input.group?.role?.mode === 'override'
         ? input.group.role.systemPrompt.trim()
-        : input.bot.role.enabled
-          ? input.bot.role.systemPrompt.trim()
-          : ''
+        : [
+            input.bot.role.enabled ? input.bot.role.systemPrompt.trim() : '',
+            input.group?.role?.mode === 'append' ? input.group.role.systemPrompt.trim() : '',
+          ]
+            .filter(Boolean)
+            .join('\n\n')
 
     const delegationFollowupEnabled = Boolean(
       input.bot.experimental.proactive.remindersEnabled &&

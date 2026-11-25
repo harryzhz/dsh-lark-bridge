@@ -650,4 +650,49 @@ describe('SQLite WAL storage, atomic auto-migration & db CLI', () => {
       store.close()
     }
   })
+
+  it('applies migration v6 index on triage_context_scopes(updated_at_ms) and counts pending turns without full JSON scan', () => {
+    const dir = makeTempDir('dsh-lark-v6-')
+    const store = new LarkBridgeStore(dir)
+    try {
+      expect(store.getStorageStats().schemaVersion).toBe(6)
+      const plan = store.db
+        .prepare(
+          'EXPLAIN QUERY PLAN SELECT scope_key, kind, payload_json, updated_at_ms FROM triage_context_scopes WHERE updated_at_ms >= ? ORDER BY updated_at_ms ASC',
+        )
+        .all(0) as Array<{ detail?: string }>
+      expect(plan.some((r) => String(r.detail ?? '').includes('idx_triage_context_scopes_updated'))).toBe(
+        true,
+      )
+
+      expect(store.countPendingTurns()).toBe(0)
+      store.upsertPendingTurn({
+        id: 'pt-count-1',
+        botId: 'bot-a',
+        chatId: 'oc_1',
+        messageId: 'om_1',
+        routeKey: 'cli_a:oc_1:om_1',
+        replyMode: 'reply',
+        trigger: 'mention',
+        allowSilentEmptyReply: false,
+        startedAtMs: Date.now(),
+      })
+      store.upsertPendingTurn({
+        id: 'pt-count-2',
+        botId: 'bot-a',
+        chatId: 'oc_1',
+        messageId: 'om_2',
+        routeKey: 'cli_a:oc_1:om_2',
+        replyMode: 'reply',
+        trigger: 'mention',
+        allowSilentEmptyReply: false,
+        startedAtMs: Date.now(),
+      })
+      expect(store.countPendingTurns()).toBe(2)
+      store.deletePendingTurn('pt-count-1')
+      expect(store.countPendingTurns()).toBe(1)
+    } finally {
+      store.close()
+    }
+  })
 })
