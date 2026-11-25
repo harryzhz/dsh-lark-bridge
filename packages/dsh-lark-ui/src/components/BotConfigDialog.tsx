@@ -44,7 +44,7 @@ import type {
 } from '../types.js'
 import { AgentRuntimeFields } from './AgentRuntimeFields.js'
 import { ConfigDialog, type ConfigSection } from './ConfigDialog.js'
-import { DirectoryField } from './DirectoryPickerModal.js'
+import { DirectoryField, DirectoryPickerPanel } from './DirectoryPickerModal.js'
 import { ExperimentalSection } from './ExperimentalSection.js'
 import {
   Avatar,
@@ -403,6 +403,7 @@ function CreateBotDialog({
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
   const [profileView, setProfileView] = useState<{ runtimeId: string; initialProfileId?: string } | null>(null)
+  const [dirPickerOpen, setDirPickerOpen] = useState(false)
   const [profileRevision, setProfileRevision] = useState(0)
 
   const opAuth = auth?.openPlatform
@@ -586,16 +587,28 @@ function CreateBotDialog({
     <Modal
       open
       onClose={onClose}
-      title={profileViewRuntime ? `${profileViewRuntime.name} 启动配置` : '新增智能体'}
+      title={
+        profileViewRuntime
+          ? `${profileViewRuntime.name} 启动配置`
+          : dirPickerOpen
+            ? '选择本地工作目录'
+            : '新增智能体'
+      }
       headless
       className={profileViewRuntime ? 'fb-dialog' : 'fb-schedule-dialog fb-create-bot-dialog'}
       onKeyDownCapture={
-        profileViewRuntime
+        profileViewRuntime || dirPickerOpen
           ? (event) => {
-              if (event.key === 'Escape' && !event.shiftKey && !event.defaultPrevented) {
+              if (
+                event.key === 'Escape' &&
+                !event.shiftKey &&
+                !event.defaultPrevented &&
+                !(event.target instanceof Element && event.target.closest('[data-fb-escape-local]'))
+              ) {
                 event.preventDefault()
                 event.stopPropagation()
-                setProfileView(null)
+                if (profileViewRuntime) setProfileView(null)
+                else setDirPickerOpen(false)
               }
             }
           : undefined
@@ -618,6 +631,17 @@ function CreateBotDialog({
                 ...(changed ? { model: undefined, reasoningEffort: undefined } : {}),
               })
             }
+          }}
+        />
+      ) : dirPickerOpen ? (
+        <DirectoryPickerPanel
+          initialPath={draft.defaultWorkingDir.trim() || '~'}
+          backLabel="新增飞书智能体"
+          onBack={() => setDirPickerOpen(false)}
+          onClose={onClose}
+          onSelect={(selected) => {
+            patch({ defaultWorkingDir: selected })
+            setDirPickerOpen(false)
           }}
         />
       ) : (
@@ -764,6 +788,7 @@ function CreateBotDialog({
             value={draft.defaultWorkingDir}
             onChange={(defaultWorkingDir) => patch({ defaultWorkingDir })}
             placeholder="~ 或 /path/to/workspace"
+            onBrowse={() => setDirPickerOpen(true)}
           />
         </SettingRow>
         <SettingRow title="工作区" desc="留空默认使用工作目录末级名称">
@@ -862,6 +887,7 @@ function EditBotDialog({
   const [syncingProfile, setSyncingProfile] = useState(false)
   const [error, setError] = useState('')
   const [profileView, setProfileView] = useState<{ runtimeId: string; initialProfileId?: string } | null>(null)
+  const [dirPickerOpen, setDirPickerOpen] = useState(false)
   const [profileRevision, setProfileRevision] = useState(0)
   const existingId = target.id
 
@@ -870,6 +896,7 @@ function EditBotDialog({
     setLocalDreamState(target.dreamState)
     setSection('basic')
     setProfileView(null)
+    setDirPickerOpen(false)
     setError('')
 
     if (!target.avatarUrl?.trim() || !target.description?.trim()) {
@@ -998,7 +1025,26 @@ function EditBotDialog({
                 />
               ),
             }
-          : null
+          : dirPickerOpen
+            ? {
+                title: '选择本地工作目录',
+                onBack: () => setDirPickerOpen(false),
+                content: (
+                  <div className="fb-dialog-subview-single">
+                    <DirectoryPickerPanel
+                      initialPath={draft.defaultWorkingDir.trim() || '~'}
+                      backLabel="基本信息"
+                      onBack={() => setDirPickerOpen(false)}
+                      onClose={onClose}
+                      onSelect={(selected) => {
+                        patch({ defaultWorkingDir: selected })
+                        setDirPickerOpen(false)
+                      }}
+                    />
+                  </div>
+                ),
+              }
+            : null
       }
     >
       {section === 'basic' && (
@@ -1038,6 +1084,7 @@ function EditBotDialog({
               value={draft.defaultWorkingDir}
               onChange={(defaultWorkingDir) => patch({ defaultWorkingDir })}
               placeholder="~ 或 /path/to/workspace"
+              onBrowse={() => setDirPickerOpen(true)}
             />
           </SettingRow>
           <SettingRow title="工作区" desc="留空默认使用工作目录末级名称">

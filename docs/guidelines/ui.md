@@ -18,11 +18,11 @@
 ## 3. 弹窗层级与二级管理视图规范
 
 - **禁止同级双弹框叠层**：严禁在主配置弹窗（如 `ConfigDialog`、`CreateBotDialog`）之上再弹出同尺寸二级 `<Modal>`，避免双层遮罩叠加导致页面背景色变暗及整窗生硬覆盖。
-- **原位下钻子视图**：从配置弹窗进入二级管理界面（如外部 Agent 启动配置管理）须在同一 `<Modal>` 内原位切换为子视图（如 `ConfigDialog` `subview` / `RuntimeProfilePanel`）：
+- **原位下钻子视图**：从配置弹窗进入二级管理界面或目录浏览（如外部 Agent 启动配置管理 `RuntimeProfilePanel`、本地工作目录选择 `DirectoryPickerPanel`）须在同一 `<Modal>` 内原位切换为子视图：
   - 顶部提供面包屑返回按钮（`‹ 上级视图 / 子视图标题`）；
-  - 支持 `Escape` 逐级返回（优先关闭已展开的下拉菜单）；
+  - 支持 `Escape` 逐级返回（优先关闭已展开的下拉菜单、新建输入框或清空非空筛选词）；
   - 全程保留父级未保存草稿。
-- **轻量辅助小窗遮罩抑制**：仅轻量辅助选择器（如目录浏览 `DirectoryPickerModal`、扫码授权 `LarkAuthDialog`）允许在父弹窗上以更小尺寸叠层打开，且必须标记 `.fb-nested-modal` 抑制二次遮罩与二次模糊，不得加深页面背景。
+- **轻量辅助小窗遮罩抑制**：仅确认明显窄于父弹窗的只读/授权小窗（如扫码授权 `LarkAuthDialog`、只读工具 Schema 预览）允许在宽父弹窗上叠层打开，且必须标记 `.fb-nested-modal` 抑制二次遮罩与二次模糊，不得加深页面背景。
 
 ## 4. 开关展开层级、缩进与子分组规范（`<NestedSettings>` / `.fb-nested`）
 

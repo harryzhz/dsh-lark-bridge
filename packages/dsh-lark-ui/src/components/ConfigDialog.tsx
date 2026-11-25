@@ -54,7 +54,12 @@ export function ConfigDialog<K extends string>({
       onKeyDownCapture={
         subview
           ? (event) => {
-              if (event.key === 'Escape' && !event.shiftKey && !event.defaultPrevented) {
+              if (
+                event.key === 'Escape' &&
+                !event.shiftKey &&
+                !event.defaultPrevented &&
+                !(event.target instanceof Element && event.target.closest('[data-fb-escape-local]'))
+              ) {
                 event.preventDefault()
                 event.stopPropagation()
                 subview.onBack()
