@@ -729,4 +729,162 @@ describe('Feishu message recall cancellation', () => {
     await manager.stop()
     store.close()
   })
+
+  it('does not abort an executing coalesced batch when only one peer message is recalled, and catches 230006 on triage quick_reply', async () => {
+    const dir = makeTempDir()
+    const store = new LarkBridgeStore(dir)
+    const runtime = createRecallMockRuntimeCtx({
+      llmStream: () => ({
+        async *[Symbol.asyncIterator]() {
+          yield {
+            type: 'block-end',
+            index: 0,
+            block: {
+              type: 'tool-call',
+              id: 'tc_qr',
+              name: 'route_message',
+              arguments: JSON.stringify({
+                action: 'quick_reply',
+                reason: '简单打招呼',
+                replyText: '你好，我在！',
+              }),
+            },
+          }
+          yield { type: 'finish', reason: { kind: 'tool-calls' } }
+        },
+      }),
+    })
+    const manager = new LarkBridgeManager(
+      runtime.ctx,
+      {
+        dataDir: dir,
+        publicBaseUrl: 'http://127.0.0.1:3880',
+        idleSweepIntervalMs: 0,
+        maxAuditEvents: 200,
+        autoInstallCliAndSkill: false,
+      },
+      store,
+    )
+
+    store.upsertBot({
+      id: 'bot-recall',
+      name: 'RecallBot',
+      larkAppId: 'cli_recall_1',
+      larkAppSecret: 'mock-secret-value',
+      defaultWorkingDir: dir,
+      agentPreset: 'standard',
+      receivedReactionEmoji: 'NONE',
+      router: {
+        enabled: true,
+        provider: 'deepseek',
+        model: 'deepseek-chat',
+        scope: 'passive_only',
+        coalesceQueuedMessages: true,
+      },
+    })
+
+    const sentTargets: string[] = []
+    const fakeTransport = {
+      state: { botOpenId: 'ou_bot_recall', connected: true },
+      addReaction: vi.fn().mockResolvedValue(undefined),
+      removeReaction: vi.fn().mockResolvedValue(undefined),
+      sendReply: vi.fn(async (opts: { replyToMessageId?: string }) => {
+        sentTargets.push(opts.replyToMessageId ?? '')
+        return { messageId: `om_out_${sentTargets.length}` }
+      }),
+    } as unknown as LarkBotTransport
+
+    // 1. Start turn 1 in a native thread so session is busy, then enqueue 2 coalesced items (om_peer_a, om_peer_b)
+    const t1Ready = runtime.waitForNextTurnStart()
+    const p1 = manager.inbound.handleInbound(
+      'bot-recall',
+      fakeTransport,
+      makeMessage({
+        messageId: 'om_batch_root',
+        threadId: 'omt_batch_1',
+        text: '@RecallBot 先做任务1',
+      }),
+    )
+    const turn1 = await t1Ready
+
+    const p2 = manager.inbound.handleInbound(
+      'bot-recall',
+      fakeTransport,
+      makeMessage({
+        messageId: 'om_peer_a',
+        rootId: 'om_batch_root',
+        parentId: 'om_batch_root',
+        threadId: 'omt_batch_1',
+        senderOpenId: 'ou_alice',
+        text: '@RecallBot Alice 正常问题',
+      }),
+    )
+    const p3 = manager.inbound.handleInbound(
+      'bot-recall',
+      fakeTransport,
+      makeMessage({
+        messageId: 'om_peer_b',
+        rootId: 'om_batch_root',
+        parentId: 'om_batch_root',
+        threadId: 'omt_batch_1',
+        senderOpenId: 'ou_bob',
+        text: '@RecallBot Bob 稍后撤回的问题',
+      }),
+    )
+    await vi.waitFor(() => expect(manager.inbound.getActiveCount()).toBe(3))
+    await new Promise((r) => setTimeout(r, 30))
+
+    const t2Ready = runtime.waitForNextTurnStart()
+    turn1.finish('任务1完成')
+    const turn2 = await t2Ready
+    expect(turn2.userText).toContain('Alice 正常问题')
+    expect(turn2.userText).toContain('Bob 稍后撤回的问题')
+
+    // Recall ONLY om_peer_b (the latest item!) while the coalesced turn is running.
+    manager.inbound.handleMessageRecalled('bot-recall', fakeTransport, makeRecallEvent('om_peer_b'))
+    expect(runtime.cancelCalls).toHaveLength(0)
+
+    turn2.finish('合并批次已完成')
+    await Promise.all([p1, p2, p3])
+    // Reply MUST still be delivered, anchored to surviving om_peer_a (NOT recalled om_peer_b)
+    expect(sentTargets).toEqual(['om_batch_root', 'om_peer_a'])
+
+    // 2. Triage quick_reply hitting Feishu 230006 settles cleanly without recording an error event
+    store.upsertBot({
+      id: 'bot-recall',
+      name: 'RecallBot',
+      larkAppId: 'cli_recall_1',
+      larkAppSecret: 'mock-secret-value',
+      defaultWorkingDir: dir,
+      agentPreset: 'standard',
+      receivedReactionEmoji: 'NONE',
+      router: {
+        enabled: true,
+        provider: 'deepseek',
+        model: 'deepseek-chat',
+        scope: 'all_group',
+      },
+    })
+    const err230006 = Object.assign(new Error('400'), {
+      response: { data: { code: 230006, msg: 'message recalled' } },
+    })
+    const qrTransport = {
+      state: { botOpenId: 'ou_bot_recall', connected: true },
+      addReaction: vi.fn().mockResolvedValue(undefined),
+      removeReaction: vi.fn().mockResolvedValue(undefined),
+      sendReply: vi.fn().mockRejectedValue(err230006),
+    } as unknown as LarkBotTransport
+
+    await manager.inbound.handleInbound(
+      'bot-recall',
+      qrTransport,
+      makeMessage({ messageId: 'om_qr_recalled', text: '@RecallBot 在吗' }),
+    )
+    const events = store.listEvents(30)
+    expect(events.some((e) => e.kind === 'lifecycle' && e.summary.includes('230006'))).toBe(true)
+    expect(events.some((e) => e.kind === 'error')).toBe(false)
+
+    await manager.stop()
+    store.close()
+  })
 })

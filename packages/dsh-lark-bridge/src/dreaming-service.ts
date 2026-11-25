@@ -113,18 +113,33 @@ function triggerPriorityTier(trigger?: string): number {
 function summarizeSessionEvents(events: readonly SessionEvent[]): SessionDigestEntry {
   const lines: string[] = []
   let firstUserText = ''
-  let usedSilenceCli = false
   let substantiveAgentCount = 0
+  let currentTurnUsedSilenceCli = false
+  let currentTurnAgentLines: string[] = []
+
+  const flushTurn = () => {
+    if (!currentTurnUsedSilenceCli && currentTurnAgentLines.length > 0) {
+      substantiveAgentCount += currentTurnAgentLines.length
+      lines.push(...currentTurnAgentLines)
+    }
+    currentTurnUsedSilenceCli = false
+    currentTurnAgentLines = []
+  }
 
   for (const ev of events) {
+    if (ev.type === 'turn/start') {
+      flushTurn()
+      continue
+    }
     if (ev.type === 'tool/call') {
       const args = (ev.data as { arguments?: unknown }).arguments
       if (typeof args === 'string' && args.includes('lark-bridge silence')) {
-        usedSilenceCli = true
+        currentTurnUsedSilenceCli = true
       }
       continue
     }
     if (ev.type === 'user/message') {
+      flushTurn()
       const blocks = (ev.data as { content?: ReadonlyArray<{ type?: string; text?: string }> }).content ?? []
       const raw = blocks
         .filter((b) => b.type === 'text' && typeof b.text === 'string')
@@ -152,11 +167,11 @@ function summarizeSessionEvents(events: readonly SessionEvent[]): SessionDigestE
         .join('\n')
       const cleanAgentText = normalizeReplyText(rawText, { allowSilentSentinel: true })
       if (cleanAgentText) {
-        substantiveAgentCount += 1
-        lines.push(`- **Agent**: ${cleanAgentText.slice(0, 700)}`)
+        currentTurnAgentLines.push(`- **Agent**: ${cleanAgentText.slice(0, 700)}`)
       }
     }
   }
+  flushTurn()
   const joined = lines.join('\n')
   const markdown =
     joined.length > MAX_TRANSCRIPT_CHARS_PER_SESSION
@@ -164,7 +179,7 @@ function summarizeSessionEvents(events: readonly SessionEvent[]): SessionDigestE
       : joined
   return {
     markdown,
-    hasSubstantiveAgentReply: !usedSilenceCli && substantiveAgentCount > 0,
+    hasSubstantiveAgentReply: substantiveAgentCount > 0,
     fingerprint: firstUserText ? normalizeFingerprint(firstUserText) : '',
   }
 }

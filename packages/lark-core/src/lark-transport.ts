@@ -682,25 +682,68 @@ export class LarkBotTransport {
     messageId: string,
     fileKey: string,
     type: 'image' | 'file',
+    options: { readonly maxBytes?: number; readonly timeoutMs?: number } = {},
   ): Promise<Buffer | undefined> {
+    const maxBytes =
+      typeof options.maxBytes === 'number' && options.maxBytes > 0
+        ? options.maxBytes
+        : 25 * 1024 * 1024
+    const timeoutMs =
+      typeof options.timeoutMs === 'number' && options.timeoutMs > 0
+        ? options.timeoutMs
+        : 30_000
+    let timeoutTimer: ReturnType<typeof setTimeout> | undefined
     try {
       const res = await this.client.im.messageResource.get({
         path: { message_id: messageId, file_key: fileKey },
         params: { type },
       })
-      const stream = (res as { getReadableStream?: () => NodeJS.ReadableStream })?.getReadableStream?.()
+      const stream = (
+        res as {
+          getReadableStream?: () => NodeJS.ReadableStream & { destroy?: (err?: Error) => void }
+        }
+      )?.getReadableStream?.()
       if (!stream) return undefined
-      const chunks: Buffer[] = []
-      for await (const chunk of stream) {
-        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+      const destroyStream = (reason: Error) => {
+        try {
+          stream.destroy?.(reason)
+        } catch {
+          // Best-effort stream teardown.
+        }
       }
-      return Buffer.concat(chunks)
+      let timedOut = false
+      timeoutTimer = setTimeout(() => {
+        timedOut = true
+        destroyStream(new Error(`download timed out after ${timeoutMs}ms`))
+      }, timeoutMs)
+      timeoutTimer.unref?.()
+
+      const chunks: Buffer[] = []
+      let totalBytes = 0
+      for await (const chunk of stream) {
+        if (timedOut) {
+          throw new Error(`download timed out after ${timeoutMs}ms`)
+        }
+        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+        totalBytes += buf.length
+        if (totalBytes > maxBytes) {
+          const err = new Error(
+            `resource size exceeded limit (${totalBytes} > ${maxBytes} bytes)`,
+          )
+          destroyStream(err)
+          throw err
+        }
+        chunks.push(buf)
+      }
+      return Buffer.concat(chunks, totalBytes)
     } catch (err) {
       this.log(
         'warn',
         `downloadResource(${type}:${fileKey}) failed: ${err instanceof Error ? err.message : String(err)}`,
       )
       return undefined
+    } finally {
+      if (timeoutTimer) clearTimeout(timeoutTimer)
     }
   }
 

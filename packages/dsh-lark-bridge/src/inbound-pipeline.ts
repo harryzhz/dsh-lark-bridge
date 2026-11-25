@@ -1179,9 +1179,16 @@ export class InboundPipeline {
       })
     }
 
+    const cleanupRecoveryReactionIfNeeded = async () => {
+      if (recovery?.existingReactionId) {
+        await transport.removeReaction(msg.messageId, recovery.existingReactionId).catch(() => {})
+      }
+    }
+
     try {
       const preDisabled = getSelfDisabledScope()
       if (preDisabled) {
+        await cleanupRecoveryReactionIfNeeded()
         recordPreTurnCancel(disabledCancelSummary(preDisabled, '已取消当前轮次并停止执行'))
         return
       }
@@ -1200,6 +1207,7 @@ export class InboundPipeline {
       ])
       const postSenderDisabled = getSelfDisabledScope()
       if (postSenderDisabled) {
+        await cleanupRecoveryReactionIfNeeded()
         recordPreTurnCancel(disabledCancelSummary(postSenderDisabled, '已取消当前轮次并停止执行'))
         return
       }
@@ -1502,19 +1510,44 @@ export class InboundPipeline {
           throw createDisabledAbortError(preExecDisabled)
         }
 
-        const latestItem = batchItems[batchItems.length - 1] ?? selfItem
-        const batchSize = batchItems.length
-        const effectiveDecision: AgentDecision =
-          batchSize === 1
-            ? latestItem.decision
+        const pruneRecalledFromBatch = (): boolean => {
+          const recalled: QueuedWorkerTurnItem[] = []
+          const surviving: QueuedWorkerTurnItem[] = []
+          for (const item of batchItems) {
+            if (this.isTurnRecalled(bot.id, item)) {
+              recalled.push(item)
+            } else {
+              surviving.push(item)
+            }
+          }
+          if (recalled.length === 0) return false
+          if (surviving.length === 0) return true
+          for (const item of recalled) {
+            this.settleRecalledTurn(item.activeTurn, '原消息已撤回，已从合并批次移除')
+          }
+          batchItems = surviving
+          return false
+        }
+
+        if (pruneRecalledFromBatch()) {
+          throw createRecalledAbortError()
+        }
+
+        const buildEffectiveDecision = (items: readonly QueuedWorkerTurnItem[]): AgentDecision => {
+          const tail = items[items.length - 1] ?? selfItem
+          return items.length === 1
+            ? tail.decision
             : {
-                ...latestItem.decision,
-                allowSilentEmptyReply: batchItems.every((i) => i.decision.allowSilentEmptyReply),
-                autoCloseAfterCompletion: batchItems.every(
-                  (i) => i.decision.autoCloseAfterCompletion,
-                ),
-                silentOnly: batchItems.every((i) => Boolean(i.decision.silentOnly)),
+                ...tail.decision,
+                allowSilentEmptyReply: items.every((i) => i.decision.allowSilentEmptyReply),
+                autoCloseAfterCompletion: items.every((i) => i.decision.autoCloseAfterCompletion),
+                silentOnly: items.every((i) => Boolean(i.decision.silentOnly)),
               }
+        }
+
+        let latestItem = batchItems[batchItems.length - 1] ?? selfItem
+        const batchSize = batchItems.length
+        let effectiveDecision: AgentDecision = buildEffectiveDecision(batchItems)
 
         this.host.titleGuard.ensureCleanSessionTitle(
           acquired.agent.session,
@@ -1555,20 +1588,54 @@ export class InboundPipeline {
         if (postPromptDisabled) {
           throw createDisabledAbortError(postPromptDisabled)
         }
-        if (batchItems.some((i) => this.isTurnRecalled(bot.id, i))) {
+        if (pruneRecalledFromBatch()) {
           throw createRecalledAbortError()
         }
+        latestItem = batchItems[batchItems.length - 1] ?? latestItem
+        effectiveDecision = buildEffectiveDecision(batchItems)
         if (batchItems.every((i) => i.activeTurn.settled) || this.host.isDisposed()) {
           shouldDisposeEphemeral = acquired.disposeAfter
           return
         }
 
-        const linkedCancel = linkAbortSignals(batchItems.map((i) => i.cancelController.signal))
+        const batchCancelController = new AbortController()
+        const cancelListeners: Array<{ readonly signal: AbortSignal; readonly fn: () => void }> = []
+        const evaluateBatchCancelSignal = (source: AbortSignal) => {
+          if (batchCancelController.signal.aborted) return
+          if (this.isSignalDisabled(source)) {
+            batchCancelController.abort(source.reason)
+            return
+          }
+          // In a coalesced batch, a single member recalling their message must not abort
+          // other members' valid messages; only abort when every item in the batch is recalled.
+          if (batchItems.every((i) => this.isTurnRecalled(bot.id, i))) {
+            batchCancelController.abort(source.reason)
+          }
+        }
+        for (const item of batchItems) {
+          const sig = item.cancelController.signal
+          if (sig.aborted) {
+            evaluateBatchCancelSignal(sig)
+          } else {
+            const fn = () => evaluateBatchCancelSignal(sig)
+            sig.addEventListener('abort', fn, { once: true })
+            cancelListeners.push({ signal: sig, fn })
+          }
+        }
+        const linkedCancel = {
+          signal: batchCancelController.signal,
+          dispose: () => {
+            for (const entry of cancelListeners) {
+              entry.signal.removeEventListener('abort', entry.fn)
+            }
+            cancelListeners.length = 0
+          },
+        }
         const isSilenced = () => batchItems.some((i) => i.activeTurn.silencedByControl)
         const isBatchCancelled = () =>
           linkedCancel.signal.aborted ||
           Boolean(this.getBatchDisabledScope(bot.id, batchItems)) ||
-          batchItems.some((i) => this.isTurnRecalled(bot.id, i))
+          batchItems.every((i) => this.isTurnRecalled(bot.id, i))
         const executingTurnCtx = buildExecutingTurnContext(
           bot,
           latestItem.msg,
@@ -1741,12 +1808,17 @@ export class InboundPipeline {
       return { dispose, archive: dispose }
     }
 
-    if (batchItems.some((item) => this.isTurnRecalled(bot.id, item))) {
-      for (const item of batchItems) {
-        if (this.isTurnRecalled(bot.id, item)) {
-          item.activeTurn.reactionRemoved = true
-        }
+    const recalledItems: QueuedWorkerTurnItem[] = []
+    const survivingItems: QueuedWorkerTurnItem[] = []
+    for (const item of batchItems) {
+      if (this.isTurnRecalled(bot.id, item)) {
+        item.activeTurn.reactionRemoved = true
+        recalledItems.push(item)
+      } else {
+        survivingItems.push(item)
       }
+    }
+    if (survivingItems.length === 0) {
       this.host.store.recordEvent({
         botId: bot.id,
         chatId: latestItem.msg.chatId,
@@ -1758,7 +1830,7 @@ export class InboundPipeline {
         kind: 'lifecycle',
         summary:
           batchSize > 1
-            ? '批次中存在已撤回消息，已取消当前轮次并跳过回复'
+            ? '批次中全部消息已撤回，已取消当前轮次并跳过回复'
             : '原消息已撤回，已取消当前轮次并跳过回复',
       })
       const currentBinding = this.host.store.getBinding(effectiveDecision.routeKey)
@@ -1767,6 +1839,20 @@ export class InboundPipeline {
       )
       return { dispose, archive: dispose }
     }
+    if (recalledItems.length > 0) {
+      this.host.store.recordEvent({
+        botId: bot.id,
+        chatId: latestItem.msg.chatId,
+        ...chatName,
+        routeKey: effectiveDecision.routeKey,
+        sessionId: acquired.sessionId,
+        traceId: latestItem.traceId,
+        durationMs: Date.now() - startedMs,
+        kind: 'lifecycle',
+        summary: `批次中 ${recalledItems.length} 条消息已撤回，继续向其余 ${survivingItems.length} 条正常消息投递回复`,
+      })
+    }
+    const deliveryItem = survivingItems[survivingItems.length - 1]!
 
     const intermediateSentCount = batchItems.reduce(
       (sum, item) => sum + item.activeTurn.intermediateSentCount,
@@ -1836,7 +1922,7 @@ export class InboundPipeline {
           deliveredRouteKey = await this.deliverReply(
             bot,
             transport,
-            latestItem.msg,
+            deliveryItem.msg,
             effectiveDecision,
             acquired.sessionId,
             normalizedReply,
@@ -1845,14 +1931,14 @@ export class InboundPipeline {
           )
         } catch (err) {
           if (isLarkMessageRecalledError(err)) {
-            latestItem.activeTurn.reactionRemoved = true
+            deliveryItem.activeTurn.reactionRemoved = true
             this.host.store.recordEvent({
               botId: bot.id,
-              chatId: latestItem.msg.chatId,
+              chatId: deliveryItem.msg.chatId,
               ...chatName,
               routeKey: effectiveDecision.routeKey,
               sessionId: acquired.sessionId,
-              traceId: latestItem.traceId,
+              traceId: deliveryItem.traceId,
               durationMs: Date.now() - startedMs,
               kind: 'lifecycle',
               summary: '目标消息已撤回（230006），已取消回复投递',
@@ -2045,7 +2131,7 @@ export class InboundPipeline {
 
     const isRecalledAbort =
       (err instanceof TurnAbortedError && err.kind === 'recalled') ||
-      batchItems.some((item) => this.isTurnRecalled(bot.id, item))
+      (batchItems.length > 0 && batchItems.every((item) => this.isTurnRecalled(bot.id, item)))
     if (isRecalledAbort) {
       let anyRecalledClaimed = false
       for (const item of batchItems) {
@@ -2390,12 +2476,32 @@ export class InboundPipeline {
     ) {
       const replyText = normalizeReplyText(result.verdict.replyText, { allowSilentSentinel: true })
       if (replyText) {
-        const sent = await transport.sendReply({
-          chatId: msg.chatId,
-          replyToMessageId: msg.messageId,
-          replyMode: decision.replyMode,
-          text: replyText,
-        })
+        let sent: SendLarkReplyResult | undefined
+        try {
+          sent = await transport.sendReply({
+            chatId: msg.chatId,
+            replyToMessageId: msg.messageId,
+            replyMode: decision.replyMode,
+            text: replyText,
+          })
+        } catch (err) {
+          if (isLarkMessageRecalledError(err)) {
+            this.markMessageRecalled(bot.id, msg.messageId)
+            this.host.store.recordEvent({
+              botId: bot.id,
+              chatId: msg.chatId,
+              ...chatName,
+              routeKey: decision.routeKey,
+              ...(result.triageSessionId ? { sessionId: result.triageSessionId } : {}),
+              traceId,
+              durationMs: Date.now() - startedMs,
+              kind: 'lifecycle',
+              summary: '目标消息已撤回（230006），已取消分流快回',
+            })
+            return { handled: true }
+          }
+          throw err
+        }
         if (decision.sessionMode === 'thread') {
           const aliasRouteKeys = this.collectReplyAliasKeys(bot, msg, decision, sent)
           this.host.triage!.context.recordEphemeralQuickReply({

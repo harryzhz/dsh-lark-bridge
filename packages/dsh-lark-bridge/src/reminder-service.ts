@@ -818,6 +818,14 @@ export class ProactiveReminderService {
       if (createdSession) {
         await this.disposeSessionHandle(sessionId)
       }
+      // During graceful service shutdown, leave the reminder in `running` so the restarted
+      // process can recover and retry it automatically via `recoverStaleRunningReminders()`.
+      if (this.disposed) {
+        return {
+          runningItem: this.host.store.getReminder(item.id) ?? item,
+          completion: Promise.resolve(this.host.store.getReminder(item.id) ?? item),
+        }
+      }
       const msg = err instanceof Error ? err.message : String(err)
       const finishedMs = Date.now()
       const failed = this.host.store.upsertReminder({
