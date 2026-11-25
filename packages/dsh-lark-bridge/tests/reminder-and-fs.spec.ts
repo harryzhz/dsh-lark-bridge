@@ -382,6 +382,7 @@ describe('ProactiveReminderService one-shot lifecycle, origin auto-routing & con
     const renamed: string[] = []
     const staleSid = 'session-interrupted-123'
 
+    const disposeSpy = vi.fn().mockResolvedValue(undefined)
     const fakeCtx = {
       logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
       sessions: {
@@ -411,7 +412,7 @@ describe('ProactiveReminderService one-shot lifecycle, origin auto-routing & con
       agents: {
         create: vi.fn(async ({ sessionId }: { sessionId: string }) => ({
           agent: { session: { id: sessionId, header: { cwd: workDir, agentPreset: 'codex' } } },
-          dispose: vi.fn().mockResolvedValue(undefined),
+          dispose: disposeSpy,
         })),
       },
       get: (service: string) => {
@@ -543,18 +544,40 @@ describe('ProactiveReminderService one-shot lifecycle, origin auto-routing & con
       routeKey: `reminder:${fresh.id}`,
     })
 
-    // Complete the in-flight turn and verify archive preserves lastSessionId
+    // Complete the in-flight turn and verify archive preserves lastSessionId (handle stays managed until idle sweep)
     releaseTurn(REMINDER_SILENT_SENTINEL)
     await vi.waitFor(() => {
       expect(store.getReminder(fresh.id)?.status).toBe('archived')
     })
+    expect(disposeSpy).not.toHaveBeenCalled()
     expect(store.getReminder(fresh.id)).toMatchObject({
       status: 'archived',
       resolution: 'silent_ok',
       lastSessionId: runningReminder.lastSessionId,
     })
 
-    await reminders.stop()
+    // 4. Shutdown during ctx.agents.create leaves reminder in `running` for next startup retry
+    let rejectCreate!: (err: Error) => void
+    ;(fakeCtx.agents.create as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectCreate = reject
+        }),
+    )
+    const shutRem = await reminders.create({
+      botId: 'alert-bot',
+      chatId: 'oc_alert',
+      title: '停机期间启动的提醒',
+      prompt: '核查状态',
+      mentions: [{ openId: 'ou_oncall_1', name: 'Alex' }],
+      afterSeconds: 300,
+    })
+    const execPromise = reminders.triggerNow(shutRem.id)
+    await vi.waitFor(() => expect(rejectCreate).toBeTypeOf('function'))
+    const stopPromise = reminders.stop()
+    rejectCreate(new Error('host shutting down'))
+    await Promise.all([execPromise, stopPromise])
+    expect(store.getReminder(shutRem.id)?.status).toBe('running')
   })
 
   it('enforces prompt length cap, reminder chain depth/TTL/backoff circuit breaker, and same-thread duplicate guard', async () => {

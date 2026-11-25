@@ -534,4 +534,80 @@ describe('LarkBotTransport profile description sync & member/bot avatar resoluti
     expect(isLarkMessageRecalledError('code=230006 message recalled')).toBe(true)
     expect(isLarkMessageRecalledError(new Error('code=230002 not in chat'))).toBe(false)
   })
+
+  it('destroys stream and returns undefined when downloadResourceBuffer exceeds maxBytes or times out', async () => {
+    const logs: string[] = []
+    const transport = new LarkBotTransport(createBot(), {
+      onMessage: () => {},
+      logger: (_level, msg) => logs.push(msg),
+    })
+
+    const internalClient = (
+      transport as unknown as {
+        client: {
+          im: {
+            messageResource: {
+              get: ReturnType<typeof vi.fn>
+            }
+          }
+        }
+      }
+    ).client
+
+    // 1. Oversized stream -> immediately destroyed without buffering full payload
+    let destroyedOnOverflow = false
+    let emittedChunks = 0
+    internalClient.im.messageResource.get = vi.fn().mockResolvedValue({
+      getReadableStream: () => {
+        const stream = {
+          destroy: vi.fn(() => {
+            destroyedOnOverflow = true
+          }),
+          async *[Symbol.asyncIterator]() {
+            for (let i = 0; i < 10; i += 1) {
+              if (destroyedOnOverflow) break
+              emittedChunks += 1
+              yield Buffer.alloc(60, 0x41)
+            }
+          },
+        }
+        return stream
+      },
+    })
+    const oversized = await transport.downloadResourceBuffer('om_big', 'file_big', 'file', {
+      maxBytes: 100,
+    })
+    expect(oversized).toBeUndefined()
+    expect(destroyedOnOverflow).toBe(true)
+    expect(emittedChunks).toBeLessThanOrEqual(2)
+    expect(logs.some((l) => l.includes('exceeded limit'))).toBe(true)
+
+    // 2. Stalled stream -> destroyed on timeout
+    let destroyedOnTimeout = false
+    internalClient.im.messageResource.get = vi.fn().mockResolvedValue({
+      getReadableStream: () => {
+        let rejectNext: ((err: Error) => void) | undefined
+        return {
+          destroy: vi.fn((err?: Error) => {
+            destroyedOnTimeout = true
+            rejectNext?.(err ?? new Error('destroyed'))
+          }),
+          [Symbol.asyncIterator]() {
+            return {
+              next: () =>
+                new Promise<IteratorResult<Buffer>>((_resolve, reject) => {
+                  rejectNext = reject
+                }),
+            }
+          },
+        }
+      },
+    })
+    const stalled = await transport.downloadResourceBuffer('om_slow', 'file_slow', 'file', {
+      timeoutMs: 30,
+    })
+    expect(stalled).toBeUndefined()
+    expect(destroyedOnTimeout).toBe(true)
+    expect(logs.some((l) => l.includes('timed out'))).toBe(true)
+  })
 })

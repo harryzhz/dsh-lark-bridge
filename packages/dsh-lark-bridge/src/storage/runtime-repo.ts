@@ -593,7 +593,10 @@ export class RuntimeRepo {
     const rows = this.db
       .prepare("SELECT session_id, payload_json FROM dream_sessions WHERE status = 'running'")
       .all() as Array<{ session_id: string; payload_json: string }>
-    if (rows.length === 0) return 0
+    const runningStates = this.db
+      .prepare("SELECT bot_id FROM dream_states WHERE status = 'running'")
+      .all() as Array<{ bot_id: string }>
+    if (rows.length === 0 && runningStates.length === 0) return 0
     this.db.transaction(() => {
       const updateStmt = this.db.prepare(
         "UPDATE dream_sessions SET status = 'failed', payload_json = ? WHERE session_id = ?",
@@ -611,8 +614,15 @@ export class RuntimeRepo {
           // Ignore malformed payload.
         }
       }
+      if (runningStates.length > 0) {
+        this.db
+          .prepare(
+            "UPDATE dream_states SET status = 'failed', last_summary = '执行因服务重启中断' WHERE status = 'running'",
+          )
+          .run()
+      }
     })
-    return rows.length
+    return rows.length || runningStates.length
   }
 
   listRawDreamSessions(botId?: string): LarkDreamSession[] {

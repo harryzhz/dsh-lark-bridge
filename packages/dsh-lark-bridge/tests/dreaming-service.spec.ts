@@ -360,6 +360,12 @@ describe('DreamingService dual-gate scheduling, product dataDir isolation & nati
 
     // Deleting a backfilled entry persists and must NOT resurrect on reload
     expect(store1.deleteDreamSession('session-legacy-older')).toBe(true)
+    store1.upsertDreamState({
+      botId: 'bot-legacy',
+      status: 'running',
+      lastSummary: '正在整理…',
+      processedSessionIds: [],
+    })
     store1.upsertDreamSession({
       sessionId: 'session-interrupted',
       botId: 'bot-legacy',
@@ -380,6 +386,10 @@ describe('DreamingService dual-gate scheduling, product dataDir isolation & nati
       sessionId: 'session-interrupted',
       status: 'failed',
       summary: '执行因服务重启中断',
+    })
+    expect(store2.getDreamState('bot-legacy')).toMatchObject({
+      status: 'failed',
+      lastSummary: '执行因服务重启中断',
     })
   })
 
@@ -719,5 +729,120 @@ describe('DreamingService dual-gate scheduling, product dataDir isolation & nati
     const latestDream = store.listDreamSessions('dream-mem-bot')[0]
     expect(latestDream?.outcome).toBe('memory_updated')
     expect(latestDream?.memoryStats).toMatchObject({ created: 1, superseded: 1 })
+  })
+
+  it('preserves multi-turn listener sessions whose earlier turn gave a substantive reply even if a later turn used lark-bridge silence', async () => {
+    const dataDir = makeTempDir()
+    const workDir = makeTempDir()
+    const store = new LarkBridgeStore(dataDir)
+    store.upsertBot({
+      id: 'dream-multi-bot',
+      name: 'MultiBot',
+      enabled: true,
+      larkAppId: 'cli_multi',
+      larkAppSecret: 'sec_multi',
+      defaultWorkingDir: workDir,
+      experimental: {
+        dreaming: {
+          enabled: true,
+          scheduleTime: '02:00',
+          minNewSessions: 1,
+          scopes: ['踩坑与排障经验'],
+          cleanupAndCorrect: true,
+        },
+      },
+    })
+    store.upsertManagedSession({
+      sessionId: 'sess-multi-silence',
+      botId: 'dream-multi-bot',
+      chatId: 'oc_multi',
+      routeKey: 'cli_multi:oc_multi:om_1',
+      trigger: 'listener',
+      createdAtMs: Date.now() - 10_000,
+      lastActivityMs: Date.now() - 5_000,
+    })
+
+    const eventsBySession = new Map<string, SessionEvent[]>([
+      [
+        'sess-multi-silence',
+        [
+          { type: 'turn/start', data: { turn: 1 } } as unknown as SessionEvent,
+          {
+            type: 'user/message',
+            data: { content: [{ type: 'text', text: '线上接口 P95 飙升了，帮忙查下' }] },
+          } as unknown as SessionEvent,
+          {
+            type: 'assistant/message',
+            data: { message: { content: [{ type: 'text', text: '已定位到数据库连接池耗尽，建议调大上限。' }] } },
+          } as unknown as SessionEvent,
+          { type: 'turn/start', data: { turn: 2 } } as unknown as SessionEvent,
+          {
+            type: 'user/message',
+            data: { content: [{ type: 'text', text: '收到谢谢，我去改配置' }] },
+          } as unknown as SessionEvent,
+          {
+            type: 'tool/call',
+            data: { name: 'bash', arguments: '{"command":"lark-bridge silence --reason ack"}' },
+          } as unknown as SessionEvent,
+          {
+            type: 'assistant/message',
+            data: { message: { content: [{ type: 'text', text: '已静默，无需打扰。' }] } },
+          } as unknown as SessionEvent,
+        ],
+      ],
+    ])
+
+    const fakeCtx = {
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      sessions: {
+        get: (sid: string) =>
+          eventsBySession.has(sid)
+            ? { id: sid, header: { cwd: workDir }, snapshotEvents: () => eventsBySession.get(sid)! }
+            : undefined,
+      },
+      agents: {
+        listPresets: () => [{ id: 'standard', name: 'Standard', defaultModel: 'mock-model' }],
+        create: vi.fn(async ({ sessionId, setup }: { sessionId: string; setup?: (c: unknown, a: unknown) => Promise<void> | void }) => {
+          const agent = {
+            session: {
+              id: sessionId,
+              header: { cwd: workDir },
+              append: vi.fn(),
+              snapshotEvents: () => [],
+            },
+          }
+          await setup?.(fakeCtx, agent)
+          return {
+            agent,
+            dispose: vi.fn().mockResolvedValue(undefined),
+          }
+        }),
+      },
+      llm: {
+        listProviders: () => [{ id: 'mock', name: 'Mock' }],
+        listModels: async () => [{ id: 'mock-model', name: 'Mock Model' }],
+      },
+      get: () => undefined,
+    } as unknown as Context
+
+    const dreaming = new DreamingService({
+      ctx: fakeCtx,
+      dataDir,
+      store,
+      runtimes: new RuntimeCatalog(fakeCtx),
+      workspaces: {
+        attachSession: vi.fn().mockResolvedValue(undefined),
+        archiveSession: vi.fn().mockResolvedValue(true),
+      } as unknown as WorkspaceGrouping,
+      runTurn: vi.fn(async () => '已整理 1 条排障经验。'),
+    })
+
+    const state = await dreaming.runForBot('dream-multi-bot', {
+      force: false,
+      now: new Date(2026, 10, 25, 2, 5, 0),
+    })
+    expect(state.status).toBe('succeeded')
+    expect(state.lastProcessedCount).toBe(1)
+    expect(state.processedSessionIds).toContain('sess-multi-silence')
   })
 })
