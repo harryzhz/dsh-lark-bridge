@@ -1,6 +1,7 @@
 import { useEffect, useId, useState, type ReactNode } from 'react'
 import type {
   CockpitPayload,
+  ObservabilityDatabasePerf,
   ObservabilityHeatmapCell,
   ObservabilityLatencyBucket,
   ObservabilitySeriesPoint,
@@ -9,9 +10,11 @@ import type {
 import {
   buildSparklineGeometry,
   computeNiceAxisMax,
+  computeNiceDurationAxisMax,
   formatBytes,
   formatCompactNumber,
   formatLatencyMs,
+  formatSubMs,
   formatTokens,
   resolveHeatmapLevel,
   WEEKDAY_LABELS,
@@ -766,15 +769,17 @@ export function ProductTimeSeriesChart({
   )
 }
 
-export type TechChartMode = 'latency' | 'vitals'
+export type TechChartMode = 'latency' | 'vitals' | 'database'
 
 export function TechnicalTimeSeriesChart({
   series,
   vitals,
+  database,
   mode,
 }: {
   readonly series: readonly ObservabilitySeriesPoint[]
   readonly vitals: readonly ProcessVitalPoint[]
+  readonly database?: ObservabilityDatabasePerf
   readonly mode: TechChartMode
 }) {
   const [hoverIdx, setHoverIdx] = useState<number | null>(null)
@@ -786,6 +791,115 @@ export function TechnicalTimeSeriesChart({
   const padB = 26
   const plotW = W - padL - padR
   const plotH = H - padT - padB
+
+  if (mode === 'database') {
+    const db = database
+    const routes = db?.apiRoutes ?? []
+    const queries = db?.slowQueries ?? []
+    const maxRouteMs = Math.max(10, ...routes.map((r) => r.p95Ms || r.avgMs))
+    const maxQueryMs = Math.max(5, ...queries.map((q) => q.maxMs || q.avgMs))
+    return (
+      <div ref={wrapRef} className="fb-obs-db-wrap">
+        <div className="fb-obs-db-kpis fb-num">
+          <div className="fb-obs-micro-cell">
+            <span className="fb-obs-micro-lbl">SQLite 查询 P50 / P95</span>
+            <strong className="fb-mono">
+              {db && db.sampleCount > 0 ? `${formatSubMs(db.p50Ms)} / ${formatSubMs(db.p95Ms)}` : '—'}
+            </strong>
+            <span className="fb-obs-muted">
+              均耗 {db && db.sampleCount > 0 ? formatSubMs(db.avgMs) : '—'} · 累计{' '}
+              {formatCompactNumber(db?.totalQueries ?? 0)} 次
+            </span>
+          </div>
+          <div className="fb-obs-micro-cell">
+            <span className="fb-obs-micro-lbl">最大单次查询</span>
+            <strong className="fb-mono">
+              {db && db.sampleCount > 0 ? formatSubMs(db.maxMs) : '—'}
+            </strong>
+            <span className="fb-obs-muted">近 {db?.sampleCount ?? 0} 次采样窗口</span>
+          </div>
+          <div className="fb-obs-micro-cell">
+            <span className="fb-obs-micro-lbl">慢查询 (≥{db?.slowThresholdMs ?? 10}ms)</span>
+            <strong className="fb-mono">{db?.slowQueryCount ?? 0}</strong>
+            <span className="fb-obs-muted">
+              {db?.lastCheckpointMs !== undefined
+                ? `WAL 整理 ${formatSubMs(db.lastCheckpointMs)}`
+                : '进程启动以来累计'}
+            </span>
+          </div>
+          <div className="fb-obs-micro-cell">
+            <span className="fb-obs-micro-lbl">完整性校验耗时</span>
+            <strong className="fb-mono">
+              {db && db.integrityCheckMs > 0 ? formatSubMs(db.integrityCheckMs) : '—'}
+            </strong>
+            <span className="fb-obs-muted">5 分钟缓存复用，不阻塞轮询</span>
+          </div>
+        </div>
+
+        <div className="fb-obs-db-split">
+          <div className="fb-obs-db-col">
+            <div className="fb-obs-subhead">后端接口响应耗时 (P50 / P95)</div>
+            {routes.length === 0 ? (
+              <div className="fb-obs-empty-inline">等待接口请求采样…</div>
+            ) : (
+              <div className="fb-obs-bars-list fb-num">
+                {routes.slice(0, 6).map((r) => {
+                  const tone = r.p95Ms >= 200 ? 'error' : r.p95Ms >= 50 ? 'warn' : 'primary'
+                  return (
+                    <div key={r.route} className="fb-obs-hrow">
+                      <div className="fb-obs-hrow-top">
+                        <code className="fb-obs-inline-code">{r.route}</code>
+                        <span className="fb-mono fb-obs-muted">
+                          {formatSubMs(r.p50Ms)} / P95 {formatSubMs(r.p95Ms)} · {r.count} 次
+                        </span>
+                      </div>
+                      <div className="fb-obs-mini-track">
+                        <div
+                          className="fb-obs-mini-fill"
+                          data-kind={tone}
+                          style={{ width: `${Math.max(4, Math.min(100, (r.p95Ms / maxRouteMs) * 100))}%` }}
+                        />
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+
+          <div className="fb-obs-db-col" data-bordered="">
+            <div className="fb-obs-subhead">SQLite 高耗时语句 Top (均耗 / 峰值)</div>
+            {queries.length === 0 ? (
+              <div className="fb-obs-empty-inline">暂无 SQLite 语句采样</div>
+            ) : (
+              <div className="fb-obs-bars-list fb-num">
+                {queries.slice(0, 6).map((q) => {
+                  const tone = q.maxMs >= 50 ? 'error' : q.maxMs >= 10 ? 'warn' : 'cache'
+                  return (
+                    <div key={q.fingerprint} className="fb-obs-hrow">
+                      <div className="fb-obs-hrow-top">
+                        <code className="fb-obs-inline-code">{q.fingerprint}</code>
+                        <span className="fb-mono fb-obs-muted">
+                          {formatSubMs(q.avgMs)} / 峰 {formatSubMs(q.maxMs)} · {q.count} 次
+                        </span>
+                      </div>
+                      <div className="fb-obs-mini-track">
+                        <div
+                          className="fb-obs-mini-fill"
+                          data-kind={tone}
+                          style={{ width: `${Math.max(4, Math.min(100, (q.maxMs / maxQueryMs) * 100))}%` }}
+                        />
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    )
+  }
 
   if (mode === 'vitals') {
     const count = Math.max(1, vitals.length)
@@ -932,11 +1046,11 @@ export function TechnicalTimeSeriesChart({
     )
   }
 
-  // Latency P50 / P95 + Error Spikes
+  // Agent end-to-end reply latency P50 / P95 + Error Spikes
   const count = Math.max(1, series.length)
   const slotW = plotW / count
   const barW = Math.max(4, Math.min(16, slotW * 0.45))
-  const maxLat = computeNiceAxisMax(
+  const maxLat = computeNiceDurationAxisMax(
     Math.max(1000, ...series.map((p) => Math.max(p.latencyP95Ms, p.latencyP50Ms))),
   )
   const maxErr = computeNiceAxisMax(Math.max(2, ...series.map((p) => p.errors)))
@@ -979,13 +1093,15 @@ export function TechnicalTimeSeriesChart({
         {hovered ? (
           <>
             <strong className="fb-mono">{hovered.fullLabel}</strong>
-            <span>P50 {formatLatencyMs(hovered.latencyP50Ms)}</span>
+            <span>回复耗时 P50 {formatLatencyMs(hovered.latencyP50Ms)}</span>
             <span>P95 {formatLatencyMs(hovered.latencyP95Ms)}</span>
             <span>均值 {formatLatencyMs(hovered.avgLatencyMs)}</span>
             <span>异常 {hovered.errors}</span>
           </>
         ) : (
-          <span>实线 P50 · 虚线 P95（左轴）· 异常柱（右轴）· 悬停查看各时段延迟分位</span>
+          <span>
+            Agent 端到端回复耗时（收消息→最终回复，含推理与工具）· 实线 P50 · 虚线 P95（左轴）· 异常柱（右轴）
+          </span>
         )}
       </div>
 
@@ -1097,15 +1213,15 @@ export function TechnicalTimeSeriesChart({
       <div className="fb-obs-legend fb-num">
         <span className="fb-obs-legend-item">
           <i className="fb-obs-dot" data-kind="primary" />
-          P50 中位延迟
+          回复耗时 P50（中位）
         </span>
         <span className="fb-obs-legend-item">
           <i className="fb-obs-dot" data-kind="warn" />
-          P95 尾延迟
+          回复耗时 P95（尾延迟）
         </span>
         <span className="fb-obs-legend-item">
           <i className="fb-obs-dot" data-kind="error" />
-          异常次数 (右轴)
+          异常次数（右轴）
         </span>
       </div>
     </div>

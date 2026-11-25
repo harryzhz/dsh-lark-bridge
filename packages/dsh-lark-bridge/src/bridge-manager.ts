@@ -610,6 +610,10 @@ export class LarkBridgeManager {
     return this.observability.getPayload(options)
   }
 
+  recordApiTiming(route: string, durationMs: number): void {
+    this.observability.recordApiTiming(route, durationMs)
+  }
+
   clearSplitBrainAlert(botId: string): boolean {
     return this.splitBrain.clearAlert(botId)
   }
@@ -758,12 +762,19 @@ export class LarkBridgeManager {
     return this.resolveWebBaseUrl()
   }
 
-  sessionWebUrl(sessionId: string): string {
+  sessionWebUrl(
+    sessionId: string,
+    options: { readonly allowGuestViewer?: boolean } = {},
+  ): string {
     const base = this.resolveWebBaseUrl()
     if (this.shouldUseLoopbackSessionHandoff(base)) {
       return this.sessionHandoff.buildUrl(base, sessionId)
     }
-    if (!isLoopbackOrigin(base) && this.sessionViewer.canViewSession(sessionId)) {
+    if (
+      options.allowGuestViewer !== false &&
+      !isLoopbackOrigin(base) &&
+      this.sessionViewer.canViewSession(sessionId)
+    ) {
       return this.sessionViewer.buildViewerUrl(base, sessionId)
     }
     return `${base}/#session=${encodeURIComponent(sessionId)}`

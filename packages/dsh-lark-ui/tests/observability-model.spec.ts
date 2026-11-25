@@ -2,9 +2,11 @@ import { describe, expect, it } from 'vitest'
 import {
   buildSparklineGeometry,
   computeNiceAxisMax,
+  computeNiceDurationAxisMax,
   formatBytes,
   formatDeltaBadge,
   formatLatencyMs,
+  formatSubMs,
   formatTokens,
   formatUptime,
   resolveErrorCodeLabel,
@@ -33,6 +35,15 @@ describe('observability-model pure helpers', () => {
     expect(formatLatencyMs(2_450)).toBe('2.45s')
     expect(formatLatencyMs(18_400)).toBe('18.4s')
     expect(formatLatencyMs(92_000)).toBe('1m 32s')
+    expect(formatLatencyMs(120_000)).toBe('2m')
+    expect(formatLatencyMs(5_400_000)).toBe('1h 30m')
+    expect(formatLatencyMs(7_200_000)).toBe('2h')
+
+    expect(formatSubMs(0)).toBe('<0.01ms')
+    expect(formatSubMs(0.14)).toBe('0.14ms')
+    expect(formatSubMs(3.45)).toBe('3.5ms')
+    expect(formatSubMs(42.3)).toBe('42ms')
+    expect(formatSubMs(1450)).toBe('1.45s')
 
     expect(formatUptime(120)).toBe('2m')
     expect(formatUptime(5 * 3600 + 1800)).toBe('5h 30m')
@@ -69,6 +80,9 @@ describe('observability-model pure helpers', () => {
     expect(computeNiceAxisMax(14)).toBe(20)
     expect(computeNiceAxisMax(42)).toBe(50)
     expect(computeNiceAxisMax(73)).toBe(100)
+    expect(computeNiceDurationAxisMax(1_800)).toBe(2_000)
+    expect(computeNiceDurationAxisMax(75_000)).toBe(120_000)
+    expect(computeNiceDurationAxisMax(5_100_000)).toBe(7_200_000)
 
     expect(resolveTriggerLabel('triage')).toBe('智能分流')
     expect(resolveTriggerLabel('substitute')).toBe('代答模式')

@@ -664,6 +664,14 @@ export class RuntimeRepo {
     return rows.length || runningStates.length
   }
 
+  hasDreamSession(sessionId: string): boolean {
+    if (!sessionId) return false
+    const row = this.db
+      .prepare('SELECT 1 AS hit FROM dream_sessions WHERE session_id = ? LIMIT 1')
+      .get(sessionId) as { hit?: number } | undefined
+    return Boolean(row?.hit)
+  }
+
   listRawDreamSessions(botId?: string): LarkDreamSession[] {
     const rows = (
       botId
@@ -845,6 +853,25 @@ export class RuntimeRepo {
       if (b.status === 'archived') return -1
       return Date.parse(a.scheduledAt) - Date.parse(b.scheduledAt)
     })
+  }
+
+  findReminderOriginBySessionId(
+    sessionId: string,
+  ): { readonly botId: string; readonly chatId?: string } | undefined {
+    if (!sessionId) return undefined
+    const row = this.db
+      .prepare(
+        `SELECT bot_id, json_extract(payload_json, '$.origin.chatId') AS chat_id
+         FROM reminders
+         WHERE json_extract(payload_json, '$.lastSessionId') = ?
+         LIMIT 1`,
+      )
+      .get(sessionId) as { bot_id?: string; chat_id?: string | null } | undefined
+    if (!row?.bot_id) return undefined
+    return {
+      botId: String(row.bot_id),
+      ...(row.chat_id ? { chatId: String(row.chat_id) } : {}),
+    }
   }
 
   getReminder(id: string): LarkReminderItem | undefined {

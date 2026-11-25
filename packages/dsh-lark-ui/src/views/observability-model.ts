@@ -107,9 +107,24 @@ export function formatLatencyMs(ms: number): string {
   if (!Number.isFinite(ms) || ms <= 0) return '—'
   if (ms < 1000) return `${Math.round(ms)}ms`
   if (ms < 60_000) return `${(ms / 1000).toFixed(ms >= 10_000 ? 1 : 2)}s`
-  const mins = Math.floor(ms / 60_000)
-  const secs = Math.round((ms % 60_000) / 1000)
-  return `${mins}m ${secs}s`
+  const totalSec = Math.round(ms / 1000)
+  if (totalSec < 3600) {
+    const mins = Math.floor(totalSec / 60)
+    const secs = totalSec % 60
+    return secs === 0 ? `${mins}m` : `${mins}m ${secs}s`
+  }
+  const hours = Math.floor(totalSec / 3600)
+  const remMins = Math.round((totalSec % 3600) / 60)
+  return remMins === 0 ? `${hours}h` : `${hours}h ${remMins}m`
+}
+
+export function formatSubMs(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return '—'
+  if (ms === 0) return '<0.01ms'
+  if (ms < 1) return `${ms.toFixed(2)}ms`
+  if (ms < 10) return `${ms.toFixed(1)}ms`
+  if (ms < 1000) return `${Math.round(ms)}ms`
+  return `${(ms / 1000).toFixed(2)}s`
 }
 
 export function formatUptime(sec: number): string {
@@ -187,4 +202,36 @@ export function computeNiceAxisMax(rawMax: number): number {
   const norm = rawMax / pow
   const nice = norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 5 ? 5 : 10
   return nice * pow
+}
+
+const NICE_DURATION_MS_STEPS = [
+  1_000,
+  2_000,
+  5_000,
+  10_000,
+  20_000,
+  30_000,
+  60_000,
+  2 * 60_000,
+  4 * 60_000,
+  6 * 60_000,
+  10 * 60_000,
+  20 * 60_000,
+  30 * 60_000,
+  60 * 60_000,
+  2 * 60 * 60_000,
+  3 * 60 * 60_000,
+  4 * 60 * 60_000,
+  6 * 60 * 60_000,
+  12 * 60 * 60_000,
+  24 * 60 * 60_000,
+] as const
+
+export function computeNiceDurationAxisMax(rawMaxMs: number): number {
+  if (!Number.isFinite(rawMaxMs) || rawMaxMs <= 0) return 1_000
+  for (const step of NICE_DURATION_MS_STEPS) {
+    if (rawMaxMs <= step) return step
+  }
+  const hours = Math.ceil(rawMaxMs / 3_600_000)
+  return Math.ceil(hours / 6) * 6 * 3_600_000
 }

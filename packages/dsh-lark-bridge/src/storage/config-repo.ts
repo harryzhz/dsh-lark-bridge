@@ -65,17 +65,70 @@ export class ConfigRepo {
   private readonly discoveredChats = new Map<string, DiscoveredLarkChat>()
   private snapshotTimer: ReturnType<typeof setTimeout> | null = null
   private snapshotDirty = false
+  private viewerSecretCache: string | null = null
+  private botsCache: { list: LarkBotConfig[]; byId: Map<string, LarkBotConfig> } | null = null
+  private groupsCache: { list: LarkGroupConfig[]; byKey: Map<string, LarkGroupConfig> } | null = null
+  private listenerTemplatesCache: ListenerTemplate[] | null = null
 
   constructor(
     private readonly db: BridgeDatabase,
     private readonly dataDir: string,
   ) {}
 
+  private loadBotsCache(): { list: LarkBotConfig[]; byId: Map<string, LarkBotConfig> } {
+    if (this.botsCache) return this.botsCache
+    const rows = this.db
+      .prepare('SELECT config_json FROM bots ORDER BY rowid ASC')
+      .all() as Array<{ config_json: string }>
+    const list: LarkBotConfig[] = []
+    const byId = new Map<string, LarkBotConfig>()
+    for (const row of rows) {
+      try {
+        const parsed = LarkBotConfigSchema.safeParse(JSON.parse(row.config_json))
+        if (parsed.success) {
+          list.push(parsed.data)
+          byId.set(parsed.data.id, parsed.data)
+        }
+      } catch {
+        // Skip corrupt row defensively.
+      }
+    }
+    this.botsCache = { list, byId }
+    return this.botsCache
+  }
+
+  private loadGroupsCache(): { list: LarkGroupConfig[]; byKey: Map<string, LarkGroupConfig> } {
+    if (this.groupsCache) return this.groupsCache
+    const rows = this.db
+      .prepare('SELECT config_json FROM groups ORDER BY rowid ASC')
+      .all() as Array<{ config_json: string }>
+    const list: LarkGroupConfig[] = []
+    const byKey = new Map<string, LarkGroupConfig>()
+    for (const row of rows) {
+      try {
+        const parsed = LarkGroupConfigSchema.safeParse(JSON.parse(row.config_json))
+        if (parsed.success) {
+          list.push(parsed.data)
+          byKey.set(parsed.data.key, parsed.data)
+        }
+      } catch {
+        // Skip corrupt row.
+      }
+    }
+    this.groupsCache = { list, byKey }
+    return this.groupsCache
+  }
+
   getViewerTicketSecret(): string {
+    if (this.viewerSecretCache) return this.viewerSecretCache
     const existing = this.db.getMeta('viewer_ticket_secret')?.trim()
-    if (existing && existing.length >= 32) return existing
+    if (existing && existing.length >= 32) {
+      this.viewerSecretCache = existing
+      return existing
+    }
     const next = randomBytes(32).toString('hex')
     this.db.setMeta('viewer_ticket_secret', next)
+    this.viewerSecretCache = next
     this.scheduleConfigSnapshot()
     return next
   }
@@ -83,37 +136,17 @@ export class ConfigRepo {
   rotateViewerTicketSecret(): string {
     const next = randomBytes(32).toString('hex')
     this.db.setMeta('viewer_ticket_secret', next)
+    this.viewerSecretCache = next
     this.scheduleConfigSnapshot()
     return next
   }
 
   listBots(): LarkBotConfig[] {
-    const rows = this.db
-      .prepare('SELECT config_json FROM bots ORDER BY rowid ASC')
-      .all() as Array<{ config_json: string }>
-    const out: LarkBotConfig[] = []
-    for (const row of rows) {
-      try {
-        const parsed = LarkBotConfigSchema.safeParse(JSON.parse(row.config_json))
-        if (parsed.success) out.push(parsed.data)
-      } catch {
-        // Skip corrupt row defensively.
-      }
-    }
-    return out
+    return [...this.loadBotsCache().list]
   }
 
   getBot(id: string): LarkBotConfig | undefined {
-    const row = this.db
-      .prepare('SELECT config_json FROM bots WHERE id = ?')
-      .get(id) as { config_json?: string } | undefined
-    if (!row?.config_json) return undefined
-    try {
-      const parsed = LarkBotConfigSchema.safeParse(JSON.parse(row.config_json))
-      return parsed.success ? parsed.data : undefined
-    } catch {
-      return undefined
-    }
+    return this.loadBotsCache().byId.get(id)
   }
 
   upsertBot(raw: unknown): LarkBotConfig {
@@ -155,6 +188,7 @@ export class ConfigRepo {
         JSON.stringify(finalBot),
         Date.now(),
       )
+    this.botsCache = null
     this.scheduleConfigSnapshot()
     return finalBot
   }
@@ -182,6 +216,7 @@ export class ConfigRepo {
     this.db
       .prepare('UPDATE bots SET config_json = ?, updated_at_ms = ? WHERE id = ?')
       .run(JSON.stringify(updated), Date.now(), botId)
+    this.botsCache = null
     this.scheduleConfigSnapshot()
   }
 
@@ -200,6 +235,8 @@ export class ConfigRepo {
       return true
     })
     if (deleted) {
+      this.botsCache = null
+      this.groupsCache = null
       for (const key of [...this.discoveredChats.keys()]) {
         if (key.startsWith(`${id}:`)) this.discoveredChats.delete(key)
       }
@@ -209,6 +246,7 @@ export class ConfigRepo {
   }
 
   listListenerTemplates(): ListenerTemplate[] {
+    if (this.listenerTemplatesCache) return [...this.listenerTemplatesCache]
     const rows = this.db
       .prepare('SELECT key, config_json FROM listener_templates')
       .all() as Array<{ key: string; config_json: string }>
@@ -221,7 +259,10 @@ export class ConfigRepo {
         // Fallback to default template.
       }
     }
-    return DEFAULT_LISTENER_TEMPLATES.map((base) => stored.get(base.key) ?? structuredClone(base))
+    this.listenerTemplatesCache = DEFAULT_LISTENER_TEMPLATES.map(
+      (base) => stored.get(base.key) ?? structuredClone(base),
+    )
+    return [...this.listenerTemplatesCache]
   }
 
   resetListenerTemplates(): ListenerTemplate[] {
@@ -235,28 +276,14 @@ export class ConfigRepo {
         stmt.run(tpl.key, JSON.stringify(tpl), now)
       }
     })
+    this.listenerTemplatesCache = null
     this.scheduleConfigSnapshot()
     return this.listListenerTemplates()
   }
 
   listGroups(botId?: string): LarkGroupConfig[] {
-    const rows = (
-      botId
-        ? this.db
-            .prepare('SELECT config_json FROM groups WHERE bot_id = ? ORDER BY rowid ASC')
-            .all(botId)
-        : this.db.prepare('SELECT config_json FROM groups ORDER BY rowid ASC').all()
-    ) as Array<{ config_json: string }>
-    const out: LarkGroupConfig[] = []
-    for (const row of rows) {
-      try {
-        const parsed = LarkGroupConfigSchema.safeParse(JSON.parse(row.config_json))
-        if (parsed.success) out.push(parsed.data)
-      } catch {
-        // Skip corrupt row.
-      }
-    }
-    return out
+    const { list } = this.loadGroupsCache()
+    return botId ? list.filter((g) => g.botId === botId) : [...list]
   }
 
   getGroup(botId: string, chatId: string): LarkGroupConfig | undefined {
@@ -264,16 +291,7 @@ export class ConfigRepo {
   }
 
   getGroupByKey(key: string): LarkGroupConfig | undefined {
-    const row = this.db
-      .prepare('SELECT config_json FROM groups WHERE key = ?')
-      .get(key) as { config_json?: string } | undefined
-    if (!row?.config_json) return undefined
-    try {
-      const parsed = LarkGroupConfigSchema.safeParse(JSON.parse(row.config_json))
-      return parsed.success ? parsed.data : undefined
-    } catch {
-      return undefined
-    }
+    return this.loadGroupsCache().byKey.get(key)
   }
 
   upsertGroup(raw: unknown): LarkGroupConfig {
@@ -348,10 +366,12 @@ export class ConfigRepo {
                ON CONFLICT(key) DO UPDATE SET config_json = excluded.config_json, updated_at_ms = excluded.updated_at_ms`,
             )
             .run(tplKey, JSON.stringify(updatedTpl), now)
+          this.listenerTemplatesCache = null
         }
       }
     })
 
+    this.groupsCache = null
     this.scheduleConfigSnapshot()
     return parsed
   }
@@ -361,7 +381,10 @@ export class ConfigRepo {
       .prepare('DELETE FROM groups WHERE key = ?')
       .run(buildGroupKey(botId, chatId))
     const existed = Number(res.changes) > 0
-    if (existed) this.scheduleConfigSnapshot()
+    if (existed) {
+      this.groupsCache = null
+      this.scheduleConfigSnapshot()
+    }
     return existed
   }
 
@@ -398,7 +421,10 @@ export class ConfigRepo {
         }
       }
     })
-    if (configMutated) this.scheduleConfigSnapshot()
+    if (configMutated) {
+      this.groupsCache = null
+      this.scheduleConfigSnapshot()
+    }
   }
 
   getDiscoveredChats(): ReadonlyMap<string, DiscoveredLarkChat> {

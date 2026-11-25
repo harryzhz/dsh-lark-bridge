@@ -624,7 +624,11 @@ export class LarkSessionViewerService {
   canViewSession(sessionId: string): boolean {
     const sid = sessionId.trim()
     if (!sid) return false
-    if (this.store.listDreamSessions?.().some((d) => d.sessionId === sid)) {
+    const isDream =
+      typeof this.store.hasDreamSession === 'function'
+        ? this.store.hasDreamSession(sid)
+        : Boolean(this.store.listDreamSessions?.().some((d) => d.sessionId === sid))
+    if (isDream) {
       return false
     }
     const ownership = this.resolveSessionOwnership(sid)
@@ -1145,9 +1149,15 @@ export class LarkSessionViewerService {
     if (managed) {
       return { botId: managed.botId, chatId: managed.chatId }
     }
-    const binding = this.store.listBindings().find((b) => b.sessionId === sessionId)
+    const binding =
+      typeof this.store.getBindingBySessionId === 'function'
+        ? this.store.getBindingBySessionId(sessionId)
+        : this.store.listBindings().find((b) => b.sessionId === sessionId)
     if (binding) {
       return { botId: binding.botId, chatId: binding.chatId }
+    }
+    if (typeof this.store.findReminderOriginBySessionId === 'function') {
+      return this.store.findReminderOriginBySessionId(sessionId)
     }
     const reminder = this.store.listReminders?.('all').find((r) => r.lastSessionId === sessionId)
     if (reminder) {

@@ -1043,6 +1043,41 @@ export interface StorageCategoryEntry {
   sharePct: number
 }
 
+export interface ObservabilitySqlQueryPerf {
+  fingerprint: string
+  count: number
+  avgMs: number
+  maxMs: number
+  lastAtMs: number
+}
+
+export interface ObservabilityApiRoutePerf {
+  route: string
+  count: number
+  avgMs: number
+  p50Ms: number
+  p95Ms: number
+  maxMs: number
+  lastAtMs: number
+}
+
+export interface ObservabilityDatabasePerf {
+  totalQueries: number
+  sampleCount: number
+  avgMs: number
+  p50Ms: number
+  p95Ms: number
+  maxMs: number
+  slowThresholdMs: number
+  slowQueryCount: number
+  integrityCheckMs: number
+  integrityCheckedAtMs?: number
+  lastCheckpointMs?: number
+  lastCheckpointAtMs?: number
+  slowQueries: ObservabilitySqlQueryPerf[]
+  apiRoutes: ObservabilityApiRoutePerf[]
+}
+
 export interface StorageTableStat {
   table: string
   rows: number
@@ -1202,6 +1237,7 @@ export interface ObservabilityPayload {
       categories: StorageCategoryEntry[]
       tables: StorageTableStat[]
     }
+    database?: ObservabilityDatabasePerf
     errors: {
       breakdown: ObservabilityErrorBreakdown[]
       recent: AuditEvent[]

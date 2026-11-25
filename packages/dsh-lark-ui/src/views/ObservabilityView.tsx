@@ -41,6 +41,7 @@ import {
   formatCompactNumber,
   formatDeltaBadge,
   formatLatencyMs,
+  formatSubMs,
   formatTokens,
   formatUptime,
   OBSERVABILITY_WINDOWS,
@@ -56,6 +57,7 @@ type RankingTab = 'bots' | 'chats'
 
 const POLL_IDLE_MS = 15_000
 const POLL_BACKFILL_MS = 3_000
+const OBSERVABILITY_SWR_CACHE = new Map<string, ObservabilityPayload>()
 
 function InsightsPane({
   payload,
@@ -539,7 +541,7 @@ function MonitorPane({
 }) {
   const [chartMode, setChartMode] = useState<TechChartMode>('latency')
   const { technical, series } = payload
-  const { sla, latency, connections, runtime, storage, errors } = technical
+  const { sla, latency, connections, runtime, storage, database, errors } = technical
 
   const p95Spark = useMemo(() => series.map((p) => p.latencyP95Ms), [series])
   const errSpark = useMemo(() => series.map((p) => p.errors), [series])
@@ -576,13 +578,13 @@ function MonitorPane({
           foot={`异常 ${sla.totalErrors} · 回退 ${sla.triageFallbackRate}% · 工具失败 ${sla.toolErrorRate}%`}
         />
         <KpiCard
-          label="响应延迟 P50 / P95"
+          label="端到端回复耗时"
           value={formatLatencyMs(latency.p50Ms)}
           unit={`/ ${formatLatencyMs(latency.p95Ms)}`}
           delta={formatDeltaBadge(latency.deltaP95Pct, { invertGood: true })}
           spark={p95Spark}
           sparkTone="warn"
-          foot={`P99 ${formatLatencyMs(latency.p99Ms)} · 均值 ${formatLatencyMs(latency.avgMs)} · 样本 ${latency.samples}`}
+          foot={`含推理与工具 · P99 ${formatLatencyMs(latency.p99Ms)} · 样本 ${latency.samples}`}
         />
         <KpiCard
           label="运行时与连接"
@@ -614,16 +616,19 @@ function MonitorPane({
             <h2 className="fb-obs-panel-title">性能与进程生命体征</h2>
             <span className="fb-obs-panel-sub fb-mono">
               {chartMode === 'latency'
-                ? `P50 ${formatLatencyMs(latency.p50Ms)} · P95 ${formatLatencyMs(latency.p95Ms)} · ERR ${sla.totalErrors}`
-                : `PID ${runtime.pid} · ${runtime.nodeVersion} · RSS ${formatBytes(runtime.rssBytes)}`}
+                ? `回复 P50 ${formatLatencyMs(latency.p50Ms)} · P95 ${formatLatencyMs(latency.p95Ms)} · ERR ${sla.totalErrors}`
+                : chartMode === 'vitals'
+                  ? `PID ${runtime.pid} · ${runtime.nodeVersion} · RSS ${formatBytes(runtime.rssBytes)}`
+                  : `SQL P50 ${database ? formatSubMs(database.p50Ms) : '—'} · P95 ${database ? formatSubMs(database.p95Ms) : '—'} · 慢查询 ${database?.slowQueryCount ?? 0}`}
             </span>
           </div>
           <FilterTabs
             label="监控曲线切换"
             value={chartMode}
             options={[
-              { value: 'latency' as const, label: '延迟分位与异常' },
+              { value: 'latency' as const, label: '回复耗时与异常' },
               { value: 'vitals' as const, label: '内存与事件循环' },
+              { value: 'database' as const, label: '数据库与接口' },
             ]}
             onChange={setChartMode}
           />
@@ -631,6 +636,7 @@ function MonitorPane({
         <TechnicalTimeSeriesChart
           series={series}
           vitals={runtime.vitalsSeries}
+          {...(database ? { database } : {})}
           mode={chartMode}
         />
       </section>
@@ -639,7 +645,7 @@ function MonitorPane({
         <section className="fb-card fb-obs-panel">
           <div className="fb-obs-panel-head">
             <div className="fb-obs-panel-title-wrap">
-              <h2 className="fb-obs-panel-title">端到端延迟分布</h2>
+              <h2 className="fb-obs-panel-title">Agent 端到端回复耗时分布</h2>
               <span className="fb-obs-panel-sub fb-mono">{latency.samples} SAMPLES</span>
             </div>
           </div>
@@ -863,6 +869,15 @@ function MonitorPane({
                 {storage.pageCount.toLocaleString('en-US')} 页 ({storage.pageSize} B)
               </span>
             </div>
+            {database && (
+              <div className="fb-obs-kv-row">
+                <span className="fb-obs-muted">SQLite 查询耗时</span>
+                <span className="fb-mono" data-warn={database.slowQueryCount > 0 ? '' : undefined}>
+                  P50 {formatSubMs(database.p50Ms)} · P95 {formatSubMs(database.p95Ms)} · 慢查询{' '}
+                  {database.slowQueryCount}
+                </span>
+              </div>
+            )}
           </div>
 
           <div className="fb-obs-divider" />
@@ -905,16 +920,23 @@ export function ObservabilityView({
   const [windowKey, setWindowKey] = useState<ObservabilityWindow>('24h')
   const [botId, setBotId] = useState('')
   const [chatId, setChatId] = useState('')
-  const [payload, setPayload] = useState<ObservabilityPayload | null>(null)
-  const [loading, setLoading] = useState(true)
+  const effectiveBotId = resolveEffectiveBotId(botId, bots)
+  const swrKey = `${windowKey}|${effectiveBotId}|${chatId}`
+  const [payload, setPayload] = useState<ObservabilityPayload | null>(
+    () => OBSERVABILITY_SWR_CACHE.get(swrKey) ?? null,
+  )
+  const [loading, setLoading] = useState(() => !OBSERVABILITY_SWR_CACHE.has(swrKey))
   const [refreshing, setRefreshing] = useState(false)
   const [compacting, setCompacting] = useState(false)
   const [error, setError] = useState('')
 
-  const effectiveBotId = resolveEffectiveBotId(botId, bots)
-
   const loadData = useCallback(
     async (opts: { readonly refreshStorage?: boolean; readonly silent?: boolean } = {}) => {
+      const cached = OBSERVABILITY_SWR_CACHE.get(swrKey)
+      if (cached && !opts.refreshStorage) {
+        setPayload(cached)
+        setLoading(false)
+      }
       if (!opts.silent) setRefreshing(true)
       try {
         const res = await bridgeApi.observability({
@@ -923,6 +945,7 @@ export function ObservabilityView({
           ...(chatId ? { chatId } : {}),
           ...(opts.refreshStorage ? { refreshStorage: true } : {}),
         })
+        OBSERVABILITY_SWR_CACHE.set(swrKey, res)
         setPayload(res)
         setError('')
       } catch (err) {
@@ -932,12 +955,12 @@ export function ObservabilityView({
         setRefreshing(false)
       }
     },
-    [windowKey, effectiveBotId, chatId],
+    [windowKey, effectiveBotId, chatId, swrKey],
   )
 
   useEffect(() => {
-    void loadData({ silent: Boolean(payload) })
-  }, [loadData])
+    void loadData({ silent: OBSERVABILITY_SWR_CACHE.has(swrKey) })
+  }, [loadData, swrKey])
 
   const backfillRunning = Boolean(payload?.backfill.running)
   useEffect(() => {

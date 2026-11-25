@@ -16,6 +16,7 @@ import { ConfigRepo } from './storage/config-repo.js'
 import {
   BridgeDatabase,
   DB_FILENAME,
+  type DatabasePerfSnapshot,
   type IntegrityCheckResult,
   type StorageStats,
   type WalCheckpointMode,
@@ -109,8 +110,22 @@ export class LarkBridgeStore {
     return this.db.checkpointWal(options)
   }
 
-  runIntegrityCheck(): IntegrityCheckResult {
-    return this.db.integrityCheck()
+  getDatabasePerfSnapshot(): DatabasePerfSnapshot {
+    return this.db.getPerfSnapshot()
+  }
+
+  runIntegrityCheck(options?: { readonly force?: boolean; readonly maxAgeMs?: number }): IntegrityCheckResult {
+    return this.db.integrityCheck(options)
+  }
+
+  hasDreamSession(sessionId: string): boolean {
+    return this.runtimeRepo.hasDreamSession(sessionId)
+  }
+
+  findReminderOriginBySessionId(
+    sessionId: string,
+  ): { readonly botId: string; readonly chatId?: string } | undefined {
+    return this.runtimeRepo.findReminderOriginBySessionId(sessionId)
   }
 
   backupTo(destPath: string): void {
