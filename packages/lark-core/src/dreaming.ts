@@ -86,7 +86,7 @@ export function composeDreamExecutionPrompt(input: DreamExecutionPromptInput): s
     }
     if (proactive.remindersEnabled) {
       proactiveLines.push(
-        `- **登记跟进提醒**：若增量对话存在待闭环承诺，或新建的优化分支需在工作时段提审，先运行 \`lark-bridge reminder list\` 去重，再运行 \`lark-bridge reminder create --bot ${input.botId} --chat <chat_id> --title "<标题>" --at "<YYYY-MM-DD HH:mm>" --prompt "<核查或提审指令>"\` 创建单次提醒。`,
+        `- **登记跟进提醒**：若增量对话存在待闭环承诺，或新建的优化分支需在工作时段提审，先运行 \`lark-bridge reminder list\` 去重，再运行 \`lark-bridge reminder create --bot ${input.botId} --chat <chat_id> --mention <open_id:负责人> [--cc <open_id:关注人>] --title "<标题>" --at "<YYYY-MM-DD HH:mm>" --prompt "<核查或提审指令>"\` 创建单次提醒（群聊必填 \`--mention\` 负责人）。`,
       )
     }
   }

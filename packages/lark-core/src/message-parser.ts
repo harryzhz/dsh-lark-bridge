@@ -211,5 +211,5 @@ export function extractPureUserIntent(rawPrompt: string): string {
 
 export function hasInjectedPromptMarkup(title: string): boolean {
   const t = title.trim()
-  return /^<(?:system_reminder|user_message|role|proactive|lark_context|substitute|listener|schedule|reminder_trigger|dream_job|role_definition|summary_memory|[a-z0-9_]+_(?:listener|substitute|message))\b/i.test(t)
+  return /^<(?:system_reminder|user_message|role|proactive|lark_context|substitute|listener|delegation_followup|schedule|reminder_trigger|dream_job|role_definition|summary_memory|[a-z0-9_]+_(?:listener|substitute|message))\b/i.test(t)
 }

@@ -24,8 +24,8 @@ const HELP = `lark-bridge — DSH 飞书桥接辅助 CLI（零密钥暴露，自
   lark-bridge memory supersede <memoryId> --reason <原因> [--type <type>] [--title <标题> (--content <正文> | --content-file <路径>)] [--scope bot|chat|workspace] [--scope-id <id>] [--tags a,b] [--pin]
   lark-bridge memory forget <memoryId> [--reason <原因>]
   lark-bridge reminder list [--status active|archived|all]
-  lark-bridge reminder create --title <标题> (--at "<YYYY-MM-DD HH:mm|ISO>" | --after <秒>) (--prompt <文本> | --prompt-file <路径>) [--reason <原因>] [--urgency normal|high] [--mention <openId[:姓名]>] [--bot <botId>] [--chat <chatId>] [--user <openId>] [--reply-to <messageId>] [--mode thread|chat|p2p] [--cwd <目录>] [--worktree <路径> --branch <分支> [--pr <链接>]]
-  lark-bridge reminder update <reminderId> [--title <标题>] [--at "<YYYY-MM-DD HH:mm|ISO>"] [--prompt <文本> | --prompt-file <路径>] [--reason <原因>]
+  lark-bridge reminder create --title <标题> (--at "<YYYY-MM-DD HH:mm|ISO>" | --after <秒>) (--prompt <文本> | --prompt-file <路径>) [--kind general|delegation] [--reason <原因>] [--urgency normal|high] [--mention <openId[:姓名]>] [--cc <openId[:姓名]>] [--bot <botId>] [--chat <chatId>] [--user <openId>] [--reply-to <messageId>] [--mode thread|chat|p2p] [--cwd <目录>] [--worktree <路径> --branch <分支> [--pr <链接>]]
+  lark-bridge reminder update <reminderId> [--title <标题>] [--at "<YYYY-MM-DD HH:mm|ISO>"] [--prompt <文本> | --prompt-file <路径>] [--reason <原因>] [--mention <openId[:姓名]>] [--cc <openId[:姓名]>]
   lark-bridge reminder cancel <reminderId>
   lark-bridge reminder run <reminderId>
   lark-bridge worktree create <slug> [--prefix agent/] [--base HEAD] [--cwd <仓库目录>]
@@ -66,7 +66,7 @@ send 选项:
   --mention <openId[:姓名]>  在消息开头 @ 指定成员（可重复传参，open_id 须为当前智能体应用视角）
 `
 
-const MULTI_FLAGS = new Set(['image', 'file', 'mention'])
+const MULTI_FLAGS = new Set(['image', 'file', 'mention', 'cc'])
 const BOOL_FLAGS = new Set([
   'help',
   'h',
@@ -502,6 +502,7 @@ async function handleReminderCommand(endpoint, positionals, flags, sessionId) {
       )
     }
     const mentions = parseMentions(flags.mention)
+    const ccMentions = parseMentions(flags.cc)
     const worktree =
       flags.worktree && flags.branch
         ? {
@@ -517,12 +518,14 @@ async function handleReminderCommand(endpoint, positionals, flags, sessionId) {
       ...(flags.user ? { userOpenId: String(flags.user) } : {}),
       ...(flags['reply-to'] ? { replyToMessageId: String(flags['reply-to']) } : {}),
       ...(flags.mode ? { deliveryMode: String(flags.mode) } : {}),
+      ...(flags.kind ? { kind: String(flags.kind).trim() } : {}),
       ...(flags.cwd ? { workingDir: resolve(String(flags.cwd)) } : {}),
       ...(flags.reason ? { reason: String(flags.reason).trim() } : {}),
       ...(flags.urgency ? { urgency: String(flags.urgency).trim() } : {}),
       ...(flags.at ? { at: String(flags.at).trim() } : {}),
       ...(flags.after !== undefined ? { afterSeconds: Number(flags.after) } : {}),
       ...(mentions.length > 0 ? { mentions } : {}),
+      ...(ccMentions.length > 0 ? { ccMentions } : {}),
       ...(worktree ? { worktree } : {}),
       title,
       prompt,
@@ -534,17 +537,21 @@ async function handleReminderCommand(endpoint, positionals, flags, sessionId) {
 
   if (sub === 'update') {
     const reminderId = positionals[2]
-    if (!reminderId) throw new Error('用法：lark-bridge reminder update <reminderId> [--title ...] [--at ...] [--prompt ...]')
+    if (!reminderId) throw new Error('用法：lark-bridge reminder update <reminderId> [--title ...] [--at ...] [--prompt ...] [--mention ...] [--cc ...]')
     const prompt = flags['prompt-file']
       ? readFileSync(resolve(String(flags['prompt-file'])), 'utf8').trim()
       : flags.prompt !== undefined
         ? String(flags.prompt).trim()
         : undefined
+    const mentions = flags.mention !== undefined ? parseMentions(flags.mention) : undefined
+    const ccMentions = flags.cc !== undefined ? parseMentions(flags.cc) : undefined
     const data = await apiRequest(endpoint, 'PUT', `/reminders/${encodeURIComponent(reminderId)}`, {
       ...(flags.title !== undefined ? { title: String(flags.title) } : {}),
       ...(flags.at !== undefined ? { at: String(flags.at) } : {}),
       ...(flags.reason !== undefined ? { reason: String(flags.reason) } : {}),
       ...(prompt !== undefined ? { prompt } : {}),
+      ...(mentions !== undefined ? { mentions } : {}),
+      ...(ccMentions !== undefined ? { ccMentions } : {}),
     })
     printJson(data)
     return

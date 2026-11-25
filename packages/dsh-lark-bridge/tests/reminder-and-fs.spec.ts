@@ -219,7 +219,7 @@ describe('ProactiveReminderService one-shot lifecycle, origin auto-routing & con
       resolution: 'silent_ok',
     })
     expect(silentResult.lastSessionId).toBeTruthy()
-    expect(submittedReminderPrompts[0]).toContain('- 关注人员：Sam(open_id="ou_dev_1")')
+    expect(submittedReminderPrompts[0]).toContain('- 主负责人（必 @）：Sam(open_id="ou_dev_1")')
     expect(submittedReminderPrompts[0]).not.toContain('- 群成员：')
     expect(submittedReminderPrompts[0]).toContain('lark-bridge members --query <姓名>')
     expect(silentResult.resultSummary).not.toContain('核查')
@@ -302,6 +302,8 @@ describe('ProactiveReminderService one-shot lifecycle, origin auto-routing & con
       prompt: '将夜间准备好的优化分支 MR 发到群里提醒评审',
       afterSeconds: 3600,
       creationMode: 'notify',
+      mentions: [{ openId: 'ou_dev_1', name: 'Sam' }],
+      ccMentions: [{ openId: 'ou_pm_1', name: 'Taylor' }],
       worktree: {
         worktreePath: join(workDir, '.worktrees', 'opt-retry'),
         branch: 'agent/opt-retry',
@@ -493,6 +495,7 @@ describe('ProactiveReminderService one-shot lifecycle, origin auto-routing & con
       deliveryMode: 'thread',
       title: '复查服务状态',
       prompt: '核对实例状态',
+      mentions: [{ openId: 'ou_oncall_1', name: 'Alex' }],
       afterSeconds: 300,
     })
 
@@ -624,6 +627,7 @@ describe('ProactiveReminderService one-shot lifecycle, origin auto-routing & con
     ).rejects.toThrow('提醒指令过长')
 
     // 2. Root reminder created normally (depth 0)
+    const ownerMentions = [{ openId: 'ou_owner_guard', name: 'Sam' }]
     const root = await reminders.create(
       {
         botId: 'guard-bot',
@@ -631,6 +635,7 @@ describe('ProactiveReminderService one-shot lifecycle, origin auto-routing & con
         replyToMessageId: 'om_root_guard',
         title: '核查同步任务',
         prompt: '核查同步任务是否完成',
+        mentions: ownerMentions,
         afterSeconds: 1800,
       },
       baseNow,
@@ -646,6 +651,7 @@ describe('ProactiveReminderService one-shot lifecycle, origin auto-routing & con
           replyToMessageId: 'om_root_guard',
           title: '重复的同步核查',
           prompt: '重复核查',
+          mentions: ownerMentions,
           afterSeconds: 1800,
         },
         baseNow + 10_000,
@@ -846,6 +852,7 @@ describe('ProactiveReminderService one-shot lifecycle, origin auto-routing & con
     })
 
     // 1. Quiet Hours: normal reminder scheduled at local 01:30 defers to 09:00 same day; high urgency stays at 01:30!
+    const quietMentions = [{ openId: 'ou_quiet_owner', name: 'Alex' }]
     const nightNow = new Date(2026, 10, 24, 1, 0, 0).getTime()
     const normalNight = await reminders.create(
       {
@@ -854,6 +861,7 @@ describe('ProactiveReminderService one-shot lifecycle, origin auto-routing & con
         replyToMessageId: 'om_night_normal',
         title: '常规任务核查',
         prompt: '核查常规任务状态',
+        mentions: quietMentions,
         afterSeconds: 1800,
       },
       nightNow,
@@ -870,6 +878,7 @@ describe('ProactiveReminderService one-shot lifecycle, origin auto-routing & con
         replyToMessageId: 'om_night_high',
         title: 'P0 止损复查',
         prompt: '核查 P0 止损指标',
+        mentions: quietMentions,
         urgency: 'high',
         afterSeconds: 1800,
       },
@@ -893,6 +902,7 @@ describe('ProactiveReminderService one-shot lifecycle, origin auto-routing & con
           replyToMessageId: `om_conc_${i}`,
           title: `并发核查 ${i}`,
           prompt: `检查事项 ${i}`,
+          mentions: quietMentions,
           afterSeconds: 60,
         },
         dayNow,
@@ -917,6 +927,195 @@ describe('ProactiveReminderService one-shot lifecycle, origin auto-routing & con
         expect(store.getReminder(id)?.status).toBe('archived')
       }
     })
+
+    await reminders.stop()
+  })
+
+  it('requires at least one primary owner mention on group reminders, hydrates missing names, formats ccMentions, and supports adaptive delegation chain deferrals', async () => {
+    const dataDir = makeTempDir()
+    const workDir = makeTempDir()
+    const store = new LarkBridgeStore(dataDir)
+
+    store.upsertBot({
+      id: 'del-bot',
+      name: 'DelegationBot',
+      enabled: true,
+      larkAppId: 'cli_del',
+      larkAppSecret: 'sec_del',
+      defaultWorkingDir: workDir,
+      experimental: {
+        dreaming: { enabled: false },
+        proactive: {
+          remindersEnabled: true,
+          delegationFollowupEnabled: true,
+          reminderCreationMode: 'silent',
+          quietHoursEnabled: true,
+          quietHoursStart: '00:00',
+          quietHoursEnd: '08:00',
+          autoCodeEnabled: false,
+          branchPrefix: 'agent/',
+        },
+      },
+    })
+    store.upsertGroup({
+      botId: 'del-bot',
+      chatId: 'oc_collab',
+      chatName: '研发协作群',
+      enabled: true,
+    })
+
+    const fakeCtx = {
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      agents: {
+        create: vi.fn(async ({ sessionId, setup }: { sessionId: string; setup?: (c: unknown, a: unknown) => void }) => {
+          const agent = { session: { id: sessionId, header: { cwd: workDir, agentPreset: 'codex' } } }
+          setup?.({}, agent)
+          return { agent, dispose: vi.fn().mockResolvedValue(undefined) }
+        }),
+      },
+      get: () => undefined,
+    } as unknown as Context
+
+    const delivered: Array<{ markdown: string; mentions: unknown; ccMentions: unknown }> = []
+    let turnHandler: (sessionId: string) => Promise<string> = async () => REMINDER_SILENT_SENTINEL
+
+    const reminders = new ProactiveReminderService({
+      ctx: fakeCtx,
+      store,
+      runtimes: new RuntimeCatalog(fakeCtx),
+      workspaces: {
+        attachSession: vi.fn().mockResolvedValue(undefined),
+        archiveSession: vi.fn().mockResolvedValue(true),
+      } as unknown as WorkspaceGrouping,
+      resolveMemberName: async (_botId, _chatId, openId) => {
+        if (openId === 'ou_bob') return 'Bob'
+        if (openId === 'ou_alex') return 'Alex'
+        return undefined
+      },
+      runTurn: vi.fn(async (agent) => turnHandler(String(agent.session.id))),
+      sendOriginCard: vi.fn().mockResolvedValue({}),
+      patchOriginCard: vi.fn().mockResolvedValue(undefined),
+      deliverReminderOutput: vi.fn(async ({ item, markdown }) => {
+        const formatted = `<at id="${item.mentions[0]?.openId}">${item.mentions[0]?.name}</at>\n\n${markdown}\n\ncc <at id="${item.ccMentions[0]?.openId}">${item.ccMentions[0]?.name}</at>`
+        delivered.push({ markdown: formatted, mentions: item.mentions, ccMentions: item.ccMentions })
+        return { messageId: 'om_del_sent', deliveredMarkdown: formatted }
+      }),
+    })
+
+    const baseNow = new Date(2026, 10, 24, 15, 0, 0).getTime()
+
+    // 1. Group reminder WITHOUT mentions MUST fail fast
+    await expect(
+      reminders.create(
+        {
+          botId: 'del-bot',
+          chatId: 'oc_collab',
+          replyToMessageId: 'om_no_mention',
+          title: '缺负责人提醒',
+          prompt: '检查状态',
+          afterSeconds: 600,
+        },
+        baseNow,
+      ),
+    ).rejects.toThrow('群聊提醒必须至少指定一位主负责人')
+
+    // 2. Delegation reminder hydrates empty names and deduplicates ccMentions against mentions
+    const rootDel = await reminders.create(
+      {
+        botId: 'del-bot',
+        chatId: 'oc_collab',
+        replyToMessageId: 'om_del_root',
+        kind: 'delegation',
+        title: '跟进线上登录 502 排查',
+        prompt: '检查 Bob 是否已处理并同步结果',
+        mentions: [{ openId: 'ou_bob', name: '' }],
+        ccMentions: [
+          { openId: 'ou_bob', name: '' },
+          { openId: 'ou_alex', name: '' },
+        ],
+        afterSeconds: 600,
+      },
+      baseNow,
+    )
+    expect(rootDel.kind).toBe('delegation')
+    expect(rootDel.mentions).toEqual([{ openId: 'ou_bob', name: 'Bob' }])
+    expect(rootDel.ccMentions).toEqual([{ openId: 'ou_alex', name: 'Alex' }])
+
+    // 3. Updating group reminder to empty mentions is also rejected
+    expect(() => reminders.update(rootDel.id, { mentions: [] })).toThrow('至少保留一位主负责人')
+
+    // 4. Chained delegation deferral: allows 10m (600s) hop-1 backoff (rejects < 600s),
+    //    auto-inherits kind/mentions/ccMentions from parent, and allows > 6h (within 24h) window!
+    let hop1Id = ''
+    turnHandler = async (sid) => {
+      await expect(
+        reminders.create(
+          {
+            sessionId: sid,
+            botId: 'del-bot',
+            chatId: 'oc_collab',
+            replyToMessageId: 'om_del_root',
+            title: '过短顺延',
+            prompt: '5 分钟后复查',
+            afterSeconds: 300,
+          },
+          baseNow + 600_000,
+        ),
+      ).rejects.toThrow('指数退避保护')
+
+      const hop1 = await reminders.create(
+        {
+          sessionId: sid,
+          botId: 'del-bot',
+          chatId: 'oc_collab',
+          replyToMessageId: 'om_del_root',
+          title: '顺延复查线上登录 502 排查',
+          prompt: 'Bob 已回应正在看，10 分钟后复查最终结果',
+          afterSeconds: 600,
+        },
+        baseNow + 600_000,
+      )
+      hop1Id = hop1.id
+      expect(hop1.kind).toBe('delegation')
+      expect(hop1.mentions).toEqual([{ openId: 'ou_bob', name: 'Bob' }])
+      expect(hop1.ccMentions).toEqual([{ openId: 'ou_alex', name: 'Alex' }])
+      expect(hop1.chainDepth).toBe(1)
+      return REMINDER_SILENT_SENTINEL
+    }
+    await reminders.runNow(rootDel.id, baseNow + 600_000)
+
+    // Hop 2 scheduled 10 hours later (passes 24h delegation window + shifts out of 00:00-08:00 quiet hours to 08:00!)
+    let hop2Id = ''
+    turnHandler = async (sid) => {
+      const hop2 = await reminders.create(
+        {
+          sessionId: sid,
+          botId: 'del-bot',
+          chatId: 'oc_collab',
+          replyToMessageId: 'om_del_root',
+          title: '次日顺延复查',
+          prompt: '确认最终处理结论',
+          afterSeconds: 10 * 3600,
+        },
+        baseNow + 1200_000,
+      )
+      hop2Id = hop2.id
+      expect(hop2.chainDepth).toBe(2)
+      const deferred = new Date(hop2.scheduledAt)
+      expect(deferred.getHours()).toBe(8)
+      expect(deferred.getMinutes()).toBe(0)
+      expect(hop2.deferredFromScheduledAt).toBeTruthy()
+      return REMINDER_SILENT_SENTINEL
+    }
+    await reminders.runNow(hop1Id, baseNow + 1200_000)
+
+    // Final execution sends reminder with owner + cc recorded in resultSummary
+    turnHandler = async () => '线上 502 排查暂未见进展同步，方便确认下当前状态吗？'
+    const finalRes = await reminders.runNow(hop2Id)
+    expect(finalRes.resolution).toBe('reminded')
+    expect(finalRes.resultSummary).toContain('<at id="ou_bob">Bob</at>')
+    expect(finalRes.resultSummary).toContain('cc <at id="ou_alex">Alex</at>')
+    expect(delivered).toHaveLength(1)
 
     await reminders.stop()
   })

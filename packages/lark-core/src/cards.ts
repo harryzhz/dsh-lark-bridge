@@ -181,8 +181,25 @@ export function buildApprovalCard(options: ApprovalCardOptions): Record<string, 
   }
 }
 
+function formatReminderStakeholderLines(
+  item: Pick<LarkReminderItem, 'mentions' | 'ccMentions'>,
+): string[] {
+  const lines: string[] = []
+  if (item.mentions && item.mentions.length > 0) {
+    lines.push(
+      `**主负责人**：${item.mentions.map((m) => m.name || m.openId).join('、')}`,
+    )
+  }
+  if (item.ccMentions && item.ccMentions.length > 0) {
+    lines.push(
+      `**抄送关注**：cc ${item.ccMentions.map((m) => m.name || m.openId).join('、')}`,
+    )
+  }
+  return lines
+}
+
 export function buildReminderConfirmCard(
-  item: Pick<LarkReminderItem, 'id' | 'title' | 'scheduledAt' | 'reason' | 'prompt'>,
+  item: Pick<LarkReminderItem, 'id' | 'title' | 'scheduledAt' | 'reason' | 'prompt' | 'mentions' | 'ccMentions'>,
   formattedTime: string,
 ): Record<string, unknown> {
   const detail = item.reason?.trim() || item.prompt.trim().slice(0, 160)
@@ -199,6 +216,7 @@ export function buildReminderConfirmCard(
           tag: 'markdown',
           content: [
             `**计划触发时间**：${formattedTime}`,
+            ...formatReminderStakeholderLines(item),
             detail ? `**跟进说明**：${detail}` : '',
           ]
             .filter(Boolean)
@@ -248,9 +266,10 @@ export function buildReminderConfirmCard(
 }
 
 export function buildReminderNoticeCard(
-  item: Pick<LarkReminderItem, 'id' | 'title'>,
+  item: Pick<LarkReminderItem, 'id' | 'title' | 'mentions' | 'ccMentions'>,
   formattedTime: string,
 ): Record<string, unknown> {
+  const stakeholderLines = formatReminderStakeholderLines(item)
   return {
     schema: '2.0',
     config: { wide_screen_mode: true },
@@ -262,7 +281,10 @@ export function buildReminderNoticeCard(
       elements: [
         {
           tag: 'markdown',
-          content: `将于 **${formattedTime}** 自动跟进执行（触发后自动归档；若届时已完成将保持静默）。`,
+          content: [
+            `将于 **${formattedTime}** 自动跟进执行（触发后自动归档；若届时已完成将保持静默）。`,
+            ...stakeholderLines,
+          ].join('\n'),
         },
         {
           tag: 'column_set',

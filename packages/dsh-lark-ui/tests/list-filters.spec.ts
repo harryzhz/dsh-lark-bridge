@@ -162,7 +162,9 @@ describe('Unified list filter helpers (bots, automation, sessions, audit events)
           chatName: '研发协作群',
           deliveryMode: 'thread',
         },
-        mentions: [],
+        mentions: [{ openId: 'ou_bob', name: 'Bob' }],
+        ccMentions: [{ openId: 'ou_lin', name: '林晓' }],
+        kind: 'delegation',
         createdAtMs: 1000,
         updatedAtMs: 1000,
       },
@@ -211,6 +213,8 @@ describe('Unified list filter helpers (bots, automation, sessions, audit events)
     expect(filterReminders(reminders, 'bot-a', 'archived', '').map((r) => r.id)).toEqual(['rem-2'])
     expect(filterReminders(reminders, 'bot-a', 'all', '').map((r) => r.id)).toEqual(['rem-1', 'rem-2'])
     expect(filterReminders(reminders, 'bot-b', 'active', 'alex').map((r) => r.id)).toEqual(['rem-3'])
+    expect(filterReminders(reminders, 'bot-a', 'active', 'bob').map((r) => r.id)).toEqual(['rem-1'])
+    expect(filterReminders(reminders, 'bot-a', 'active', '林晓').map((r) => r.id)).toEqual(['rem-1'])
     expect(filterReminders(reminders, 'bot-a', 'active', 'alex')).toEqual([])
   })
 

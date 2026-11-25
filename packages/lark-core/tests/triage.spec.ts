@@ -652,4 +652,56 @@ describe('Smart triage config, per-group overrides & protocol', () => {
     expect(ctxReminder).toContain('线上接口返回 502')
     expect(ctxReminder).toContain('已自动附带 2 张引用图片')
   })
+
+  it('guides triage for delegation follow-up and blocks quick_reply in silentOnly observation mode', () => {
+    const sysObserver = buildTriageSystemPrompt({
+      botName: 'TriageBot',
+      hasActiveWorker: false,
+      trigger: 'listener',
+      delegationFollowupEnabled: true,
+      silentOnly: true,
+    })
+    expect(sysObserver).toContain('委派事项静默观察')
+    expect(sysObserver).toContain('silent_only=true')
+    expect(sysObserver).toContain('禁止使用 `quick_reply`')
+
+    const sysListener = buildTriageSystemPrompt({
+      botName: 'TriageBot',
+      hasActiveWorker: false,
+      trigger: 'listener',
+      listenerPrompt: '旁听项目讨论',
+      delegationFollowupEnabled: true,
+    })
+    expect(sysListener).toContain('已开启「委派事项跟进」')
+    expect(sysListener).toContain('不要按“指派他人”静默')
+
+    const userMsg = buildTriageUserMessage({
+      botName: 'TriageBot',
+      trigger: 'listener',
+      senderName: 'Alex',
+      senderType: 'user',
+      peerMentions: ['Bob'],
+      userText: '@Bob 帮我审批一下发布单',
+      hasActiveWorker: false,
+      silentOnly: true,
+      delegationFollowupEnabled: true,
+      recentMessages: [],
+    })
+    expect(userMsg).toContain('silent_only=true')
+    expect(userMsg).toContain('peer_mentions="Bob"')
+
+    // In silentOnly mode, any accidental quick_reply verdict is converted to silent
+    const downgraded = parseTriageVerdict({
+      toolCalls: [
+        {
+          name: 'route_message',
+          arguments: '{"action":"quick_reply","reason":"打招呼","reply_text":"收到！"}',
+        },
+      ],
+      hasActiveWorker: false,
+      silentOnly: true,
+    })
+    expect(downgraded.action).toBe('silent')
+    expect(downgraded.reason).toContain('后台观察模式禁止直接回复')
+  })
 })

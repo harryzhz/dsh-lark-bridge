@@ -261,6 +261,8 @@ export class LarkBridgeManager {
       runtimes: this.runtimes,
       workspaces: this.workspaces,
       onActivityChange: notifyActivityChange,
+      resolveMemberName: (botId, chatId, openId) =>
+        this.facade.resolveMemberName(botId, chatId, openId),
       runTurn: (agent, content) =>
         runTurnAndCollectReply(this.ctx, agent, content, {
           signal: this.shutdownController.signal,

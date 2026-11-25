@@ -15,6 +15,7 @@ import {
   type InboundLarkMessage,
   type LarkBotConfig,
   type LarkGroupConfig,
+  type LarkMention,
   type MentionTriggerMode,
   type RoutingDecision,
   type RoutingRuntimeContext,
@@ -353,6 +354,30 @@ function mentionsOpenId(msg: InboundLarkMessage, targetOpenId: string): boolean 
   return msg.mentions.some((m) => m.openId === targetOpenId)
 }
 
+/**
+ * Extracts mentioned peers in a group message, excluding the bot itself, `@all`,
+ * and self-mentions (delegating to oneself).
+ */
+export function extractPeerUserMentions(
+  msg: Pick<InboundLarkMessage, 'mentions' | 'botOpenId' | 'senderOpenId'>,
+  overrideBotOpenId?: string,
+): LarkMention[] {
+  const effectiveBotOpenId = overrideBotOpenId || msg.botOpenId
+  const seen = new Set<string>()
+  const out: LarkMention[] = []
+  for (const m of msg.mentions) {
+    const openId = m.openId?.trim()
+    if (!openId) continue
+    if (openId === 'all' || m.key === '@_all') continue
+    if (effectiveBotOpenId && openId === effectiveBotOpenId) continue
+    if (msg.senderOpenId && openId === msg.senderOpenId) continue
+    if (seen.has(openId)) continue
+    seen.add(openId)
+    out.push(m)
+  }
+  return out
+}
+
 function routeScopeForSessionMode(
   sessionMode: GroupSessionMode,
   msg: InboundLarkMessage,
@@ -451,6 +476,27 @@ function buildListenerReminder(listener: GroupListenerRule, msg: InboundLarkMess
   }
   lines.push('</listener>')
   return lines.join('\n')
+}
+
+function buildDelegationFollowupReminder(
+  msg: InboundLarkMessage,
+  mode: 'silent_only' | 'assist',
+): string {
+  if (mode === 'silent_only') {
+    return [
+      `<delegation_followup mode="silent_only" chat_id="${escapeXmlAttr(msg.chatId)}">`,
+      '仅判断当前消息是否构成成员间明确的行动委派（A @ B 排查、修复、发版、审批、CR 或交付具体事项）：',
+      '1. 若属于需要后续核查的明确委派：先运行 `lark-bridge reminder list` 去重，再用 `lark-bridge reminder create --kind delegation` 登记跟进提醒（`--mention <B_open_id>:<B姓名>` 为主负责人，`--cc <A_open_id>:<A姓名>` 抄送发起人；有明确截止时间按截止时间，无明确时间则自适应：紧急故障 10 分钟、常规协作/CR/审批 1 小时，并在 `--prompt` 中要求核查话题与群主消息流、已回应但未给结果则顺延复查、已闭环则静默）。',
+      '2. 若仅是寒暄、纯信息同步、纯问答或无行动项的 @ 他人：不建提醒。',
+      '3. 本轮为后台静默观察，严禁向群聊回复文本，完成后直接调用 `lark-bridge silence --reason "<原因>"`。',
+      '</delegation_followup>',
+    ].join('\n')
+  }
+  return [
+    `<delegation_followup mode="assist" chat_id="${escapeXmlAttr(msg.chatId)}">`,
+    '已开启「委派事项跟进」：若当前消息属于 A @ B 的明确行动委派（排查/修复/发版/审批/CR/交付等），不要按“指派他人”直接忽略——可先运行 `lark-bridge reminder list` 去重，再在后台用 `lark-bridge reminder create --kind delegation --mention <B_open_id>:<B姓名> --cc <A_open_id>:<A姓名>` 登记跟进提醒（无明确时间则紧急故障 10 分钟、常规协作/CR/审批 1 小时）；如本身无需在群内插话，登记后调用 `lark-bridge silence` 静默退出。',
+    '</delegation_followup>',
+  ].join('\n')
 }
 
 function buildSubstituteReminder(
@@ -643,6 +689,18 @@ export function decideLarkRouting(
   if (isActiveThreadContext && isBarePeerMentionOnly && !matchesSubstituteTarget) {
     return { action: 'ignore', reason: 'no_matching_rule' }
   }
+  const delegationEnabled = Boolean(
+    bot.experimental.proactive.remindersEnabled &&
+      bot.experimental.proactive.delegationFollowupEnabled,
+  )
+  const peerMentions = extractPeerUserMentions(msg)
+  const hasDelegationCandidate =
+    delegationEnabled &&
+    msg.senderType === 'user' &&
+    (msg.msgType === 'text' || msg.msgType === 'post') &&
+    peerMentions.length > 0 &&
+    stripBotMentions(msg.text, msg.mentions).length > 0
+
   if (
     allowThreadFollowup &&
     allowSenderInActiveThread &&
@@ -671,6 +729,9 @@ export function decideLarkRouting(
       existingThreadTrigger === 'listener'
         ? (group?.listener?.allowSilentEmptyReply ?? true)
         : false
+    const turnReminders = hasDelegationCandidate
+      ? [buildDelegationFollowupReminder(msg, 'assist')]
+      : []
     return {
       action: 'agent',
       trigger: 'active-thread',
@@ -689,11 +750,12 @@ export function decideLarkRouting(
       ...(receivedReactionEmoji ? { receivedReactionEmoji } : {}),
       allowSilentEmptyReply,
       autoCloseAfterCompletion: false,
+      ...(hasDelegationCandidate ? { delegationFollowup: true } : {}),
       ...(idleCloseMs ? { idleCloseMs } : {}),
       ...(roleReminder ? { roleReminder } : {}),
-      turnReminders: [],
+      turnReminders,
       userText,
-      promptText: composeTurnPrompt([], userText),
+      promptText: composeTurnPrompt(turnReminders, userText),
     }
   }
 
@@ -738,15 +800,53 @@ export function decideLarkRouting(
   }
 
   // 5. Group chat: passive listener rule configured on group
+  let listenerIgnoreReason: string | undefined
   if (group?.listener?.enabled) {
     const check = matchesListenerRule(group.listener, msg)
-    if (!check.ok) {
-      return { action: 'ignore', reason: check.reason ?? 'listener_filtered' }
+    if (check.ok) {
+      const listener = group.listener
+      const routeKey = resolveSessionRouteKey(bot, msg, listener.sessionMode, runtime)
+      const userText = replaceMentionKeysWithNames(msg.text, msg.mentions) || `[${msg.msgType}]`
+      const turnReminders = [
+        buildListenerReminder(listener, msg),
+        ...(hasDelegationCandidate ? [buildDelegationFollowupReminder(msg, 'assist')] : []),
+      ]
+      return {
+        action: 'agent',
+        trigger: 'listener',
+        routeKey,
+        workingDir,
+        workspaceName,
+        ...(resolvedChatName ? { chatName: resolvedChatName } : {}),
+        agentPreset,
+        ...(runtimeProfileId ? { runtimeProfileId } : {}),
+        ...(model ? { model } : {}),
+        ...(reasoningEffort ? { reasoningEffort } : {}),
+        sessionMode: listener.sessionMode,
+        replyMode: resolveReplyModeInContext(listener.replyMode, msg),
+        useCard,
+        sendIntermediateMessages,
+        ...(receivedReactionEmoji ? { receivedReactionEmoji } : {}),
+        allowSilentEmptyReply: listener.allowSilentEmptyReply,
+        autoCloseAfterCompletion:
+          listener.autoCloseAfterCompletion || listener.sessionMode === 'per_message',
+        ...(hasDelegationCandidate ? { delegationFollowup: true } : {}),
+        ...(idleCloseMs ? { idleCloseMs } : {}),
+        ...(roleReminder ? { roleReminder } : {}),
+        turnReminders,
+        userText,
+        promptText: composeTurnPrompt(turnReminders, userText),
+        ...(listener.name ? { listenerName: listener.name } : {}),
+      }
     }
-    const listener = group.listener
-    const routeKey = resolveSessionRouteKey(bot, msg, listener.sessionMode, runtime)
+    listenerIgnoreReason = check.reason ?? 'listener_filtered'
+  }
+
+  // 6. Group chat: silent proactive delegation observer (`A @ B <task>`)
+  if (hasDelegationCandidate) {
+    const routeKey = resolveSessionRouteKey(bot, msg, 'per_message', runtime)
     const userText = replaceMentionKeysWithNames(msg.text, msg.mentions) || `[${msg.msgType}]`
-    const turnReminders = [buildListenerReminder(listener, msg)]
+    const turnReminders = [buildDelegationFollowupReminder(msg, 'silent_only')]
     return {
       action: 'agent',
       trigger: 'listener',
@@ -758,22 +858,22 @@ export function decideLarkRouting(
       ...(runtimeProfileId ? { runtimeProfileId } : {}),
       ...(model ? { model } : {}),
       ...(reasoningEffort ? { reasoningEffort } : {}),
-      sessionMode: listener.sessionMode,
-      replyMode: resolveReplyModeInContext(listener.replyMode, msg),
+      sessionMode: 'per_message',
+      replyMode: 'new-topic',
       useCard,
-      sendIntermediateMessages,
-      ...(receivedReactionEmoji ? { receivedReactionEmoji } : {}),
-      allowSilentEmptyReply: listener.allowSilentEmptyReply,
-      autoCloseAfterCompletion:
-        listener.autoCloseAfterCompletion || listener.sessionMode === 'per_message',
+      sendIntermediateMessages: false,
+      allowSilentEmptyReply: true,
+      autoCloseAfterCompletion: true,
+      silentOnly: true,
+      delegationFollowup: true,
       ...(idleCloseMs ? { idleCloseMs } : {}),
       ...(roleReminder ? { roleReminder } : {}),
       turnReminders,
       userText,
       promptText: composeTurnPrompt(turnReminders, userText),
-      ...(listener.name ? { listenerName: listener.name } : {}),
+      listenerName: '委派事项跟进',
     }
   }
 
-  return { action: 'ignore', reason: 'no_matching_rule' }
+  return { action: 'ignore', reason: listenerIgnoreReason ?? 'no_matching_rule' }
 }
