@@ -1892,4 +1892,118 @@ describe('decideLarkRouting, <user_message> format, memberOverrides & title inte
       userText: '[表情包]',
     })
   })
+
+  it('isolates main-stream quote forks under new-topic and refuses matching roots already bound to a native thread', () => {
+    const bot = createBot({
+      groupReplyMode: 'new-topic',
+      groupSessionMode: 'thread',
+      mentionTriggerMode: 'mention_and_active_thread',
+    })
+    const rootKey = 'cli_dsh_app:oc_team_dev:om_root_0'
+
+    // 1. Two main-stream quote replies off an ephemeral quick-reply root spawn isolated routeKeys
+    //    while carrying ephemeralHandoffRouteKey so both inherit the quick-reply context.
+    const forkA = decideLarkRouting(
+      bot,
+      createMessage({
+        messageId: 'om_fork_a',
+        rootId: 'om_root_0',
+        parentId: 'om_quick_1',
+        text: '@_bot_1 分支 A',
+        mentions: [{ key: '@_bot_1', openId: 'ou_bot', name: 'DSH-Bot' }],
+      }),
+      {
+        hasActiveSessionForRoute: () => false,
+        hasEphemeralRouterThread: (k) => k === rootKey,
+      },
+    )
+    const forkB = decideLarkRouting(
+      bot,
+      createMessage({
+        messageId: 'om_fork_b',
+        rootId: 'om_root_0',
+        parentId: 'om_quick_1',
+        text: '@_bot_1 分支 B',
+        mentions: [{ key: '@_bot_1', openId: 'ou_bot', name: 'DSH-Bot' }],
+      }),
+      {
+        hasActiveSessionForRoute: () => false,
+        hasEphemeralRouterThread: (k) => k === rootKey,
+      },
+    )
+    expect(forkA).toMatchObject({
+      action: 'agent',
+      trigger: 'mention',
+      routeKey: 'cli_dsh_app:oc_team_dev:om_fork_a',
+      ephemeralHandoffRouteKey: rootKey,
+    })
+    expect(forkB).toMatchObject({
+      action: 'agent',
+      trigger: 'mention',
+      routeKey: 'cli_dsh_app:oc_team_dev:om_fork_b',
+      ephemeralHandoffRouteKey: rootKey,
+    })
+
+    // 2. When rootKey is already bound to a native thread (`isRouteBoundToNativeThread = true`),
+    //    a main-stream quote (no threadId) never hijacks it (neither via @mention nor active-thread).
+    const mentionOffPromoted = decideLarkRouting(
+      bot,
+      createMessage({
+        messageId: 'om_fork_c',
+        rootId: 'om_root_0',
+        parentId: 'om_quick_1',
+        text: '@_bot_1 分支 C',
+        mentions: [{ key: '@_bot_1', openId: 'ou_bot', name: 'DSH-Bot' }],
+      }),
+      {
+        hasActiveSessionForRoute: (k) => k === rootKey,
+        isRouteBoundToNativeThread: (k) => k === rootKey,
+      },
+    )
+    expect(mentionOffPromoted).toMatchObject({
+      action: 'agent',
+      trigger: 'mention',
+      routeKey: 'cli_dsh_app:oc_team_dev:om_fork_c',
+    })
+
+    const unmentionedOffPromoted = decideLarkRouting(
+      bot,
+      createMessage({
+        messageId: 'om_unmentioned_c',
+        rootId: 'om_root_0',
+        parentId: 'om_quick_1',
+        text: '顺口说一句',
+        mentions: [],
+      }),
+      {
+        hasActiveSessionForRoute: (k) => k === rootKey,
+        isRouteBoundToNativeThread: (k) => k === rootKey,
+        getRouteTrigger: () => 'mention',
+        hasRouteReplied: () => true,
+      },
+    )
+    expect(unmentionedOffPromoted).toEqual({ action: 'ignore', reason: 'no_matching_rule' })
+
+    // 3. Unpromoted main-stream worker binding (isRouteBoundToNativeThread = false) still matches
+    //    rootKey so Scenario 8 quote-chain-to-topic promotion continues the existing session.
+    const unpromotedUpgrade = decideLarkRouting(
+      bot,
+      createMessage({
+        messageId: 'om_upgrade_1',
+        rootId: 'om_root_0',
+        parentId: 'om_reply_1',
+        text: '@_bot_1 升级成话题',
+        mentions: [{ key: '@_bot_1', openId: 'ou_bot', name: 'DSH-Bot' }],
+      }),
+      {
+        hasActiveSessionForRoute: (k) => k === rootKey,
+        isRouteBoundToNativeThread: () => false,
+      },
+    )
+    expect(unpromotedUpgrade).toMatchObject({
+      action: 'agent',
+      trigger: 'mention',
+      routeKey: rootKey,
+    })
+  })
 })

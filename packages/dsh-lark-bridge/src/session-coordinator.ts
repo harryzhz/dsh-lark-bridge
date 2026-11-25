@@ -7,6 +7,7 @@ import { appendPluginRecord, type SessionId } from '@deepseek-ai/dsh-session'
 import {
   decideLarkRouting,
   expandWorkingDir,
+  isNativeThreadRouteKey,
   type InboundLarkMessage,
   type LarkBotConfig,
 } from '@dsh-lark/lark-core'
@@ -46,8 +47,16 @@ interface WaitingBatch<T> {
 export interface AcquiredAgent {
   readonly agent: Agent
   readonly sessionId: string
+  readonly routeKey: string
   readonly isNew: boolean
   readonly disposeAfter: boolean
+}
+
+export function bindingHasNativeThread(
+  binding: Pick<LarkSessionBinding, 'routeKey' | 'aliasRouteKeys'>,
+): boolean {
+  if (isNativeThreadRouteKey(binding.routeKey)) return true
+  return (binding.aliasRouteKeys ?? []).some((alias) => isNativeThreadRouteKey(alias))
 }
 
 export interface SessionCoordinatorHost {
@@ -629,8 +638,11 @@ export class SessionCoordinator {
         setup: async (agentCtx, agent) => {
           await launch.mountPreset(agentCtx, agent)
           const isP2p = msg.chatType === 'p2p'
-          const replyAnchor =
-            msg.rootId ?? (msg.threadId?.startsWith('om_') ? msg.threadId : undefined) ?? msg.messageId
+          const replyAnchor = msg.threadId
+            ? (msg.rootId ?? (msg.threadId.startsWith('om_') ? msg.threadId : undefined) ?? msg.messageId)
+            : decision.replyMode === 'new-topic'
+              ? msg.messageId
+              : (msg.rootId ?? msg.messageId)
           appendPluginRecord(agent.session, LARK_ORIGIN_RECORD_TYPE, {
             botId: bot.id,
             botName: bot.name,
@@ -667,7 +679,13 @@ export class SessionCoordinator {
       if (reuseSession) {
         this.host.store.upsertBinding(this.createBinding(bot, msg, decision, sessionId, resolvedCwd))
       }
-      return { agent: handle.agent, sessionId, isNew: true, disposeAfter: !reuseSession }
+      return {
+        agent: handle.agent,
+        sessionId,
+        routeKey: decision.routeKey,
+        isNew: true,
+        disposeAfter: !reuseSession,
+      }
     } catch (err) {
       actor.state = 'archived'
       this.actors.delete(sessionId)
@@ -771,7 +789,13 @@ export class SessionCoordinator {
       decision.workspaceName,
       binding.sessionId,
     )
-    return { agent, sessionId: binding.sessionId, isNew: false, disposeAfter: false }
+    return {
+      agent,
+      sessionId: binding.sessionId,
+      routeKey: decision.routeKey,
+      isNew: false,
+      disposeAfter: false,
+    }
   }
 
   private createBinding(

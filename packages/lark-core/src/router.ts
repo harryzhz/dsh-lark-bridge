@@ -49,6 +49,15 @@ export function buildRouteKey(
   return `${larkAppId}:${chatId}:${scopeId}`
 }
 
+export function extractRouteScope(routeKey: string): string {
+  const parts = routeKey.split(':')
+  return parts.slice(2).join(':')
+}
+
+export function isNativeThreadRouteKey(routeKey: string): boolean {
+  return extractRouteScope(routeKey).startsWith('omt_')
+}
+
 function resolveGroupReplyMode(bot: LarkBotConfig, group?: LarkGroupConfig): GroupReplyMode {
   if (group && group.replyMode !== 'inherit') return group.replyMode
   return bot.groupReplyMode
@@ -61,33 +70,73 @@ function resolveReplyModeInContext(
   return msg.threadId ? 'new-topic' : configured
 }
 
-function resolveThreadRouteKey(
+interface ResolvedSessionRoute {
+  readonly routeKey: string
+  readonly ephemeralHandoffRouteKey?: string
+}
+
+function resolveActiveThreadLookupKey(
   bot: LarkBotConfig,
   msg: InboundLarkMessage,
   runtime: RoutingRuntimeContext,
 ): string {
   const isRouteActive = (key: string) =>
     runtime.hasActiveSessionForRoute(key) || Boolean(runtime.hasEphemeralRouterThread?.(key))
-  const primaryAnchor = msg.rootId ?? msg.threadId ?? msg.messageId
-  const primaryKey = buildRouteKey(bot.larkAppId, msg.chatId, primaryAnchor)
-  if (isRouteActive(primaryKey)) return primaryKey
-  if (msg.rootId && msg.threadId && msg.threadId !== msg.rootId) {
-    const threadIdKey = buildRouteKey(bot.larkAppId, msg.chatId, msg.threadId)
-    if (isRouteActive(threadIdKey)) return threadIdKey
+  // Already inside a native Feishu thread (`omt_*`): match rootId first, then threadId fallback.
+  if (msg.threadId) {
+    const primaryAnchor = msg.rootId ?? msg.threadId
+    const primaryKey = buildRouteKey(bot.larkAppId, msg.chatId, primaryAnchor)
+    if (isRouteActive(primaryKey)) return primaryKey
+    if (msg.rootId && msg.threadId !== msg.rootId) {
+      const threadIdKey = buildRouteKey(bot.larkAppId, msg.chatId, msg.threadId)
+      if (isRouteActive(threadIdKey)) return threadIdKey
+    }
+    return primaryKey
   }
-  return primaryKey
+  // Main-stream quote reply (no threadId): never match a root whose session already promoted
+  // into an independent native Feishu thread, otherwise sibling quotes hijack that thread.
+  if (msg.rootId) {
+    const rootKey = buildRouteKey(bot.larkAppId, msg.chatId, msg.rootId)
+    if (runtime.isRouteBoundToNativeThread?.(rootKey)) {
+      return buildRouteKey(bot.larkAppId, msg.chatId, msg.messageId)
+    }
+    return rootKey
+  }
+  return buildRouteKey(bot.larkAppId, msg.chatId, msg.messageId)
 }
 
-function resolveSessionRouteKey(
+function resolveSessionRoute(
   bot: LarkBotConfig,
   msg: InboundLarkMessage,
   sessionMode: GroupSessionMode,
+  replyMode: GroupReplyMode,
   runtime: RoutingRuntimeContext,
-): string {
-  if (sessionMode === 'thread') {
-    return resolveThreadRouteKey(bot, msg, runtime)
+): ResolvedSessionRoute {
+  if (sessionMode !== 'thread') {
+    return {
+      routeKey: buildRouteKey(bot.larkAppId, msg.chatId, routeScopeForSessionMode(sessionMode, msg)),
+    }
   }
-  return buildRouteKey(bot.larkAppId, msg.chatId, routeScopeForSessionMode(sessionMode, msg))
+  if (msg.threadId || !msg.rootId) {
+    return { routeKey: resolveActiveThreadLookupKey(bot, msg, runtime) }
+  }
+  const rootKey = buildRouteKey(bot.larkAppId, msg.chatId, msg.rootId)
+  const selfKey = buildRouteKey(bot.larkAppId, msg.chatId, msg.messageId)
+  if (runtime.isRouteBoundToNativeThread?.(rootKey)) {
+    return { routeKey: selfKey }
+  }
+  const hasUnpromotedWorker = runtime.hasActiveSessionForRoute(rootKey)
+  if (replyMode === 'new-topic' && !hasUnpromotedWorker) {
+    // Replying with `reply_in_thread: true` to a main-stream quote reply unconditionally spawns a
+    // brand-new Feishu thread rooted at `msg.messageId`. Bind directly to `selfKey` so concurrent
+    // or repeated sibling quotes off the same root never merge into one session.
+    const hasEphemeral = Boolean(runtime.hasEphemeralRouterThread?.(rootKey))
+    return {
+      routeKey: selfKey,
+      ...(hasEphemeral ? { ephemeralHandoffRouteKey: rootKey } : {}),
+    }
+  }
+  return { routeKey: rootKey }
 }
 
 function resolveGroupSessionMode(
@@ -599,14 +648,20 @@ export function decideLarkRouting(
   const effectiveGroupReplyMode = resolveReplyModeInContext(groupReplyMode, msg)
   const groupSessionMode = resolveGroupSessionMode(bot, group)
   const mentionTriggerMode = resolveMentionTriggerMode(bot, group)
-  const threadRouteKey = resolveThreadRouteKey(bot, msg, runtime)
+  const threadRouteKey = resolveActiveThreadLookupKey(bot, msg, runtime)
   const chatRouteKey = buildRouteKey(bot.larkAppId, msg.chatId, 'chat')
 
   // 2. Group chat: direct @bot mention
   const mentionedBot = Boolean(msg.botOpenId && mentionsOpenId(msg, msg.botOpenId))
   if (mentionedBot) {
     const clean = stripBotMentions(msg.text, msg.mentions, msg.botOpenId)
-    const routeKey = resolveSessionRouteKey(bot, msg, groupSessionMode, runtime)
+    const resolvedRoute = resolveSessionRoute(
+      bot,
+      msg,
+      groupSessionMode,
+      effectiveGroupReplyMode,
+      runtime,
+    )
     const cmd = parseSlashCommand(clean)
     if (cmd) {
       const cmdRouteKey = groupSessionMode === 'chat' ? chatRouteKey : threadRouteKey
@@ -623,7 +678,10 @@ export function decideLarkRouting(
     return {
       action: 'agent',
       trigger: 'mention',
-      routeKey,
+      routeKey: resolvedRoute.routeKey,
+      ...(resolvedRoute.ephemeralHandoffRouteKey
+        ? { ephemeralHandoffRouteKey: resolvedRoute.ephemeralHandoffRouteKey }
+        : {}),
       workingDir,
       workspaceName,
       ...(resolvedChatName ? { chatName: resolvedChatName } : {}),
@@ -647,9 +705,17 @@ export function decideLarkRouting(
   }
 
   // 3. Group chat: active thread continuation (without re-mentioning agent)
-  const hasWorkerSession = runtime.hasActiveSessionForRoute(threadRouteKey)
+  const mainStreamRootAlreadyPromoted = Boolean(
+    !msg.threadId &&
+      msg.rootId &&
+      runtime.isRouteBoundToNativeThread?.(buildRouteKey(bot.larkAppId, msg.chatId, msg.rootId)),
+  )
+  const hasWorkerSession =
+    !mainStreamRootAlreadyPromoted && runtime.hasActiveSessionForRoute(threadRouteKey)
   const hasEphemeralThread =
-    !hasWorkerSession && Boolean(runtime.hasEphemeralRouterThread?.(threadRouteKey))
+    !mainStreamRootAlreadyPromoted &&
+    !hasWorkerSession &&
+    Boolean(runtime.hasEphemeralRouterThread?.(threadRouteKey))
   const existingThreadTrigger = runtime.getRouteTrigger?.(threadRouteKey)
   const hasThreadReplied = runtime.hasRouteReplied?.(threadRouteKey) ?? true
   const allowThreadFollowup =
@@ -659,7 +725,9 @@ export function decideLarkRouting(
         ? hasThreadReplied && mentionTriggerMode === 'mention_and_active_thread'
         : mentionTriggerMode === 'mention_and_active_thread'
   const isActiveThreadContext = Boolean(
-    (msg.rootId || msg.threadId) && (hasWorkerSession || hasEphemeralThread),
+    (msg.rootId || msg.threadId) &&
+      !mainStreamRootAlreadyPromoted &&
+      (hasWorkerSession || hasEphemeralThread),
   )
   const allowSenderInActiveThread =
     msg.senderType !== 'bot' ||
@@ -732,10 +800,20 @@ export function decideLarkRouting(
     const turnReminders = hasDelegationCandidate
       ? [buildDelegationFollowupReminder(msg, 'assist')]
       : []
+    const forksEphemeralToNewTopic =
+      !msg.threadId &&
+      Boolean(msg.rootId) &&
+      activeThreadReplyMode === 'new-topic' &&
+      !hasWorkerSession &&
+      hasEphemeralThread
+    const activeRouteKey = forksEphemeralToNewTopic
+      ? buildRouteKey(bot.larkAppId, msg.chatId, msg.messageId)
+      : threadRouteKey
     return {
       action: 'agent',
       trigger: 'active-thread',
-      routeKey: threadRouteKey,
+      routeKey: activeRouteKey,
+      ...(forksEphemeralToNewTopic ? { ephemeralHandoffRouteKey: threadRouteKey } : {}),
       workingDir,
       workspaceName,
       ...(resolvedChatName ? { chatName: resolvedChatName } : {}),
@@ -768,13 +846,22 @@ export function decideLarkRouting(
         sub.activeThreadFollowup && groupSessionMode === 'per_message'
           ? 'thread'
           : groupSessionMode
-      const routeKey = resolveSessionRouteKey(bot, msg, effectiveSubSessionMode, runtime)
+      const resolvedSubRoute = resolveSessionRoute(
+        bot,
+        msg,
+        effectiveSubSessionMode,
+        effectiveGroupReplyMode,
+        runtime,
+      )
       const userText = replaceMentionKeysWithNames(msg.text, msg.mentions) || `[${msg.msgType}]`
       const turnReminders = [buildSubstituteReminder(matchedTarget.name, sub.disclosure, msg)]
       return {
         action: 'agent',
         trigger: 'substitute',
-        routeKey,
+        routeKey: resolvedSubRoute.routeKey,
+        ...(resolvedSubRoute.ephemeralHandoffRouteKey
+          ? { ephemeralHandoffRouteKey: resolvedSubRoute.ephemeralHandoffRouteKey }
+          : {}),
         workingDir,
         workspaceName,
         ...(resolvedChatName ? { chatName: resolvedChatName } : {}),
@@ -805,7 +892,14 @@ export function decideLarkRouting(
     const check = matchesListenerRule(group.listener, msg)
     if (check.ok) {
       const listener = group.listener
-      const routeKey = resolveSessionRouteKey(bot, msg, listener.sessionMode, runtime)
+      const effectiveListenerReplyMode = resolveReplyModeInContext(listener.replyMode, msg)
+      const resolvedListenerRoute = resolveSessionRoute(
+        bot,
+        msg,
+        listener.sessionMode,
+        effectiveListenerReplyMode,
+        runtime,
+      )
       const userText = replaceMentionKeysWithNames(msg.text, msg.mentions) || `[${msg.msgType}]`
       const turnReminders = [
         buildListenerReminder(listener, msg),
@@ -814,7 +908,10 @@ export function decideLarkRouting(
       return {
         action: 'agent',
         trigger: 'listener',
-        routeKey,
+        routeKey: resolvedListenerRoute.routeKey,
+        ...(resolvedListenerRoute.ephemeralHandoffRouteKey
+          ? { ephemeralHandoffRouteKey: resolvedListenerRoute.ephemeralHandoffRouteKey }
+          : {}),
         workingDir,
         workspaceName,
         ...(resolvedChatName ? { chatName: resolvedChatName } : {}),
@@ -823,7 +920,7 @@ export function decideLarkRouting(
         ...(model ? { model } : {}),
         ...(reasoningEffort ? { reasoningEffort } : {}),
         sessionMode: listener.sessionMode,
-        replyMode: resolveReplyModeInContext(listener.replyMode, msg),
+        replyMode: effectiveListenerReplyMode,
         useCard,
         sendIntermediateMessages,
         ...(receivedReactionEmoji ? { receivedReactionEmoji } : {}),
@@ -844,13 +941,19 @@ export function decideLarkRouting(
 
   // 6. Group chat: silent proactive delegation observer (`A @ B <task>`)
   if (hasDelegationCandidate) {
-    const routeKey = resolveSessionRouteKey(bot, msg, 'per_message', runtime)
+    const resolvedDelegationRoute = resolveSessionRoute(
+      bot,
+      msg,
+      'per_message',
+      'new-topic',
+      runtime,
+    )
     const userText = replaceMentionKeysWithNames(msg.text, msg.mentions) || `[${msg.msgType}]`
     const turnReminders = [buildDelegationFollowupReminder(msg, 'silent_only')]
     return {
       action: 'agent',
       trigger: 'listener',
-      routeKey,
+      routeKey: resolvedDelegationRoute.routeKey,
       workingDir,
       workspaceName,
       ...(resolvedChatName ? { chatName: resolvedChatName } : {}),

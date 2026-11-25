@@ -11,6 +11,7 @@ import {
   composeRouterHandoffReminder,
   composeTurnPrompt,
   decideLarkRouting,
+  extractRouteScope,
   isGroupEnabled,
   isLarkMessageRecalledError,
   isSilentReplySentinel,
@@ -40,7 +41,12 @@ import {
 } from './media-intake.js'
 import type { MemoryService } from './memory-service.js'
 import type { RuntimeCatalog } from './runtime-catalog.js'
-import type { AcquiredAgent, AgentDecision, SessionCoordinator } from './session-coordinator.js'
+import {
+  bindingHasNativeThread,
+  type AcquiredAgent,
+  type AgentDecision,
+  type SessionCoordinator,
+} from './session-coordinator.js'
 import type { SessionTitleGuard } from './session-title-guard.js'
 import { handleSlashCommand } from './slash-commands.js'
 import type { LarkBridgeStore } from './store.js'
@@ -137,6 +143,58 @@ function linkAbortSignals(signals: readonly (AbortSignal | undefined)[]): {
   }
 }
 
+export interface ExecutingTurnContext {
+  readonly botId: string
+  readonly larkAppId: string
+  readonly chatId: string
+  readonly chatType: 'p2p' | 'group'
+  readonly chatName?: string
+  readonly routeKey: string
+  readonly messageId: string
+  readonly rootId?: string
+  readonly threadId?: string
+  readonly replyMode: GroupReplyMode
+  readonly replyToMessageId?: string
+  readonly replyInThread: boolean
+}
+
+function buildExecutingTurnContext(
+  bot: LarkBotConfig,
+  msg: InboundLarkMessage,
+  decision: AgentDecision,
+  chatName?: string,
+): ExecutingTurnContext {
+  const chatType: 'p2p' | 'group' = msg.chatType === 'p2p' ? 'p2p' : 'group'
+  let replyToMessageId: string | undefined
+  let replyInThread = false
+  if (chatType === 'group') {
+    if (msg.threadId) {
+      replyToMessageId = msg.rootId ?? msg.messageId
+      replyInThread = true
+    } else if (decision.replyMode === 'new-topic') {
+      replyToMessageId = msg.messageId
+      replyInThread = true
+    } else if (decision.replyMode === 'reply') {
+      replyToMessageId = msg.messageId
+      replyInThread = false
+    }
+  }
+  return {
+    botId: bot.id,
+    larkAppId: bot.larkAppId,
+    chatId: msg.chatId,
+    chatType,
+    ...(chatName ? { chatName } : {}),
+    routeKey: decision.routeKey,
+    messageId: msg.messageId,
+    ...(msg.rootId ? { rootId: msg.rootId } : {}),
+    ...(msg.threadId ? { threadId: msg.threadId } : {}),
+    replyMode: decision.replyMode,
+    ...(replyToMessageId ? { replyToMessageId } : {}),
+    replyInThread,
+  }
+}
+
 export interface ActiveTurnRecord {
   readonly id: string
   readonly traceId: string
@@ -144,7 +202,7 @@ export interface ActiveTurnRecord {
   readonly chatId: string
   readonly chatName?: string
   readonly messageId: string
-  readonly routeKey: string
+  routeKey: string
   readonly replyMode: GroupReplyMode
   readonly trigger: string
   readonly allowSilentEmptyReply: boolean
@@ -232,6 +290,7 @@ function createTraceId(): string {
 export class InboundPipeline {
   private readonly dedup = new MessageDeduplicator()
   private readonly activeTurns = new Map<string, ActiveTurnRecord>()
+  private readonly executingTurnBySession = new Map<string, ExecutingTurnContext>()
   private readonly recalledMessages = new Map<string, number>()
   private readonly inflightCancels = new Set<InflightCancelEntry>()
   private readonly recoveringTurnIds = new Set<string>()
@@ -239,6 +298,11 @@ export class InboundPipeline {
 
   constructor(private readonly host: InboundPipelineHost) {
     this.dedup.hydrate(host.store.listSeenMessages?.() ?? [])
+  }
+
+  getExecutingTurnContext(sessionId: string): ExecutingTurnContext | undefined {
+    const sid = sessionId.trim()
+    return sid ? this.executingTurnBySession.get(sid) : undefined
   }
 
   getActiveCount(): number {
@@ -632,6 +696,10 @@ export class InboundPipeline {
       groupConfig,
       ...(knownChatName ? { chatName: knownChatName } : {}),
       hasActiveSessionForRoute: (routeKey) => Boolean(this.host.store.getBinding(routeKey)),
+      isRouteBoundToNativeThread: (routeKey) => {
+        const binding = this.host.store.getBinding(routeKey)
+        return Boolean(binding && bindingHasNativeThread(binding))
+      },
       hasEphemeralRouterThread: (routeKey) =>
         Boolean(this.host.triage?.context.hasEphemeralThread(routeKey)),
       getRouteTrigger: (routeKey) =>
@@ -1239,6 +1307,8 @@ export class InboundPipeline {
       })
 
       let trackedSessionId: string | undefined
+      let trackedRouteKey = decision.routeKey
+      let boundDecision: AgentDecision = decision
       let acquiredRef: AcquiredAgent | undefined
       let leaderRegistered = false
       let releaseTurnSlot: (() => void) | undefined
@@ -1265,6 +1335,11 @@ export class InboundPipeline {
         acquiredRef = acquired
         trackedSessionId = acquired.sessionId
         activeTurn.sessionId = trackedSessionId
+        if (acquired.routeKey !== decision.routeKey) {
+          boundDecision = { ...decision, routeKey: acquired.routeKey }
+          trackedRouteKey = acquired.routeKey
+          activeTurn.routeKey = acquired.routeKey
+        }
 
         const postAcquireDisabled = activeTurn.cancelledByDisable ?? getSelfDisabledScope()
         if (postAcquireDisabled) {
@@ -1284,12 +1359,22 @@ export class InboundPipeline {
           return
         }
 
-        const handoff = this.host.triage?.context.consumeEphemeralHandoff(decision.routeKey)
-        if (handoff && decision.sessionMode === 'thread') {
-          for (const aliasKey of handoff.aliasRouteKeys) {
-            this.host.store.bindRouteAlias(decision.routeKey, aliasKey)
+        const peekedHandoff = boundDecision.ephemeralHandoffRouteKey
+          ? this.host.triage?.context.peekEphemeralHandoff(boundDecision.ephemeralHandoffRouteKey)
+          : undefined
+        const consumedHandoff = !boundDecision.ephemeralHandoffRouteKey
+          ? this.host.triage?.context.consumeEphemeralHandoff(boundDecision.routeKey)
+          : undefined
+        if (
+          consumedHandoff &&
+          boundDecision.sessionMode === 'thread' &&
+          boundDecision.routeKey === decision.routeKey
+        ) {
+          for (const aliasKey of consumedHandoff.aliasRouteKeys) {
+            this.host.store.bindRouteAlias(boundDecision.routeKey, aliasKey)
           }
         }
+        const handoff = peekedHandoff ?? consumedHandoff
         const effectiveHandoffTurns =
           handoff?.turns.length ? handoff.turns : recovery?.handoffTurns
         if (effectiveHandoffTurns && effectiveHandoffTurns.length > 0) {
@@ -1313,7 +1398,7 @@ export class InboundPipeline {
 
         const selfItem: QueuedWorkerTurnItem = {
           msg,
-          decision,
+          decision: boundDecision,
           activeTurn,
           cancelController: msgCancelController,
           mediaCache,
@@ -1332,7 +1417,7 @@ export class InboundPipeline {
         }
 
         const allowCoalesce =
-          routerConfig.coalesceQueuedMessages && decision.sessionMode !== 'per_message'
+          routerConfig.coalesceQueuedMessages && boundDecision.sessionMode !== 'per_message'
         const slot = await this.host.sessions.acquireCoalescedTurnSlot(trackedSessionId, selfItem, {
           coalesce: allowCoalesce,
           signal: this.host.shutdownSignal,
@@ -1380,7 +1465,7 @@ export class InboundPipeline {
               this.claimActiveTurn(orphaned.activeTurn)
             }
           }
-          const currentBinding = this.host.store.getBinding(decision.routeKey)
+          const currentBinding = this.host.store.getBinding(trackedRouteKey)
           shouldDisposeEphemeral = Boolean(
             acquired.disposeAfter ||
               (anyCancelled && acquired.isNew && currentBinding?.hasReplied === false),
@@ -1482,6 +1567,13 @@ export class InboundPipeline {
           linkedCancel.signal.aborted ||
           Boolean(this.getBatchDisabledScope(bot.id, batchItems)) ||
           batchItems.some((i) => this.isTurnRecalled(bot.id, i))
+        const executingTurnCtx = buildExecutingTurnContext(
+          bot,
+          latestItem.msg,
+          effectiveDecision,
+          resolvedChatName,
+        )
+        this.executingTurnBySession.set(acquired.sessionId, executingTurnCtx)
         let replyText: string
         try {
           replyText = await runTurnAndCollectReply(this.host.ctx, acquired.agent, content, {
@@ -1496,26 +1588,33 @@ export class InboundPipeline {
               ? {
                   onIntermediate: async (stepText) => {
                     if (effectiveDecision.silentOnly || isSilenced() || isBatchCancelled()) return
-                    const sent = await this.deliverIntermediateReply(
+                    const intermediate = await this.deliverIntermediateReply(
                       bot,
                       transport,
                       latestItem.msg,
                       effectiveDecision,
                       stepText,
                     )
-                    if (sent) {
+                    if (intermediate.sent) {
                       const sentAtMs = Date.now()
                       latestItem.activeTurn.intermediateSentCount += 1
                       latestItem.activeTurn.lastActivityAtMs = sentAtMs
                       latestItem.activeTurn.lastPersistedActivityAtMs = sentAtMs
+                      if (intermediate.routeKey !== effectiveDecision.routeKey) {
+                        latestItem.activeTurn.routeKey = intermediate.routeKey
+                        trackedRouteKey = intermediate.routeKey
+                      }
                       this.persistActiveTurn(latestItem.activeTurn)
-                      this.host.store.markBindingReplied(effectiveDecision.routeKey)
+                      this.host.store.markBindingReplied(intermediate.routeKey)
                     }
                   },
                 }
               : {}),
           })
         } finally {
+          if (this.executingTurnBySession.get(acquired.sessionId) === executingTurnCtx) {
+            this.executingTurnBySession.delete(acquired.sessionId)
+          }
           linkedCancel.dispose()
         }
 
@@ -1537,7 +1636,7 @@ export class InboundPipeline {
           bot,
           transport,
           msg,
-          decision,
+          decision: boundDecision,
           resolvedChatName,
           activeTurn,
           batchItems,
@@ -1563,7 +1662,7 @@ export class InboundPipeline {
         }
         if (trackedSessionId && !otherTurnsInFlight && shouldDisposeEphemeral) {
           await this.host.sessions
-            .disposeEphemeral(trackedSessionId, decision.routeKey, {
+            .disposeEphemeral(trackedSessionId, trackedRouteKey, {
               archive: shouldArchiveEphemeral,
             })
             .catch(() => {})
@@ -1718,9 +1817,10 @@ export class InboundPipeline {
       const fallbackText = interceptedSilentSentinel
         ? UNEXPECTED_SILENT_SENTINEL_FALLBACK
         : undefined
+      let deliveredRouteKey = effectiveDecision.routeKey
       if (hasFinalText || intermediateSentCount === 0) {
         try {
-          await this.deliverReply(
+          deliveredRouteKey = await this.deliverReply(
             bot,
             transport,
             latestItem.msg,
@@ -1754,11 +1854,11 @@ export class InboundPipeline {
         }
       }
       if (hasFinalText && latestItem.msg.chatType === 'group') {
-        this.host.triage?.context.recordWorkerReply(effectiveDecision.routeKey, normalizedReply, Date.now(), {
+        this.host.triage?.context.recordWorkerReply(deliveredRouteKey, normalizedReply, Date.now(), {
           chatScopeKey: `chat:${bot.id}:${latestItem.msg.chatId}`,
         })
       }
-      this.host.store.markBindingReplied(effectiveDecision.routeKey)
+      this.host.store.markBindingReplied(deliveredRouteKey)
       this.host.store.recordMetric({
         botId: bot.id,
         chatId: latestItem.msg.chatId,
@@ -1776,7 +1876,7 @@ export class InboundPipeline {
       this.host.store.recordEvent({
         botId: bot.id,
         chatId: latestItem.msg.chatId,
-        routeKey: effectiveDecision.routeKey,
+        routeKey: deliveredRouteKey,
         sessionId: acquired.sessionId,
         traceId: latestItem.traceId,
         durationMs: latencyMs,
@@ -1785,7 +1885,9 @@ export class InboundPipeline {
       })
     }
 
-    const currentBinding = this.host.store.getBinding(effectiveDecision.routeKey)
+    const currentBinding =
+      this.host.store.getBinding(effectiveDecision.routeKey) ??
+      this.host.store.getBindingBySessionId(acquired.sessionId)
     const isNeverRepliedListener =
       isSilentSkip &&
       effectiveDecision.trigger === 'listener' &&
@@ -2911,11 +3013,11 @@ export class InboundPipeline {
     msg: InboundLarkMessage,
     decision: AgentDecision,
     stepText: string,
-  ): Promise<boolean> {
+  ): Promise<{ readonly sent: boolean; readonly routeKey: string }> {
     const text = normalizeReplyText(stepText, {
       allowSilentSentinel: true,
     })
-    if (!text) return false
+    if (!text) return { sent: false, routeKey: decision.routeKey }
     const card = decision.useCard
       ? buildReplyCard({
           markdown: text,
@@ -2928,8 +3030,8 @@ export class InboundPipeline {
       replyMode: decision.replyMode,
       ...(card ? { card } : { text }),
     })
-    this.syncReplyRouteAliases(bot, msg, decision, sent)
-    return true
+    const routeKey = this.syncReplyRouteAliases(bot, msg, decision, sent)
+    return { sent: true, routeKey }
   }
 
   private async deliverReply(
@@ -2941,7 +3043,7 @@ export class InboundPipeline {
     replyText: string,
     groupConfig?: LarkGroupConfig,
     fallbackText?: string,
-  ): Promise<void> {
+  ): Promise<string> {
     const text =
       normalizeReplyText(replyText, { allowSilentSentinel: true }) ||
       fallbackText ||
@@ -2972,7 +3074,7 @@ export class InboundPipeline {
       replyMode: decision.replyMode,
       ...(card ? { card } : { text }),
     })
-    this.syncReplyRouteAliases(bot, msg, decision, sent)
+    return this.syncReplyRouteAliases(bot, msg, decision, sent)
   }
 
   private collectReplyAliasKeys(
@@ -2999,9 +3101,40 @@ export class InboundPipeline {
     msg: InboundLarkMessage,
     decision: AgentDecision,
     sent: SendLarkReplyResult | undefined,
-  ): void {
-    for (const aliasKey of this.collectReplyAliasKeys(bot, msg, decision, sent)) {
-      this.host.store.bindRouteAlias(decision.routeKey, aliasKey)
+  ): string {
+    if (msg.chatType !== 'group' || decision.sessionMode !== 'thread') return decision.routeKey
+    const existing = this.host.store.getBinding(decision.routeKey)
+    let targetRouteKey = existing?.routeKey ?? decision.routeKey
+    if (existing && sent?.threadId) {
+      const existingNativeThreads = [existing.routeKey, ...(existing.aliasRouteKeys ?? [])]
+        .map(extractRouteScope)
+        .filter((scope) => scope.startsWith('omt_'))
+      if (existingNativeThreads.length > 0 && !existingNativeThreads.includes(sent.threadId)) {
+        // Invariant: never attach a second distinct native Feishu thread onto an existing thread binding.
+        return existing.routeKey
+      }
+      const promotedRootScope =
+        sent.rootId || (decision.replyMode === 'new-topic' && !msg.threadId ? msg.messageId : undefined)
+      const promotedRootKey = promotedRootScope
+        ? buildRouteKey(bot.larkAppId, msg.chatId, promotedRootScope)
+        : undefined
+      if (
+        existingNativeThreads.length === 0 &&
+        promotedRootKey &&
+        promotedRootKey !== existing.routeKey
+      ) {
+        // First-time promotion from an unpromoted main-stream quote chain to a native Feishu thread:
+        // transfer primary ownership to the new thread root and detach the old main-stream root so
+        // sibling quote replies on the original message spawn isolated sessions/threads.
+        const promoted = this.host.store.promoteBindingRoute(existing.routeKey, promotedRootKey)
+        if (promoted) {
+          targetRouteKey = promoted.routeKey
+        }
+      }
     }
+    for (const aliasKey of this.collectReplyAliasKeys(bot, msg, decision, sent)) {
+      this.host.store.bindRouteAlias(targetRouteKey, aliasKey)
+    }
+    return targetRouteKey
   }
 }

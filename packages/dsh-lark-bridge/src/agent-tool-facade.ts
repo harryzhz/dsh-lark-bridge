@@ -101,6 +101,8 @@ export class AgentToolFacade {
     readonly chatName?: string
     readonly routeKey?: string
     readonly replyToMessageId?: string
+    readonly replyInThread?: boolean
+    readonly threadId?: string
     readonly scheduleContext?: ReturnType<ScheduleNotifier['getActiveSessionContext']>
     readonly bots: readonly LarkBotStatus[]
     readonly groups: ReturnType<LarkBridgeStore['listGroupViews']>
@@ -110,10 +112,43 @@ export class AgentToolFacade {
     const sid = sessionId?.trim() || undefined
 
     if (sid) {
+      // Ground truth during an active interactive turn: anchor CLI sends/history/reminders
+      // to the exact currently executing turn rather than guessing from static binding aliases.
+      const executingTurn = this.host.inbound.getExecutingTurnContext?.(sid)
+      if (executingTurn) {
+        const bot = this.host.store.getBot(executingTurn.botId)
+        const botStatus = bots.find((b) => b.botId === executingTurn.botId)
+        const chatName =
+          executingTurn.chatName ||
+          this.host.store.resolveChatName(executingTurn.botId, executingTurn.chatId)
+        return {
+          sessionId: sid,
+          bound: true,
+          source: 'session_binding',
+          botId: executingTurn.botId,
+          botName: bot?.name ?? executingTurn.botId,
+          larkAppId: bot?.larkAppId ?? executingTurn.larkAppId,
+          ...(botStatus?.botOpenId ? { botOpenId: botStatus.botOpenId } : {}),
+          chatId: executingTurn.chatId,
+          ...(chatName ? { chatName } : {}),
+          routeKey: executingTurn.routeKey,
+          ...(executingTurn.replyToMessageId
+            ? { replyToMessageId: executingTurn.replyToMessageId }
+            : {}),
+          replyInThread: executingTurn.replyInThread,
+          ...(executingTurn.threadId ? { threadId: executingTurn.threadId } : {}),
+          bots,
+          groups,
+        }
+      }
+
       const binding = this.host.store.listBindings().find((b) => b.sessionId === sid)
       if (binding) {
         const botStatus = bots.find((b) => b.botId === binding.botId)
         const replyToMessageId = extractBindingReplyAnchor(binding)
+        const threadAlias = (binding.aliasRouteKeys ?? [])
+          .map((k) => k.split(':').slice(2).join(':'))
+          .find((scope) => scope.startsWith('omt_'))
         return {
           sessionId: sid,
           bound: true,
@@ -126,6 +161,8 @@ export class AgentToolFacade {
           ...(binding.chatName ? { chatName: binding.chatName } : {}),
           routeKey: binding.routeKey,
           ...(replyToMessageId ? { replyToMessageId } : {}),
+          ...(replyToMessageId ? { replyInThread: true } : {}),
+          ...(threadAlias ? { threadId: threadAlias } : {}),
           bots,
           groups,
         }
@@ -265,13 +302,12 @@ export class AgentToolFacade {
     const userOpenId = input.userOpenId?.trim() || undefined
     const chatId = userOpenId ? undefined : input.chatId?.trim() || ctxInfo.chatId
     const explicitReplyTo = input.replyToMessageId?.trim() || undefined
+    const usingImplicitReplyTo = Boolean(!explicitReplyTo && !input.chatId && !userOpenId && ctxInfo.replyToMessageId)
     const replyToMessageId =
-      explicitReplyTo ||
-      (!input.chatId && !userOpenId && ctxInfo.replyToMessageId
-        ? ctxInfo.replyToMessageId
-        : undefined)
+      explicitReplyTo || (usingImplicitReplyTo ? ctxInfo.replyToMessageId : undefined)
     const replyInThread =
-      input.replyInThread ?? Boolean(ctxInfo.replyToMessageId && !explicitReplyTo)
+      input.replyInThread ??
+      (usingImplicitReplyTo ? (ctxInfo.replyInThread ?? true) : false)
 
     if (!userOpenId && !chatId && !replyToMessageId) {
       throw new Error('Target chatId (--chat), userOpenId (--user), or bound session is required')
@@ -280,6 +316,15 @@ export class AgentToolFacade {
     const receiveIdType: 'open_id' | 'chat_id' = userOpenId ? 'open_id' : 'chat_id'
     const receiveId = userOpenId ?? chatId
     const messageIds: string[] = []
+    const syncImplicitThreadAlias = (sent: { readonly threadId?: string } | undefined) => {
+      if (!usingImplicitReplyTo || !replyInThread || !sent?.threadId || !chatId || !ctxInfo.routeKey) {
+        return
+      }
+      this.host.store.bindRouteAlias(
+        ctxInfo.routeKey,
+        buildRouteKey(bot.larkAppId, chatId, sent.threadId),
+      )
+    }
 
     const uploadedImages: ReplyCardImage[] = []
     for (const img of input.images ?? []) {
@@ -311,6 +356,7 @@ export class AgentToolFacade {
         msgType: 'interactive',
         content: JSON.stringify(input.card),
       })
+      syncImplicitThreadAlias(sent)
       if (sent.messageId) messageIds.push(sent.messageId)
     } else if (markdown || input.title || uploadedImages.length > 0) {
       if (!markdown && !input.title && uploadedImages.length === 1 && input.textOnly) {
@@ -321,6 +367,7 @@ export class AgentToolFacade {
           msgType: 'image',
           content: JSON.stringify({ image_key: uploadedImages[0]!.imgKey }),
         })
+        syncImplicitThreadAlias(sent)
         if (sent.messageId) messageIds.push(sent.messageId)
       } else if (input.textOnly && uploadedImages.length === 0 && !input.title) {
         const sent = await transport.sendProactiveMessage({
@@ -330,6 +377,7 @@ export class AgentToolFacade {
           msgType: 'post',
           content: JSON.stringify(buildLarkPostPayload(markdown)),
         })
+        syncImplicitThreadAlias(sent)
         if (sent.messageId) messageIds.push(sent.messageId)
       } else {
         const group = chatId ? this.host.store.getGroup(bot.id, chatId) : undefined
@@ -347,6 +395,7 @@ export class AgentToolFacade {
           msgType: 'interactive',
           content: JSON.stringify(card),
         })
+        syncImplicitThreadAlias(sent)
         if (sent.messageId) messageIds.push(sent.messageId)
       }
     }
@@ -361,6 +410,7 @@ export class AgentToolFacade {
         msgType: 'file',
         content: JSON.stringify({ file_key: uploaded.fileKey }),
       })
+      syncImplicitThreadAlias(sent)
       if (sent.messageId) messageIds.push(sent.messageId)
     }
 
@@ -395,7 +445,8 @@ export class AgentToolFacade {
     const threadId =
       input.threadId === 'none'
         ? undefined
-        : input.threadId?.trim() || (!input.chatId ? ctxInfo.replyToMessageId : undefined)
+        : input.threadId?.trim() ||
+          (!input.chatId ? (ctxInfo.threadId ?? ctxInfo.replyToMessageId) : undefined)
     const messages = await this.host.connections.transportFor(bot).listMessages({
       chatId,
       ...(threadId ? { threadId } : {}),

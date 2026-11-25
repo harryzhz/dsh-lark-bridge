@@ -223,6 +223,17 @@ export class TriageContextStore {
     this.enforceBounds()
   }
 
+  peekEphemeralHandoff(
+    routeKey: string,
+    now = Date.now(),
+  ): { readonly turns: readonly RouterHandoffTurn[] } | undefined {
+    const primary = this.resolveEphemeralPrimary(routeKey, now)
+    if (!primary) return undefined
+    const thread = this.ephemeralThreads.get(primary)
+    if (!thread) return undefined
+    return { turns: [...thread.turns] }
+  }
+
   consumeEphemeralHandoff(
     routeKey: string,
     now = Date.now(),
