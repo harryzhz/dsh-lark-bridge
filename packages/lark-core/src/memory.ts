@@ -4,8 +4,11 @@ import { expandWorkingDir } from './types.js'
 export const MEMORY_MAX_TITLE_CHARS = 100
 export const MEMORY_MAX_CONTENT_CHARS = 1200
 export const MEMORY_MAX_TAGS = 8
-export const MEMORY_LAYER1_MAX_ENTRIES = 20
-export const MEMORY_LAYER1_MAX_CHARS = 2600
+export const MEMORY_LAYER1_MAX_ENTRIES = 15
+export const MEMORY_LAYER1_MAX_CHARS = 1000
+export const MEMORY_LAYER1_MAX_EXPANDED = 2
+export const MEMORY_LAYER1_EXPANDED_EXCERPT_CHARS = 180
+export const MEMORY_LAYER1_MIN_QUERY_SCORE = 4
 export const MEMORY_MARKDOWN_MAX_LINES = 200
 export const MEMORY_MARKDOWN_MAX_CHARS = 12_000
 
@@ -164,81 +167,298 @@ function singleLineExcerpt(raw: string, maxChars: number): string {
   return `${flat.slice(0, Math.max(1, maxChars - 1)).trimEnd()}…`
 }
 
+const ASCII_QUERY_STOPWORDS: ReadonlySet<string> = new Set([
+  'the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'can', 'had', 'her', 'was', 'one',
+  'our', 'out', 'has', 'his', 'how', 'its', 'may', 'new', 'now', 'old', 'see', 'two', 'way',
+  'who', 'did', 'get', 'let', 'put', 'say', 'she', 'too', 'use', 'add', 'fix', 'run', 'set',
+  'try', 'is', 'to', 'in', 'on', 'at', 'of', 'or', 'an', 'do', 'go', 'no', 'ok', 'hi', 'my',
+  'we', 'it', 'by', 'as', 'be', 'if', 'so', 'up', 'me', 'he', 'this', 'that', 'with', 'from',
+  'have', 'will', 'what', 'when', 'where', 'which', 'there', 'their', 'about', 'would', 'could',
+  'should', 'please', 'help', 'check', 'look', 'just', 'like', 'some', 'more', 'also', 'then',
+  'than', 'into', 'only', 'make', 'need', 'want', 'know', 'good', 'well', 'here', 'true',
+  'false', 'null', 'void', 'http', 'https', 'www', 'com', 'org', 'net', 'src', 'dist', 'mjs',
+  'cjs', 'tsx', 'jsx', 'json', 'yaml', 'yml', 'md', 'ts', 'js',
+])
+
+const CJK_QUERY_STOP_PHRASES_RE =
+  /请问|麻烦|帮我|帮忙|看一下|看下|看看|查一下|查下|问一下|问下|为什么|怎么样|怎么|如何|什么|哪些|哪里|是否|能否|能不能|可以|需要|应该|必须|现在|目前|今天|昨天|明天|已经|还没|没有|不是|还是|或者|以及|关于|针对|进行|处理|问题|情况|东西|时候|如果|因为|所以|但是|然后|就是|一个|一下|一些|这个|那个|这些|那些|我们|你们|他们|自己|大家|觉得|确认|好的|谢谢/g
+
+const CJK_QUERY_STOP_CHARS_RE =
+  /[的了吗呢啊吧呀哦嗯嘛么着过在是有和与或也都就再很太真把被给让对向从到为以之不没会要能可请看问说做用来去上下中里这那我你他她它]/g
+
+export interface MemoryQueryTerms {
+  readonly asciiTokens: readonly string[]
+  readonly cjkBigrams: readonly string[]
+  readonly normalizedQuery: string
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function matchesAsciiTerm(haystackLower: string, tokenLower: string): boolean {
+  if (!tokenLower) return false
+  if (tokenLower.length >= 5) {
+    return haystackLower.includes(tokenLower)
+  }
+  const re = new RegExp(`(?<![a-z0-9])${escapeRegExp(tokenLower)}(?![a-z0-9])`)
+  return re.test(haystackLower)
+}
+
+/**
+ * Extracts normalized ASCII domain tokens and CJK bigrams from a natural-language
+ * user turn for millisecond-level, zero-LLM query-aware memory relevance scoring.
+ */
+export function extractMemoryQueryTerms(rawQuery?: string): MemoryQueryTerms {
+  const sample = (rawQuery ?? '').trim().slice(0, 400)
+  if (!sample) {
+    return { asciiTokens: [], cjkBigrams: [], normalizedQuery: '' }
+  }
+  const normalizedQuery = sample.toLowerCase()
+
+  const asciiSeen = new Set<string>()
+  const asciiTokens: string[] = []
+  const asciiMatches = normalizedQuery.match(/[a-z0-9]{2,32}/g) ?? []
+  for (const clean of asciiMatches) {
+    if (/^\d{1,2}$/.test(clean)) continue
+    if (ASCII_QUERY_STOPWORDS.has(clean)) continue
+    if (asciiSeen.has(clean)) continue
+    asciiSeen.add(clean)
+    asciiTokens.push(clean)
+    if (asciiTokens.length >= 16) break
+  }
+
+  const cjkCleaned = sample
+    .replace(CJK_QUERY_STOP_PHRASES_RE, ' ')
+    .replace(CJK_QUERY_STOP_CHARS_RE, ' ')
+  const cjkRuns = cjkCleaned.match(/[\u4e00-\u9fff]{2,}/g) ?? []
+  const cjkSeen = new Set<string>()
+  const cjkBigrams: string[] = []
+  for (const run of cjkRuns) {
+    for (let i = 0; i <= run.length - 2; i += 1) {
+      const gram = run.slice(i, i + 2)
+      if (cjkSeen.has(gram)) continue
+      cjkSeen.add(gram)
+      cjkBigrams.push(gram)
+      if (cjkBigrams.length >= 24) break
+    }
+    if (cjkBigrams.length >= 24) break
+  }
+
+  return { asciiTokens, cjkBigrams, normalizedQuery }
+}
+
+/**
+ * Computes a lightweight lexical + tag relevance score for an active memory entry
+ * against the user's first-turn message. Short ASCII tokens use identifier-boundary
+ * matching to avoid false positives (e.g. `pr` vs `prompt`, `ui` vs `build`).
+ */
+export function scoreMemoryEntryForQuery(
+  entry: Pick<LarkMemoryEntry, 'title' | 'content' | 'tags'>,
+  terms: MemoryQueryTerms,
+): number {
+  if (terms.asciiTokens.length === 0 && terms.cjkBigrams.length === 0) return 0
+
+  const titleLower = entry.title.toLowerCase()
+  const contentLower = entry.content.toLowerCase()
+  let score = 0
+
+  for (const rawTag of entry.tags) {
+    const tag = rawTag.trim().toLowerCase()
+    if (tag.length < 2) continue
+    const hasCjk = /[\u4e00-\u9fff]/.test(tag)
+    const matched = hasCjk
+      ? terms.normalizedQuery.includes(tag)
+      : matchesAsciiTerm(terms.normalizedQuery, tag)
+    if (matched) score += 5
+  }
+
+  for (const token of terms.asciiTokens) {
+    if (matchesAsciiTerm(titleLower, token)) {
+      score += 4
+    } else if (matchesAsciiTerm(contentLower, token)) {
+      score += 2
+    }
+  }
+
+  for (const gram of terms.cjkBigrams) {
+    if (titleLower.includes(gram)) {
+      score += 2
+    } else if (contentLower.includes(gram)) {
+      score += 1
+    }
+  }
+
+  return score
+}
+
+/**
+ * Selects top query-relevant memories above `minScore` from an already scope-filtered
+ * and priority-ranked candidate list, preserving priority order on score ties.
+ */
+export function selectQueryMatchedMemories(
+  entries: readonly LarkMemoryEntry[],
+  queryText?: string,
+  options: { readonly limit?: number; readonly minScore?: number } = {},
+): LarkMemoryEntry[] {
+  const limit = Math.max(0, options.limit ?? MEMORY_LAYER1_MAX_EXPANDED)
+  if (limit === 0 || entries.length === 0) return []
+  const terms = extractMemoryQueryTerms(queryText)
+  if (terms.asciiTokens.length === 0 && terms.cjkBigrams.length === 0) return []
+
+  const minScore = options.minScore ?? MEMORY_LAYER1_MIN_QUERY_SCORE
+  const scored: Array<{ readonly entry: LarkMemoryEntry; readonly score: number; readonly rank: number }> = []
+  for (let i = 0; i < entries.length; i += 1) {
+    const entry = entries[i]!
+    const score = scoreMemoryEntryForQuery(entry, terms)
+    if (score >= minScore) {
+      scored.push({ entry, score, rank: i })
+    }
+  }
+
+  scored.sort((a, b) => (b.score !== a.score ? b.score - a.score : a.rank - b.rank))
+  return scored.slice(0, limit).map((item) => item.entry)
+}
+
 export interface MemoryReminderResult {
   readonly reminder: string
   readonly includedEntryIds: readonly string[]
+  readonly expandedEntryIds: readonly string[]
+}
+
+function formatMemoryIndexLine(entry: LarkMemoryEntry): string {
+  const pinMark = entry.pinned ? '[置顶]' : ''
+  return `- [${entry.id}]${pinMark} ${entry.type}: ${entry.title}`
+}
+
+function formatMemoryExpandedLine(entry: LarkMemoryEntry): string {
+  const pinMark = entry.pinned ? '[置顶]' : ''
+  const excerpt = singleLineExcerpt(entry.content, MEMORY_LAYER1_EXPANDED_EXCERPT_CHARS)
+  return `- [${entry.id}]${pinMark} ${entry.type}: ${entry.title} — ${excerpt}`
 }
 
 /**
  * Progressive Disclosure Layer 1:
- * Synthesizes a strictly budgeted core memory index for the first turn of a session,
- * leaving full details and historical search to on-demand Layer 2 CLI tools.
+ * Synthesizes a compact `<memory>` block for the first turn of a session:
+ * - Default: Title-Only index + `MEMORY.md` file pointer (full CLI syntax lives in the `lark-bridge` skill).
+ * - Query-Aware: Expands top query-relevant entries inline (up to `maxExpanded`) without starving
+ *   high-priority title anchors, keeping total size strictly budgeted.
  */
 export function composeMemoryReminder(input: {
   readonly botId: string
   readonly entries: readonly LarkMemoryEntry[]
   readonly totalActiveCount?: number
+  readonly queryText?: string
+  readonly markdownPath?: string
   readonly maxEntries?: number
   readonly maxChars?: number
+  readonly maxExpanded?: number
 }): MemoryReminderResult | undefined {
   const maxEntries = Math.max(1, input.maxEntries ?? MEMORY_LAYER1_MAX_ENTRIES)
-  const maxChars = Math.max(400, input.maxChars ?? MEMORY_LAYER1_MAX_CHARS)
+  const maxChars = Math.max(320, input.maxChars ?? MEMORY_LAYER1_MAX_CHARS)
+  const maxExpanded = Math.max(0, input.maxExpanded ?? MEMORY_LAYER1_MAX_EXPANDED)
   const totalActive = input.totalActiveCount ?? input.entries.length
-
-  const footerLines = [
-    '记忆工具（跨运行时持久化，按需调用，不重复抄写源码/文档已有静态信息）：',
-    `- 按需检索/详情：\`lark-bridge memory search "<关键词>"\` 或 \`lark-bridge memory get <id>\``,
-    `- 沉淀长期认知/纠偏：\`lark-bridge memory upsert --type feedback|user|project|reference --title "<标题>" --content "<精炼事实>" [--scope bot|chat|workspace]\`；事实推翻时用 \`lark-bridge memory supersede <oldId> --reason "<依据>"\``,
-  ]
+  const cleanFilePath = input.markdownPath?.trim()
+  const fileAttr = cleanFilePath ? ` file="${escapeXmlAttr(cleanFilePath)}"` : ''
+  const header = `<memory bot_id="${escapeXmlAttr(input.botId)}" active="${totalActive}"${fileAttr}>`
 
   if (input.entries.length === 0) {
     const emptyBlock = [
-      `<memory bot_id="${escapeXmlAttr(input.botId)}" active_count="${totalActive}">`,
-      '当前尚无已沉淀的跨会话长期记忆。仅当用户明确纠偏、给出长期偏好或确立关键隐性决策时写入，避免记录一次性细节。',
-      ...footerLines,
+      header,
+      '尚无长期记忆；收到明确纠偏、长期偏好或关键隐性决策时用 `lark-bridge memory upsert` 沉淀（参数见 `lark-bridge` 技能）。',
       '</memory>',
     ].join('\n')
-    return { reminder: emptyBlock, includedEntryIds: [] }
+    return { reminder: emptyBlock, includedEntryIds: [], expandedEntryIds: [] }
   }
 
-  const header = `<memory bot_id="${escapeXmlAttr(input.botId)}" active_count="${totalActive}">`
-  const lead =
-    '以下为按优先级精选的长期记忆索引（仅作高信号线索，执行代码操作前仍须以当前仓库事实为准）：'
-  const footer = [...footerLines, '</memory>'].join('\n')
-  const reservedChars = header.length + lead.length + footer.length + 120
-  let remainingChars = Math.max(200, maxChars - reservedChars)
+  const expandedCandidates = selectQueryMatchedMemories(input.entries, input.queryText, {
+    limit: Math.min(maxExpanded, maxEntries),
+  })
+  const expandedCandidateIds = new Set(expandedCandidates.map((e) => e.id))
+  const indexCandidates = input.entries.filter((e) => !expandedCandidateIds.has(e.id))
 
-  const bulletLines: string[] = []
-  const includedEntryIds: string[] = []
+  const detailHint = cleanFilePath
+    ? '用 `lark-bridge memory get <id>` 或读上表文件查全文'
+    : '用 `lark-bridge memory get <id>` 查全文'
+  const indexOnlyLead = `长期记忆索引（遇相关话题${detailHint}；执行代码操作前以仓库现状为准，读写见 \`lark-bridge\` 技能）：`
+  const expandedLead = '相关记忆（命中当前话题，执行代码操作前仍以仓库现状为准）：'
+  const remainingLead = `其余记忆目录（遇相关话题${detailHint}；读写见 \`lark-bridge\` 技能）：`
+  const allExpandedFooter = `（${detailHint}；读写见 \`lark-bridge\` 技能）`
 
-  for (const entry of input.entries.slice(0, maxEntries)) {
-    const pinMark = entry.pinned ? '[置顶]' : ''
-    const scopeLabel = MEMORY_SCOPE_LABELS[entry.scope]
-    const dateLabel = formatMemoryDateIso(entry.lastVerifiedAtMs)
-    const excerpt = singleLineExcerpt(entry.content, 110)
-    const line = `- [${entry.id}]${pinMark}[${entry.type}][${scopeLabel}][${dateLabel}] ${entry.title}：${excerpt}`
-    if (line.length + 1 > remainingChars && bulletLines.length > 0) break
-    bulletLines.push(line)
-    includedEntryIds.push(entry.id)
+  const hasExpandedCandidates = expandedCandidates.length > 0
+  const hasIndexCandidates = indexCandidates.length > 0
+  const staticOverhead =
+    header.length +
+    '</memory>'.length +
+    (hasExpandedCandidates
+      ? expandedLead.length + (hasIndexCandidates ? remainingLead.length : allExpandedFooter.length)
+      : indexOnlyLead.length) +
+    64
+  let remainingChars = Math.max(160, maxChars - staticOverhead)
+
+  // Reserve a modest floor for high-priority title anchors so expanded hits never crowd out
+  // pinned / feedback rules when other entries exist.
+  const indexReserveChars = hasExpandedCandidates && hasIndexCandidates
+    ? Math.min(240, Math.floor(remainingChars * 0.35))
+    : 0
+  let expandedBudget = Math.max(0, remainingChars - indexReserveChars)
+
+  const expandedLines: string[] = []
+  const expandedEntryIds: string[] = []
+  const demotedToIndex: LarkMemoryEntry[] = []
+
+  for (const entry of expandedCandidates) {
+    const line = formatMemoryExpandedLine(entry)
+    if (line.length + 1 <= expandedBudget) {
+      expandedLines.push(line)
+      expandedEntryIds.push(entry.id)
+      expandedBudget -= line.length + 1
+      remainingChars -= line.length + 1
+    } else {
+      demotedToIndex.push(entry)
+    }
+  }
+
+  const indexPool = [...demotedToIndex, ...indexCandidates]
+  const indexLines: string[] = []
+  const indexEntryIds: string[] = []
+  const maxIndexSlots = Math.max(0, maxEntries - expandedEntryIds.length)
+
+  for (const entry of indexPool.slice(0, maxIndexSlots)) {
+    const line = formatMemoryIndexLine(entry)
+    const hasAnyEntry = expandedLines.length > 0 || indexLines.length > 0
+    if (line.length + 1 > remainingChars && hasAnyEntry) break
+    indexLines.push(line)
+    indexEntryIds.push(entry.id)
     remainingChars -= line.length + 1
   }
 
+  const includedEntryIds = [...expandedEntryIds, ...indexEntryIds]
   const omittedCount = Math.max(0, totalActive - includedEntryIds.length)
   const omittedLine =
-    omittedCount > 0
-      ? `（另有 ${omittedCount} 条未展开，可用 \`lark-bridge memory search\` 或 \`lark-bridge memory list\` 按需查询）`
-      : ''
+    omittedCount > 0 ? `（另有 ${omittedCount} 条，按需 \`lark-bridge memory search\` 查询）` : ''
 
-  const reminder = [
-    header,
-    lead,
-    ...bulletLines,
-    ...(omittedLine ? [omittedLine] : []),
-    '',
-    footer,
-  ].join('\n')
+  const bodyLines: string[] = [header]
+  if (expandedLines.length > 0) {
+    bodyLines.push(expandedLead, ...expandedLines)
+    if (indexLines.length > 0) {
+      bodyLines.push(remainingLead, ...indexLines)
+    } else {
+      bodyLines.push(allExpandedFooter)
+    }
+  } else {
+    bodyLines.push(indexOnlyLead, ...indexLines)
+  }
+  if (omittedLine) {
+    bodyLines.push(omittedLine)
+  }
+  bodyLines.push('</memory>')
 
-  return { reminder, includedEntryIds }
+  return {
+    reminder: bodyLines.join('\n'),
+    includedEntryIds,
+    expandedEntryIds,
+  }
 }
 
 /**

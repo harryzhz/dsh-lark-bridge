@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, renameSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import {
   composeMemoryReminder,
@@ -110,8 +110,18 @@ export class MemoryService {
     return this.store.countActiveMemoryByBot()
   }
 
-  list(options: MemoryQueryOptions = {}): LarkMemoryEntry[] {
-    return this.store.listMemoryEntries(options)
+  list(
+    options: MemoryQueryOptions = {},
+    telemetry: { readonly recordRecall?: boolean; readonly nowMs?: number } = {},
+  ): LarkMemoryEntry[] {
+    const entries = this.store.listMemoryEntries(options)
+    if (telemetry.recordRecall && options.query?.trim() && entries.length > 0) {
+      const activeIds = entries.filter((e) => e.status === 'active').map((e) => e.id)
+      if (activeIds.length > 0) {
+        this.store.recordMemoryRecalls(activeIds, telemetry.nowMs ?? Date.now())
+      }
+    }
+    return entries
   }
 
   get(id: string, options: { readonly recordRecall?: boolean } = {}): LarkMemoryEntry | undefined {
@@ -176,12 +186,18 @@ export class MemoryService {
   }
 
   /**
-   * Builds Layer 1 progressive disclosure `<memory>` reminder for a new session
-   * and updates recall statistics for the surfaced entries.
+   * Builds Layer 1 progressive disclosure `<memory>` reminder for a new session:
+   * - Surfaces a compact Title-Only index plus the atomic `MEMORY.md` file path.
+   * - Expands top query-matched entries inline when `options.queryText` hits active memories.
+   * - Records genuine recalls only for query-expanded entries (avoiding passive index inflation).
    */
   composeFirstTurnReminder(
     context: MemoryRecallContext,
-    options: { readonly includeWhenEmpty?: boolean; readonly nowMs?: number } = {},
+    options: {
+      readonly includeWhenEmpty?: boolean
+      readonly queryText?: string
+      readonly nowMs?: number
+    } = {},
   ): string | undefined {
     const allActive = this.store.listMemoryEntries({
       botId: context.botId,
@@ -192,14 +208,21 @@ export class MemoryService {
     if (ranked.length === 0 && !options.includeWhenEmpty) {
       return undefined
     }
+    const nowMs = options.nowMs ?? Date.now()
+    const markdownPath = this.memoryMarkdownPath(context.botId)
+    if (ranked.length > 0 && !existsSync(markdownPath)) {
+      this.syncMirrorBestEffort(context.botId, nowMs)
+    }
     const composed = composeMemoryReminder({
       botId: context.botId,
       entries: ranked,
       totalActiveCount: ranked.length,
+      ...(options.queryText ? { queryText: options.queryText } : {}),
+      markdownPath,
     })
     if (!composed) return undefined
-    if (composed.includedEntryIds.length > 0) {
-      this.store.recordMemoryRecalls(composed.includedEntryIds, options.nowMs ?? Date.now())
+    if (composed.expandedEntryIds.length > 0) {
+      this.store.recordMemoryRecalls(composed.expandedEntryIds, nowMs)
     }
     return composed.reminder
   }

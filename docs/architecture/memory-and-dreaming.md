@@ -22,7 +22,7 @@ Memory 系统将长期记忆下沉为**桥接层一等公民**，做到**运行�
 
 | 业界 SOTA 参考 | 核心设计思想 | 在 `dsh-lark-bridge` 中的落地实现 |
 | --- | --- | --- |
-| **Letta (MemGPT)** | 有界核心记忆（Always-in-Context Core Memory）+ 按需外部检索 + 离线 Sleep-Time 整理 | 首轮严格预算注入 `<memory>`（≤ 20 条、≤ 2600 字符）；详情与检索下沉至 `lark-bridge memory` CLI；夜间 Auto-Dream 离线维护 |
+| **Letta (MemGPT)** | 有界核心记忆（Always-in-Context Core Memory）+ 按需外部检索 + 离线 Sleep-Time 整理 | 首轮严格预算注入极简 `<memory>`（≤ 15 条、≤ 1000 字符，默认 Title-Only + 首轮 Query-Aware 精准展开最多 2 条）；详情与检索下沉至 `MEMORY.md` 与 `lark-bridge memory` CLI；夜间 Auto-Dream 离线维护 |
 | **Claude Code Auto-Memory & Auto-Dream** | 四分类语义记忆 + 渐进披露（索引 → 详情 → 源码）+ 四阶段离线整理 | `feedback / user / project / reference` 四分类；首轮仅下发单行索引 + 工具指针；Auto-Dream 严格执行「摸底 → 采信 → 沉淀/纠偏 → 汇报」四阶段 |
 | **Zep / Graphiti** | 双时态非破坏式事实替代（Bi-Temporal Superseding） | 新事实推翻旧事实时通过 `supersede` 将旧条目置为 `superseded` 并记录 `supersededBy / supersededAtMs / supersedeReason`，检索默认仅返回 `active` 真相 |
 
@@ -201,10 +201,10 @@ sequenceDiagram
     participant DB as SQLite + MEMORY.md
 
     U->>Pipe: 新话题首条消息 (isNewSession = true)
-    Pipe->>Mem: composeFirstTurnReminder({ botId, chatId, workingDir })
-    Mem->>DB: 查询该 Bot active 记忆并按优先级排序
-    Mem->>DB: 批量递增命中条目的 recall_count & last_recalled_ms
-    Mem-->>Pipe: 返回有界 <memory> (≤ 20 条, ≤ 2600 字符)
+    Pipe->>Mem: composeFirstTurnReminder({ botId, chatId, workingDir }, { queryText })
+    Mem->>DB: 查询该 Bot active 记忆并按优先级排序 + Query-Aware 相关性打分
+    Mem->>DB: 仅对 Query-Aware 命中展开的条目递增 recall_count
+    Mem-->>Pipe: 返回极简 <memory> (Title-Only 目录 + 最多 2 条命中展开 + file="MEMORY.md", ≤ 1000 字符)
     Pipe->>Agent: 首轮 <system_reminder> 注入 <memory> 索引
 
     Note over Agent: 回合中按需进入 Layer 2
@@ -229,7 +229,10 @@ sequenceDiagram
   2. 类型权重：`feedback (0) < user (1) < project (2) < reference (3)`
   3. 作用域特异度：`chat` / `workspace`（`0`）优先于 `bot` 全局（`1`）
   4. `lastVerifiedAtMs DESC` → `updatedAtMs DESC`
-- **预算上限**：最多 **20 条**、总字符 **≤ 2600 字符**；每条压缩为单行索引（摘要截断至 110 字），超出部分在末尾注明未展开数量并提示调用 Layer 2 CLI 按需检索。
+- **预算上限与极简分层**：最多 **15 条**、总字符 **≤ 1000 字符**，尾部冗余 CLI 完整参数说明统一收口至 `skills/lark-bridge/SKILL.md`，标签属性直接暴露 `file="<dataDir>/memory/<botId>/MEMORY.md"`：
+  1. **Query-Aware 命中展开（最多 2 条）**：利用首条用户消息（含引用消息）做毫秒级本地词法/标签打分（短英文词采用词边界匹配防误伤），仅将高相关条目（分数 ≥ 4）展开至 ≤ 180 字要点，并为其预留索引保底预算，防止挤掉置顶/纠偏标题；
+  2. **Title-Only 常驻目录**：其余活跃条目仅保留 `[id][置顶?] type: title` 单行锚点（约 35 字符/条），消除 Unknown Unknowns 且避免截断半截正文；超出预算在末尾提示调用 `lark-bridge memory search`。
+- **真实召回计数校准**：被动进入 Title-Only 目录不再虚增 `recallCount`；仅当条目经首轮 Query-Aware 命中展开、或 Agent 通过 CLI 调用 `memory search` / `memory get` 时递增，Web 控制台搜索框键入不计入召回。
 
 ### 5.2 Layer 2（HTTP API、CLI 与鉴权边界）
 

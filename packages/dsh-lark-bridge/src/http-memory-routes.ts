@@ -117,15 +117,20 @@ export async function dispatchMemoryApiRequest(
     const limitParam = url.searchParams.get('limit')
     const limit = limitParam && Number.isFinite(Number(limitParam)) ? Number(limitParam) : undefined
 
-    const entries = memory.list({
-      ...(botId ? { botId } : {}),
-      ...(scope ? { scope } : {}),
-      ...(scopeId ? { scopeId } : {}),
-      ...(type ? { type } : {}),
-      ...(status ? { status } : {}),
-      ...(query ? { query } : {}),
-      ...(limit ? { limit } : {}),
-    })
+    const recordRecall =
+      isCliAuthenticated && Boolean(query) && url.searchParams.get('recordRecall') !== '0'
+    const entries = memory.list(
+      {
+        ...(botId ? { botId } : {}),
+        ...(scope ? { scope } : {}),
+        ...(scopeId ? { scopeId } : {}),
+        ...(type ? { type } : {}),
+        ...(status ? { status } : {}),
+        ...(query ? { query } : {}),
+        ...(limit ? { limit } : {}),
+      },
+      { recordRecall },
+    )
     return {
       status: 200,
       payload: {

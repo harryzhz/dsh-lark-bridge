@@ -2701,13 +2701,22 @@ export class InboundPipeline {
       })
       if (proactiveReminder) reminders.push(proactiveReminder)
 
+      const memoryQueryParts = [
+        ...items.map((item) => item.decision.userText.trim()).filter(Boolean),
+        primary.prefetchedQuote?.text?.trim() ?? '',
+      ].filter(Boolean)
+      const memoryQueryText = memoryQueryParts.join('\n') || undefined
+
       const memoryReminder = this.host.memory?.composeFirstTurnReminder(
         {
           botId: bot.id,
           chatId: primary.msg.chatId,
           workingDir: effectiveDecision.workingDir,
         },
-        { includeWhenEmpty: Boolean(bot.experimental.dreaming.enabled) },
+        {
+          includeWhenEmpty: Boolean(bot.experimental.dreaming.enabled),
+          ...(memoryQueryText ? { queryText: memoryQueryText } : {}),
+        },
       )
       if (memoryReminder) reminders.push(memoryReminder)
     }
