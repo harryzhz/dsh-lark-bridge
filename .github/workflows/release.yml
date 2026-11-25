@@ -74,7 +74,8 @@ jobs:
           sha256sum *.tgz > SHA256SUMS.txt
           ls -la
 
-      - name: Commit version bump and push release tag
+      - name: Commit and push version bump
+        id: commit
         if: steps.plan.outputs.should_release == 'true' && steps.plan.outputs.mode == 'auto'
         env:
           RELEASE_TAG: ${{ steps.plan.outputs.tag }}
@@ -84,17 +85,18 @@ jobs:
           git add package.json packages/dsh-lark-bridge/package.json packages/dsh-lark-ui/package.json packages/dsh-bundle/package.json packages/lark-core/package.json
           if ! git diff --cached --quiet; then
             git commit -m "chore(release): ${RELEASE_TAG} [skip ci]"
+            git push origin HEAD:main
           fi
-          git tag -a "${RELEASE_TAG}" -m "Release ${RELEASE_TAG}"
-          git push origin HEAD:main
-          git push origin "refs/tags/${RELEASE_TAG}"
+          echo "release_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Publish GitHub Release with .tgz assets
         if: steps.plan.outputs.should_release == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.plan.outputs.tag }}
+          target_commitish: ${{ steps.commit.outputs.release_sha || github.sha }}
           name: ${{ steps.plan.outputs.tag }}
+          make_latest: true
           generate_release_notes: true
           body: |
             ### 通过 GitHub Release `.tgz` 安装（无需构建脚本，始终指向最新版本）

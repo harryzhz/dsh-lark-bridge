@@ -147,8 +147,10 @@ export function computeReleasePlan(ctx) {
     if (highest && !changedFiles.some((f) => isShippablePath(f))) {
       return { shouldRelease: false, mode: 'none', reason: 'no_shippable_changes' }
     }
-    const bump = detectBumpLevel(commitMessages)
-    const next = formatSemver(bumpSemver(baseVer, bump))
+    const next =
+      highest && compareSemver(pkgVer, highest.version) > 0
+        ? formatSemver(pkgVer)
+        : formatSemver(bumpSemver(baseVer, detectBumpLevel(commitMessages)))
     return {
       shouldRelease: true,
       mode: 'auto',

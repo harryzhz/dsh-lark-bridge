@@ -43,6 +43,19 @@ describe('release-plan auto-release logic', () => {
       prevTag: 'v0.4.0',
       reason: 'auto_main_merge',
     })
+
+    // Honors pre-bumped package.json (or retry after partial release push) without double-bumping
+    const preBumped = computeReleasePlan({
+      eventName: 'push',
+      ref: 'refs/heads/main',
+      headSubject: 'ci(release): retry release',
+      headTags: [],
+      existingTags: ['v0.4.0'],
+      pkgVersion: '0.4.1',
+      changedFiles: ['packages/dsh-lark-ui/src/views/MemoryView.tsx'],
+      commitMessages: ['feat(ui): redesign Memory Library (#52)'],
+    })
+    expect(preBumped.tag).toBe('v0.4.1')
   })
 
   it('supports explicit [minor] and [major] / BREAKING CHANGE overrides', () => {
