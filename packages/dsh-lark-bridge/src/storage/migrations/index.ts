@@ -7,6 +7,7 @@ import { TRIAGE_SESSIONS_MIGRATION } from './002-triage-sessions.js'
 import { MEMORY_MIGRATION } from './003-memory.js'
 import { RESILIENCE_MIGRATION } from './004-resilience.js'
 import { TURN_RECOVERY_HARDENING_MIGRATION } from './005-turn-recovery-hardening.js'
+import { TRIAGE_CONTEXT_UPDATED_IDX_MIGRATION } from './006-triage-context-updated-idx.js'
 
 export type { SqlMigration }
 export {
@@ -15,6 +16,7 @@ export {
   MEMORY_MIGRATION,
   RESILIENCE_MIGRATION,
   TURN_RECOVERY_HARDENING_MIGRATION,
+  TRIAGE_CONTEXT_UPDATED_IDX_MIGRATION,
 }
 
 export const ALL_MIGRATIONS: readonly SqlMigration[] = [
@@ -23,6 +25,7 @@ export const ALL_MIGRATIONS: readonly SqlMigration[] = [
   MEMORY_MIGRATION,
   RESILIENCE_MIGRATION,
   TURN_RECOVERY_HARDENING_MIGRATION,
+  TRIAGE_CONTEXT_UPDATED_IDX_MIGRATION,
 ]
 
 export const ENTITY_TABLE_NAMES = [

@@ -15,7 +15,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { LarkBridgeManager } from '../src/bridge-manager.js'
 import { dispatchLarkApiRequest } from '../src/http-api.js'
 import { LarkBridgeStore } from '../src/store.js'
-import { classifyTriageError } from '../src/triage-service.js'
+import { TriageContextStore, classifyTriageError } from '../src/triage-service.js'
 
 const tempDirs: string[] = []
 
@@ -1384,6 +1384,155 @@ describe('Smart Triage Gate, Per-Group Overrides & Busy-Queue Coalescing', () =>
     )
     expect(h.triageCalls).toHaveLength(3)
     expect(h.submittedWorkerPrompts).toHaveLength(3)
+
+    await h.manager.stop()
+    h.store.close()
+  })
+
+  it('bounds hydratedScopes with eviction, coalesces history SQLite writes, preserves append group role in triage prompt, and cancels silently when aborted pre-stream', async () => {
+    // 1. TriageContextStore debounces burst history writes and evicts hydratedScopes cleanly
+    const upsertSpy = vi.fn()
+    const deleteSpy = vi.fn().mockReturnValue(1)
+    const ctxStore = new TriageContextStore({
+      historyPersistDebounceMs: 10_000,
+      persistence: {
+        loadTriageContextScopes: () => [],
+        upsertTriageContextScope: upsertSpy,
+        deleteTriageContextScope: deleteSpy,
+        pruneTriageContextScopes: () => 0,
+      },
+    })
+
+    const t0 = 1_760_000_000_000
+    for (let i = 0; i < 10; i += 1) {
+      ctxStore.recordChatMessage('chat:bot-1:oc_burst', {
+        role: 'user',
+        text: `msg-${i}`,
+        timestampMs: t0 + i * 100,
+        messageId: `om_burst_${i}`,
+      })
+    }
+    // Debounced: 10 burst messages produce 0 immediate SQLite writes, then 1 coalesced write on flush
+    expect(upsertSpy).toHaveBeenCalledTimes(0)
+    ctxStore.flushPersisted()
+    expect(upsertSpy).toHaveBeenCalledTimes(1)
+
+    // Evicting/expiring a scope removes it from hydratedScopes so future cold backfill is allowed
+    ctxStore.markScopeHydrated('chat:bot-1:oc_burst')
+    expect(ctxStore.hasHydratedScope('chat:bot-1:oc_burst')).toBe(true)
+    ctxStore.prunePersisted(t0 + 25 * 60 * 60_000)
+    expect(ctxStore.hasHydratedScope('chat:bot-1:oc_burst')).toBe(false)
+
+    // 2. Group role `append` mode preserves appended persona instructions in triage system prompt,
+    //    and pre-stream signal.aborted returns `silent` cancel instead of fail-open handoff
+    const h = createHarness({
+      triageStream: () => makeToolCallStream({ action: 'silent', reason: '群追加设定命中' }),
+    })
+    const fx = makeFakeTransport()
+    h.store.upsertBot({
+      id: 'bot-role',
+      name: 'RoleBot',
+      larkAppId: 'cli_role',
+      larkAppSecret: 'sec_role',
+      defaultWorkingDir: h.dir,
+      agentPreset: 'standard',
+      role: {
+        enabled: true,
+        name: '平台助手',
+        systemPrompt: '基础角色：负责全局研发支持。',
+      },
+      router: {
+        enabled: true,
+        provider: 'deepseek',
+        model: 'deepseek-chat',
+        scope: 'all_group',
+      },
+    })
+    h.store.upsertGroup({
+      key: 'bot-role:oc_append',
+      botId: 'bot-role',
+      chatId: 'oc_append',
+      chatName: '追加设定群',
+      enabled: true,
+      role: {
+        mode: 'append',
+        name: '',
+        systemPrompt: '群追加规则：仅回应发布窗口变更，其余闲聊一律静默。',
+      },
+    })
+
+    await h.manager.inbound.handleInbound(
+      'bot-role',
+      fx.transport,
+      makeGroupMsg({
+        botId: 'bot-role',
+        larkAppId: 'cli_role',
+        chatId: 'oc_append',
+        messageId: 'om_append_1',
+        text: '@RoleBot 今天天气不错',
+        mentions: [{ key: '@_user_1', openId: 'ou_bot', name: 'RoleBot' }],
+      }),
+    )
+    expect(h.triageCalls[0]?.system).toContain('基础角色：负责全局研发支持。')
+    expect(h.triageCalls[0]?.system).toContain('群追加规则：仅回应发布窗口变更，其余闲聊一律静默。')
+
+    // Pre-aborted signal returns silent cancel (not fail-open handoff)
+    const ac = new AbortController()
+    ac.abort('recalled')
+    const botCfg = h.store.getBot('bot-role')!
+    const abortedResult = await h.manager.triage.evaluate({
+      bot: botCfg,
+      group: h.store.getGroup('bot-role', 'oc_append'),
+      msg: makeGroupMsg({
+        botId: 'bot-role',
+        larkAppId: 'cli_role',
+        chatId: 'oc_append',
+        messageId: 'om_aborted_pre',
+        text: '测试提前撤回',
+      }),
+      decision: {
+        kind: 'agent',
+        trigger: 'mention',
+        routeKey: 'cli_role:oc_append:om_aborted_pre',
+        chatId: 'oc_append',
+        workingDir: h.dir,
+        workspaceName: 'demo',
+        agentPreset: 'standard',
+        replyMode: 'reply',
+        sessionMode: 'thread',
+        useCard: false,
+        userText: '测试提前撤回',
+        allowSilentEmptyReply: false,
+        autoCloseAfterCompletion: false,
+        sendIntermediateMessages: false,
+        idleCloseMinutes: 30,
+      },
+      routerConfig: {
+        source: 'bot',
+        enabled: true,
+        provider: 'deepseek',
+        model: 'deepseek-chat',
+        scope: 'all_group',
+        bypass: {
+          senderTypes: ['bot'],
+          triggerKeywords: [],
+          allowSenderTypesOverride: false,
+        },
+        timeoutMs: 5_000,
+        maxTriageImages: 0,
+        systemPrompt: '',
+        recentMessageCount: 5,
+        contextTtlMinutes: 30,
+        includeLastReply: true,
+        coalesceQueuedMessages: false,
+      },
+      hasActiveWorker: false,
+      workerBusy: false,
+      traceId: 'tr_abort_pre',
+      signal: ac.signal,
+    })
+    expect(abortedResult.verdict.action).toBe('silent')
+    expect(abortedResult.verdict.fallback).toBeUndefined()
 
     await h.manager.stop()
     h.store.close()

@@ -370,7 +370,10 @@ export class LarkBridgeManager {
     const activeDreamingCount = this.dreaming.getActiveCount()
     const totalInFlight =
       activeTurnsCount + activeTriageCount + activeRemindersCount + activeDreamingCount
-    const persistedPendingTurns = this.store.listPendingTurns().length
+    const persistedPendingTurns =
+      typeof this.store.countPendingTurns === 'function'
+        ? this.store.countPendingTurns()
+        : this.store.listPendingTurns().length
     return {
       phase: this.phase,
       draining: this.phase === 'draining',
@@ -494,6 +497,7 @@ export class LarkBridgeManager {
       ]),
       SHUTDOWN_DISPOSE_BUDGET_MS,
     )
+    this.triage.context.flushPersisted()
     this.triage.context.prunePersisted()
     this.store.flushSeenMessages?.()
     this.store.flushConfigSnapshot?.()

@@ -346,6 +346,10 @@ export class LarkBridgeStore {
     return this.runtimeRepo.listPendingTurns()
   }
 
+  countPendingTurns(): number {
+    return this.runtimeRepo.countPendingTurns()
+  }
+
   upsertPendingTurn(turn: LarkPendingTurn): LarkPendingTurn {
     return this.runtimeRepo.upsertPendingTurn(turn)
   }
