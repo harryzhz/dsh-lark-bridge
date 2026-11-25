@@ -939,6 +939,8 @@ export class ScheduleNotifier {
         this.host.store.recordMetric({
           botId: target.botId,
           chatId: target.chatId,
+          sessionId: session.id,
+          trigger: 'schedule',
           kind: isError ? 'error' : 'replied',
           latencyMs,
         })

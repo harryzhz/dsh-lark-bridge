@@ -95,6 +95,30 @@ export function ShieldAuthIcon({ size = 16, className }: { size?: number; classN
 }
 
 /**
+ * Monochrome 16x16 outline pulse-telemetry icon for the "观测台" tab.
+ */
+export function ObservabilityTabIcon({ size = 16, className }: { size?: number; className?: string }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.15}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      style={{ display: 'block', flexShrink: 0 }}
+      aria-hidden="true"
+    >
+      <rect x="2" y="2.5" width="12" height="11" rx="2.4" />
+      <path d="M4.1 9.2H5.8L7.05 5.7L8.95 10.6L10.2 7.8H11.9" />
+    </svg>
+  )
+}
+
+/**
  * Monochrome circular-upward arrow outline icon for the plugin update action.
  */
 export function PluginUpdateIcon({ size = 16, className }: { size?: number; className?: string }) {

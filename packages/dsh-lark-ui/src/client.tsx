@@ -16,7 +16,14 @@ import { ConfirmDialog, type ConfirmRequest } from './components/ConfirmDialog.j
 import { resolveEffectiveBotId } from './components/fields.js'
 import { GroupConfigDialog } from './components/GroupConfigDialog.js'
 import { LarkAuthDialog } from './components/LarkAuthDialog.js'
-import { LarkSidebarIcon, LarkTitleIcon, PluginUpdateIcon, RobotTabIcon, ShieldAuthIcon } from './components/LarkLogo.js'
+import {
+  LarkSidebarIcon,
+  LarkTitleIcon,
+  ObservabilityTabIcon,
+  PluginUpdateIcon,
+  RobotTabIcon,
+  ShieldAuthIcon,
+} from './components/LarkLogo.js'
 import { MemoryEditDialog, type MemoryDialogRequest } from './components/MemoryEditDialog.js'
 import { PENDING_SELF_RELOAD_STORAGE_KEY, PluginUpdateDialog } from './components/PluginUpdateDialog.js'
 import { ReminderEditDialog } from './components/ReminderEditDialog.js'
@@ -44,6 +51,7 @@ import type {
 import { BotsView } from './views/BotsView.js'
 import { GroupsView } from './views/GroupsView.js'
 import { MemoryView } from './views/MemoryView.js'
+import { ObservabilityView } from './views/ObservabilityView.js'
 import { OverviewView } from './views/OverviewView.js'
 import { SchedulesView } from './views/SchedulesView.js'
 import { SessionsView } from './views/SessionsView.js'
@@ -51,10 +59,11 @@ import { SessionsView } from './views/SessionsView.js'
 const PANEL_ID = 'lark-bridge'
 const SCHEDULE_PANEL_ID = 'schedules'
 
-type Tab = 'overview' | 'bots' | 'groups' | 'schedules' | 'sessions' | 'memory'
+type Tab = 'overview' | 'observability' | 'bots' | 'groups' | 'schedules' | 'sessions' | 'memory'
 
 const TABS: ReadonlyArray<{ key: Tab; label: string; icon: ReactNode }> = [
   { key: 'overview', label: '概览', icon: <IconGaugeOutlineRegular size={16} /> },
+  { key: 'observability', label: '观测台', icon: <ObservabilityTabIcon size={16} /> },
   { key: 'bots', label: '智能体', icon: <RobotTabIcon size={16} /> },
   { key: 'groups', label: '群聊', icon: <IconUsersOutlineRegular size={16} /> },
   { key: 'schedules', label: '自动化', icon: <IconAlarmClockOutlineRegular size={16} /> },
@@ -196,10 +205,15 @@ function LarkBridgePage() {
   const updatableCount = data.pluginUpdates?.updatableCount ?? 0
 
   const isWorkspaceTab = tab === 'memory'
+  const isDashboardTab = tab === 'observability'
 
   return (
     <div className="fb-page" data-workspace={isWorkspaceTab ? '' : undefined}>
-      <div className="fb-container" data-workspace={isWorkspaceTab ? '' : undefined}>
+      <div
+        className="fb-container"
+        data-workspace={isWorkspaceTab ? '' : undefined}
+        data-dashboard={isDashboardTab ? '' : undefined}
+      >
         <div className={isWorkspaceTab ? 'fb-workspace-chrome' : undefined}>
           <header className="fb-header">
             <h1 className="fb-title">
@@ -290,6 +304,15 @@ function LarkBridgePage() {
             models={data.models}
             pluginUpdates={data.pluginUpdates}
             onOpenPluginUpdates={() => setUpdateOpen(true)}
+            onOpenObservability={() => setTab('observability')}
+          />
+        )}
+        {tab === 'observability' && (
+          <ObservabilityView
+            bots={data.bots}
+            runtimes={data.runtimes}
+            models={data.models}
+            onToast={(text, ok = true) => setToast({ text, ok })}
           />
         )}
         {tab === 'bots' && (

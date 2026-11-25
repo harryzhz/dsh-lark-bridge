@@ -356,6 +356,16 @@ export class SessionCoordinator {
     return this.actors.get(sessionId)?.state
   }
 
+  getRuntimeConcurrencyStats(): { readonly activeActors: number; readonly queuedTurns: number } {
+    let activeActors = 0
+    let queuedTurns = 0
+    for (const actor of this.actors.values()) {
+      if (actor.isBusy) activeActors += 1
+      if (actor.pendingCount > 1) queuedTurns += actor.pendingCount - 1
+    }
+    return { activeActors, queuedTurns }
+  }
+
   markTurnRegistered(sessionId: string): void {
     const actor = this.ensureActor(sessionId, 'idle')
     actor.pendingCount += 1

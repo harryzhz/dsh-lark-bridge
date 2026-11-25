@@ -22,6 +22,8 @@ import type {
   MemoryStatus,
   MemoryType,
   ModelGroup,
+  ObservabilityPayload,
+  ObservabilityWindow,
   OpenPlatformAppsPayload,
   ManagedPluginId,
   PluginUpdateOperation,
@@ -317,6 +319,29 @@ export const bridgeApi = {
   unbind: (routeKey: string) => del(`/bindings/${seg(routeKey)}`),
   rotateViewerSecret: () => post<{ ok: boolean }>('/viewer/rotate-secret'),
   diagnostics: () => request<Record<string, unknown>>('/diagnostics'),
+  observability: (params: {
+    window?: ObservabilityWindow
+    botId?: string
+    chatId?: string
+    refreshStorage?: boolean
+  } = {}) => {
+    const qs = new URLSearchParams()
+    if (params.window) qs.set('window', params.window)
+    if (params.botId?.trim()) qs.set('botId', params.botId.trim())
+    if (params.chatId?.trim()) qs.set('chatId', params.chatId.trim())
+    if (params.refreshStorage) qs.set('refreshStorage', '1')
+    const suffix = qs.toString()
+    return request<ObservabilityPayload>(`/observability${suffix ? `?${suffix}` : ''}`)
+  },
+  checkpointWal: () =>
+    post<{
+      ok: boolean
+      checkpoint: {
+        beforeWalBytes: number
+        afterWalBytes: number
+        truncated: boolean
+      }
+    }>('/observability/checkpoint'),
   clearSplitBrainAlert: (botId: string) =>
     post<{ ok: boolean; cleared: boolean }>(`/diagnostics/split-brain/${seg(botId)}/clear`),
 

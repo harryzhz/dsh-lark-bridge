@@ -178,6 +178,38 @@ export async function dispatchLarkApiRequest(
       return ok(diagnostics)
     }
 
+    if (segments[0] === 'observability') {
+      if (method === 'GET' && segments.length === 1) {
+        const rawWindow = url.searchParams.get('window')?.trim()
+        const window =
+          rawWindow === '24h' || rawWindow === '7d' || rawWindow === '30d' || rawWindow === '90d'
+            ? rawWindow
+            : '7d'
+        const botId = url.searchParams.get('botId')?.trim() || undefined
+        const chatId = url.searchParams.get('chatId')?.trim() || undefined
+        const refreshStorage =
+          url.searchParams.get('refreshStorage') === '1' ||
+          url.searchParams.get('refreshStorage') === 'true'
+        const payload = await manager.getObservability({
+          window,
+          ...(botId ? { botId } : {}),
+          ...(chatId ? { chatId } : {}),
+          refreshStorage,
+        })
+        return ok({ ok: true, ...payload })
+      }
+      if (method === 'POST' && segments[1] === 'checkpoint' && segments.length === 2) {
+        const canOperateStorage =
+          (principalKind === 'owner' && !isCliAuthenticated) || Boolean(isOperatorAuthenticated)
+        if (!canOperateStorage) {
+          return ok({ ok: false, error: 'owner_or_operator_required' }, 403)
+        }
+        const result = manager.store.checkpointWal({ mode: 'TRUNCATE' })
+        const stats = manager.store.getStorageStats()
+        return ok({ ok: true, checkpoint: result, storage: stats })
+      }
+    }
+
     // ── Plugin release check & restart-free hot-update control plane ─────
     if (segments[0] === 'plugins') {
       const canOperateUpdates =

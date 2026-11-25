@@ -36,6 +36,8 @@ import { DreamingService } from './dreaming-service.js'
 import { InboundPipeline } from './inbound-pipeline.js'
 import { InstanceLock } from './instance-lock.js'
 import { MemoryService } from './memory-service.js'
+import { ObservabilityService } from './observability-service.js'
+import type { ObservabilityPayload, ObservabilityWindow } from './observability-types.js'
 import { PluginUpdateService } from './plugin-updater.js'
 import { ProactiveReminderService } from './reminder-service.js'
 import { RuntimeCatalog } from './runtime-catalog.js'
@@ -108,6 +110,7 @@ export class LarkBridgeManager {
   readonly titleGuard: SessionTitleGuard
   readonly splitBrain: SplitBrainDetector
   readonly pluginUpdater: PluginUpdateService
+  readonly observability: ObservabilityService
 
   private readonly instanceLock: InstanceLock
   private readonly directoryEnricher: LarkDirectoryEnricher
@@ -224,6 +227,7 @@ export class LarkBridgeManager {
       isDisposed: () => this.disposed,
       isDraining: () => this.phase === 'draining' || this.phase === 'stopping',
       onActivityChange: notifyActivityChange,
+      onTriageRecorded: (input) => this.observability?.recordTriageEvaluation(input),
       sessionWebUrl: (sid) => this.sessionWebUrl(sid),
       issueConsoleLoginLink: (input) => this.issueConsoleLoginLink(input),
     })
@@ -326,6 +330,22 @@ export class LarkBridgeManager {
         },
       },
     })
+
+    this.observability = new ObservabilityService({
+      ctx,
+      dataDir: config.dataDir,
+      store,
+      startedAtMs: this.startedAtMs,
+      enableBackgroundTimers: config.idleSweepIntervalMs > 0,
+      listBotStatuses: () => this.listBotStatuses(),
+      getTransportDiagnostics: (botId) => this.connections.getDiagnosticsSnapshot(botId),
+      listSplitBrainAlerts: () => this.splitBrain.listAlerts(),
+      getLifecycleStatus: () => this.getLifecycleStatus(),
+      getConcurrencyStats: () => this.sessions.getRuntimeConcurrencyStats(),
+      getDiagnosticAlerts: () => this.getDiagnostics().alerts,
+      getConfiguredScheduleCount: () =>
+        this.store.listScheduleBindings().filter((s) => s.enabled).length,
+    })
   }
 
   // Test-compatible accessors preserving direct delegation without duplicating state.
@@ -371,6 +391,7 @@ export class LarkBridgeManager {
     }
 
     this.disposers.push(this.workspaces.install())
+    this.disposers.push(this.observability.install())
     this.schedules.start()
     this.dreaming.start(this.config.idleSweepIntervalMs > 0 ? 60_000 : 0)
     await this.reminders.recoverStaleRunningReminders().catch((err) => {
@@ -578,6 +599,15 @@ export class LarkBridgeManager {
       instanceLock: this.instanceLock.status(),
       startedAtMs: this.startedAtMs,
     })
+  }
+
+  getObservability(options: {
+    readonly window?: ObservabilityWindow
+    readonly botId?: string
+    readonly chatId?: string
+    readonly refreshStorage?: boolean
+  } = {}): Promise<ObservabilityPayload> {
+    return this.observability.getPayload(options)
   }
 
   clearSplitBrainAlert(botId: string): boolean {
