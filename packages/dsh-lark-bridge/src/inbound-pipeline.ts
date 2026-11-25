@@ -246,6 +246,20 @@ export interface InboundPipelineHost {
   readonly isDisposed: () => boolean
   readonly isDraining?: () => boolean
   readonly onActivityChange?: () => void
+  readonly onTriageRecorded?: (input: {
+    readonly botId: string
+    readonly chatId: string
+    readonly chatType?: 'group' | 'p2p'
+    readonly triageSessionId?: string
+    readonly traceId?: string
+    readonly action: 'silent' | 'quick_reply' | 'handoff'
+    readonly fallback?: boolean
+    readonly errorCode?: string
+    readonly provider?: string
+    readonly model?: string
+    readonly durationMs: number
+    readonly usage?: import('@deepseek-ai/dsh-llm').TokenUsage
+  }) => void
   readonly sessionWebUrl: (sessionId: string) => string
   readonly issueConsoleLoginLink?: (input: {
     readonly botId: string
@@ -1138,6 +1152,8 @@ export class InboundPipeline {
       this.host.store.recordMetric({
         botId: bot.id,
         chatId: msg.chatId,
+        chatType: msg.chatType,
+        trigger: decision.trigger,
         ...chatName,
         kind: 'inbound',
         now: startedMs,
@@ -1961,6 +1977,9 @@ export class InboundPipeline {
       this.host.store.recordMetric({
         botId: bot.id,
         chatId: latestItem.msg.chatId,
+        chatType: latestItem.msg.chatType,
+        sessionId: acquired.sessionId,
+        trigger: effectiveDecision.trigger,
         ...chatName,
         kind: 'replied',
         latencyMs,
@@ -2449,11 +2468,33 @@ export class InboundPipeline {
 
     if (this.host.isDisposed()) return { handled: true }
 
+    this.host.onTriageRecorded?.({
+      botId: bot.id,
+      chatId: msg.chatId,
+      chatType: msg.chatType === 'p2p' ? 'p2p' : 'group',
+      ...(result.triageSessionId ? { triageSessionId: result.triageSessionId } : {}),
+      traceId,
+      action: result.verdict.action,
+      ...(result.verdict.fallback ? { fallback: true } : {}),
+      ...(result.errorCode ? { errorCode: result.errorCode } : {}),
+      ...(result.provider ? { provider: result.provider } : {}),
+      ...(result.model ? { model: result.model } : {}),
+      durationMs: result.durationMs,
+      ...(result.usage ? { usage: result.usage } : {}),
+    })
+
     if (
       result.verdict.action === 'silent' ||
       (decision.silentOnly && result.verdict.action === 'quick_reply')
     ) {
-      this.host.store.recordMetric({ botId: bot.id, chatId: msg.chatId, kind: 'silent_skip' })
+      this.host.store.recordMetric({
+        botId: bot.id,
+        chatId: msg.chatId,
+        chatType: msg.chatType,
+        ...(result.triageSessionId ? { sessionId: result.triageSessionId } : {}),
+        trigger: decision.trigger,
+        kind: 'silent_skip',
+      })
       this.host.store.recordEvent({
         botId: bot.id,
         chatId: msg.chatId,
@@ -2525,6 +2566,9 @@ export class InboundPipeline {
         this.host.store.recordMetric({
           botId: bot.id,
           chatId: msg.chatId,
+          chatType: msg.chatType,
+          ...(result.triageSessionId ? { sessionId: result.triageSessionId } : {}),
+          trigger: 'triage',
           ...chatName,
           kind: 'replied',
           latencyMs,

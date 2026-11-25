@@ -83,6 +83,7 @@ export interface TriageEvaluationResult {
   readonly errorMessage?: string
   readonly durationMs: number
   readonly triageSessionId?: string
+  readonly usage?: TokenUsage
 }
 
 const TRIAGE_ERROR_REDACT_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
@@ -980,6 +981,7 @@ export class LlmTriageService {
       model: target.model,
       durationMs,
       ...(triageSessionId ? { triageSessionId } : {}),
+      ...(run.usage ? { usage: run.usage } : {}),
     }
   }
 

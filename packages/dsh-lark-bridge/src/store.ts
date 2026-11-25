@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 import type {
   DiscoveredLarkChat,
@@ -9,6 +10,7 @@ import type {
   ListenerTemplate,
   SeenMessageEntry,
 } from '@dsh-lark/lark-core'
+import type { ObservabilityWindow, TelemetryUsageEventInput } from './observability-types.js'
 import { CockpitProjector } from './storage/cockpit-projector.js'
 import { ConfigRepo } from './storage/config-repo.js'
 import {
@@ -31,6 +33,10 @@ import {
   type MemoryUpsertInput,
   type MemoryUpsertOutcome,
 } from './storage/memory-repo.js'
+import {
+  ObservabilityRepo,
+  type ObservabilityRepoAggregate,
+} from './storage/observability-repo.js'
 import { RuntimeRepo } from './storage/runtime-repo.js'
 import { TelemetryRepo } from './storage/telemetry-repo.js'
 import type {
@@ -57,6 +63,7 @@ export class LarkBridgeStore {
   readonly runtimeRepo: RuntimeRepo
   readonly memoryRepo: MemoryRepo
   readonly telemetryRepo: TelemetryRepo
+  readonly observabilityRepo: ObservabilityRepo
   readonly projector: CockpitProjector
   private lastMigrationReport?: MigrationVerificationReport
 
@@ -72,7 +79,11 @@ export class LarkBridgeStore {
     this.runtimeRepo = new RuntimeRepo(this.db)
     this.memoryRepo = new MemoryRepo(this.db)
     this.telemetryRepo = new TelemetryRepo(this.db, this.configRepo, maxAuditEvents)
+    this.observabilityRepo = new ObservabilityRepo(this.db, this.configRepo)
     this.projector = new CockpitProjector(this.configRepo, this.runtimeRepo, this.telemetryRepo)
+    if (!this.db.getMeta('observability_v7_installed_at_ms')) {
+      this.db.setMeta('observability_v7_installed_at_ms', String(Date.now()))
+    }
     this.runtimeRepo.recoverInterruptedDreamSessions()
   }
 
@@ -290,6 +301,10 @@ export class LarkBridgeStore {
     return this.runtimeRepo.listManagedSessionsForBot(botId)
   }
 
+  listAllManagedSessions(limit = 600): LarkManagedSession[] {
+    return this.runtimeRepo.listAllManagedSessions(limit)
+  }
+
   getDreamState(botId: string): LarkDreamRunState | undefined {
     return this.runtimeRepo.getDreamState(botId)
   }
@@ -443,17 +458,91 @@ export class LarkBridgeStore {
     this.memoryRepo.recordRecalls(ids, nowMs)
   }
 
+  getMemorySummaryStats(botId?: string): {
+    readonly activeCount: number
+    readonly pinnedCount: number
+    readonly totalRecalls: number
+  } {
+    return this.memoryRepo.getSummaryStats(botId)
+  }
+
   // ── Telemetry, Audit & View Projections ──────────────────────────────────
+
+  getObservabilityInstalledAtMs(): number {
+    const raw = this.db.getMeta('observability_v7_installed_at_ms')
+    const parsed = raw ? Number(raw) : NaN
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : Date.now()
+  }
+
+  recordUsageEvent(input: TelemetryUsageEventInput): boolean {
+    return this.observabilityRepo.recordUsageEvent(input)
+  }
+
+  recordUsageEventsBatch(events: readonly TelemetryUsageEventInput[]): number {
+    return this.observabilityRepo.recordUsageEventsBatch(events)
+  }
+
+  queryObservabilityAggregate(options: {
+    readonly window?: ObservabilityWindow
+    readonly botId?: string
+    readonly chatId?: string
+    readonly nowMs?: number
+  }): ObservabilityRepoAggregate {
+    return this.observabilityRepo.queryAggregate(options)
+  }
 
   recordMetric(input: {
     readonly botId: string
     readonly chatId?: string
     readonly chatName?: string
+    readonly chatType?: string
+    readonly sessionId?: string
+    readonly trigger?: string
+    readonly errorCode?: string
     readonly kind: 'inbound' | 'replied' | 'listener' | 'silent_skip' | 'ignored' | 'error'
     readonly latencyMs?: number
     readonly now?: number
   }): void {
     this.telemetryRepo.recordMetric(input)
+    if (input.kind === 'listener') return
+    const ts = input.now ?? Date.now()
+    const normalizedChatType: 'group' | 'p2p' | 'internal' | '' =
+      input.chatType === 'p2p' || input.trigger === 'p2p'
+        ? 'p2p'
+        : input.chatType === 'internal'
+          ? 'internal'
+          : input.chatId
+            ? 'group'
+            : ''
+    const recordKind =
+      input.kind === 'inbound' || input.kind === 'ignored'
+        ? 'inbound'
+        : input.trigger === 'schedule' || input.trigger === 'reminder' || input.trigger === 'dreaming'
+          ? 'proactive'
+          : 'turn'
+    const outcome =
+      input.kind === 'inbound'
+        ? 'received'
+        : input.kind === 'replied'
+          ? 'replied'
+          : input.kind === 'silent_skip'
+            ? 'silent_skip'
+            : input.kind === 'ignored'
+              ? 'ignored'
+              : 'error'
+    this.observabilityRepo.recordUsageEvent({
+      id: `metric:${ts}:${randomUUID()}`,
+      timestampMs: ts,
+      recordKind,
+      botId: input.botId,
+      ...(input.chatId ? { chatId: input.chatId } : {}),
+      ...(normalizedChatType ? { chatType: normalizedChatType } : {}),
+      ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+      ...(input.trigger ? { trigger: input.trigger } : {}),
+      ...(input.errorCode ? { errorCode: input.errorCode } : {}),
+      outcome,
+      ...(input.latencyMs !== undefined ? { latencyMs: input.latencyMs } : {}),
+    })
   }
 
   recordEvent(input: Omit<LarkAuditEvent, 'id' | 'timestampMs'>): LarkAuditEvent {

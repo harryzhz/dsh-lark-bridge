@@ -919,6 +919,9 @@ export class ProactiveReminderService {
       this.host.store.recordMetric({
         botId: bot.id,
         ...(item.origin.chatId ? { chatId: item.origin.chatId } : {}),
+        chatType: item.origin.chatType,
+        sessionId,
+        trigger: 'reminder',
         kind: 'replied',
         latencyMs: durationMs,
       })

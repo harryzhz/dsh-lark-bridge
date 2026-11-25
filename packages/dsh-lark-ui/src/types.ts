@@ -884,3 +884,317 @@ export interface PluginUpdatesOverview {
   plugins: ManagedPluginStatus[]
   operation?: PluginUpdateOperation
 }
+
+export type ObservabilityWindow = '24h' | '7d' | '30d' | '90d'
+
+export interface ObservabilitySeriesPoint {
+  bucketStartMs: number
+  bucketEndMs: number
+  label: string
+  fullLabel: string
+  inbound: number
+  replied: number
+  silentSkipped: number
+  errors: number
+  sessions: number
+  llmSteps: number
+  toolCalls: number
+  inputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  outputTokens: number
+  reasoningTokens: number
+  totalTokens: number
+  latencyP50Ms: number
+  latencyP95Ms: number
+  avgLatencyMs: number
+}
+
+export interface ObservabilityLatencyBucket {
+  id: string
+  label: string
+  count: number
+  pct: number
+}
+
+export interface ObservabilityModelBreakdown {
+  model: string
+  provider: string
+  agentPreset: string
+  steps: number
+  inputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  outputTokens: number
+  reasoningTokens: number
+  totalTokens: number
+  cacheHitRate: number
+  sharePct: number
+}
+
+export interface ObservabilityTriggerBreakdown {
+  trigger: string
+  count: number
+  replied: number
+  errors: number
+  totalTokens: number
+  sharePct: number
+}
+
+export interface ObservabilityErrorBreakdown {
+  code: string
+  count: number
+  sharePct: number
+  latestAtMs: number
+}
+
+export interface ObservabilityBotRow {
+  botId: string
+  name: string
+  avatarUrl?: string
+  agentPreset: string
+  runtimeProfileId?: string
+  model?: string
+  enabled: boolean
+  connected: boolean
+  sessions: number
+  activeBindings: number
+  inbound: number
+  replied: number
+  silentSkipped: number
+  errors: number
+  successRate: number
+  totalTokens: number
+  cacheHitRate: number
+  avgLatencyMs: number
+  p95LatencyMs: number
+  ackP50Ms: number
+  ackP95Ms: number
+  ackSamples: number
+  sdkErrorCount: number
+  lastEventAtMs?: number
+  lastError?: string
+}
+
+export interface ObservabilityChatRow {
+  key: string
+  botId: string
+  botName: string
+  chatId: string
+  chatName: string
+  chatType: 'group' | 'p2p' | 'internal'
+  sessions: number
+  activeBindings: number
+  inbound: number
+  replied: number
+  errors: number
+  totalTokens: number
+  cacheHitRate: number
+  avgLatencyMs: number
+  lastActiveMs: number
+}
+
+export interface ObservabilityChatFilterOption {
+  chatId: string
+  chatName: string
+  chatType: 'group' | 'p2p'
+  botIds: string[]
+}
+
+export interface ObservabilityHeatmapCell {
+  dayOfWeek: number
+  hour: number
+  count: number
+  tokens: number
+}
+
+export interface ProcessVitalPoint {
+  timestampMs: number
+  label: string
+  rssBytes: number
+  heapUsedBytes: number
+  heapTotalBytes: number
+  externalBytes: number
+  eventLoopP95Ms: number
+  eventLoopMeanMs: number
+  activeTurns: number
+  onlineBots: number
+}
+
+export interface StorageCategoryEntry {
+  id: string
+  label: string
+  pathLabel: string
+  scope: 'bridge' | 'dsh'
+  bytes: number
+  fileCount: number
+  sharePct: number
+}
+
+export interface StorageTableStat {
+  table: string
+  rows: number
+}
+
+export interface ObservabilityPayload {
+  generatedAtMs: number
+  window: ObservabilityWindow
+  fromMs: number
+  toMs: number
+  bucketSpanMs: number
+  filters: {
+    botId: string
+    chatId: string
+    chats: ObservabilityChatFilterOption[]
+  }
+  backfill: {
+    running: boolean
+    completed: boolean
+    scannedSessions: number
+    totalSessions: number
+    lastCompletedAtMs?: number
+  }
+  product: {
+    tokens: {
+      total: number
+      input: number
+      output: number
+      cacheRead: number
+      cacheWrite: number
+      reasoning: number
+      cacheHitRate: number
+      avgPerReply: number
+      deltaPct: number | null
+    }
+    sessions: {
+      activeInWindow: number
+      createdInWindow: number
+      archivedInWindow: number
+      liveBindings: number
+      deltaPct: number | null
+    }
+    traffic: {
+      inbound: number
+      replied: number
+      silentSkipped: number
+      ignored: number
+      errors: number
+      llmSteps: number
+      toolCalls: number
+      toolErrors: number
+      toolErrorRate: number
+      deltaPct: number | null
+    }
+    triage: {
+      total: number
+      silent: number
+      quickReply: number
+      handoff: number
+      fallback: number
+      deflectRate: number
+      avgLatencyMs: number
+      p95LatencyMs: number
+      totalTokens: number
+    }
+    proactive: {
+      scheduleRuns: number
+      reminderRuns: number
+      dreamRuns: number
+      activeReminders: number
+      pendingConfirmReminders: number
+      configuredSchedules: number
+      activeMemories: number
+      pinnedMemories: number
+      totalMemoryRecalls: number
+    }
+    models: ObservabilityModelBreakdown[]
+    triggers: ObservabilityTriggerBreakdown[]
+    heatmap: {
+      maxCount: number
+      cells: ObservabilityHeatmapCell[]
+    }
+    botRanking: ObservabilityBotRow[]
+    chatRanking: ObservabilityChatRow[]
+  }
+  technical: {
+    sla: {
+      successRate: number
+      deltaPct: number | null
+      errorRate: number
+      triageFallbackRate: number
+      toolErrorRate: number
+      totalErrors: number
+      abortedTurns: number
+      interruptedRecoveries: number
+    }
+    latency: {
+      samples: number
+      avgMs: number
+      p50Ms: number
+      p75Ms: number
+      p95Ms: number
+      p99Ms: number
+      maxMs: number
+      deltaP95Pct: number | null
+      histogram: ObservabilityLatencyBucket[]
+    }
+    connections: {
+      onlineBots: number
+      enabledBots: number
+      totalBots: number
+      avgAckP50Ms: number
+      maxAckP95Ms: number
+      totalSdkErrors: number
+      splitBrainCount: number
+      bots: ObservabilityBotRow[]
+    }
+    runtime: {
+      phase: string
+      draining: boolean
+      pid: number
+      nodeVersion: string
+      platform: string
+      uptimeSec: number
+      rssBytes: number
+      heapUsedBytes: number
+      heapTotalBytes: number
+      externalBytes: number
+      eventLoopMeanMs: number
+      eventLoopP95Ms: number
+      eventLoopMaxMs: number
+      activeTurns: number
+      activeTriageCount: number
+      activeRemindersCount: number
+      activeDreamingCount: number
+      persistedPendingTurns: number
+      activeActors: number
+      queuedTurns: number
+      vitalsSeries: ProcessVitalPoint[]
+    }
+    storage: {
+      scannedAtMs: number
+      totalBytes: number
+      bridgeBytes: number
+      dshBytes: number
+      dbBytes: number
+      walBytes: number
+      shmBytes: number
+      walBloated: boolean
+      walDetail: string
+      journalMode: string
+      schemaVersion: number
+      pageCount: number
+      pageSize: number
+      integrityOk: boolean
+      foreignKeyErrors: number
+      categories: StorageCategoryEntry[]
+      tables: StorageTableStat[]
+    }
+    errors: {
+      breakdown: ObservabilityErrorBreakdown[]
+      recent: AuditEvent[]
+    }
+    alerts: DiagnosticAlert[]
+  }
+  series: ObservabilitySeriesPoint[]
+}

@@ -471,6 +471,21 @@ export class DreamingService {
         processedSessionIds: nextProcessed,
       })
 
+      this.host.store.recordUsageEvent?.({
+        id: `dream:${sessionId}`,
+        timestampMs: startedMs,
+        recordKind: 'proactive',
+        botId,
+        chatId: 'dream:internal',
+        chatType: 'internal',
+        sessionId,
+        trigger: 'dreaming',
+        agentPreset: bot.agentPreset,
+        ...(bot.model ? { model: bot.model } : {}),
+        outcome: 'completed',
+        latencyMs: durationMs,
+      })
+
       this.host.store.recordEvent({
         botId,
         sessionId,
@@ -513,6 +528,21 @@ export class DreamingService {
         lastCheckedDateKey: dateKey,
         ...(createdSession ? { lastSessionId: sessionId } : {}),
         lastSummary: `整理失败：${msg}`,
+      })
+      this.host.store.recordUsageEvent?.({
+        id: `dream:${createdSession ? sessionId : `${botId}:${startedMs}`}`,
+        timestampMs: startedMs,
+        recordKind: 'proactive',
+        botId,
+        chatId: 'dream:internal',
+        chatType: 'internal',
+        ...(createdSession ? { sessionId } : {}),
+        trigger: 'dreaming',
+        agentPreset: bot.agentPreset,
+        ...(bot.model ? { model: bot.model } : {}),
+        outcome: 'error',
+        errorCode: 'dream_error',
+        latencyMs: finishedMs - startedMs,
       })
       this.host.store.recordEvent({
         botId,

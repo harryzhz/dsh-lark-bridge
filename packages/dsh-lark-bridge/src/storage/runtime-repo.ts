@@ -527,6 +527,24 @@ export class RuntimeRepo {
     return rows.map((r) => this.hydrateManagedSession(r))
   }
 
+  listAllManagedSessions(limit = 600): LarkManagedSession[] {
+    const bounded = Math.max(1, Math.min(Math.floor(limit) || 600, MAX_MANAGED_SESSIONS))
+    const rows = this.db
+      .prepare('SELECT * FROM managed_sessions ORDER BY last_activity_ms DESC LIMIT ?')
+      .all(bounded) as Array<{
+      session_id: string
+      bot_id: string
+      chat_id: string
+      route_key: string | null
+      trigger: string | null
+      created_at_ms: number
+      last_activity_ms: number
+      idle_close_ms: number | null
+      archived_at_ms: number | null
+    }>
+    return rows.map((r) => this.hydrateManagedSession(r))
+  }
+
   // ── Dreaming States & Sessions ──────────────────────────────────────────
 
   getDreamState(botId: string): LarkDreamRunState | undefined {

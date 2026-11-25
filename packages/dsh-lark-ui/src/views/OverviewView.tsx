@@ -35,12 +35,14 @@ export function OverviewView({
   models,
   pluginUpdates,
   onOpenPluginUpdates,
+  onOpenObservability,
 }: {
   cockpit: CockpitPayload | null
   runtimes: readonly RuntimeOption[]
   models: readonly ModelGroup[]
   pluginUpdates?: PluginUpdatesOverview | null
   onOpenPluginUpdates?: () => void
+  onOpenObservability?: () => void
 }) {
   const [hoveredHourKey, setHoveredHourKey] = useState<string | null>(null)
   const [dismissedAlertIds, setDismissedAlertIds] = useState<Record<string, boolean>>({})
@@ -156,6 +158,15 @@ export function OverviewView({
                 <i className="fb-swatch" data-kind="error" />
                 异常 {summary.errors24h}
               </span>
+            )}
+            {onOpenObservability && (
+              <button
+                type="button"
+                className="fb-inline-jump"
+                onClick={onOpenObservability}
+              >
+                深入观测 →
+              </button>
             )}
           </div>
         </div>

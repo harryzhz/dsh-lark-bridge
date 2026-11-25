@@ -562,6 +562,33 @@ export class MemoryRepo {
     }
   }
 
+  getSummaryStats(botId?: string): {
+    readonly activeCount: number
+    readonly pinnedCount: number
+    readonly totalRecalls: number
+  } {
+    const sql = botId
+      ? `SELECT
+           SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active_cnt,
+           SUM(CASE WHEN status = 'active' AND pinned = 1 THEN 1 ELSE 0 END) AS pinned_cnt,
+           SUM(recall_count) AS total_recalls
+         FROM memory_entries
+         WHERE bot_id = ?`
+      : `SELECT
+           SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active_cnt,
+           SUM(CASE WHEN status = 'active' AND pinned = 1 THEN 1 ELSE 0 END) AS pinned_cnt,
+           SUM(recall_count) AS total_recalls
+         FROM memory_entries`
+    const row = (botId ? this.db.prepare(sql).get(botId) : this.db.prepare(sql).get()) as
+      | { active_cnt?: number | null; pinned_cnt?: number | null; total_recalls?: number | null }
+      | undefined
+    return {
+      activeCount: Number(row?.active_cnt ?? 0),
+      pinnedCount: Number(row?.pinned_cnt ?? 0),
+      totalRecalls: Number(row?.total_recalls ?? 0),
+    }
+  }
+
   private syncFts(entry: LarkMemoryEntry): void {
     this.db.prepare('DELETE FROM memory_entries_fts WHERE entry_id = ?').run(entry.id)
     this.db
