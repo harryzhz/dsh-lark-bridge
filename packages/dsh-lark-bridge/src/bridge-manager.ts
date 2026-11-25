@@ -680,6 +680,24 @@ export class LarkBridgeManager {
     return this.facade.agentCreateSchedule(input)
   }
 
+  agentUpdateSchedule(
+    scheduleId: string,
+    input: {
+      readonly title?: string
+      readonly prompt?: string
+      readonly timing?: ScheduleCreateInputLike['timing']
+      readonly cwd?: string
+      readonly agentPreset?: string
+      readonly active?: boolean
+    },
+  ) {
+    return this.facade.agentUpdateSchedule(scheduleId, input)
+  }
+
+  agentDeleteSchedule(scheduleId: string) {
+    return this.facade.agentDeleteSchedule(scheduleId)
+  }
+
   private shouldUseLoopbackSessionHandoff(base: string): boolean {
     if (!this.liveWebOrigin || !isLoopbackOrigin(base) || !isLoopbackOrigin(this.liveWebOrigin)) {
       return false

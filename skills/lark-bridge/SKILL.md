@@ -140,6 +140,14 @@ lark-bridge schedule create \
   --tz Asia/Shanghai \
   --prompt-file ./.dsh-lark-bridge/tmp/patrol-prompt.md
 
+# 修改已有定时任务的时间规则、标题、提示词、目录/预设或暂停/恢复
+lark-bridge schedule update <scheduleId> --daily 07:00 --tz Asia/Shanghai
+lark-bridge schedule update <scheduleId> --pause
+lark-bridge schedule update <scheduleId> --resume
+
+# 删除周期性定时任务（同时清理飞书群通知绑定）
+lark-bridge schedule delete <scheduleId>
+
 # 绑定已有定时任务到指定飞书群或立即试跑
 lark-bridge schedule bind <scheduleId> --bot <botId> --chat <chatId> --mode chat --notify non_empty
 lark-bridge schedule run <scheduleId>

@@ -32,6 +32,8 @@ const HELP = `lark-bridge — DSH 飞书桥接辅助 CLI（零密钥暴露，自
   lark-bridge worktree list [--cwd <仓库目录>]
   lark-bridge schedule list
   lark-bridge schedule create --title <标题> (--prompt <文本> | --prompt-file <路径>) (--cron <表达式> | --daily <HH:MM> | --weekly <1,2..@HH:MM> | --every <秒> | --after <秒>) [--tz Asia/Shanghai] [--bot <botId> --chat <chatId>] [--mode chat|thread] [--notify non_empty|always|error_only] [--cwd <目录>] [--preset <id>]
+  lark-bridge schedule update <scheduleId> [--title <标题>] [--prompt <文本> | --prompt-file <路径>] [--cron <表达式> | --daily <HH:MM> | --weekly <1,2..@HH:MM> | --every <秒> | --after <秒>] [--tz Asia/Shanghai] [--cwd <目录>] [--preset <id>] [--pause | --resume]
+  lark-bridge schedule delete <scheduleId>
   lark-bridge schedule bind <scheduleId> --bot <botId> --chat <chatId> [--mode chat|thread] [--notify non_empty|always|error_only]
   lark-bridge schedule run <scheduleId>
   lark-bridge db status [--data-dir <目录>]
@@ -81,6 +83,8 @@ const BOOL_FLAGS = new Set([
   'pin',
   'wait',
   'allow-in-session',
+  'pause',
+  'resume',
 ])
 
 function parseCliArgs(argv) {
@@ -243,7 +247,21 @@ function normalizeTimeHHMMSS(raw) {
   throw new Error(`无效的时间格式 "${raw}"，请使用 HH:MM（例如 09:30）`)
 }
 
-function buildScheduleTiming(flags) {
+function buildScheduleTiming(flags, options = {}) {
+  const { optional = false } = options
+  const selectors = ['cron', 'daily', 'weekly', 'every', 'after'].filter((k) => flags[k] !== undefined)
+  if (selectors.length > 1) {
+    throw new Error('请仅指定一种定时规则（--cron、--daily、--weekly、--every 或 --after 不能同时使用）')
+  }
+  if (selectors.length === 0) {
+    if (optional) {
+      if (flags.tz !== undefined) {
+        throw new Error('仅指定 --tz 无法更新定时规则，请同时指定 --cron、--daily 或 --weekly')
+      }
+      return undefined
+    }
+    throw new Error('请指定一种定时规则：--cron、--daily、--weekly、--every 或 --after')
+  }
   const tz = String(flags.tz || 'Asia/Shanghai')
   if (flags.cron) {
     return { kind: 'cron', cron: { expression: String(flags.cron).trim(), time_zone: tz } }
@@ -277,7 +295,7 @@ function buildScheduleTiming(flags) {
     if (!Number.isFinite(sec) || sec <= 0) throw new Error('--after 须为正秒数')
     return { kind: 'after', after_seconds: Math.round(sec) }
   }
-  throw new Error('请指定一种定时规则：--cron、--daily、--weekly、--every 或 --after')
+  return undefined
 }
 
 function handleWorktreeCommand(positionals, flags) {
@@ -577,6 +595,51 @@ async function handleScheduleCommand(endpoint, positionals, flags, sessionId) {
     printJson(data)
     return
   }
+  if (sub === 'update') {
+    const scheduleId = positionals[2]
+    if (!scheduleId) {
+      throw new Error(
+        '用法：lark-bridge schedule update <scheduleId> [--title <标题>] [--prompt <文本> | --prompt-file <路径>] [--daily <HH:MM> | --weekly <1,2..@HH:MM> | --cron <表达式> | --every <秒> | --after <秒>] [--tz Asia/Shanghai] [--cwd <目录>] [--preset <id>] [--pause | --resume]',
+      )
+    }
+    if (flags.pause && flags.resume) {
+      throw new Error('--pause 与 --resume 不能同时使用')
+    }
+    const prompt = flags['prompt-file']
+      ? readFileSync(resolve(String(flags['prompt-file'])), 'utf8')
+      : flags.prompt !== undefined
+        ? String(flags.prompt)
+        : undefined
+    const timing = buildScheduleTiming(flags, { optional: true })
+    const payload = {
+      ...(flags.title !== undefined ? { title: String(flags.title) } : {}),
+      ...(prompt !== undefined ? { prompt } : {}),
+      ...(timing !== undefined ? { timing } : {}),
+      ...(flags.cwd !== undefined ? { cwd: String(flags.cwd) } : {}),
+      ...(flags.preset !== undefined ? { agentPreset: String(flags.preset) } : {}),
+      ...(flags.pause ? { active: false } : {}),
+      ...(flags.resume ? { active: true } : {}),
+    }
+    if (Object.keys(payload).length === 0) {
+      throw new Error('请至少指定一个要更新的字段（--title、--prompt、--daily/--weekly/--cron、--cwd、--preset、--pause 或 --resume）')
+    }
+    const data = await apiRequest(
+      endpoint,
+      'PATCH',
+      `/agent/schedules/${encodeURIComponent(scheduleId)}`,
+      payload,
+    )
+    printJson(data)
+    return
+  }
+  if (sub === 'delete') {
+    const scheduleId = positionals[2]
+    if (!scheduleId) throw new Error('用法：lark-bridge schedule delete <scheduleId>')
+    printJson(
+      await apiRequest(endpoint, 'DELETE', `/agent/schedules/${encodeURIComponent(scheduleId)}`),
+    )
+    return
+  }
   if (sub === 'bind') {
     const scheduleId = positionals[2]
     const botId = String(flags.bot || '').trim()
@@ -604,7 +667,7 @@ async function handleScheduleCommand(endpoint, positionals, flags, sessionId) {
     printJson(await apiRequest(endpoint, 'POST', `/schedules/${encodeURIComponent(scheduleId)}/run`))
     return
   }
-  throw new Error(`未知的 schedule 子命令 "${sub}"`)
+  throw new Error(`未知的 schedule 子命令 "${sub}"（支持 list | create | update | delete | bind | run）`)
 }
 
 async function main() {

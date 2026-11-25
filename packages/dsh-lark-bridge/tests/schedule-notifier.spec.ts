@@ -1,19 +1,23 @@
+import { execFile } from 'node:child_process'
 import { mkdtempSync, rmSync } from 'node:fs'
-import type { IncomingMessage, ServerResponse } from 'node:http'
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { Readable } from 'node:stream'
+import { promisify } from 'node:util'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { UserMessage } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { LarkBridgeManager } from '../src/bridge-manager.js'
+import { OPERATOR_TOKEN_HEADER } from '../src/cli-support.js'
 import { createLarkHttpHandler, type ConnectionAdmitter } from '../src/http-api.js'
 import {
   ScheduleNotifier,
   type HostScheduleService,
   type ScheduleCreateInputLike,
+  type ScheduleEditRequestLike,
   type ScheduleEntryLike,
 } from '../src/schedule-notifier.js'
 import { LarkBridgeStore } from '../src/store.js'
@@ -34,14 +38,14 @@ function makeTempDir(): string {
 
 function invokeHandler(
   handler: (req: IncomingMessage, res: ServerResponse) => Promise<void> | void,
-  opts: { method?: string; url: string; body?: unknown },
+  opts: { method?: string; url: string; body?: unknown; headers?: Record<string, string> },
 ): Promise<{ status: number; json: Record<string, unknown> }> {
   return new Promise((resolve, reject) => {
     const rawBody = opts.body !== undefined ? JSON.stringify(opts.body) : ''
     const req = Readable.from(rawBody ? [Buffer.from(rawBody)] : []) as unknown as IncomingMessage
     req.method = opts.method ?? 'GET'
     req.url = opts.url
-    req.headers = {}
+    req.headers = opts.headers ?? {}
 
     let status = 200
     let body = ''
@@ -687,5 +691,330 @@ describe('ScheduleNotifier, <system_reminder><schedule> injection & /api/lark-br
     expect(archiveSession).toHaveBeenCalledWith('sess-zwsp')
     expect(archiveSession).toHaveBeenCalledWith('sess-sentinel')
     notifier.stop()
+  })
+
+  it('supports updating and deleting schedules via /api/lark-bridge/agent/schedules/:id with auth and validation', async () => {
+    const dataDir = makeTempDir()
+    const repoDir = makeTempDir()
+    const nextDir = makeTempDir()
+    const store = new LarkBridgeStore(dataDir)
+    store.upsertBot({
+      id: 'dsh-bot',
+      name: 'DSH-Bot',
+      enabled: false,
+      larkAppId: 'cli_sched_edit',
+      larkAppSecret: 'sec',
+      defaultWorkingDir: repoDir,
+    })
+    store.upsertScheduleBinding({
+      scheduleId: 'sched-daily-1',
+      enabled: true,
+      targets: [{ botId: 'dsh-bot', chatId: 'oc_team' }],
+      deliveryMode: 'chat',
+      notifyOn: 'non_empty',
+    })
+
+    const entries = new Map<string, ScheduleEntryLike>([
+      [
+        'sched-daily-1',
+        {
+          id: 'sched-daily-1',
+          kind: 'daily',
+          title: '每日服务巡检',
+          prompt: '检查服务状态',
+          status: 'active',
+          time: '09:00:00.000',
+          scheduledAt: '2026-11-26T01:00:00.000Z',
+          target: { kind: 'new', create: { cwd: repoDir, agentPreset: 'agy' } },
+          involvedSessionIds: [],
+        },
+      ],
+      [
+        'sched-session-1',
+        {
+          id: 'sched-session-1',
+          kind: 'daily',
+          title: '复用会话任务',
+          prompt: '检查状态',
+          status: 'active',
+          time: '10:00:00.000',
+          scheduledAt: '2026-11-26T02:00:00.000Z',
+          target: { kind: 'session', sessionId: 'sess-existing' },
+          involvedSessionIds: ['sess-existing'],
+        },
+      ],
+    ])
+    const editCalls: ScheduleEditRequestLike[] = []
+    let forceConflict = false
+
+    const scheduleService: HostScheduleService = {
+      catalog: async () => [...entries.values()],
+      view: async ({ id }) => entries.get(id) ?? { code: 'schedule_not_found' },
+      run: async ({ id }) => entries.get(id) ?? { code: 'schedule_not_found' },
+      edit: vi.fn(async (req: ScheduleEditRequestLike) => {
+        editCalls.push(req)
+        if (forceConflict) return { id: req.id, code: 'schedule_conflict' }
+        const cur = entries.get(req.id)
+        if (!cur) return { id: req.id, code: 'schedule_not_found' }
+        if (req.action === 'delete') {
+          entries.delete(req.id)
+          return { id: req.id, deleted: true as const }
+        }
+        const next: ScheduleEntryLike = {
+          ...cur,
+          ...(req.patch.title !== undefined ? { title: req.patch.title } : {}),
+          ...(req.patch.prompt !== undefined ? { prompt: req.patch.prompt } : {}),
+          ...(req.patch.active !== undefined ? { status: req.patch.active ? 'active' : 'paused' } : {}),
+          ...(req.patch.timing?.kind === 'daily'
+            ? {
+                kind: 'daily',
+                time: `${req.patch.timing.daily.time}.000`,
+                scheduledAt: '2026-11-25T23:00:00.000Z',
+              }
+            : {}),
+          ...(req.patch.target ? { target: req.patch.target as ScheduleEntryLike['target'] } : {}),
+        }
+        entries.set(req.id, next)
+        return next
+      }),
+    }
+
+    const fakeCtx = {
+      logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn() },
+      sessions: { get: () => undefined },
+      llm: { listProviders: () => [] },
+      on: () => () => {},
+      get(name: string) {
+        return name === 'schedule' ? scheduleService : undefined
+      },
+    } as unknown as Context
+
+    const manager = new LarkBridgeManager(
+      fakeCtx,
+      {
+        dataDir,
+        publicBaseUrl: 'http://127.0.0.1:3880',
+        idleSweepIntervalMs: 0,
+        maxAuditEvents: 50,
+        autoInstallCliAndSkill: false,
+      },
+      store,
+    )
+    const admitter: ConnectionAdmitter = { admit: () => ({ peer: { principal: { kind: 'owner' } } }) }
+    const handler = createLarkHttpHandler(fakeCtx, admitter, manager)
+
+    // 1. Update timing to daily 07:00
+    const resTiming = await invokeHandler(handler, {
+      method: 'PATCH',
+      url: '/api/lark-bridge/agent/schedules/sched-daily-1',
+      body: {
+        timing: { kind: 'daily', daily: { time: '07:00:00', time_zone: 'Asia/Shanghai' } },
+      },
+    })
+    expect(resTiming.status).toBe(200)
+    expect(resTiming.json.ok).toBe(true)
+    expect(resTiming.json.ruleSummary).toBe('每天 07:00')
+    expect(resTiming.json.binding).toMatchObject({ scheduleId: 'sched-daily-1' })
+    expect(editCalls[0]).toEqual({
+      id: 'sched-daily-1',
+      action: 'update',
+      patch: { timing: { kind: 'daily', daily: { time: '07:00:00', time_zone: 'Asia/Shanghai' } } },
+    })
+
+    // 2. Update cwd alone preserves existing agentPreset; pause & resume work
+    const resCwd = await invokeHandler(handler, {
+      method: 'PATCH',
+      url: '/api/lark-bridge/agent/schedules/sched-daily-1',
+      body: { cwd: nextDir, active: false },
+    })
+    expect(resCwd.status).toBe(200)
+    expect(editCalls[1]).toEqual({
+      id: 'sched-daily-1',
+      action: 'update',
+      patch: {
+        target: { kind: 'new', create: { cwd: nextDir, agentPreset: 'agy' } },
+        active: false,
+      },
+    })
+    expect((resCwd.json.entry as ScheduleEntryLike).status).toBe('paused')
+
+    // 3. Validation failures: empty patch, bad active type, nonexistent cwd, session-target cwd edit
+    const resEmpty = await invokeHandler(handler, {
+      method: 'PATCH',
+      url: '/api/lark-bridge/agent/schedules/sched-daily-1',
+      body: {},
+    })
+    expect(resEmpty.status).toBe(400)
+
+    const resBadActive = await invokeHandler(handler, {
+      method: 'PATCH',
+      url: '/api/lark-bridge/agent/schedules/sched-daily-1',
+      body: { active: 'false' },
+    })
+    expect(resBadActive.status).toBe(400)
+
+    const resBadCwd = await invokeHandler(handler, {
+      method: 'PATCH',
+      url: '/api/lark-bridge/agent/schedules/sched-daily-1',
+      body: { cwd: join(dataDir, 'missing-dir') },
+    })
+    expect(resBadCwd.status).toBe(400)
+
+    const resSessionTarget = await invokeHandler(handler, {
+      method: 'PATCH',
+      url: '/api/lark-bridge/agent/schedules/sched-session-1',
+      body: { cwd: nextDir },
+    })
+    expect(resSessionTarget.status).toBe(400)
+
+    // 4. Not found (404) & conflict (409)
+    const resMissing = await invokeHandler(handler, {
+      method: 'PATCH',
+      url: '/api/lark-bridge/agent/schedules/sched-missing',
+      body: { title: '新标题' },
+    })
+    expect(resMissing.status).toBe(404)
+    expect(resMissing.json.code).toBe('schedule_not_found')
+
+    forceConflict = true
+    const resConflict = await invokeHandler(handler, {
+      method: 'PATCH',
+      url: '/api/lark-bridge/agent/schedules/sched-daily-1',
+      body: { title: '冲突标题' },
+    })
+    expect(resConflict.status).toBe(409)
+    expect(resConflict.json.code).toBe('schedule_conflict')
+    forceConflict = false
+
+    // 5. Operator token is rejected fail-closed (403)
+    const opHeaders = { [OPERATOR_TOKEN_HEADER]: manager.operatorAuth.token }
+    const resOpPatch = await invokeHandler(handler, {
+      method: 'PATCH',
+      url: '/api/lark-bridge/agent/schedules/sched-daily-1',
+      headers: opHeaders,
+      body: { title: '禁止修改' },
+    })
+    expect(resOpPatch.status).toBe(403)
+
+    const resOpDel = await invokeHandler(handler, {
+      method: 'DELETE',
+      url: '/api/lark-bridge/agent/schedules/sched-daily-1',
+      headers: opHeaders,
+    })
+    expect(resOpDel.status).toBe(403)
+
+    // 6. Delete removes host task and cascades to bridge schedule binding
+    const resDel = await invokeHandler(handler, {
+      method: 'DELETE',
+      url: '/api/lark-bridge/agent/schedules/sched-daily-1',
+    })
+    expect(resDel.status).toBe(200)
+    expect(resDel.json).toEqual({
+      ok: true,
+      id: 'sched-daily-1',
+      deleted: true,
+      bindingDeleted: true,
+    })
+    expect(store.getScheduleBinding('sched-daily-1')).toBeUndefined()
+
+    const resDelAgain = await invokeHandler(handler, {
+      method: 'DELETE',
+      url: '/api/lark-bridge/agent/schedules/sched-daily-1',
+    })
+    expect(resDelAgain.status).toBe(404)
+
+    await manager.stop()
+  })
+
+  it('lark-bridge CLI supports schedule update and delete commands against the agent API', async () => {
+    const execFileAsync = promisify(execFile)
+    const token = 'test-cli-bearer-token-1234567890'
+    const received: Array<{ method: string; url: string; auth?: string; body: unknown }> = []
+
+    const server = createServer((req, res) => {
+      const chunks: Buffer[] = []
+      req.on('data', (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)))
+      req.on('end', () => {
+        const raw = Buffer.concat(chunks).toString('utf8').trim()
+        received.push({
+          method: req.method ?? '',
+          url: req.url ?? '',
+          auth: req.headers.authorization,
+          body: raw ? JSON.parse(raw) : undefined,
+        })
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, id: 'sched-cli-1', ruleSummary: '每天 07:00' }))
+      })
+    })
+    await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen))
+    const addr = server.address() as { port: number }
+    const apiBaseUrl = `http://127.0.0.1:${addr.port}/api/lark-bridge`
+
+    const cliScript = resolve(import.meta.dirname, '../../dsh-bundle/bin/lark-bridge.mjs')
+    const env = {
+      ...process.env,
+      LARK_BRIDGE_API_URL: apiBaseUrl,
+      LARK_BRIDGE_CLI_TOKEN: token,
+    }
+
+    try {
+      const { stdout: updateOut } = await execFileAsync(
+        process.execPath,
+        [cliScript, 'schedule', 'update', 'sched-cli-1', '--daily', '07:00', '--tz', 'Asia/Shanghai'],
+        { env, encoding: 'utf8' },
+      )
+      expect(JSON.parse(updateOut).ok).toBe(true)
+      expect(received[0]).toEqual({
+        method: 'PATCH',
+        url: '/api/lark-bridge/agent/schedules/sched-cli-1',
+        auth: `Bearer ${token}`,
+        body: {
+          timing: { kind: 'daily', daily: { time: '07:00:00', time_zone: 'Asia/Shanghai' } },
+        },
+      })
+
+      await execFileAsync(process.execPath, [cliScript, 'schedule', 'update', 'sched-cli-1', '--pause'], {
+        env,
+        encoding: 'utf8',
+      })
+      expect(received[1]).toEqual({
+        method: 'PATCH',
+        url: '/api/lark-bridge/agent/schedules/sched-cli-1',
+        auth: `Bearer ${token}`,
+        body: { active: false },
+      })
+
+      await execFileAsync(process.execPath, [cliScript, 'schedule', 'delete', 'sched-cli-1'], {
+        env,
+        encoding: 'utf8',
+      })
+      expect(received[2]).toEqual({
+        method: 'DELETE',
+        url: '/api/lark-bridge/agent/schedules/sched-cli-1',
+        auth: `Bearer ${token}`,
+        body: undefined,
+      })
+
+      // Conflicting --pause & --resume fails fast before hitting server
+      await expect(
+        execFileAsync(
+          process.execPath,
+          [cliScript, 'schedule', 'update', 'sched-cli-1', '--pause', '--resume'],
+          { env, encoding: 'utf8' },
+        ),
+      ).rejects.toThrow()
+
+      // Specifying --tz without any timing selector fails fast
+      await expect(
+        execFileAsync(
+          process.execPath,
+          [cliScript, 'schedule', 'update', 'sched-cli-1', '--tz', 'Asia/Shanghai'],
+          { env, encoding: 'utf8' },
+        ),
+      ).rejects.toThrow()
+      expect(received).toHaveLength(3)
+    } finally {
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()))
+    }
   })
 })
