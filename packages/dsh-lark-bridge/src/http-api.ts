@@ -4,6 +4,7 @@ import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
 import { resolveEffectiveWorkspaceName, toPublicBotView } from '@dsh-lark/lark-core'
 import type { AgentCliSendInput, LarkBridgeManager } from './bridge-manager.js'
 import { OPERATOR_TOKEN_HEADER } from './cli-support.js'
+import { LARK_CONSOLE_LOGIN_PATH, handleConsoleLogin } from './console-login.js'
 import {
   assertExistingWorkingDirectory,
   browseHostDirectories,
@@ -217,6 +218,27 @@ export async function dispatchLarkApiRequest(
       manager.store.rotateViewerTicketSecret()
       manager.sessionViewer?.invalidateAccess(true)
       return ok({ ok: true })
+    }
+
+    // ── Short-lived single-use console login ticket issue (owner-only) ───
+    if (method === 'POST' && pathname === 'console-login/issue') {
+      if (principalKind !== 'owner' || isCliAuthenticated || isOperatorAuthenticated) {
+        return ok({ ok: false, error: 'owner_web_session_required' }, 403)
+      }
+      const body = bodyRecord(request.body)
+      const botId = typeof body.botId === 'string' && body.botId.trim() ? body.botId.trim() : 'owner'
+      const bot = manager.store.getBot(botId)
+      const botName =
+        bot?.name ?? (typeof body.botName === 'string' && body.botName.trim() ? body.botName.trim() : 'DSH 控制台')
+      const issued = manager.issueConsoleLoginLink({
+        botId: bot?.id ?? botId,
+        botName,
+        adminOpenId: 'owner_session',
+      })
+      if (!issued) {
+        return ok({ ok: false, error: 'console_login_unavailable' }, 503)
+      }
+      return ok({ ok: true, ...issued })
     }
 
     // ── Agent CLI endpoints (never expose app secrets or OAuth tokens) ───
@@ -1052,6 +1074,22 @@ export function createLarkHttpHandler(
         connection,
         handoff: manager.sessionHandoff,
         ...(manager.sessionViewer ? { viewer: manager.sessionViewer } : {}),
+      })
+      return
+    }
+    if (requestPath === LARK_CONSOLE_LOGIN_PATH) {
+      await handleConsoleLogin(req, res, {
+        liveOrigin: manager.getLiveWebOrigin?.() ?? '',
+        advertisedOrigin,
+        connection,
+        handoff: manager.consoleLogin,
+        onAudit: (ev) => {
+          manager.store.recordEvent({
+            botId: ev.botId,
+            kind: 'lifecycle',
+            summary: ev.summary,
+          })
+        },
       })
       return
     }
