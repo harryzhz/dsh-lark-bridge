@@ -223,7 +223,56 @@ export class ObservabilityService {
   private backfillLastCompletedAtMs?: number
   private backfillPromise: Promise<void> | null = null
 
+  private readonly apiRouteTimings = new Map<
+    string,
+    { count: number; totalMs: number; maxMs: number; lastAtMs: number; ring: number[]; cursor: number }
+  >()
+
   constructor(private readonly host: ObservabilityServiceHost) {}
+
+  recordApiTiming(route: string, durationMs: number): void {
+    const key = route.trim()
+    if (!key) return
+    const ms = Number.isFinite(durationMs) && durationMs >= 0 ? durationMs : 0
+    const now = Date.now()
+    let entry = this.apiRouteTimings.get(key)
+    if (!entry) {
+      if (this.apiRouteTimings.size >= 40) return
+      entry = { count: 0, totalMs: 0, maxMs: 0, lastAtMs: now, ring: [], cursor: 0 }
+      this.apiRouteTimings.set(key, entry)
+    }
+    entry.count += 1
+    entry.totalMs += ms
+    if (ms > entry.maxMs) entry.maxMs = ms
+    entry.lastAtMs = now
+    if (entry.ring.length < 120) {
+      entry.ring.push(ms)
+    } else {
+      entry.ring[entry.cursor] = ms
+      entry.cursor = (entry.cursor + 1) % 120
+    }
+  }
+
+  private getApiPerfSnapshot() {
+    const round2 = (n: number) => Math.round(n * 100) / 100
+    return [...this.apiRouteTimings.entries()]
+      .map(([route, s]) => {
+        const sorted = [...s.ring].sort((a, b) => a - b)
+        const pick = (q: number) =>
+          sorted[Math.max(0, Math.min(sorted.length - 1, Math.ceil(sorted.length * q) - 1))] ?? 0
+        return {
+          route,
+          count: s.count,
+          avgMs: round2(s.totalMs / Math.max(1, s.count)),
+          p50Ms: round2(pick(0.5)),
+          p95Ms: round2(pick(0.95)),
+          maxMs: round2(s.maxMs),
+          lastAtMs: s.lastAtMs,
+        }
+      })
+      .sort((a, b) => b.p95Ms - a.p95Ms || b.avgMs - a.avgMs)
+      .slice(0, 10)
+  }
 
   install(): () => void {
     this.disposed = false
@@ -687,6 +736,10 @@ export class ObservabilityService {
           foreignKeyErrors: integrity.foreignKeyErrors,
           categories: storageScan.categories,
           tables,
+        },
+        database: {
+          ...this.host.store.getDatabasePerfSnapshot(),
+          apiRoutes: this.getApiPerfSnapshot(),
         },
         errors: {
           breakdown: agg.errors,

@@ -417,10 +417,11 @@ describe('ObservabilityRepo, ObservabilityService & HTTP endpoints', () => {
     expect(payload.product.triage.deflectRate).toBe(100)
     expect(payload.backfill.completed).toBe(true)
 
-    // Verify HTTP API routing and fail-closed checkpoint auth
+    // Verify HTTP API routing, API timing capture, DB perf telemetry, and fail-closed checkpoint auth
     const fakeManager = {
       store,
       getObservability: (opts: Record<string, unknown>) => svc.getPayload(opts),
+      recordApiTiming: (route: string, ms: number) => svc.recordApiTiming(route, ms),
     }
 
     // Default window is 24h when omitted
@@ -440,9 +441,35 @@ describe('ObservabilityRepo, ObservabilityService & HTTP endpoints', () => {
       principalKind: 'owner',
     })
     expect(obsRes.status).toBe(200)
-    expect((obsRes.payload as { product: { tokens: { total: number } } }).product.tokens.total).toBe(
-      5250,
-    )
+    const obsPayload = obsRes.payload as {
+      product: { tokens: { total: number } }
+      technical: {
+        database: {
+          totalQueries: number
+          sampleCount: number
+          p50Ms: number
+          p95Ms: number
+          slowQueries: Array<{ fingerprint: string; count: number }>
+          apiRoutes: Array<{ route: string; count: number }>
+        }
+      }
+    }
+    expect(obsPayload.product.tokens.total).toBe(5250)
+    expect(obsPayload.technical.database.totalQueries).toBeGreaterThan(0)
+    expect(obsPayload.technical.database.sampleCount).toBeGreaterThan(0)
+    expect(obsPayload.technical.database.slowQueries.length).toBeGreaterThan(0)
+    expect(
+      obsPayload.technical.database.apiRoutes.some((r) => r.route === 'GET /observability'),
+    ).toBe(true)
+
+    // Verify O(1) session ownership lookups & cached integrity check
+    expect(store.hasDreamSession('sess-live-1')).toBe(false)
+    expect(store.getBindingBySessionId('sess-live-1')?.botId).toBe('bot-live')
+    expect(store.findReminderOriginBySessionId('sess-live-1')).toBeUndefined()
+    const check1 = store.runIntegrityCheck()
+    const check2 = store.runIntegrityCheck()
+    expect(check1.ok).toBe(true)
+    expect(check2.ok).toBe(true)
 
     const cliCheckpointRes = await dispatchLarkApiRequest(fakeCtx, fakeManager as never, {
       method: 'POST',

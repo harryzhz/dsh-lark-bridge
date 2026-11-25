@@ -26,6 +26,54 @@ export interface IntegrityCheckResult {
   readonly foreignKeyErrors: number
 }
 
+export interface DatabaseQueryStat {
+  readonly fingerprint: string
+  readonly count: number
+  readonly avgMs: number
+  readonly maxMs: number
+  readonly lastAtMs: number
+}
+
+export interface DatabasePerfSnapshot {
+  readonly totalQueries: number
+  readonly sampleCount: number
+  readonly avgMs: number
+  readonly p50Ms: number
+  readonly p95Ms: number
+  readonly maxMs: number
+  readonly slowThresholdMs: number
+  readonly slowQueryCount: number
+  readonly integrityCheckMs: number
+  readonly integrityCheckedAtMs?: number
+  readonly lastCheckpointMs?: number
+  readonly lastCheckpointAtMs?: number
+  readonly slowQueries: readonly DatabaseQueryStat[]
+}
+
+const QUERY_PERF_RING_SIZE = 512
+const QUERY_SLOW_THRESHOLD_MS = 10
+const INTEGRITY_CHECK_CACHE_TTL_MS = 5 * 60_000
+const MAX_FINGERPRINT_ENTRIES = 64
+
+function fingerprintSql(sql: string): string {
+  const clean = sql.replace(/\s+/g, ' ').trim()
+  const pragma = /^PRAGMA\s+([a-z0-9_]+)/i.exec(clean)
+  if (pragma) return `PRAGMA ${pragma[1]!.toLowerCase()}`
+  const select = /^SELECT\b[\s\S]*?\bFROM\s+["`]?([a-z0-9_]+)["`]?/i.exec(clean)
+  if (select) return `SELECT ${select[1]}`
+  const insert = /^INSERT\b[\s\S]*?\bINTO\s+["`]?([a-z0-9_]+)["`]?/i.exec(clean)
+  if (insert) return `INSERT ${insert[1]}`
+  const update = /^UPDATE\s+["`]?([a-z0-9_]+)["`]?/i.exec(clean)
+  if (update) return `UPDATE ${update[1]}`
+  const del = /^DELETE\s+FROM\s+["`]?([a-z0-9_]+)["`]?/i.exec(clean)
+  if (del) return `DELETE ${del[1]}`
+  return clean.split(' ').slice(0, 2).join(' ').toUpperCase() || 'SQL'
+}
+
+function roundMs(value: number): number {
+  return Math.round(value * 100) / 100
+}
+
 export interface StorageStats {
   readonly dbPath: string
   readonly schemaVersion: number
@@ -94,6 +142,22 @@ export class BridgeDatabase {
   private savepointSeq = 0
   private closed = false
 
+  private readonly durationRing: number[] = []
+  private ringCursor = 0
+  private totalQueries = 0
+  private slowQueryCount = 0
+  private readonly queryStats = new Map<
+    string,
+    { count: number; totalMs: number; maxMs: number; lastAtMs: number }
+  >()
+  private integrityCache: {
+    readonly result: IntegrityCheckResult
+    readonly checkedAtMs: number
+    readonly durationMs: number
+  } | null = null
+  private lastCheckpointMs?: number
+  private lastCheckpointAtMs?: number
+
   constructor(dbPath: string, options: BridgeDatabaseOptions = {}) {
     assertNodeSqliteSupported()
     this.dbPath = dbPath
@@ -122,10 +186,98 @@ export class BridgeDatabase {
   prepare(sql: string): StatementSync {
     let stmt = this.statements.get(sql)
     if (!stmt) {
-      stmt = this.db.prepare(sql)
+      const raw = this.db.prepare(sql)
+      const fp = fingerprintSql(sql)
+      const record = (ms: number) => this.recordQueryTiming(fp, ms)
+      stmt = new Proxy(raw, {
+        get(target, prop, receiver) {
+          const val = Reflect.get(target, prop, target)
+          if (
+            (prop === 'get' || prop === 'all' || prop === 'run') &&
+            typeof val === 'function'
+          ) {
+            return (...args: unknown[]) => {
+              const t0 = performance.now()
+              try {
+                return (val as (...a: unknown[]) => unknown).apply(target, args)
+              } finally {
+                record(performance.now() - t0)
+              }
+            }
+          }
+          return typeof val === 'function' ? val.bind(target) : Reflect.get(target, prop, receiver)
+        },
+      })
       this.statements.set(sql, stmt)
     }
     return stmt
+  }
+
+  private recordQueryTiming(fingerprint: string, durationMs: number): void {
+    const ms = Number.isFinite(durationMs) && durationMs >= 0 ? durationMs : 0
+    this.totalQueries += 1
+    if (this.durationRing.length < QUERY_PERF_RING_SIZE) {
+      this.durationRing.push(ms)
+    } else {
+      this.durationRing[this.ringCursor] = ms
+      this.ringCursor = (this.ringCursor + 1) % QUERY_PERF_RING_SIZE
+    }
+    if (ms >= QUERY_SLOW_THRESHOLD_MS) {
+      this.slowQueryCount += 1
+    }
+    const existing = this.queryStats.get(fingerprint)
+    const now = Date.now()
+    if (existing) {
+      existing.count += 1
+      existing.totalMs += ms
+      if (ms > existing.maxMs) existing.maxMs = ms
+      existing.lastAtMs = now
+    } else if (this.queryStats.size < MAX_FINGERPRINT_ENTRIES) {
+      this.queryStats.set(fingerprint, { count: 1, totalMs: ms, maxMs: ms, lastAtMs: now })
+    }
+  }
+
+  getPerfSnapshot(): DatabasePerfSnapshot {
+    const sampleCount = this.durationRing.length
+    let avgMs = 0
+    let p50Ms = 0
+    let p95Ms = 0
+    let maxMs = 0
+    if (sampleCount > 0) {
+      const sorted = [...this.durationRing].sort((a, b) => a - b)
+      const pick = (q: number) =>
+        sorted[Math.max(0, Math.min(sorted.length - 1, Math.ceil(sorted.length * q) - 1))] ?? 0
+      const sum = sorted.reduce((acc, v) => acc + v, 0)
+      avgMs = roundMs(sum / sampleCount)
+      p50Ms = roundMs(pick(0.5))
+      p95Ms = roundMs(pick(0.95))
+      maxMs = roundMs(sorted[sorted.length - 1] ?? 0)
+    }
+    const slowQueries: DatabaseQueryStat[] = [...this.queryStats.entries()]
+      .map(([fingerprint, s]) => ({
+        fingerprint,
+        count: s.count,
+        avgMs: roundMs(s.totalMs / Math.max(1, s.count)),
+        maxMs: roundMs(s.maxMs),
+        lastAtMs: s.lastAtMs,
+      }))
+      .sort((a, b) => b.maxMs - a.maxMs || b.avgMs - a.avgMs)
+      .slice(0, 8)
+    return {
+      totalQueries: this.totalQueries,
+      sampleCount,
+      avgMs,
+      p50Ms,
+      p95Ms,
+      maxMs,
+      slowThresholdMs: QUERY_SLOW_THRESHOLD_MS,
+      slowQueryCount: this.slowQueryCount,
+      integrityCheckMs: this.integrityCache ? roundMs(this.integrityCache.durationMs) : 0,
+      ...(this.integrityCache ? { integrityCheckedAtMs: this.integrityCache.checkedAtMs } : {}),
+      ...(this.lastCheckpointMs !== undefined ? { lastCheckpointMs: roundMs(this.lastCheckpointMs) } : {}),
+      ...(this.lastCheckpointAtMs !== undefined ? { lastCheckpointAtMs: this.lastCheckpointAtMs } : {}),
+      slowQueries,
+    }
   }
 
   exec(sql: string): void {
@@ -201,18 +353,36 @@ export class BridgeDatabase {
     }))
   }
 
-  integrityCheck(): IntegrityCheckResult {
+  integrityCheck(
+    options: { readonly force?: boolean; readonly maxAgeMs?: number } = {},
+  ): IntegrityCheckResult {
+    const now = Date.now()
+    const maxAgeMs = options.maxAgeMs ?? INTEGRITY_CHECK_CACHE_TTL_MS
+    if (
+      !options.force &&
+      this.integrityCache &&
+      now - this.integrityCache.checkedAtMs < maxAgeMs
+    ) {
+      return this.integrityCache.result
+    }
+    const t0 = performance.now()
     const rows = this.prepare('PRAGMA integrity_check').all() as Array<Record<string, unknown>>
     const messages = rows
       .map((r) => String(Object.values(r)[0] ?? ''))
       .filter(Boolean)
     const fkRows = this.prepare('PRAGMA foreign_key_check').all()
     const ok = messages.length === 1 && messages[0] === 'ok' && fkRows.length === 0
-    return {
+    const result: IntegrityCheckResult = {
       ok,
       messages,
       foreignKeyErrors: fkRows.length,
     }
+    this.integrityCache = {
+      result,
+      checkedAtMs: now,
+      durationMs: performance.now() - t0,
+    }
+    return result
   }
 
   /**
@@ -239,6 +409,7 @@ export class BridgeDatabase {
     this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
     this.db.exec('VACUUM')
     this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+    this.integrityCache = null
     this.tightenPermissions()
     const afterBytes = safeFileSize(this.dbPath) + safeFileSize(`${this.dbPath}-wal`)
     return { beforeBytes, afterBytes }
@@ -269,6 +440,7 @@ export class BridgeDatabase {
     }
     const walPath = `${this.dbPath}-wal`
     const beforeWalBytes = safeFileSize(walPath)
+    const t0 = performance.now()
     const row = this.db.prepare(`PRAGMA wal_checkpoint(${mode})`).get() as
       | { busy?: number; log?: number; checkpointed?: number }
       | undefined
@@ -306,6 +478,11 @@ export class BridgeDatabase {
     }
 
     const afterWalBytes = safeFileSize(walPath)
+    this.lastCheckpointMs = performance.now() - t0
+    this.lastCheckpointAtMs = Date.now()
+    if (mode === 'TRUNCATE' && truncated) {
+      this.integrityCache = null
+    }
     if (afterWalBytes !== beforeWalBytes) {
       this.tightenPermissions()
     }

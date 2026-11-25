@@ -98,6 +98,24 @@ function bodyRecord(body: unknown): Record<string, unknown> {
     : {}
 }
 
+function normalizeApiRouteLabel(method: string, segments: readonly string[]): string {
+  if (segments.length === 0) return `${method} /health`
+  const [s0, s1] = segments
+  if (s0 === 'cockpit' || s0 === 'overview') return `${method} /cockpit`
+  if (s0 === 'observability') {
+    return s1 === 'checkpoint' ? `${method} /observability/checkpoint` : `${method} /observability`
+  }
+  if (s0 === 'memory') return `${method} /memory`
+  if (s0 === 'bindings' || s0 === 'events' || s0 === 'bots' || s0 === 'groups' || s0 === 'reminders' || s0 === 'schedules' || s0 === 'diagnostics' || s0 === 'runtimes' || s0 === 'models') {
+    return segments.length > 1 ? `${method} /${s0}/:id` : `${method} /${s0}`
+  }
+  if (s0 === 'plugins' && s1) return `${method} /plugins/${s1}`
+  if (s0 === 'lifecycle' && s1) return `${method} /lifecycle/${s1}`
+  if (s0 === 'auth' && s1) return `${method} /auth/${s1}`
+  if (s0 === 'agent' && s1) return `${method} /agent/${s1}`
+  return `${method} /${s0}`
+}
+
 /**
  * Transport-agnostic Lark Bridge API dispatcher shared by:
  * 1) `ctx.connection.fetch.register('/api/lark-bridge-rpc')` (Web & Electron Desktop UI)
@@ -108,11 +126,13 @@ export async function dispatchLarkApiRequest(
   manager: LarkBridgeManager,
   request: LarkApiRequest,
 ): Promise<LarkApiResponse> {
+  const startedAt = performance.now()
   const method = request.method.toUpperCase()
   const rawPath = request.path.startsWith('/') ? request.path : `/${request.path}`
   const url = new URL(rawPath, 'http://127.0.0.1')
   const pathname = url.pathname.replace(/^\/api\/lark-bridge\/?/, '').replace(/^\/+/, '')
   const segments = pathname ? pathname.split('/').map(decodeURIComponent) : []
+  const routeLabel = normalizeApiRouteLabel(method, segments)
   const { isCliAuthenticated, isOperatorAuthenticated, principalKind } = request
   const isOwnerWebSession =
     principalKind === 'owner' && !isCliAuthenticated && !isOperatorAuthenticated
@@ -843,11 +863,11 @@ export async function dispatchLarkApiRequest(
       }))
       const dreamSessions = (manager.store.listDreamSessions?.() ?? []).map((s) => ({
         ...s,
-        sessionUrl: manager.sessionWebUrl(s.sessionId),
+        sessionUrl: manager.sessionWebUrl(s.sessionId, { allowGuestViewer: false }),
       }))
       const triageSessions = (manager.store.listTriageSessions?.() ?? []).map((s) => ({
         ...s,
-        sessionUrl: manager.sessionWebUrl(s.sessionId),
+        sessionUrl: manager.sessionWebUrl(s.sessionId, { allowGuestViewer: false }),
       }))
       return ok({
         ok: true,
@@ -1164,6 +1184,8 @@ export async function dispatchLarkApiRequest(
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
     return ok({ ok: false, error: message }, 400)
+  } finally {
+    manager.recordApiTiming?.(routeLabel, performance.now() - startedAt)
   }
 }
 

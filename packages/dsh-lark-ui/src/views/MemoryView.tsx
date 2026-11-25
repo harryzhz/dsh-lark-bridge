@@ -913,6 +913,8 @@ function MemoryReaderColumn({
   )
 }
 
+const MEMORY_SWR_CACHE = new Map<string, { entries: MemoryEntry[]; markdownPath: string }>()
+
 export function MemoryView({
   bots,
   groups,
@@ -940,27 +942,37 @@ export function MemoryView({
   onDataChanged: () => Promise<void>
   onOpenSession?: (sessionId: string) => void
 }) {
+  const effectiveBotId = resolveEffectiveBotId(selectedBotId, bots)
+  const singleScopedBotId = bots.length === 1 ? bots[0]!.id : effectiveBotId
+  const memoryCacheKey = singleScopedBotId || '__all__'
+  const initialCached = MEMORY_SWR_CACHE.get(memoryCacheKey)
+
   const [nav, setNav] = useState<MemoryNavNode>({ kind: 'all' })
   const [sortBy, setSortBy] = useState<MemorySortBy>('priority')
   const [historyFilter, setHistoryFilter] = useState<MemoryHistoryFilter>('all')
   const [query, setQuery] = useState('')
-  const [entries, setEntries] = useState<MemoryEntry[]>([])
-  const [markdownPath, setMarkdownPath] = useState('')
-  const [loading, setLoading] = useState(true)
+  const [entries, setEntries] = useState<MemoryEntry[]>(() => initialCached?.entries ?? [])
+  const [markdownPath, setMarkdownPath] = useState(() => initialCached?.markdownPath ?? '')
+  const [loading, setLoading] = useState(() => !initialCached)
   const [loadError, setLoadError] = useState('')
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [mutatingId, setMutatingId] = useState<string | null>(null)
   const reqSeqRef = useRef(0)
 
-  const effectiveBotId = resolveEffectiveBotId(selectedBotId, bots)
-  const singleScopedBotId = bots.length === 1 ? bots[0]!.id : effectiveBotId
   const botsById = useMemo(() => new Map(bots.map((b) => [b.id, b])), [bots])
   const entriesById = useMemo(() => new Map(entries.map((e) => [e.id, e])), [entries])
 
   const loadMemories = useCallback(
     async (silent = false) => {
       const seq = ++reqSeqRef.current
-      if (!silent) setLoading(true)
+      const cached = MEMORY_SWR_CACHE.get(memoryCacheKey)
+      if (cached) {
+        setEntries(cached.entries)
+        setMarkdownPath(cached.markdownPath)
+        setLoading(false)
+      } else if (!silent) {
+        setLoading(true)
+      }
       try {
         const res = await bridgeApi.memories({
           ...(singleScopedBotId ? { botId: singleScopedBotId } : {}),
@@ -968,8 +980,11 @@ export function MemoryView({
           limit: 500,
         })
         if (seq !== reqSeqRef.current) return
-        setEntries(res.entries ?? [])
-        setMarkdownPath(res.markdownPath ?? '')
+        const nextEntries = res.entries ?? []
+        const nextPath = res.markdownPath ?? ''
+        MEMORY_SWR_CACHE.set(memoryCacheKey, { entries: nextEntries, markdownPath: nextPath })
+        setEntries(nextEntries)
+        setMarkdownPath(nextPath)
         setLoadError('')
       } catch (err) {
         if (seq !== reqSeqRef.current) return
@@ -978,12 +993,12 @@ export function MemoryView({
         if (seq === reqSeqRef.current) setLoading(false)
       }
     },
-    [singleScopedBotId],
+    [singleScopedBotId, memoryCacheKey],
   )
 
   useEffect(() => {
-    void loadMemories(false)
-  }, [loadMemories, revision])
+    void loadMemories(MEMORY_SWR_CACHE.has(memoryCacheKey))
+  }, [loadMemories, revision, memoryCacheKey])
 
   useEffect(() => {
     const timer = window.setInterval(() => void loadMemories(true), 12_000)

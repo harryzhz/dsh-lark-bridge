@@ -2208,7 +2208,52 @@ body > [role='presentation']:has(> [role='dialog'][aria-modal='true'])
   justify-content: space-between;
   flex-wrap: wrap;
   gap: 8px 12px;
-  min-height: 28px;
+  min-height: 26px;
+}
+.fb-obs-panel-head .fb-filter-tabs {
+  gap: 4px;
+}
+.fb-obs-panel-head .fb-filter-tab {
+  height: 24px;
+  padding: 0 9px;
+  border-radius: 12px;
+  font-size: 12px;
+  line-height: 18px;
+  gap: 4px;
+}
+.fb-obs-panel-head .fb-tab-count {
+  font-size: 11px;
+}
+.fb-obs-db-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.fb-obs-db-kpis {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+.fb-obs-db-split {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+  align-items: start;
+}
+.fb-obs-db-col {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.fb-obs-db-col[data-bordered] {
+  padding-left: 18px;
+  border-left: 0.5px solid var(--dsw-alias-border-l2);
+}
+@media (max-width: 820px) {
+  .fb-obs-db-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .fb-obs-db-split { grid-template-columns: 1fr; }
+  .fb-obs-db-col[data-bordered] { padding-left: 0; border-left: none; padding-top: 12px; border-top: 0.5px solid var(--dsw-alias-border-l2); }
 }
 .fb-obs-panel-title-wrap {
   display: inline-flex;

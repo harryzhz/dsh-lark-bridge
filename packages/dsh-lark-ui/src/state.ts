@@ -113,21 +113,32 @@ export function useBridgeData(): BridgeData & {
   }, [])
 
   const refresh = useCallback(async () => {
-    try {
-      const [cockpit, bots, groups, schedulePayload, reminders, sessionOverview, events] = await Promise.all([
-        bridgeApi.cockpit(),
-        bridgeApi.bots(),
-        bridgeApi.groups(),
-        bridgeApi.schedules(),
-        bridgeApi.reminders('all'),
-        bridgeApi.sessionsOverview(),
-        bridgeApi.events(),
-      ])
+    const corePromise = Promise.all([
+      bridgeApi.cockpit(),
+      bridgeApi.bots(),
+      bridgeApi.groups(),
+    ]).then(([cockpit, bots, groups]) => {
       setData((prev) => ({
         ...prev,
         cockpit,
         bots,
         groups,
+        listenerTemplates: cockpit.listenerTemplates?.length
+          ? [...cockpit.listenerTemplates]
+          : prev.listenerTemplates,
+        triageDefaults: cockpit.triageDefaults ?? prev.triageDefaults,
+      }))
+      setError('')
+    })
+
+    const secondaryPromise = Promise.all([
+      bridgeApi.schedules(),
+      bridgeApi.reminders('all'),
+      bridgeApi.sessionsOverview(),
+      bridgeApi.events(),
+    ]).then(([schedulePayload, reminders, sessionOverview, events]) => {
+      setData((prev) => ({
+        ...prev,
         schedules: schedulePayload.schedules,
         scheduleAvailable: schedulePayload.available,
         reminders,
@@ -135,12 +146,11 @@ export function useBridgeData(): BridgeData & {
         dreamSessions: sessionOverview.dreamSessions,
         triageSessions: sessionOverview.triageSessions,
         events,
-        listenerTemplates: cockpit.listenerTemplates?.length
-          ? [...cockpit.listenerTemplates]
-          : prev.listenerTemplates,
-        triageDefaults: cockpit.triageDefaults ?? prev.triageDefaults,
       }))
-      setError('')
+    })
+
+    try {
+      await Promise.all([corePromise, secondaryPromise])
     } catch (err) {
       if (!hasActivePendingSelfReload()) {
         setError(err instanceof Error ? err.message : String(err))

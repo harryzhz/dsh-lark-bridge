@@ -369,13 +369,24 @@ export interface ObservabilityRepoAggregate {
   readonly chatFilterOptions: readonly ObservabilityChatFilterOption[]
 }
 
+const AGGREGATE_CACHE_TTL_MS = 5_000
+const MAX_AGGREGATE_CACHE_ENTRIES = 16
+
 export class ObservabilityRepo {
   private insertCounter = 0
+  private readonly aggregateCache = new Map<
+    string,
+    { readonly expiresAtMs: number; readonly result: ObservabilityRepoAggregate }
+  >()
 
   constructor(
     private readonly db: BridgeDatabase,
     private readonly config: ConfigRepo,
   ) {}
+
+  private invalidateAggregateCache(): void {
+    if (this.aggregateCache.size > 0) this.aggregateCache.clear()
+  }
 
   recordUsageEvent(input: TelemetryUsageEventInput): boolean {
     const id = input.id.trim()
@@ -518,6 +529,7 @@ export class ObservabilityRepo {
     })
 
     if (inserted) {
+      this.invalidateAggregateCache()
       this.insertCounter += 1
       if (this.insertCounter >= PRUNE_EVERY_INSERTS) {
         this.insertCounter = 0
@@ -606,9 +618,27 @@ export class ObservabilityRepo {
     const prevFromMs = fromMs - spec.spanMs
     const botId = options.botId?.trim() || ''
     const chatId = options.chatId?.trim() || ''
+    const cacheKey = `${spec.window}|${botId}|${chatId}|${alignedEndMs}`
+    const wallNow = Date.now()
+    const isLiveNow = options.nowMs === undefined
+    if (isLiveNow) {
+      const hit = this.aggregateCache.get(cacheKey)
+      if (hit && wallNow < hit.expiresAtMs) {
+        return hit.result
+      }
+    }
 
-    const currentRows = this.fetchUsageEvents(fromMs, alignedEndMs, botId, chatId)
-    const previousRows = this.fetchUsageEvents(prevFromMs, fromMs, botId, chatId)
+    // Fetch current + previous window in a single indexed range scan, then partition in memory.
+    const combinedRows = this.fetchUsageEvents(prevFromMs, alignedEndMs, botId, chatId)
+    const currentRows: RawUsageEventRow[] = []
+    const previousRows: RawUsageEventRow[] = []
+    for (const row of combinedRows) {
+      if (Number(row.timestamp_ms) >= fromMs) {
+        currentRows.push(row)
+      } else {
+        previousRows.push(row)
+      }
+    }
 
     const current = emptyWindowTotals()
     for (const row of currentRows) accumulateRow(current, row)
@@ -634,7 +664,7 @@ export class ObservabilityRepo {
       chatId,
     )
 
-    return {
+    const result: ObservabilityRepoAggregate = {
       window: spec.window,
       fromMs,
       toMs: alignedEndMs,
@@ -654,6 +684,17 @@ export class ObservabilityRepo {
       chatRanking,
       chatFilterOptions,
     }
+    if (isLiveNow) {
+      if (this.aggregateCache.size >= MAX_AGGREGATE_CACHE_ENTRIES) {
+        const oldestKey = this.aggregateCache.keys().next().value
+        if (oldestKey !== undefined) this.aggregateCache.delete(oldestKey)
+      }
+      this.aggregateCache.set(cacheKey, {
+        expiresAtMs: wallNow + AGGREGATE_CACHE_TTL_MS,
+        result,
+      })
+    }
+    return result
   }
 
   private alignWindowEnd(nowMs: number, spec: WindowSpec): number {

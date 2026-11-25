@@ -179,6 +179,41 @@ export interface StorageTableStat {
   readonly rows: number
 }
 
+export interface ObservabilitySqlQueryPerf {
+  readonly fingerprint: string
+  readonly count: number
+  readonly avgMs: number
+  readonly maxMs: number
+  readonly lastAtMs: number
+}
+
+export interface ObservabilityApiRoutePerf {
+  readonly route: string
+  readonly count: number
+  readonly avgMs: number
+  readonly p50Ms: number
+  readonly p95Ms: number
+  readonly maxMs: number
+  readonly lastAtMs: number
+}
+
+export interface ObservabilityDatabasePerf {
+  readonly totalQueries: number
+  readonly sampleCount: number
+  readonly avgMs: number
+  readonly p50Ms: number
+  readonly p95Ms: number
+  readonly maxMs: number
+  readonly slowThresholdMs: number
+  readonly slowQueryCount: number
+  readonly integrityCheckMs: number
+  readonly integrityCheckedAtMs?: number
+  readonly lastCheckpointMs?: number
+  readonly lastCheckpointAtMs?: number
+  readonly slowQueries: readonly ObservabilitySqlQueryPerf[]
+  readonly apiRoutes: readonly ObservabilityApiRoutePerf[]
+}
+
 export interface ObservabilityPayload {
   readonly generatedAtMs: number
   readonly window: ObservabilityWindow
@@ -333,6 +368,7 @@ export interface ObservabilityPayload {
       readonly categories: readonly StorageCategoryEntry[]
       readonly tables: readonly StorageTableStat[]
     }
+    readonly database: ObservabilityDatabasePerf
     readonly errors: {
       readonly breakdown: readonly ObservabilityErrorBreakdown[]
       readonly recent: readonly LarkAuditEvent[]
