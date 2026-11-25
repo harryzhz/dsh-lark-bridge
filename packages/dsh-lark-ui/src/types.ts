@@ -858,6 +858,12 @@ export interface PluginUpdateItemResult {
   rolledBack?: boolean
 }
 
+export type PluginUpdateFailureCode =
+  | 'drain_timeout'
+  | 'verify_failed'
+  | 'install_failed'
+  | 'unknown'
+
 export interface PluginUpdateOperation {
   operationId: string
   status: PluginUpdateOpStatus
@@ -865,7 +871,10 @@ export interface PluginUpdateOperation {
   startedAtMs: number
   updatedAtMs: number
   finishedAtMs?: number
+  targetSelector?: ManagedPluginId | 'all'
   currentTarget?: ManagedPluginId
+  forced?: boolean
+  failureCode?: PluginUpdateFailureCode
   items: PluginUpdateItemResult[]
   hotReloaded: boolean
   restartRequired: boolean
@@ -880,6 +889,8 @@ export interface PluginUpdatesOverview {
   hotReloadSupported: boolean
   hotReloadUnavailableReason?: string
   checkedAtMs?: number
+  inFlightTurns?: number
+  activeExternalAgents?: number
   updatableCount: number
   plugins: ManagedPluginStatus[]
   operation?: PluginUpdateOperation

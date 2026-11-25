@@ -231,7 +231,19 @@ export async function dispatchLarkApiRequest(
         const overview = await manager.pluginUpdater.getOverview({ check: true, force })
         return ok(overview)
       }
-      if (method === 'POST' && segments[1] === 'update') {
+      if (method === 'POST' && segments[1] === 'update' && segments[2] === 'force') {
+        if (!canOperateUpdates) {
+          return ok({ ok: false, error: 'owner_or_operator_required' }, 403)
+        }
+        const body = bodyRecord(request.body)
+        const operationId =
+          typeof body.operationId === 'string' && body.operationId.trim()
+            ? body.operationId.trim()
+            : undefined
+        const result = manager.pluginUpdater.forceActiveDrain(operationId)
+        return ok({ ok: true, ...result })
+      }
+      if (method === 'POST' && segments[1] === 'update' && segments.length === 2) {
         if (!canOperateUpdates) {
           return ok({ ok: false, error: 'owner_or_operator_required' }, 403)
         }

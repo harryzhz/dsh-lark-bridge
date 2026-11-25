@@ -114,6 +114,12 @@ export interface PluginUpdateItemResult {
   readonly rolledBack?: boolean
 }
 
+export type PluginUpdateFailureCode =
+  | 'drain_timeout'
+  | 'verify_failed'
+  | 'install_failed'
+  | 'unknown'
+
 export interface PluginUpdateOperation {
   readonly operationId: string
   readonly status: PluginUpdateOpStatus
@@ -121,7 +127,10 @@ export interface PluginUpdateOperation {
   readonly startedAtMs: number
   readonly updatedAtMs: number
   readonly finishedAtMs?: number
+  readonly targetSelector?: ManagedPluginId | 'all'
   readonly currentTarget?: ManagedPluginId
+  readonly forced?: boolean
+  readonly failureCode?: PluginUpdateFailureCode
   readonly items: readonly PluginUpdateItemResult[]
   readonly hotReloaded: boolean
   readonly restartRequired: boolean
@@ -136,6 +145,8 @@ export interface PluginUpdatesOverview {
   readonly hotReloadSupported: boolean
   readonly hotReloadUnavailableReason?: string
   readonly checkedAtMs?: number
+  readonly inFlightTurns: number
+  readonly activeExternalAgents: number
   readonly updatableCount: number
   readonly plugins: readonly ManagedPluginStatus[]
   readonly operation?: PluginUpdateOperation
@@ -206,6 +217,100 @@ export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>
 interface GlobalUpdateState {
   active?: PluginUpdateOperation
   last?: PluginUpdateOperation
+  drainAbort?: AbortController
+  drainForceRequested?: boolean
+}
+
+class TaggedUpdateError extends Error {
+  readonly failureCode: PluginUpdateFailureCode
+  constructor(message: string, failureCode: PluginUpdateFailureCode) {
+    super(message)
+    this.name = 'TaggedUpdateError'
+    this.failureCode = failureCode
+  }
+}
+
+interface HostClientModulesLike {
+  sources: Map<string, { readonly packageName?: string }>
+  dirty: Set<string>
+  reconcilePackage(packageName: string): boolean
+  flush(onError: (err: unknown) => void): void
+}
+
+/**
+ * Hold intermediate client-module removal broadcasts while self-updating `dsh-lark-bridge`.
+ * Without this guard, `removeBundle` emits a graph frame deleting the UI bundle, immediately
+ * unmounting the Lark Bridge panel & sidebar icon for 8-15 seconds until `installBundle` finishes.
+ * Holding only deletion (while still allowing the newly installed source to publish) makes the
+ * browser receive ONE atomic `graph` update with a changed `rev`, triggering DSH `entries.replace()`
+ * which prefetches the new `client.js` before swapping in ~15ms.
+ */
+export function holdClientModulesDuringSwap(
+  ctx: Context,
+  packageNames: readonly string[],
+): () => Promise<void> {
+  const raw = ctx.get('clientModules' as never) as Partial<HostClientModulesLike> | undefined
+  if (
+    !raw ||
+    typeof raw.reconcilePackage !== 'function' ||
+    !(raw.sources instanceof Map) ||
+    !(raw.dirty instanceof Set) ||
+    typeof raw.flush !== 'function'
+  ) {
+    return async () => {}
+  }
+  const cm = raw as HostClientModulesLike
+  const held = new Set(packageNames.filter(Boolean))
+  if (held.size === 0) return async () => {}
+
+  const hasOwnReconcile = Object.prototype.hasOwnProperty.call(cm, 'reconcilePackage')
+  const origReconcile = cm.reconcilePackage
+
+  const hasActiveSource = (pkgName: string): boolean => {
+    for (const source of cm.sources.values()) {
+      if (source?.packageName === pkgName) return true
+    }
+    return false
+  }
+
+  const wrapped = function (this: HostClientModulesLike, packageName: string): boolean {
+    if (held.has(packageName) && !hasActiveSource(packageName)) {
+      return false
+    }
+    return origReconcile.call(this, packageName)
+  }
+
+  cm.reconcilePackage = wrapped
+  let released = false
+
+  return async () => {
+    if (released) return
+    released = true
+    // Allow any microtask flush queued by `installBundle`'s fiber activation to settle first.
+    await Promise.resolve()
+    if (cm.reconcilePackage === wrapped) {
+      if (hasOwnReconcile) {
+        cm.reconcilePackage = origReconcile
+      } else {
+        delete (cm as Partial<HostClientModulesLike>).reconcilePackage
+      }
+    }
+    // If swap & rollback both left a held package genuinely absent, converge `clientModules` to truth.
+    let needConverge = false
+    for (const pkgName of held) {
+      if (!hasActiveSource(pkgName)) {
+        cm.dirty.add(pkgName)
+        needConverge = true
+      }
+    }
+    if (needConverge) {
+      try {
+        cm.flush(() => {})
+      } catch {
+        // Non-fatal fallback convergence.
+      }
+    }
+  }
 }
 
 const GLOBAL_UPDATE_KEY = Symbol.for('dsh-lark-bridge.plugin-update-state')
@@ -1108,6 +1213,8 @@ export class PluginUpdateService {
 
     const updatableCount = plugins.filter((p) => p.updateAvailable).length
     const op = this.getOperation()
+    const lcStatus = this.lifecycle.getLifecycleStatus()
+    const activeExternalAgents = this.lifecycle.countActiveExternalAgents?.() ?? 0
 
     return {
       ok: true,
@@ -1117,10 +1224,30 @@ export class PluginUpdateService {
       hotReloadSupported,
       ...(hotReloadUnavailableReason ? { hotReloadUnavailableReason } : {}),
       ...(latestCheckedAtMs ? { checkedAtMs: latestCheckedAtMs } : {}),
+      inFlightTurns: lcStatus.totalInFlight,
+      activeExternalAgents,
       updatableCount,
       plugins,
       ...(op ? { operation: op } : {}),
     }
+  }
+
+  /**
+   * Preempt an in-progress `draining` wait and proceed immediately into the hot-update swap.
+   */
+  forceActiveDrain(operationId?: string): { readonly forced: boolean; readonly operation?: PluginUpdateOperation } {
+    const state = getGlobalUpdateState()
+    const active = state.active
+    if (!active) return { forced: false }
+    if (operationId && active.operationId !== operationId) {
+      return { forced: false, operation: active }
+    }
+    if (active.status !== 'draining' || !state.drainAbort) {
+      return { forced: false, operation: active }
+    }
+    state.drainForceRequested = true
+    state.drainAbort.abort()
+    return { forced: true, operation: active }
   }
 
   async startUpdate(options: StartPluginUpdateOptions = {}): Promise<PluginUpdateOperation> {
@@ -1188,7 +1315,8 @@ export class PluginUpdateService {
         ...(options.version ? { version: options.version } : {}),
       })
       const newer = isNewerVersion(installed.installedVersion, release.version)
-      if (!newer && !options.force && !options.allowMigrateLocal) {
+      const allowSameVersion = Boolean(options.allowMigrateLocal) || (Boolean(options.force) && targetSelector !== 'all')
+      if (!newer && !allowSameVersion) {
         continue
       }
       planned.push({
@@ -1231,6 +1359,8 @@ export class PluginUpdateService {
       message: `正在校验 ${planned.map((p) => `${p.spec.displayName} v${p.release.version}`).join('、')} 发布包…`,
       startedAtMs: now,
       updatedAtMs: now,
+      targetSelector,
+      ...(options.force ? { forced: true } : {}),
       items,
       hotReloaded: false,
       restartRequired: false,
@@ -1242,6 +1372,8 @@ export class PluginUpdateService {
         next.status === 'succeeded' || next.status === 'failed' || next.status === 'rolled_back'
       if (finished) {
         state.active = undefined
+        state.drainAbort = undefined
+        state.drainForceRequested = false
         state.last = next
       } else {
         state.active = next
@@ -1256,6 +1388,7 @@ export class PluginUpdateService {
     // Pre-verify all tarballs synchronously BEFORE queuing the detached swap, or inside the async task?
     // Run inside detached async pipeline after a brief tick so the 202 HTTP/RPC response flushes cleanly.
     const lifecycle = this.lifecycle
+    const rootCtx = this.ctx
     const profileDir = this.getProfileContext()?.dir
     const drainTimeoutMs = options.drainTimeoutMs ?? 90_000
     const force = Boolean(options.force)
@@ -1278,6 +1411,7 @@ export class PluginUpdateService {
       }
 
       let drainedByUs = false
+      let releaseClientModulesHold: (() => Promise<void>) | undefined
       try {
         // Yield briefly so the 202 response flushes before any heavy work or plugin unload.
         await new Promise((r) => setTimeout(r, 150))
@@ -1290,7 +1424,14 @@ export class PluginUpdateService {
             currentTarget: target.spec.id,
             message: `正在下载校验 ${target.spec.displayName} v${target.release.version}（SHA256）…`,
           })
-          await verifyFn(target.release)
+          try {
+            await verifyFn(target.release)
+          } catch (err) {
+            throw new TaggedUpdateError(
+              err instanceof Error ? err.message : String(err),
+              'verify_failed',
+            )
+          }
         }
 
         // Stage 2: Check & gracefully drain in-flight Feishu turns (and external agents if updating external-agents).
@@ -1301,37 +1442,59 @@ export class PluginUpdateService {
           ? (lifecycle.countActiveExternalAgents?.() ?? 0)
           : 0
 
-        if (lcStatus.totalInFlight > 0 || activeExternalCount > 0) {
+        if (force) {
+          // Force update: skip blocking drain wait; still briefly pause new inbound intake when self-swapping bridge.
+          if (includesBridge) {
+            await lifecycle.beginDrain({ reason: `plugin_hot_update_force:${operationId}` }).catch(() => {})
+            drainedByUs = true
+          }
+        } else if (lcStatus.totalInFlight > 0 || activeExternalCount > 0) {
+          const drainAbort = new AbortController()
+          state.drainAbort = drainAbort
+          state.drainForceRequested = false
           updateOp({
             status: 'draining',
             message: `等待在途任务优雅排空（飞书回合 ${lcStatus.totalInFlight}，外部会话 ${activeExternalCount}）…`,
           })
-          if (includesBridge || lcStatus.totalInFlight > 0) {
-            await lifecycle.beginDrain({ reason: `plugin_hot_update:${operationId}` })
-            drainedByUs = true
-            const drained = await lifecycle.waitForDrain(drainTimeoutMs)
-            const remainingExternal = includesExternal
-              ? (lifecycle.countActiveExternalAgents?.() ?? 0)
-              : 0
-            if ((!drained.drained || remainingExternal > 0) && !force) {
-              await lifecycle.cancelDrain().catch(() => {})
-              drainedByUs = false
-              throw new Error(
-                `在途任务排空超时（剩余飞书回合 ${drained.totalInFlight}，活跃外部会话 ${remainingExternal}），已取消更新并恢复接单；可稍后重试或使用 --force`,
-              )
+          try {
+            if (includesBridge || lcStatus.totalInFlight > 0) {
+              await lifecycle.beginDrain({ reason: `plugin_hot_update:${operationId}` })
+              drainedByUs = true
+              const drained = await lifecycle.waitForDrain(drainTimeoutMs, drainAbort.signal)
+              const remainingExternal = includesExternal
+                ? (lifecycle.countActiveExternalAgents?.() ?? 0)
+                : 0
+              if (state.drainForceRequested) {
+                updateOp({ forced: true })
+              } else if (!drained.drained || remainingExternal > 0) {
+                await lifecycle.cancelDrain().catch(() => {})
+                drainedByUs = false
+                throw new TaggedUpdateError(
+                  `在途任务排空超时（剩余飞书回合 ${drained.totalInFlight}，活跃外部会话 ${remainingExternal}），已取消更新并恢复接单；可稍后重试或在弹窗中点击「强制更新」（CLI 使用 --force）`,
+                  'drain_timeout',
+                )
+              }
+            } else if (activeExternalCount > 0) {
+              const deadline = Date.now() + drainTimeoutMs
+              while (Date.now() < deadline && !drainAbort.signal.aborted) {
+                if ((lifecycle.countActiveExternalAgents?.() ?? 0) === 0) break
+                await new Promise((r) => setTimeout(r, 400))
+              }
+              if (state.drainForceRequested) {
+                updateOp({ forced: true })
+              } else {
+                const remaining = lifecycle.countActiveExternalAgents?.() ?? 0
+                if (remaining > 0) {
+                  throw new TaggedUpdateError(
+                    `仍有 ${remaining} 个外部 Agent 会话运行中，已取消更新外部运行时；可等待会话空闲后重试或在弹窗中点击「强制更新」（CLI 使用 --force）`,
+                    'drain_timeout',
+                  )
+                }
+              }
             }
-          } else if (activeExternalCount > 0 && !force) {
-            const deadline = Date.now() + drainTimeoutMs
-            while (Date.now() < deadline) {
-              if ((lifecycle.countActiveExternalAgents?.() ?? 0) === 0) break
-              await new Promise((r) => setTimeout(r, 500))
-            }
-            const remaining = lifecycle.countActiveExternalAgents?.() ?? 0
-            if (remaining > 0) {
-              throw new Error(
-                `仍有 ${remaining} 个外部 Agent 会话运行中，已取消更新外部运行时；可等待会话空闲后重试或传 --force`,
-              )
-            }
+          } finally {
+            state.drainAbort = undefined
+            state.drainForceRequested = false
           }
         } else if (includesBridge) {
           // Briefly pause inbound intake during self-swap to avoid dropping mid-air messages.
@@ -1340,7 +1503,7 @@ export class PluginUpdateService {
         }
 
         lifecycle.recordUpdateEvent?.(
-          `开始免重启热更新：${planned.map((p) => `${p.spec.displayName} ${p.fromVersion ?? '?'}→${p.release.version}`).join('，')}`,
+          `开始${current.forced ? '强制' : ''}免重启热更新：${planned.map((p) => `${p.spec.displayName} ${p.fromVersion ?? '?'}→${p.release.version}`).join('，')}`,
         )
 
         // Stage 3: Execute removeBundle -> installBundle via host-owned `pluginManager` (survives bridge unload!).
@@ -1353,7 +1516,7 @@ export class PluginUpdateService {
           updateOp({
             status: 'removing',
             currentTarget: target.spec.id,
-            message: `正在卸载旧版 ${target.spec.displayName}${target.fromVersion ? ` v${target.fromVersion}` : ''}…`,
+            message: `正在准备切换 ${target.spec.displayName} ${target.fromVersion ? `v${target.fromVersion} → ` : ''}v${target.release.version}…`,
           })
 
           // Record current realpath before removal so Node's persistent ESM realpathCache
@@ -1362,11 +1525,21 @@ export class PluginUpdateService {
             recordManagedPackageMove(profileDir, target.installedKey, target.spec.packageName)
           }
 
+          // When self-updating bridge, hold intermediate client-module deletion broadcasts so the
+          // browser keeps the UI & sidebar mounted during pnpm swap and transitions atomically via
+          // `entries.replace()` once the new bundle activates.
+          if (target.spec.id === 'bridge') {
+            releaseClientModulesHold = holdClientModulesDuringSwap(rootCtx, [
+              target.installedKey,
+              target.spec.packageName,
+            ])
+          }
+
           const removeRes = await pm.removeBundle(target.installedKey)
           if (removeRes.application === 'failed' || removeRes.application === 'cancelled') {
             const errMsg = formatChangeError(removeRes, `卸载旧版 ${target.spec.displayName} 失败`)
             updateItem(i, { status: 'failed', error: errMsg })
-            throw new Error(errMsg)
+            throw new TaggedUpdateError(errMsg, 'install_failed')
           }
 
           updateOp({
@@ -1414,6 +1587,7 @@ export class PluginUpdateService {
             })
             updateOp({
               status: rolledBack ? 'rolled_back' : 'failed',
+              failureCode: 'install_failed',
               error: errMsg,
               message: rolledBack ? `${errMsg}（已自动回滚到原版本）` : errMsg,
               finishedAtMs: Date.now(),
@@ -1451,17 +1625,24 @@ export class PluginUpdateService {
         })
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
+        const failureCode: PluginUpdateFailureCode =
+          err instanceof TaggedUpdateError ? err.failureCode : 'unknown'
         if (drainedByUs) {
           await lifecycle.cancelDrain().catch(() => {})
         }
         updateOp({
           status: 'failed',
+          failureCode,
           error: message,
           message: `更新失败：${message}`,
           finishedAtMs: Date.now(),
           hotReloaded: false,
           restartRequired: false,
         })
+      } finally {
+        if (releaseClientModulesHold) {
+          await releaseClientModulesHold().catch(() => {})
+        }
       }
     }
 
@@ -1474,5 +1655,7 @@ export function resetGlobalPluginUpdateStateForTest(): void {
   const state = getGlobalUpdateState()
   state.active = undefined
   state.last = undefined
+  state.drainAbort = undefined
+  state.drainForceRequested = false
   getGlobalEsmRelocatorState().staleDirToSymlink.clear()
 }

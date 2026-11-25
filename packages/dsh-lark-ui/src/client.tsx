@@ -25,7 +25,12 @@ import {
   ShieldAuthIcon,
 } from './components/LarkLogo.js'
 import { MemoryEditDialog, type MemoryDialogRequest } from './components/MemoryEditDialog.js'
-import { PENDING_SELF_RELOAD_STORAGE_KEY, PluginUpdateDialog } from './components/PluginUpdateDialog.js'
+import {
+  PENDING_SELF_RELOAD_STORAGE_KEY,
+  PluginUpdateDialog,
+  consumePendingSelfReloadMarker,
+  markPendingSelfReload,
+} from './components/PluginUpdateDialog.js'
 import { ReminderEditDialog } from './components/ReminderEditDialog.js'
 import { ScheduleConfigDialog } from './components/ScheduleConfigDialog.js'
 import { installSessionModelFilter } from './session-model-filter.js'
@@ -74,29 +79,31 @@ const TABS: ReadonlyArray<{ key: Tab; label: string; icon: ReactNode }> = [
 let openDshSession: ((sessionId: string) => Promise<SessionActivationResult>) | undefined
 let openDshSchedules: (() => void) | undefined
 let pendingPostSelfReloadOpId: string | undefined
+let pendingPostSelfReloadTab: Tab | undefined
+let currentActiveTab: Tab = 'overview'
+let larkBridgePageMounted = false
 
-function consumePendingSelfReloadMarker(): string | undefined {
-  try {
-    const raw = window.sessionStorage.getItem(PENDING_SELF_RELOAD_STORAGE_KEY)
-    if (!raw) return undefined
-    window.sessionStorage.removeItem(PENDING_SELF_RELOAD_STORAGE_KEY)
-    const parsed = JSON.parse(raw) as { operationId?: unknown; at?: unknown }
-    if (
-      typeof parsed.operationId === 'string' &&
-      typeof parsed.at === 'number' &&
-      Date.now() - parsed.at < 3 * 60_000
-    ) {
-      return parsed.operationId
-    }
-  } catch {
-    // Ignore storage error.
-  }
-  return undefined
+const VALID_TABS = new Set<Tab>([
+  'overview',
+  'observability',
+  'bots',
+  'groups',
+  'schedules',
+  'sessions',
+  'memory',
+])
+
+function isValidTab(raw: string | undefined): raw is Tab {
+  return Boolean(raw && VALID_TABS.has(raw as Tab))
 }
 
 function LarkBridgePage() {
   const data = useBridgeData()
-  const [tab, setTab] = useState<Tab>('overview')
+  const [tab, setTab] = useState<Tab>(() => {
+    const restored = pendingPostSelfReloadTab
+    pendingPostSelfReloadTab = undefined
+    return restored ?? 'overview'
+  })
   const [editingBot, setEditingBot] = useState<BotRecord | 'new' | null>(null)
   const [editingGroup, setEditingGroup] = useState<GroupView | null>(null)
   const [editingSchedule, setEditingSchedule] = useState<ScheduleView | null>(null)
@@ -110,6 +117,17 @@ function LarkBridgePage() {
   const [confirm, setConfirm] = useState<ConfirmRequest | null>(null)
   const [toast, setToast] = useState<{ text: string; ok: boolean } | null>(null)
   const [syncing, setSyncing] = useState(false)
+
+  useEffect(() => {
+    currentActiveTab = tab
+  }, [tab])
+
+  useEffect(() => {
+    larkBridgePageMounted = true
+    return () => {
+      larkBridgePageMounted = false
+    }
+  }, [])
 
   useEffect(() => {
     const opId = pendingPostSelfReloadOpId
@@ -550,6 +568,7 @@ function LarkBridgePage() {
       <PluginUpdateDialog
         open={updateOpen}
         overview={data.pluginUpdates}
+        activeTab={tab}
         onClose={() => setUpdateOpen(false)}
         onCheck={(force) => data.refreshPluginUpdates({ check: true, ...(force ? { force: true } : {}) })}
         onUpdated={async (message, ok) => {
@@ -874,24 +893,64 @@ export function apply(ctx: ClientContext): void {
     ctx.slots.register({ name: 'sidebar.panellist', id: PANEL_ID, order: 25, label: '飞书桥接' }, LarkSidebarIcon),
   )
 
-  // After a restart-free self-update (`removeBundle` -> `installBundle`), DSH briefly unmounts the
-  // old panel back to Home; once the new client bundle registers, snap straight back to Lark Bridge.
-  const reloadedOpId = consumePendingSelfReloadMarker()
-  if (reloadedOpId) {
-    pendingPostSelfReloadOpId = reloadedOpId
-    const restorePanel = (layout: LayoutNavigationLike | undefined): boolean => {
-      if (!layout?.selectPanel) return false
-      if (layout.hasMainPanel && !layout.hasMainPanel(PANEL_ID)) return false
-      layout.selectPanel(PANEL_ID)
-      return true
-    }
-    const timer = window.setTimeout(() => {
-      if (!restorePanel(layoutRef ?? readOptionalService<LayoutNavigationLike>(ctx, 'layout'))) {
-        window.setTimeout(() => {
-          restorePanel(layoutRef ?? readOptionalService<LayoutNavigationLike>(ctx, 'layout'))
-        }, 350)
+  // Preserve current panel & active tab when this client bundle is replaced in-place by HMR
+  // (e.g. UI-triggered, CLI-triggered, or off-peak self-update while the user has Lark Bridge open).
+  ctx.effect?.(() => () => {
+    try {
+      const existingRaw = window.sessionStorage.getItem(PENDING_SELF_RELOAD_STORAGE_KEY)
+      if (existingRaw) {
+        const parsed = JSON.parse(existingRaw) as Record<string, unknown>
+        window.sessionStorage.setItem(
+          PENDING_SELF_RELOAD_STORAGE_KEY,
+          JSON.stringify({
+            ...parsed,
+            tab: currentActiveTab,
+            wasMounted: larkBridgePageMounted,
+          }),
+        )
+      } else if (larkBridgePageMounted) {
+        markPendingSelfReload('', currentActiveTab)
       }
-    }, 120)
-    ctx.effect?.(() => () => window.clearTimeout(timer), 'dsh-lark-ui.post-self-reload-restore')
+    } catch {
+      // Ignore storage error.
+    }
+  }, 'dsh-lark-ui.preserve-panel-on-hmr')
+
+  // After an atomic in-place self-update (`entries.replace()`), restore the active Lark Bridge panel
+  // & tab synchronously on the same tick (with microtask/rAF fallback) so there is zero visible flash.
+  const reloadMarker = consumePendingSelfReloadMarker()
+  if (reloadMarker) {
+    if (reloadMarker.operationId) {
+      pendingPostSelfReloadOpId = reloadMarker.operationId
+    }
+    if (isValidTab(reloadMarker.tab)) {
+      pendingPostSelfReloadTab = reloadMarker.tab
+    }
+    if (reloadMarker.wasMounted !== false) {
+      let restored = false
+      const tryRestorePanel = (): boolean => {
+        if (restored) return true
+        const layout = layoutRef ?? readOptionalService<LayoutNavigationLike>(ctx, 'layout')
+        if (!layout?.selectPanel) return false
+        if (layout.hasMainPanel && !layout.hasMainPanel(PANEL_ID)) return false
+        layout.selectPanel(PANEL_ID)
+        restored = true
+        return true
+      }
+      if (!tryRestorePanel()) {
+        queueMicrotask(() => {
+          if (!tryRestorePanel()) {
+            const rafId = window.requestAnimationFrame(() => {
+              if (!tryRestorePanel()) {
+                window.setTimeout(() => {
+                  tryRestorePanel()
+                }, 80)
+              }
+            })
+            ctx.effect?.(() => () => window.cancelAnimationFrame(rafId), 'dsh-lark-ui.post-self-reload-raf')
+          }
+        })
+      }
+    }
   }
 }
