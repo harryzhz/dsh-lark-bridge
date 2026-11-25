@@ -19,7 +19,6 @@ import { LarkAuthDialog } from './components/LarkAuthDialog.js'
 import {
   LarkSidebarIcon,
   LarkTitleIcon,
-  ObservabilityTabIcon,
   PluginUpdateIcon,
   RobotTabIcon,
   ShieldAuthIcon,
@@ -57,18 +56,16 @@ import { BotsView } from './views/BotsView.js'
 import { GroupsView } from './views/GroupsView.js'
 import { MemoryView } from './views/MemoryView.js'
 import { ObservabilityView } from './views/ObservabilityView.js'
-import { OverviewView } from './views/OverviewView.js'
 import { SchedulesView } from './views/SchedulesView.js'
 import { SessionsView } from './views/SessionsView.js'
 
 const PANEL_ID = 'lark-bridge'
 const SCHEDULE_PANEL_ID = 'schedules'
 
-type Tab = 'overview' | 'observability' | 'bots' | 'groups' | 'schedules' | 'sessions' | 'memory'
+type Tab = 'cockpit' | 'bots' | 'groups' | 'schedules' | 'sessions' | 'memory'
 
 const TABS: ReadonlyArray<{ key: Tab; label: string; icon: ReactNode }> = [
-  { key: 'overview', label: '概览', icon: <IconGaugeOutlineRegular size={16} /> },
-  { key: 'observability', label: '观测台', icon: <ObservabilityTabIcon size={16} /> },
+  { key: 'cockpit', label: '驾驶舱', icon: <IconGaugeOutlineRegular size={16} /> },
   { key: 'bots', label: '智能体', icon: <RobotTabIcon size={16} /> },
   { key: 'groups', label: '群聊', icon: <IconUsersOutlineRegular size={16} /> },
   { key: 'schedules', label: '自动化', icon: <IconAlarmClockOutlineRegular size={16} /> },
@@ -80,12 +77,11 @@ let openDshSession: ((sessionId: string) => Promise<SessionActivationResult>) | 
 let openDshSchedules: (() => void) | undefined
 let pendingPostSelfReloadOpId: string | undefined
 let pendingPostSelfReloadTab: Tab | undefined
-let currentActiveTab: Tab = 'overview'
+let currentActiveTab: Tab = 'cockpit'
 let larkBridgePageMounted = false
 
 const VALID_TABS = new Set<Tab>([
-  'overview',
-  'observability',
+  'cockpit',
   'bots',
   'groups',
   'schedules',
@@ -93,8 +89,10 @@ const VALID_TABS = new Set<Tab>([
   'memory',
 ])
 
-function isValidTab(raw: string | undefined): raw is Tab {
-  return Boolean(raw && VALID_TABS.has(raw as Tab))
+function normalizeRestoredTab(raw: string | undefined): Tab | undefined {
+  if (!raw) return undefined
+  if (raw === 'overview' || raw === 'observability') return 'cockpit'
+  return VALID_TABS.has(raw as Tab) ? (raw as Tab) : undefined
 }
 
 function LarkBridgePage() {
@@ -102,7 +100,7 @@ function LarkBridgePage() {
   const [tab, setTab] = useState<Tab>(() => {
     const restored = pendingPostSelfReloadTab
     pendingPostSelfReloadTab = undefined
-    return restored ?? 'overview'
+    return restored ?? 'cockpit'
   })
   const [editingBot, setEditingBot] = useState<BotRecord | 'new' | null>(null)
   const [editingGroup, setEditingGroup] = useState<GroupView | null>(null)
@@ -306,21 +304,15 @@ function LarkBridgePage() {
 
         {data.error && <div className="fb-card fb-empty">无法连接桥接服务：{data.error}</div>}
 
-        {tab === 'overview' && (
-          <OverviewView
+        {tab === 'cockpit' && (
+          <ObservabilityView
             cockpit={data.cockpit}
+            bots={data.bots}
             runtimes={data.runtimes}
             models={data.models}
             pluginUpdates={data.pluginUpdates}
             onOpenPluginUpdates={() => setUpdateOpen(true)}
-            onOpenObservability={() => setTab('observability')}
-          />
-        )}
-        {tab === 'observability' && (
-          <ObservabilityView
-            bots={data.bots}
-            runtimes={data.runtimes}
-            models={data.models}
+            onRefreshOverview={data.refresh}
             onToast={(text, ok = true) => setToast({ text, ok })}
           />
         )}
@@ -914,8 +906,9 @@ export function apply(ctx: ClientContext): void {
     if (reloadMarker.operationId) {
       pendingPostSelfReloadOpId = reloadMarker.operationId
     }
-    if (isValidTab(reloadMarker.tab)) {
-      pendingPostSelfReloadTab = reloadMarker.tab
+    const restoredTab = normalizeRestoredTab(reloadMarker.tab)
+    if (restoredTab) {
+      pendingPostSelfReloadTab = restoredTab
     }
     if (reloadMarker.wasMounted !== false) {
       let restored = false

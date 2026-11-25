@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
 import {
   Button,
   IconRefreshOutlineRegular,
@@ -17,14 +17,17 @@ import { resolveModelDisplayName, resolveRuntimeDisplayName } from '../component
 import { formatTime } from '../state.js'
 import type {
   BotRecord,
+  CockpitPayload,
   ModelGroup,
   ObservabilityPayload,
   ObservabilityWindow,
+  PluginUpdatesOverview,
   RuntimeOption,
 } from '../types.js'
 import {
   ActivityHeatmap,
   LatencyHistogram,
+  MiniStorageMeter,
   ProductTimeSeriesChart,
   SegmentedBar,
   Sparkline,
@@ -46,8 +49,9 @@ import {
   resolveTableLabel,
   resolveTriggerLabel,
 } from './observability-model.js'
+import { OverviewView } from './OverviewView.js'
 
-type ObservabilityLens = 'product' | 'technical'
+export type CockpitPane = 'overview' | 'insights' | 'monitor'
 type RankingTab = 'bots' | 'chats'
 
 const POLL_IDLE_MS = 15_000
@@ -62,6 +66,7 @@ function KpiCard({
   delta,
   spark,
   sparkTone = 'primary',
+  visual,
 }: {
   readonly label: string
   readonly tag?: string
@@ -71,6 +76,7 @@ function KpiCard({
   readonly delta?: { readonly text: string; readonly tone: 'good' | 'bad' | 'neutral' }
   readonly spark?: readonly number[]
   readonly sparkTone?: 'primary' | 'success' | 'warn' | 'danger'
+  readonly visual?: ReactNode
 }) {
   return (
     <div className="fb-card fb-obs-kpi">
@@ -89,14 +95,16 @@ function KpiCard({
           <span>{value}</span>
           {unit && <span className="fb-obs-kpi-unit">{unit}</span>}
         </div>
-        {spark && <Sparkline values={spark} tone={sparkTone} />}
+        {visual ?? (spark ? <Sparkline values={spark} tone={sparkTone} /> : null)}
       </div>
-      <div className="fb-obs-kpi-foot fb-num">{foot}</div>
+      <div className="fb-obs-kpi-foot fb-num" title={foot}>
+        {foot}
+      </div>
     </div>
   )
 }
 
-function ProductObservabilityPane({
+function InsightsPane({
   payload,
   runtimes,
   models,
@@ -159,6 +167,7 @@ function ProductObservabilityPane({
   }, [tokens])
 
   const proactiveTotal = proactive.scheduleRuns + proactive.reminderRuns + proactive.dreamRuns
+  const maxTriggerTokens = Math.max(0, ...product.triggers.map((t) => t.totalTokens))
   const maxTriggerCount = Math.max(1, ...product.triggers.map((t) => t.count))
 
   return (
@@ -170,7 +179,7 @@ function ProductObservabilityPane({
           delta={formatDeltaBadge(tokens.deltaPct)}
           spark={tokenSpark}
           sparkTone="primary"
-          foot={`缓存命中 ${tokens.cacheHitRate}% · 单轮均耗 ${formatTokens(tokens.avgPerReply)}`}
+          foot={`缓存命中 ${tokens.cacheHitRate}% · 单轮 ${formatTokens(tokens.avgPerReply)}`}
         />
         <KpiCard
           label="活跃会话"
@@ -178,7 +187,7 @@ function ProductObservabilityPane({
           delta={formatDeltaBadge(sessions.deltaPct)}
           spark={sessionSpark}
           sparkTone="primary"
-          foot={`新建 ${sessions.createdInWindow} · 在线绑定 ${sessions.liveBindings} · 归档 ${sessions.archivedInWindow}`}
+          foot={`新建 ${sessions.createdInWindow} · 在线 ${sessions.liveBindings} · 归档 ${sessions.archivedInWindow}`}
         />
         <KpiCard
           label="消息与回复"
@@ -187,7 +196,7 @@ function ProductObservabilityPane({
           delta={formatDeltaBadge(traffic.deltaPct)}
           spark={trafficSpark}
           sparkTone="success"
-          foot={`静默 ${traffic.silentSkipped} · 过滤 ${traffic.ignored} · 工具调用 ${formatCompactNumber(traffic.toolCalls)}`}
+          foot={`静默 ${traffic.silentSkipped} · 过滤 ${traffic.ignored} · 工具 ${formatCompactNumber(traffic.toolCalls)}`}
         />
         <KpiCard
           label="分流减负率"
@@ -197,8 +206,8 @@ function ProductObservabilityPane({
           sparkTone="success"
           foot={
             triage.total > 0
-              ? `静默 ${triage.silent} · 快回 ${triage.quickReply} · 移交 ${triage.handoff} · 均耗 ${formatLatencyMs(triage.avgLatencyMs)}`
-              : `主动执行 ${proactiveTotal} 次 · 有效记忆 ${proactive.activeMemories} 条`
+              ? `静默 ${triage.silent} · 快回 ${triage.quickReply} · 均耗 ${formatLatencyMs(triage.avgLatencyMs)}`
+              : `主动执行 ${proactiveTotal} 次 · 记忆 ${proactive.activeMemories} 条`
           }
         />
       </div>
@@ -216,7 +225,7 @@ function ProductObservabilityPane({
             </span>
           </div>
           <FilterTabs
-            label="产品趋势指标切换"
+            label="洞察趋势指标切换"
             value={chartMode}
             options={[
               { value: 'tokens' as const, label: 'Token 消耗' },
@@ -229,86 +238,93 @@ function ProductObservabilityPane({
         <ProductTimeSeriesChart series={series} mode={chartMode} />
       </section>
 
-      <div className="fb-obs-grid-64">
-        <section className="fb-card fb-obs-panel">
-          <div className="fb-obs-panel-head">
-            <div className="fb-obs-panel-title-wrap">
-              <h2 className="fb-obs-panel-title">Token 结构与模型消耗</h2>
-              <span className="fb-obs-panel-sub fb-mono">CACHE HIT {tokens.cacheHitRate}%</span>
-            </div>
+      <section className="fb-card fb-obs-panel">
+        <div className="fb-obs-panel-head">
+          <div className="fb-obs-panel-title-wrap">
+            <h2 className="fb-obs-panel-title">Token 结构与模型消耗</h2>
+            <span className="fb-obs-panel-sub fb-mono">CACHE HIT {tokens.cacheHitRate}%</span>
           </div>
-
-          <SegmentedBar items={tokenAnatomy} />
-
-          <div className="fb-obs-divider" />
-
-          {product.models.length === 0 ? (
-            <div className="fb-obs-empty-inline">
-              当前周期暂无模型 Token 采样，完成一次对话或等待历史会话索引完成后呈现
-            </div>
-          ) : (
-            <div className="fb-obs-table-wrap">
-              <table className="fb-obs-table fb-num">
-                <thead>
-                  <tr>
-                    <th>模型 / 运行时</th>
-                    <th className="fb-obs-tr">步数</th>
-                    <th className="fb-obs-tr">输入</th>
-                    <th className="fb-obs-tr">缓存命中</th>
-                    <th className="fb-obs-tr">输出</th>
-                    <th className="fb-obs-tr">总量</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {product.models.slice(0, 7).map((m) => (
-                    <tr key={`${m.provider}::${m.model}`}>
-                      <td>
-                        <div className="fb-obs-cell-stack">
-                          <span className="fb-obs-cell-main" title={m.model}>
-                            {resolveModelDisplayName(m.agentPreset, m.model, runtimes, models) || m.model}
-                          </span>
-                          <span className="fb-obs-cell-sub fb-mono">
-                            {[
-                              m.agentPreset ? resolveRuntimeDisplayName(m.agentPreset, runtimes) : '',
-                              m.provider,
-                            ]
-                              .filter(Boolean)
-                              .join(' · ') || '—'}
-                          </span>
-                        </div>
-                      </td>
-                      <td className="fb-obs-tr fb-mono">{m.steps}</td>
-                      <td className="fb-obs-tr fb-mono">
-                        {formatTokens(m.inputTokens + m.cacheWriteTokens)}
-                      </td>
-                      <td className="fb-obs-tr">
-                        <span
-                          className="fb-obs-pill fb-mono"
-                          data-tone={m.cacheHitRate >= 50 ? 'good' : 'neutral'}
-                        >
-                          {m.cacheHitRate}%
-                        </span>
-                      </td>
-                      <td className="fb-obs-tr fb-mono">{formatTokens(m.outputTokens)}</td>
-                      <td className="fb-obs-tr">
-                        <div className="fb-obs-bar-num">
-                          <strong className="fb-mono">{formatTokens(m.totalTokens)}</strong>
-                          <div className="fb-obs-mini-track">
-                            <div
-                              className="fb-obs-mini-fill"
-                              style={{ width: `${Math.max(4, m.sharePct)}%` }}
-                            />
-                          </div>
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+          {product.models.length > 0 && (
+            <span className="fb-obs-panel-sub fb-mono">
+              {product.models.length} MODELS · {formatCompactNumber(traffic.llmSteps)} STEPS
+            </span>
           )}
-        </section>
+        </div>
 
+        <SegmentedBar items={tokenAnatomy} layout="grid" />
+
+        <div className="fb-obs-divider" />
+
+        {product.models.length === 0 ? (
+          <div className="fb-obs-empty-inline">
+            当前周期暂无模型 Token 采样，完成一次对话或等待历史会话索引完成后呈现
+          </div>
+        ) : (
+          <div className="fb-obs-table-wrap">
+            <table className="fb-obs-table fb-num">
+              <thead>
+                <tr>
+                  <th>模型 / 运行时</th>
+                  <th className="fb-obs-tr">步数</th>
+                  <th className="fb-obs-tr">非缓存输入</th>
+                  <th className="fb-obs-tr">缓存命中</th>
+                  <th className="fb-obs-tr">输出</th>
+                  <th className="fb-obs-tr">占比</th>
+                  <th className="fb-obs-tr">总量</th>
+                </tr>
+              </thead>
+              <tbody>
+                {product.models.slice(0, 8).map((m) => (
+                  <tr key={`${m.provider}::${m.model}`}>
+                    <td>
+                      <div className="fb-obs-cell-stack" data-wide="">
+                        <span className="fb-obs-cell-main" title={m.model}>
+                          {resolveModelDisplayName(m.agentPreset, m.model, runtimes, models) || m.model}
+                        </span>
+                        <span className="fb-obs-cell-sub fb-mono">
+                          {[
+                            m.agentPreset ? resolveRuntimeDisplayName(m.agentPreset, runtimes) : '',
+                            m.provider,
+                          ]
+                            .filter(Boolean)
+                            .join(' · ') || '—'}
+                        </span>
+                      </div>
+                    </td>
+                    <td className="fb-obs-tr fb-mono">{formatCompactNumber(m.steps)}</td>
+                    <td className="fb-obs-tr fb-mono">
+                      {formatTokens(m.inputTokens + m.cacheWriteTokens)}
+                    </td>
+                    <td className="fb-obs-tr">
+                      <span
+                        className="fb-obs-pill fb-mono"
+                        data-tone={m.cacheHitRate >= 50 ? 'good' : 'neutral'}
+                      >
+                        {m.cacheHitRate}%
+                      </span>
+                    </td>
+                    <td className="fb-obs-tr fb-mono">{formatTokens(m.outputTokens)}</td>
+                    <td className="fb-obs-tr fb-mono fb-obs-muted">{m.sharePct.toFixed(1)}%</td>
+                    <td className="fb-obs-tr">
+                      <div className="fb-obs-bar-num">
+                        <strong className="fb-mono">{formatTokens(m.totalTokens)}</strong>
+                        <div className="fb-obs-mini-track">
+                          <div
+                            className="fb-obs-mini-fill"
+                            style={{ width: `${Math.max(4, m.sharePct)}%` }}
+                          />
+                        </div>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
+      <div className="fb-obs-grid-2">
         <section className="fb-card fb-obs-panel">
           <div className="fb-obs-panel-head">
             <div className="fb-obs-panel-title-wrap">
@@ -383,76 +399,47 @@ function ProductObservabilityPane({
             <div className="fb-obs-empty-inline">当前周期暂无触发记录</div>
           ) : (
             <div className="fb-obs-bars-list fb-num">
-              {product.triggers.slice(0, 6).map((tr) => (
-                <div key={tr.trigger} className="fb-obs-hrow">
-                  <div className="fb-obs-hrow-top">
-                    <span>{resolveTriggerLabel(tr.trigger)}</span>
-                    <span className="fb-mono fb-obs-muted">
-                      {tr.count} 次{tr.totalTokens > 0 ? ` · ${formatTokens(tr.totalTokens)}` : ''}
-                    </span>
+              {product.triggers.slice(0, 6).map((tr) => {
+                const widthPct =
+                  maxTriggerTokens > 0
+                    ? (tr.totalTokens / maxTriggerTokens) * 100
+                    : (tr.count / maxTriggerCount) * 100
+                const activityLabel =
+                  tr.count > 0
+                    ? `${tr.count} 次`
+                    : (tr.sessions ?? 0) > 0
+                      ? `${tr.sessions} 会话`
+                      : ''
+                const metaText = [
+                  activityLabel,
+                  tr.totalTokens > 0 ? formatTokens(tr.totalTokens) : '',
+                ]
+                  .filter(Boolean)
+                  .join(' · ')
+                return (
+                  <div key={tr.trigger} className="fb-obs-hrow">
+                    <div className="fb-obs-hrow-top">
+                      <span>{resolveTriggerLabel(tr.trigger)}</span>
+                      <span className="fb-mono fb-obs-muted">{metaText || '0'}</span>
+                    </div>
+                    <div className="fb-obs-mini-track">
+                      <div
+                        className="fb-obs-mini-fill"
+                        style={{ width: `${Math.max(3, widthPct)}%` }}
+                      />
+                    </div>
                   </div>
-                  <div className="fb-obs-mini-track">
-                    <div
-                      className="fb-obs-mini-fill"
-                      style={{ width: `${Math.max(3, (tr.count / maxTriggerCount) * 100)}%` }}
-                    />
-                  </div>
-                </div>
-              ))}
+                )
+              })}
             </div>
           )}
-        </section>
-      </div>
-
-      <div className="fb-obs-grid-2">
-        <section className="fb-card fb-obs-panel">
-          <div className="fb-obs-panel-head">
-            <div className="fb-obs-panel-title-wrap">
-              <h2 className="fb-obs-panel-title">活跃节律与主动协作</h2>
-              <span className="fb-obs-panel-sub fb-mono">7×24H MATRIX</span>
-            </div>
-          </div>
-
-          <ActivityHeatmap
-            cells={product.heatmap.cells}
-            maxCount={product.heatmap.maxCount}
-          />
-
-          <div className="fb-obs-divider" />
-
-          <div className="fb-obs-micro-grid fb-num">
-            <div className="fb-obs-micro-cell">
-              <span className="fb-obs-micro-lbl">有效记忆</span>
-              <strong className="fb-mono">{proactive.activeMemories}</strong>
-              <span className="fb-obs-muted">置顶 {proactive.pinnedMemories}</span>
-            </div>
-            <div className="fb-obs-micro-cell">
-              <span className="fb-obs-micro-lbl">记忆累计召回</span>
-              <strong className="fb-mono">{proactive.totalMemoryRecalls}</strong>
-              <span className="fb-obs-muted">Dream {proactive.dreamRuns} 次</span>
-            </div>
-            <div className="fb-obs-micro-cell">
-              <span className="fb-obs-micro-lbl">定时任务</span>
-              <strong className="fb-mono">{proactive.configuredSchedules}</strong>
-              <span className="fb-obs-muted">周期执行 {proactive.scheduleRuns}</span>
-            </div>
-            <div className="fb-obs-micro-cell">
-              <span className="fb-obs-micro-lbl">提醒事项</span>
-              <strong className="fb-mono">{proactive.activeReminders}</strong>
-              <span className="fb-obs-muted">
-                {proactive.pendingConfirmReminders > 0
-                  ? `待确认 ${proactive.pendingConfirmReminders}`
-                  : `已执行 ${proactive.reminderRuns}`}
-              </span>
-            </div>
-          </div>
         </section>
 
         <section className="fb-card fb-obs-panel">
           <div className="fb-obs-panel-head">
             <div className="fb-obs-panel-title-wrap">
               <h2 className="fb-obs-panel-title">维度消耗排行</h2>
-              <span className="fb-obs-panel-sub">点击条目下钻筛选</span>
+              <span className="fb-obs-panel-sub">点击下钻</span>
             </div>
             <FilterTabs
               label="排行维度切换"
@@ -504,7 +491,7 @@ function ProductObservabilityPane({
             <div className="fb-obs-empty-inline">当前周期暂无群聊或私聊数据</div>
           ) : (
             <div className="fb-obs-rank-list fb-num">
-              {product.chatRanking.slice(0, 8).map((c) => {
+              {product.chatRanking.slice(0, 7).map((c) => {
                 const targetFilter = c.chatType === 'p2p' ? P2P_CHAT_FILTER : c.chatId
                 const active = selectedChatId === targetFilter
                 return (
@@ -537,11 +524,58 @@ function ProductObservabilityPane({
           )}
         </section>
       </div>
+
+      <section className="fb-card fb-obs-panel">
+        <div className="fb-obs-panel-head">
+          <div className="fb-obs-panel-title-wrap">
+            <h2 className="fb-obs-panel-title">活跃节律与主动协作</h2>
+            <span className="fb-obs-panel-sub fb-mono">7×24H MATRIX</span>
+          </div>
+        </div>
+
+        <div className="fb-obs-heat-split">
+          <div className="fb-obs-heat-pane">
+            <ActivityHeatmap
+              cells={product.heatmap.cells}
+              maxCount={product.heatmap.maxCount}
+            />
+          </div>
+          <div className="fb-obs-proactive-pane">
+            <div className="fb-obs-subhead">记忆与主动能力</div>
+            <div className="fb-obs-micro-grid fb-num" data-cols="2">
+              <div className="fb-obs-micro-cell">
+                <span className="fb-obs-micro-lbl">有效记忆</span>
+                <strong className="fb-mono">{proactive.activeMemories}</strong>
+                <span className="fb-obs-muted">核心置顶 {proactive.pinnedMemories}</span>
+              </div>
+              <div className="fb-obs-micro-cell">
+                <span className="fb-obs-micro-lbl">记忆累计召回</span>
+                <strong className="fb-mono">{proactive.totalMemoryRecalls}</strong>
+                <span className="fb-obs-muted">Dream {proactive.dreamRuns} 次</span>
+              </div>
+              <div className="fb-obs-micro-cell">
+                <span className="fb-obs-micro-lbl">定时任务</span>
+                <strong className="fb-mono">{proactive.configuredSchedules}</strong>
+                <span className="fb-obs-muted">周期执行 {proactive.scheduleRuns}</span>
+              </div>
+              <div className="fb-obs-micro-cell">
+                <span className="fb-obs-micro-lbl">提醒事项</span>
+                <strong className="fb-mono">{proactive.activeReminders}</strong>
+                <span className="fb-obs-muted">
+                  {proactive.pendingConfirmReminders > 0
+                    ? `待确认 ${proactive.pendingConfirmReminders}`
+                    : `已执行 ${proactive.reminderRuns}`}
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
     </div>
   )
 }
 
-function TechnicalObservabilityPane({
+function MonitorPane({
   payload,
   compacting,
   onCheckpointWal,
@@ -604,12 +638,19 @@ function TechnicalObservabilityPane({
           tag={runtime.draining ? 'DRAINING' : `UP ${formatUptime(runtime.uptimeSec)}`}
           spark={rssSpark}
           sparkTone={connections.onlineBots === connections.enabledBots ? 'success' : 'danger'}
-          foot={`RSS ${formatBytes(runtime.rssBytes)} · EL P95 ${runtime.eventLoopP95Ms}ms · 在途 ${runtime.activeTurns}`}
+          foot={`RSS ${formatBytes(runtime.rssBytes)} · EL P95 ${runtime.eventLoopP95Ms}ms`}
         />
         <KpiCard
           label="总存储占用"
           value={formatBytes(storage.totalBytes)}
           tag={storage.walBloated ? 'WAL 偏大' : storage.integrityOk ? 'WAL OK' : 'CHECK ERR'}
+          visual={
+            <MiniStorageMeter
+              bridgeBytes={storage.bridgeBytes}
+              dshBytes={storage.dshBytes}
+              walBloated={storage.walBloated}
+            />
+          }
           foot={`主库 ${formatBytes(storage.dbBytes)} · WAL ${formatBytes(storage.walBytes)} · DSH ${formatBytes(storage.dshBytes)}`}
         />
       </div>
@@ -625,7 +666,7 @@ function TechnicalObservabilityPane({
             </span>
           </div>
           <FilterTabs
-            label="技术曲线切换"
+            label="监控曲线切换"
             value={chartMode}
             options={[
               { value: 'latency' as const, label: '延迟分位与异常' },
@@ -762,7 +803,7 @@ function TechnicalObservabilityPane({
             </div>
           </div>
 
-          <div className="fb-obs-micro-grid fb-num">
+          <div className="fb-obs-micro-grid fb-num" data-cols="2">
             <div className="fb-obs-micro-cell">
               <span className="fb-obs-micro-lbl">活跃 Actor</span>
               <strong className="fb-mono">{runtime.activeActors}</strong>
@@ -776,9 +817,7 @@ function TechnicalObservabilityPane({
             <div className="fb-obs-micro-cell">
               <span className="fb-obs-micro-lbl">WS SDK 异常</span>
               <strong className="fb-mono">{connections.totalSdkErrors}</strong>
-              <span className="fb-obs-muted">
-                多实例冲突 {connections.splitBrainCount}
-              </span>
+              <span className="fb-obs-muted">多实例冲突 {connections.splitBrainCount}</span>
             </div>
             <div className="fb-obs-micro-cell">
               <span className="fb-obs-micro-lbl">V8 堆使用</span>
@@ -799,8 +838,8 @@ function TechnicalObservabilityPane({
                     <th>智能体</th>
                     <th className="fb-obs-tr">ACK P50 / P95</th>
                     <th className="fb-obs-tr">成功率</th>
-                    <th className="fb-obs-tr">活跃绑定</th>
-                    <th className="fb-obs-tr">SDK 异常</th>
+                    <th className="fb-obs-tr">绑定</th>
+                    <th className="fb-obs-tr">异常</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -853,7 +892,7 @@ function TechnicalObservabilityPane({
             </Button>
           </div>
 
-          <SegmentedBar items={storageSegments} />
+          <SegmentedBar items={storageSegments} layout="list" />
 
           <div className="fb-obs-divider" />
 
@@ -891,18 +930,26 @@ function TechnicalObservabilityPane({
 }
 
 export function ObservabilityView({
+  cockpit,
   bots,
   runtimes,
   models,
+  pluginUpdates,
+  onOpenPluginUpdates,
+  onRefreshOverview,
   onToast,
 }: {
+  readonly cockpit: CockpitPayload | null
   readonly bots: readonly BotRecord[]
   readonly runtimes: readonly RuntimeOption[]
   readonly models: readonly ModelGroup[]
+  readonly pluginUpdates?: PluginUpdatesOverview | null
+  readonly onOpenPluginUpdates?: () => void
+  readonly onRefreshOverview?: () => Promise<void>
   readonly onToast: (text: string, ok?: boolean) => void
 }) {
-  const [lens, setLens] = useState<ObservabilityLens>('product')
-  const [windowKey, setWindowKey] = useState<ObservabilityWindow>('7d')
+  const [pane, setPane] = useState<CockpitPane>('overview')
+  const [windowKey, setWindowKey] = useState<ObservabilityWindow>('24h')
   const [botId, setBotId] = useState('')
   const [chatId, setChatId] = useState('')
   const [payload, setPayload] = useState<ObservabilityPayload | null>(null)
@@ -988,26 +1035,34 @@ export function ObservabilityView({
     }
   }
 
+  const handleManualRefresh = () => {
+    void Promise.all([
+      loadData({ refreshStorage: true }),
+      onRefreshOverview ? onRefreshOverview() : Promise.resolve(),
+    ])
+  }
+
   return (
     <div className="fb-obs-root">
       <div className="fb-obs-bar">
         <div className="fb-obs-bar-left">
           <CountSegmentedSwitch
-            label="观测台视角切换"
-            value={lens}
+            label="驾驶舱面板切换"
+            value={pane}
             options={[
-              { value: 'product' as const, label: '产品洞察' },
-              { value: 'technical' as const, label: '技术观测' },
+              { value: 'overview' as const, label: '概览' },
+              { value: 'insights' as const, label: '洞察' },
+              { value: 'monitor' as const, label: '监控' },
             ]}
-            onChange={setLens}
+            onChange={setPane}
           />
-          {payload?.backfill.running && (
+          {payload?.backfill.running && pane !== 'overview' && (
             <span className="fb-obs-status-chip fb-mono">
               <i className="fb-obs-pulse-dot" data-busy="" />
-              索引历史会话 {payload.backfill.scannedSessions}/{payload.backfill.totalSessions}
+              索引 {payload.backfill.scannedSessions}/{payload.backfill.totalSessions}
             </span>
           )}
-          {payload && !payload.backfill.running && (
+          {payload && (!payload.backfill.running || pane === 'overview') && (
             <span className="fb-obs-status-chip fb-mono" title="实时采集，自动刷新">
               <i className="fb-obs-pulse-dot" />
               LIVE · {formatTime(payload.generatedAtMs)}
@@ -1016,62 +1071,79 @@ export function ObservabilityView({
         </div>
 
         <div className="fb-obs-bar-right">
-          <div className="fb-obs-window-group" role="group" aria-label="时间周期">
-            {OBSERVABILITY_WINDOWS.map((w) => (
-              <button
-                key={w.value}
-                type="button"
-                className="fb-obs-window-btn fb-mono"
-                aria-pressed={windowKey === w.value}
-                title={w.desc}
-                onClick={() => setWindowKey(w.value)}
-              >
-                {w.label}
-              </button>
-            ))}
-          </div>
+          {pane !== 'overview' && (
+            <>
+              <div className="fb-obs-window-group" role="group" aria-label="时间周期">
+                {OBSERVABILITY_WINDOWS.map((w) => (
+                  <button
+                    key={w.value}
+                    type="button"
+                    className="fb-obs-window-btn fb-mono"
+                    aria-pressed={windowKey === w.value}
+                    title={w.desc}
+                    onClick={() => setWindowKey(w.value)}
+                  >
+                    {w.label}
+                  </button>
+                ))}
+              </div>
 
-          {bots.length > 1 && (
-            <SelectMenu
-              size="sm"
-              value={effectiveBotId}
-              options={[
-                { value: '', label: '全部智能体' },
-                ...bots.map((b) => ({ value: b.id, label: b.name })),
-              ]}
-              onChange={handleBotChange}
-            />
+              {bots.length > 1 && (
+                <SelectMenu
+                  size="sm"
+                  value={effectiveBotId}
+                  options={[
+                    { value: '', label: '全部智能体' },
+                    ...bots.map((b) => ({ value: b.id, label: b.name })),
+                  ]}
+                  onChange={handleBotChange}
+                />
+              )}
+
+              <SelectMenu
+                size="sm"
+                value={effectiveChatId}
+                options={chatOptions}
+                onChange={setChatId}
+              />
+            </>
           )}
-
-          <SelectMenu
-            size="sm"
-            value={effectiveChatId}
-            options={chatOptions}
-            onChange={setChatId}
-          />
 
           <Button
             size="sm"
             variant="ghost"
             icon={<IconRefreshOutlineRegular size={14} />}
             disabled={refreshing}
-            onClick={() => void loadData({ refreshStorage: true })}
+            onClick={handleManualRefresh}
           >
             刷新
           </Button>
         </div>
       </div>
 
-      {error && (
-        <div className="fb-card fb-empty">观测数据加载失败：{error}</div>
+      {pane === 'overview' && (
+        <div className="fb-obs-overview-pane">
+          <OverviewView
+            cockpit={cockpit}
+            runtimes={runtimes}
+            models={models}
+            pluginUpdates={pluginUpdates}
+            onOpenPluginUpdates={onOpenPluginUpdates}
+            onOpenObservability={() => setPane('insights')}
+          />
+        </div>
       )}
 
-      {!error && loading && !payload && (
+      {pane !== 'overview' && error && (
+        <div className="fb-card fb-empty">驾驶舱数据加载失败：{error}</div>
+      )}
+
+      {pane !== 'overview' && !error && loading && !payload && (
         <div className="fb-card fb-empty">正在加载观测指标…</div>
       )}
 
-      {payload && lens === 'product' && (
-        <ProductObservabilityPane
+      {pane === 'insights' && payload && (
+        <InsightsPane
           payload={payload}
           runtimes={runtimes}
           models={models}
@@ -1082,8 +1154,8 @@ export function ObservabilityView({
         />
       )}
 
-      {payload && lens === 'technical' && (
-        <TechnicalObservabilityPane
+      {pane === 'monitor' && payload && (
+        <MonitorPane
           payload={payload}
           compacting={compacting}
           onCheckpointWal={() => void handleCheckpointWal()}

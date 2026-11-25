@@ -19,12 +19,15 @@ export const TRIGGER_LABELS: Readonly<Record<string, string>> = {
   mention: '@提及对话',
   p2p: '私聊直达',
   listener: '主动监听',
+  substitute: '代答模式',
+  delegate: '委派跟进',
   triage: '智能分流',
   schedule: '定时任务',
   reminder: '主动提醒',
   dreaming: 'Dreaming 记忆整理',
   command: '斜杠命令',
   active_thread: '话题续聊',
+  group: '群聊对话',
 }
 
 export const ERROR_CODE_LABELS: Readonly<Record<string, string>> = {

@@ -946,6 +946,7 @@ export interface ObservabilityModelBreakdown {
 export interface ObservabilityTriggerBreakdown {
   trigger: string
   count: number
+  sessions?: number
   replied: number
   errors: number
   totalTokens: number

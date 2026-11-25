@@ -59,7 +59,7 @@ export function resolveWindowSpec(raw?: string): WindowSpec {
   if (raw === '7d' || raw === '30d' || raw === '90d' || raw === '24h') {
     return WINDOW_SPECS[raw]
   }
-  return WINDOW_SPECS['7d']
+  return WINDOW_SPECS['24h']
 }
 
 export function formatDayKey(ms: number): string {
@@ -866,17 +866,33 @@ export class ObservabilityRepo {
   private buildTriggerBreakdown(rows: readonly RawUsageEventRow[]): ObservabilityTriggerBreakdown[] {
     const map = new Map<
       string,
-      { count: number; replied: number; errors: number; totalTokens: number }
+      {
+        count: number
+        sessions: Set<string>
+        replied: number
+        errors: number
+        totalTokens: number
+      }
     >()
     let grandCount = 0
+    let grandTokens = 0
 
     for (const row of rows) {
       const trigger =
         row.record_kind === 'triage'
           ? 'triage'
           : row.trigger.trim() || (row.chat_type === 'p2p' ? 'p2p' : 'mention')
-      const cur = map.get(trigger) ?? { count: 0, replied: 0, errors: 0, totalTokens: 0 }
-      cur.totalTokens += Number(row.total_tokens) || 0
+      const cur = map.get(trigger) ?? {
+        count: 0,
+        sessions: new Set<string>(),
+        replied: 0,
+        errors: 0,
+        totalTokens: 0,
+      }
+      const tok = Number(row.total_tokens) || 0
+      cur.totalTokens += tok
+      grandTokens += tok
+      if (row.session_id) cur.sessions.add(row.session_id)
       if (row.record_kind === 'turn' || row.record_kind === 'proactive' || row.record_kind === 'triage') {
         cur.count += 1
         grandCount += 1
@@ -891,16 +907,25 @@ export class ObservabilityRepo {
     }
 
     return [...map.entries()]
-      .filter(([, v]) => v.count > 0 || v.totalTokens > 0)
+      .filter(([, v]) => v.count > 0 || v.totalTokens > 0 || v.sessions.size > 0)
       .sort((a, b) => b[1].totalTokens - a[1].totalTokens || b[1].count - a[1].count)
-      .map(([trigger, v]) => ({
-        trigger,
-        count: v.count,
-        replied: v.replied,
-        errors: v.errors,
-        totalTokens: v.totalTokens,
-        sharePct: grandCount > 0 ? Math.round((v.count / grandCount) * 1000) / 10 : 0,
-      }))
+      .map(([trigger, v]) => {
+        const sharePct =
+          grandTokens > 0
+            ? Math.round((v.totalTokens / grandTokens) * 1000) / 10
+            : grandCount > 0
+              ? Math.round((v.count / grandCount) * 1000) / 10
+              : 0
+        return {
+          trigger,
+          count: v.count,
+          sessions: v.sessions.size,
+          replied: v.replied,
+          errors: v.errors,
+          totalTokens: v.totalTokens,
+          sharePct,
+        }
+      })
   }
 
   private buildErrorBreakdown(rows: readonly RawUsageEventRow[]): ObservabilityErrorBreakdown[] {

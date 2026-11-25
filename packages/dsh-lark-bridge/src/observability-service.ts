@@ -868,12 +868,22 @@ export class ObservabilityService {
 
     const installedAtMs = this.host.store.getObservabilityInstalledAtMs()
     const batch: TelemetryUsageEventInput[] = []
+    const triggerBySession = new Map<string, string>()
+    for (const ms of this.host.store.listAllManagedSessions()) {
+      if (ms.trigger) triggerBySession.set(ms.sessionId, ms.trigger)
+    }
+    for (const b of this.host.store.listBindings()) {
+      if (b.trigger && !triggerBySession.has(b.sessionId)) {
+        triggerBySession.set(b.sessionId, b.trigger)
+      }
+    }
 
     // 1. Historical audit_events strictly before v7 live recording started (zero double-counting).
     const audits = this.host.store.listEvents(2000)
     for (const ev of audits) {
       if (ev.timestampMs >= installedAtMs) continue
       if (ev.botId === 'system') continue
+      const sessionTrigger = ev.sessionId ? triggerBySession.get(ev.sessionId) : undefined
       if (ev.kind === 'inbound') {
         batch.push({
           id: `audit:${ev.id}`,
@@ -882,16 +892,19 @@ export class ObservabilityService {
           botId: ev.botId,
           ...(ev.chatId ? { chatId: ev.chatId } : {}),
           ...(ev.sessionId ? { sessionId: ev.sessionId } : {}),
+          ...(sessionTrigger ? { trigger: sessionTrigger } : {}),
           outcome: 'received',
         })
       } else if (ev.kind === 'reply') {
-        const trigger = ev.summary.includes('定时') || ev.summary.includes('自动化')
-          ? 'schedule'
-          : ev.summary.includes('提醒')
-            ? 'reminder'
-            : ev.summary.includes('分流快回')
-              ? 'triage'
-              : 'mention'
+        const trigger =
+          sessionTrigger ||
+          (ev.summary.includes('定时') || ev.summary.includes('自动化')
+            ? 'schedule'
+            : ev.summary.includes('提醒')
+              ? 'reminder'
+              : ev.summary.includes('分流快回')
+                ? 'triage'
+                : 'mention')
         batch.push({
           id: `audit:${ev.id}`,
           timestampMs: ev.timestampMs,
