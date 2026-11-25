@@ -253,6 +253,9 @@ export class MemoryRepo {
 
     return this.db.transaction(() => {
       const explicitExisting = input.id ? this.get(input.id) : undefined
+      if (explicitExisting && explicitExisting.botId !== botId) {
+        throw new Error(`记忆条目 "${explicitExisting.id}" 属于其他智能体，禁止跨智能体覆写`)
+      }
       const sameTitleRow =
         !explicitExisting && !input.supersedesId
           ? (this.db
@@ -294,7 +297,18 @@ export class MemoryRepo {
           )
         const updated = this.get(existing.id)!
         this.syncFts(updated)
-        return { action: 'updated', entry: updated }
+        const supersededEntry = this.applySupersedeTarget(
+          botId,
+          updated.id,
+          input.supersedesId,
+          input.supersedeReason,
+          nowMs,
+        )
+        return {
+          action: 'updated',
+          entry: updated,
+          ...(supersededEntry ? { supersededEntry } : {}),
+        }
       }
 
       const id = input.id?.trim() || generateMemoryId()
@@ -328,28 +342,13 @@ export class MemoryRepo {
       const created = this.get(id)!
       this.syncFts(created)
 
-      let supersededEntry: LarkMemoryEntry | undefined
-      if (input.supersedesId?.trim()) {
-        const old = this.get(input.supersedesId.trim())
-        if (old && old.botId === botId && old.id !== created.id) {
-          this.db
-            .prepare(
-              `UPDATE memory_entries
-               SET status = 'superseded', superseded_by = ?, superseded_at_ms = ?,
-                   supersede_reason = ?, updated_at_ms = ?
-               WHERE id = ?`,
-            )
-            .run(
-              created.id,
-              nowMs,
-              input.supersedeReason?.trim() || '已被新结论替代',
-              nowMs,
-              old.id,
-            )
-          supersededEntry = this.get(old.id)
-          if (supersededEntry) this.syncFts(supersededEntry)
-        }
-      }
+      const supersededEntry = this.applySupersedeTarget(
+        botId,
+        created.id,
+        input.supersedesId,
+        input.supersedeReason,
+        nowMs,
+      )
 
       return {
         action: 'created',
@@ -357,6 +356,36 @@ export class MemoryRepo {
         ...(supersededEntry ? { supersededEntry } : {}),
       }
     })
+  }
+
+  private applySupersedeTarget(
+    botId: string,
+    replacementId: string,
+    supersedesId: string | undefined,
+    supersedeReason: string | undefined,
+    nowMs: number,
+  ): LarkMemoryEntry | undefined {
+    const targetId = supersedesId?.trim()
+    if (!targetId) return undefined
+    const old = this.get(targetId)
+    if (!old || old.botId !== botId || old.id === replacementId) return undefined
+    this.db
+      .prepare(
+        `UPDATE memory_entries
+         SET status = 'superseded', superseded_by = ?, superseded_at_ms = ?,
+             supersede_reason = ?, updated_at_ms = ?
+         WHERE id = ?`,
+      )
+      .run(
+        replacementId,
+        nowMs,
+        supersedeReason?.trim() || '已被新结论替代',
+        nowMs,
+        old.id,
+      )
+    const supersededEntry = this.get(old.id)
+    if (supersededEntry) this.syncFts(supersededEntry)
+    return supersededEntry
   }
 
   update(id: string, patch: MemoryUpdateInput, nowMs = Date.now()): LarkMemoryEntry | undefined {

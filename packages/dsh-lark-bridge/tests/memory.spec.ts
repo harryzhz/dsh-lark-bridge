@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import type { Context } from '@deepseek-ai/cordis'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { LarkBridgeManager } from '../src/bridge-manager.js'
+import { LarkBridgeManager } from '../src/bridge-manager.js'
 import { ensureCliAuthEndpoint } from '../src/cli-support.js'
 import { createLarkHttpHandler, type ConnectionAdmitter } from '../src/http-api.js'
 import { MemoryService } from '../src/memory-service.js'
@@ -359,5 +359,163 @@ describe('MemoryService: SOTA typed memory, scope isolation, FTS5 search, bi-tem
     expect(memory.get(createdId, { recordRecall: false })).toBeUndefined()
 
     store.close()
+  })
+
+  it('auto-infers workingDir for workspace-scoped memory APIs and enforces supersede & bot isolation on upsert', async () => {
+    const dataDir = makeTempDir()
+    const workspaceA = makeTempDir()
+    const workspaceB = makeTempDir()
+    const store = new LarkBridgeStore(dataDir)
+    store.upsertBot({
+      id: 'bot-a',
+      name: 'Bot A',
+      enabled: true,
+      larkAppId: 'cli_bot_a',
+      larkAppSecret: 'mock-secret-a',
+      defaultWorkingDir: workspaceA,
+    })
+    store.upsertBot({
+      id: 'bot-b',
+      name: 'Bot B',
+      enabled: true,
+      larkAppId: 'cli_bot_b',
+      larkAppSecret: 'mock-secret-b',
+      defaultWorkingDir: workspaceB,
+    })
+    store.upsertBinding({
+      routeKey: 'cli_bot_a:oc_ws_a:om_ws_a',
+      sessionId: 'sess-ws-a',
+      botId: 'bot-a',
+      botName: 'Bot A',
+      larkAppId: 'cli_bot_a',
+      chatType: 'group',
+      chatId: 'oc_ws_a',
+      chatName: 'Workspace A Group',
+      workspaceName: 'WS-A',
+      agentPreset: 'standard',
+      workingDir: workspaceA,
+      trigger: 'mention',
+      hasReplied: true,
+      createdAtMs: Date.now(),
+      lastActivityMs: Date.now(),
+      idleCloseMs: 60_000,
+    })
+
+    const fakeCtx = {
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      llm: { listProviders: () => [] },
+      on: () => () => {},
+      get: () => undefined,
+    } as unknown as Context
+    const manager = new LarkBridgeManager(
+      fakeCtx,
+      {
+        dataDir,
+        publicBaseUrl: 'http://127.0.0.1:3880',
+        idleSweepIntervalMs: 0,
+        maxAuditEvents: 50,
+        autoInstallCliAndSkill: false,
+      },
+      store,
+    )
+
+    const admitter: ConnectionAdmitter = {
+      admit: () => ({ peer: { principal: { kind: 'owner' } } }),
+    }
+    const handler = createLarkHttpHandler(fakeCtx, admitter, manager)
+
+    // 1. resolveAgentContext includes workingDir so workspace-scoped POST/GET auto-infer scopeId
+    const ctxInfo = manager.resolveAgentContext('sess-ws-a')
+    expect(ctxInfo.workingDir).toBe(workspaceA)
+
+    // Seed another workspace memory under the same bot to verify scope filtering
+    manager.memory.upsert({
+      botId: 'bot-a',
+      scope: 'workspace',
+      scopeId: workspaceB,
+      type: 'project',
+      title: 'Workspace B 规则',
+      content: '仅属于工作区 B',
+    })
+
+    const createWsRes = await invokeHandler(handler, {
+      method: 'POST',
+      url: '/api/lark-bridge/memory',
+      headers: { authorization: `Bearer ${manager.cliAuth.token}` },
+      body: {
+        sessionId: 'sess-ws-a',
+        scope: 'workspace',
+        type: 'project',
+        title: 'Workspace A 构建命令',
+        content: '使用 pnpm build 与 pnpm test',
+      },
+    })
+    expect(createWsRes.status).toBe(201)
+    expect((createWsRes.json.entry as { scopeId: string }).scopeId).toBe(workspaceA)
+
+    const listWsRes = await invokeHandler(handler, {
+      method: 'GET',
+      url: '/api/lark-bridge/memory?scope=workspace&sessionId=sess-ws-a',
+      headers: { authorization: `Bearer ${manager.cliAuth.token}` },
+    })
+    expect(listWsRes.status).toBe(200)
+    const wsEntries = listWsRes.json.entries as Array<{ title: string; scopeId: string }>
+    expect(wsEntries).toHaveLength(1)
+    expect(wsEntries[0]?.title).toBe('Workspace A 构建命令')
+    expect(wsEntries[0]?.scopeId).toBe(workspaceA)
+
+    // 2. MemoryRepo.upsert applies supersedesId even when updating an existing entry by id
+    const oldEntry = manager.memory.upsert({
+      botId: 'bot-a',
+      scope: 'bot',
+      type: 'feedback',
+      title: '旧规范',
+      content: '旧要求',
+    }).entry
+    const existingReplacement = manager.memory.upsert({
+      botId: 'bot-a',
+      scope: 'bot',
+      type: 'feedback',
+      title: '新规范初版',
+      content: '新要求初版',
+    }).entry
+
+    const updatedWithSupersede = manager.memory.upsert({
+      id: existingReplacement.id,
+      botId: 'bot-a',
+      scope: 'bot',
+      type: 'feedback',
+      title: '新规范终版',
+      content: '新要求终版',
+      supersedesId: oldEntry.id,
+      supersedeReason: '合并到统一终版规范',
+    })
+    expect(updatedWithSupersede.action).toBe('updated')
+    expect(updatedWithSupersede.supersededEntry?.id).toBe(oldEntry.id)
+    expect(updatedWithSupersede.supersededEntry?.status).toBe('superseded')
+    expect(updatedWithSupersede.supersededEntry?.supersededBy).toBe(existingReplacement.id)
+    expect(manager.memory.get(oldEntry.id, { recordRecall: false })?.status).toBe('superseded')
+
+    // 3. MemoryRepo.upsert rejects cross-bot overwrite when id belongs to another bot
+    const botBEntry = manager.memory.upsert({
+      botId: 'bot-b',
+      scope: 'bot',
+      type: 'reference',
+      title: 'Bot B 私有参考',
+      content: '不可被 Bot A 覆写',
+    }).entry
+    expect(() =>
+      manager.memory.upsert({
+        id: botBEntry.id,
+        botId: 'bot-a',
+        scope: 'bot',
+        type: 'reference',
+        title: '越权覆写',
+        content: '应当被拒绝',
+      }),
+    ).toThrow(/禁止跨智能体覆写/)
+    expect(manager.memory.get(botBEntry.id, { recordRecall: false })?.title).toBe('Bot B 私有参考')
+
+    await manager.stop()
   })
 })
