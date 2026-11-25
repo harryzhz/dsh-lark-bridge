@@ -901,4 +901,159 @@ describe('PluginUpdateService release detection & restart-free hot update', () =
     expect(dirty.has('@harryzhz/dsh-lark-bridge')).toBe(true)
     expect(flushMock).toHaveBeenCalledTimes(1)
   })
+
+  it('resumes drain after external-agents-only success and after failed install rollback, and blocks concurrent startUpdate calls during release fetch', async () => {
+    const profileDir = makeTempDir('dsh-prof-')
+    const dataDir = makeTempDir('dsh-data-')
+    const extTarball = Buffer.from('fake-ext-tgz-v0.4.2')
+    const extSha = createHash('sha256').update(extTarball).digest('hex')
+    const bridgeTarball = Buffer.from('fake-bridge-tgz-v0.4.10')
+    const bridgeSha = createHash('sha256').update(bridgeTarball).digest('hex')
+
+    writeProfileFixtures(
+      profileDir,
+      {
+        '@harryzhz/dsh-lark-bridge':
+          'https://github.com/harryzhz/dsh-lark-bridge/releases/download/v0.4.9/harryzhz-dsh-lark-bridge-0.4.9.tgz',
+        '@harryzhz/dsh-external-agents':
+          'https://github.com/harryzhz/dsh-external-agents/releases/download/v0.4.1/harryzhz-dsh-external-agents-0.4.1.tgz',
+      },
+      {
+        '@harryzhz/dsh-lark-bridge': '0.4.9',
+        '@harryzhz/dsh-external-agents': '0.4.1',
+      },
+    )
+
+    let holdReleaseResolve: (() => void) | undefined
+    const fetchImpl: FetchLike = async (url) => {
+      if (holdReleaseResolve && url.includes('/releases/latest')) {
+        await new Promise<void>((resolve) => {
+          const prev = holdReleaseResolve
+          holdReleaseResolve = () => {
+            prev?.()
+            resolve()
+          }
+        })
+      }
+      if (url.endsWith('/harryzhz/dsh-external-agents/releases/latest')) {
+        return new Response(
+          JSON.stringify({
+            tag_name: 'v0.4.2',
+            assets: [
+              {
+                name: 'harryzhz-dsh-external-agents-0.4.2.tgz',
+                browser_download_url:
+                  'https://github.com/harryzhz/dsh-external-agents/releases/download/v0.4.2/harryzhz-dsh-external-agents-0.4.2.tgz',
+                digest: `sha256:${extSha}`,
+              },
+            ],
+          }),
+          { status: 200 },
+        )
+      }
+      if (url.endsWith('/harryzhz/dsh-lark-bridge/releases/latest')) {
+        return new Response(
+          JSON.stringify({
+            tag_name: 'v0.4.10',
+            assets: [
+              {
+                name: 'harryzhz-dsh-lark-bridge-0.4.10.tgz',
+                browser_download_url:
+                  'https://github.com/harryzhz/dsh-lark-bridge/releases/download/v0.4.10/harryzhz-dsh-lark-bridge-0.4.10.tgz',
+                digest: `sha256:${bridgeSha}`,
+              },
+            ],
+          }),
+          { status: 200 },
+        )
+      }
+      if (url.includes('external-agents')) return new Response(extTarball, { status: 200 })
+      return new Response(bridgeTarball, { status: 200 })
+    }
+
+    let failExtInstall = false
+    const pm: HostPluginManagerLike = {
+      listBundles: vi.fn(async (): Promise<HostBundleInfoLike[]> => [
+        { name: '@harryzhz/dsh-lark-bridge', version: '0.4.9', enabled: true, installed: true, removable: true },
+        { name: '@harryzhz/dsh-external-agents', version: '0.4.1', enabled: true, installed: true, removable: true },
+      ]),
+      removeBundle: vi.fn(async (): Promise<HostChangeResultLike> => ({
+        changed: true,
+        application: 'applied',
+        stage: 'remove',
+      })),
+      installBundle: vi.fn(async (spec): Promise<HostChangeResultLike> => {
+        if (failExtInstall && spec.includes('0.4.2')) {
+          return {
+            changed: false,
+            application: 'failed',
+            stage: 'install',
+            error: { code: 'EINSTALL', diagnostic: 'simulated install failure' },
+          }
+        }
+        return { changed: true, application: 'applied', stage: 'enable' }
+      }),
+    }
+
+    const busyStatus = {
+      phase: 'running' as const,
+      draining: false,
+      drained: false,
+      activeTurns: [],
+      activeTriageCount: 0,
+      activeRemindersCount: 0,
+      activeDreamingCount: 0,
+      totalInFlight: 1,
+      persistedPendingTurns: 1,
+      pid: process.pid,
+      startedAtMs: Date.now(),
+    }
+    const drainedStatus = { ...busyStatus, draining: true, drained: true, totalInFlight: 0 }
+
+    const beginDrain = vi.fn(async () => ({ ...busyStatus, draining: true }))
+    const cancelDrain = vi.fn(async () => busyStatus)
+    const lifecycle: PluginUpdateLifecycleHost = {
+      getLifecycleStatus: vi.fn(() => busyStatus),
+      beginDrain,
+      waitForDrain: vi.fn(async () => drainedStatus),
+      cancelDrain,
+      countActiveExternalAgents: vi.fn(() => 0),
+    }
+
+    const service = new PluginUpdateService({
+      ctx: makeFakeContext({
+        profileContext: { name: 'web', dir: profileDir },
+        pluginManager: pm,
+        hmr: { runExclusive: vi.fn(), reconcileProfile: vi.fn() },
+      }),
+      dataDir,
+      lifecycle,
+      fetchImpl,
+      runningBridgeVersion: '0.4.9',
+    })
+
+    // 1. Concurrent startUpdate during async release fetch must reject the second caller
+    holdReleaseResolve = () => {}
+    const firstStart = service.startUpdate({ target: 'external-agents' })
+    await expect(service.startUpdate({ target: 'external-agents' })).rejects.toThrow(/初始化中|进行中/)
+    const releaseGate = holdReleaseResolve
+    holdReleaseResolve = undefined
+    releaseGate()
+
+    const op1 = await firstStart
+    const settled1 = await waitForSettledOp(service, op1.operationId)
+    expect(settled1.status).toBe('succeeded')
+    expect(beginDrain).toHaveBeenCalledTimes(1)
+    expect(cancelDrain).toHaveBeenCalledTimes(1)
+
+    // 2. Rollback early-return when external-agents install fails during target='all' must also resume drain
+    beginDrain.mockClear()
+    cancelDrain.mockClear()
+    failExtInstall = true
+    const op2 = await service.startUpdate({ target: 'all' })
+    const settled2 = await waitForSettledOp(service, op2.operationId)
+    expect(settled2.status).toBe('rolled_back')
+    expect(beginDrain).toHaveBeenCalledTimes(1)
+    expect(cancelDrain).toHaveBeenCalledTimes(1)
+  })
 })

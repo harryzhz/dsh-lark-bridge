@@ -220,6 +220,8 @@ export function PluginUpdateDialog({
         misses += 1
         setReconnecting(true)
         if (misses >= 60) {
+          cancelled = true
+          window.clearInterval(timer)
           clearPendingSelfReloadMarker()
           setActionError('等待新版本恢复超时，请刷新页面查看当前插件状态')
           setReconnecting(false)

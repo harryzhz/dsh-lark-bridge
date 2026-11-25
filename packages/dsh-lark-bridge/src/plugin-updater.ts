@@ -215,6 +215,7 @@ export interface PluginUpdateLifecycleHost {
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>
 
 interface GlobalUpdateState {
+  starting?: boolean
   active?: PluginUpdateOperation
   last?: PluginUpdateOperation
   drainAbort?: AbortController
@@ -1255,30 +1256,13 @@ export class PluginUpdateService {
     if (state.active) {
       throw new Error(`已有插件更新任务正在进行中 (${state.active.operationId})，请稍候`)
     }
+    if (state.starting) {
+      throw new Error('已有插件更新任务正在初始化中，请稍候')
+    }
+    state.starting = true
 
     const pm = this.getPluginManager()
-    if (!pm) {
-      throw new Error('当前 DSH 运行环境未提供 pluginManager 服务，无法执行在线更新')
-    }
     const hmr = this.getHmr()
-    if (!hmr && !options.allowRestartRequired) {
-      throw new Error('当前 DSH Profile 未启用 HMR，无法免重启热更新（请先移除 cordis.patch.yml 中的 hmr 禁用配置并重启一次）')
-    }
-
-    const targetSelector = options.target ?? 'all'
-    if (options.version && targetSelector === 'all') {
-      throw new Error('指定 --version 时必须明确选择单个插件（bridge 或 external-agents）')
-    }
-
-    const installedMap = await this.resolveInstalledPackages()
-    const selectedSpecs =
-      targetSelector === 'all'
-        ? this.plugins.filter((spec) => installedMap.has(spec.id))
-        : this.plugins.filter((spec) => spec.id === targetSelector)
-
-    if (selectedSpecs.length === 0) {
-      throw new Error(`未找到目标插件：${targetSelector}`)
-    }
 
     interface PlannedTarget {
       readonly spec: ManagedPluginSpec
@@ -1289,101 +1273,134 @@ export class PluginUpdateService {
       readonly release: ReleaseInfo
     }
 
-    const planned: PlannedTarget[] = []
-    for (const spec of selectedSpecs) {
-      const installed = installedMap.get(spec.id)
-      if (!installed?.installed) {
-        if (targetSelector !== 'all') {
-          throw new Error(`当前 Profile 未安装 ${spec.displayName} (${spec.packageName})`)
+    let targetSelector: ManagedPluginId | 'all'
+    let planned: PlannedTarget[]
+    let operationId: string
+    let initialOp: PluginUpdateOperation
+    let statusFile: string
+    let publishOp: (next: PluginUpdateOperation) => PluginUpdateOperation
+
+    try {
+      if (!pm) {
+        throw new Error('当前 DSH 运行环境未提供 pluginManager 服务，无法执行在线更新')
+      }
+      if (!hmr && !options.allowRestartRequired) {
+        throw new Error('当前 DSH Profile 未启用 HMR，无法免重启热更新（请先移除 cordis.patch.yml 中的 hmr 禁用配置并重启一次）')
+      }
+
+      targetSelector = options.target ?? 'all'
+      if (options.version && targetSelector === 'all') {
+        throw new Error('指定 --version 时必须明确选择单个插件（bridge 或 external-agents）')
+      }
+
+      const installedMap = await this.resolveInstalledPackages()
+      const selectedSpecs =
+        targetSelector === 'all'
+          ? this.plugins.filter((spec) => installedMap.has(spec.id))
+          : this.plugins.filter((spec) => spec.id === targetSelector)
+
+      if (selectedSpecs.length === 0) {
+        throw new Error(`未找到目标插件：${targetSelector}`)
+      }
+
+      planned = []
+      for (const spec of selectedSpecs) {
+        const installed = installedMap.get(spec.id)
+        if (!installed?.installed) {
+          if (targetSelector !== 'all') {
+            throw new Error(`当前 Profile 未安装 ${spec.displayName} (${spec.packageName})`)
+          }
+          continue
         }
-        continue
-      }
-      const source = classifySourceSpec(installed.rawSpec)
-      if (
-        (source.kind === 'local-link' || source.kind === 'local-file') &&
-        !options.allowMigrateLocal
-      ) {
-        if (targetSelector !== 'all') {
-          throw new Error(
-            `${spec.displayName} 当前为${source.label}，已拒绝直接覆盖；如需迁移为 GitHub Release 请传入 allowMigrateLocal`,
-          )
+        const source = classifySourceSpec(installed.rawSpec)
+        if (
+          (source.kind === 'local-link' || source.kind === 'local-file') &&
+          !options.allowMigrateLocal
+        ) {
+          if (targetSelector !== 'all') {
+            throw new Error(
+              `${spec.displayName} 当前为${source.label}，已拒绝直接覆盖；如需迁移为 GitHub Release 请传入 allowMigrateLocal`,
+            )
+          }
+          continue
         }
-        continue
+        const release = await this.resolveLatestRelease(spec, {
+          force: true,
+          ...(options.version ? { version: options.version } : {}),
+        })
+        const newer = isNewerVersion(installed.installedVersion, release.version)
+        const allowSameVersion = Boolean(options.allowMigrateLocal) || (Boolean(options.force) && targetSelector !== 'all')
+        if (!newer && !allowSameVersion) {
+          continue
+        }
+        planned.push({
+          spec,
+          installedKey: installed.installedPackageName,
+          ...(installed.rawSpec ? { previousSpec: installed.rawSpec } : {}),
+          ...(installed.installedVersion ? { fromVersion: installed.installedVersion } : {}),
+          wasEnabled: installed.enabled,
+          release,
+        })
       }
-      const release = await this.resolveLatestRelease(spec, {
-        force: true,
-        ...(options.version ? { version: options.version } : {}),
+
+      if (planned.length === 0) {
+        throw new Error('所有目标插件均已是最新版本，无需更新')
+      }
+
+      // Always update external-agents before self-updating bridge so the coordinator stays alive as long as possible.
+      planned.sort((a, b) => {
+        if (a.spec.id === 'bridge' && b.spec.id !== 'bridge') return 1
+        if (a.spec.id !== 'bridge' && b.spec.id === 'bridge') return -1
+        return 0
       })
-      const newer = isNewerVersion(installed.installedVersion, release.version)
-      const allowSameVersion = Boolean(options.allowMigrateLocal) || (Boolean(options.force) && targetSelector !== 'all')
-      if (!newer && !allowSameVersion) {
-        continue
+
+      const now = Date.now()
+      operationId = `upd_${randomUUID().slice(0, 12)}`
+      const items: PluginUpdateItemResult[] = planned.map((p) => ({
+        id: p.spec.id,
+        displayName: p.spec.displayName,
+        packageName: p.spec.packageName,
+        ...(p.fromVersion ? { fromVersion: p.fromVersion } : {}),
+        toVersion: p.release.version,
+        status: 'pending',
+        hotReloaded: false,
+        restartRequired: false,
+      }))
+
+      initialOp = {
+        operationId,
+        status: 'verifying',
+        message: `正在校验 ${planned.map((p) => `${p.spec.displayName} v${p.release.version}`).join('、')} 发布包…`,
+        startedAtMs: now,
+        updatedAtMs: now,
+        targetSelector,
+        ...(options.force ? { forced: true } : {}),
+        items,
+        hotReloaded: false,
+        restartRequired: false,
       }
-      planned.push({
-        spec,
-        installedKey: installed.installedPackageName,
-        ...(installed.rawSpec ? { previousSpec: installed.rawSpec } : {}),
-        ...(installed.installedVersion ? { fromVersion: installed.installedVersion } : {}),
-        wasEnabled: installed.enabled,
-        release,
-      })
-    }
 
-    if (planned.length === 0) {
-      throw new Error('所有目标插件均已是最新版本，无需更新')
-    }
-
-    // Always update external-agents before self-updating bridge so the coordinator stays alive as long as possible.
-    planned.sort((a, b) => {
-      if (a.spec.id === 'bridge' && b.spec.id !== 'bridge') return 1
-      if (a.spec.id !== 'bridge' && b.spec.id === 'bridge') return -1
-      return 0
-    })
-
-    const now = Date.now()
-    const operationId = `upd_${randomUUID().slice(0, 12)}`
-    const items: PluginUpdateItemResult[] = planned.map((p) => ({
-      id: p.spec.id,
-      displayName: p.spec.displayName,
-      packageName: p.spec.packageName,
-      ...(p.fromVersion ? { fromVersion: p.fromVersion } : {}),
-      toVersion: p.release.version,
-      status: 'pending',
-      hotReloaded: false,
-      restartRequired: false,
-    }))
-
-    const initialOp: PluginUpdateOperation = {
-      operationId,
-      status: 'verifying',
-      message: `正在校验 ${planned.map((p) => `${p.spec.displayName} v${p.release.version}`).join('、')} 发布包…`,
-      startedAtMs: now,
-      updatedAtMs: now,
-      targetSelector,
-      ...(options.force ? { forced: true } : {}),
-      items,
-      hotReloaded: false,
-      restartRequired: false,
-    }
-
-    const statusFile = this.statusFile
-    const publishOp = (next: PluginUpdateOperation): PluginUpdateOperation => {
-      const finished =
-        next.status === 'succeeded' || next.status === 'failed' || next.status === 'rolled_back'
-      if (finished) {
-        state.active = undefined
-        state.drainAbort = undefined
-        state.drainForceRequested = false
-        state.last = next
-      } else {
-        state.active = next
-        state.last = next
+      statusFile = this.statusFile
+      publishOp = (next: PluginUpdateOperation): PluginUpdateOperation => {
+        const finished =
+          next.status === 'succeeded' || next.status === 'failed' || next.status === 'rolled_back'
+        if (finished) {
+          state.active = undefined
+          state.drainAbort = undefined
+          state.drainForceRequested = false
+          state.last = next
+        } else {
+          state.active = next
+          state.last = next
+        }
+        atomicWriteJson(statusFile, next)
+        return next
       }
-      atomicWriteJson(statusFile, next)
-      return next
-    }
 
-    publishOp(initialOp)
+      publishOp(initialOp)
+    } finally {
+      state.starting = false
+    }
 
     // Pre-verify all tarballs synchronously BEFORE queuing the detached swap, or inside the async task?
     // Run inside detached async pipeline after a brief tick so the 202 HTTP/RPC response flushes cleanly.
@@ -1411,7 +1428,14 @@ export class PluginUpdateService {
       }
 
       let drainedByUs = false
+      let bridgeHotReloaded = false
       let releaseClientModulesHold: (() => Promise<void>) | undefined
+      const resumeDrainIfNeeded = async (): Promise<void> => {
+        if (drainedByUs && !bridgeHotReloaded) {
+          drainedByUs = false
+          await lifecycle.cancelDrain().catch(() => {})
+        }
+      }
       try {
         // Yield briefly so the 202 response flushes before any heavy work or plugin unload.
         await new Promise((r) => setTimeout(r, 150))
@@ -1579,7 +1603,11 @@ export class PluginUpdateService {
                   restoreRes.application !== 'failed' &&
                   restoreRes.application !== 'cancelled',
               )
+              if (target.spec.id === 'bridge' && restoreRes?.application === 'applied') {
+                bridgeHotReloaded = true
+              }
             }
+            await resumeDrainIfNeeded()
             updateItem(i, {
               status: rolledBack ? 'rolled_back' : 'failed',
               error: errMsg,
@@ -1599,6 +1627,9 @@ export class PluginUpdateService {
 
           const hotReloaded = installRes.application === 'applied'
           const restartRequired = installRes.application === 'restart-required'
+          if (target.spec.id === 'bridge' && hotReloaded) {
+            bridgeHotReloaded = true
+          }
           if (restartRequired) anyRestartRequired = true
           if (!hotReloaded) allHotReloaded = false
 
@@ -1610,6 +1641,7 @@ export class PluginUpdateService {
           })
         }
 
+        await resumeDrainIfNeeded()
         const summary = planned
           .map((p) => `${p.spec.displayName} v${p.release.version}`)
           .join('、')
@@ -1627,9 +1659,7 @@ export class PluginUpdateService {
         const message = err instanceof Error ? err.message : String(err)
         const failureCode: PluginUpdateFailureCode =
           err instanceof TaggedUpdateError ? err.failureCode : 'unknown'
-        if (drainedByUs) {
-          await lifecycle.cancelDrain().catch(() => {})
-        }
+        await resumeDrainIfNeeded()
         updateOp({
           status: 'failed',
           failureCode,
@@ -1640,6 +1670,7 @@ export class PluginUpdateService {
           restartRequired: false,
         })
       } finally {
+        await resumeDrainIfNeeded()
         if (releaseClientModulesHold) {
           await releaseClientModulesHold().catch(() => {})
         }
@@ -1653,6 +1684,7 @@ export class PluginUpdateService {
 
 export function resetGlobalPluginUpdateStateForTest(): void {
   const state = getGlobalUpdateState()
+  state.starting = false
   state.active = undefined
   state.last = undefined
   state.drainAbort = undefined
