@@ -114,6 +114,9 @@ export async function dispatchLarkApiRequest(
   const pathname = url.pathname.replace(/^\/api\/lark-bridge\/?/, '').replace(/^\/+/, '')
   const segments = pathname ? pathname.split('/').map(decodeURIComponent) : []
   const { isCliAuthenticated, isOperatorAuthenticated, principalKind } = request
+  const isOwnerWebSession =
+    principalKind === 'owner' && !isCliAuthenticated && !isOperatorAuthenticated
+  const isPureOperatorSession = Boolean(isOperatorAuthenticated) && !isCliAuthenticated
 
   try {
     if (method === 'GET' && (pathname === '' || pathname === 'health')) {
@@ -175,6 +178,11 @@ export async function dispatchLarkApiRequest(
       return ok(diagnostics)
     }
 
+    // Operator maintenance tokens are strictly scoped to health, lifecycle drain/resume, and diagnostics.
+    if (isPureOperatorSession) {
+      return ok({ ok: false, error: 'operator_scope_forbidden' }, 403)
+    }
+
     if (
       method === 'POST' &&
       segments[0] === 'diagnostics' &&
@@ -182,7 +190,7 @@ export async function dispatchLarkApiRequest(
       segments[2] &&
       segments[3] === 'clear'
     ) {
-      if (principalKind !== 'owner' || isCliAuthenticated) {
+      if (!isOwnerWebSession) {
         return ok({ ok: false, error: 'owner_web_session_required' }, 403)
       }
       const cleared = manager.clearSplitBrainAlert(segments[2])
@@ -191,7 +199,7 @@ export async function dispatchLarkApiRequest(
 
     // ── Desktop renderer session-open channel (owner-only) ──────────────
     if (segments[0] === 'desktop') {
-      if (principalKind !== 'owner' || isCliAuthenticated) {
+      if (!isOwnerWebSession) {
         return ok({ ok: false, error: 'owner_session_required' }, 403)
       }
       if (method === 'GET' && segments[1] === 'open-wait') {
@@ -212,7 +220,7 @@ export async function dispatchLarkApiRequest(
 
     // ── Read-only viewer secret rotation (owner Web/Desktop session only) ─
     if (method === 'POST' && pathname === 'viewer/rotate-secret') {
-      if (principalKind !== 'owner' || isCliAuthenticated) {
+      if (!isOwnerWebSession) {
         return ok({ ok: false, error: 'owner_web_session_required' }, 403)
       }
       manager.store.rotateViewerTicketSecret()
@@ -222,7 +230,7 @@ export async function dispatchLarkApiRequest(
 
     // ── Short-lived single-use console login ticket issue (owner-only) ───
     if (method === 'POST' && pathname === 'console-login/issue') {
-      if (principalKind !== 'owner' || isCliAuthenticated || isOperatorAuthenticated) {
+      if (!isOwnerWebSession) {
         return ok({ ok: false, error: 'owner_web_session_required' }, 403)
       }
       const body = bodyRecord(request.body)
@@ -383,7 +391,7 @@ export async function dispatchLarkApiRequest(
 
     // ── Auth & Open Platform endpoints (owner Web/Desktop session only) ──
     if (segments[0] === 'auth') {
-      if (isCliAuthenticated) {
+      if (!isOwnerWebSession) {
         return ok({ ok: false, error: 'owner_web_session_required' }, 403)
       }
       if (method === 'GET' && segments[1] === 'status') {
@@ -448,6 +456,7 @@ export async function dispatchLarkApiRequest(
         url,
         body: request.body,
         isCliAuthenticated,
+        ...(isOperatorAuthenticated !== undefined ? { isOperatorAuthenticated } : {}),
         principalKind,
       })
       if (handled) return handled
@@ -506,7 +515,7 @@ export async function dispatchLarkApiRequest(
     }
 
     if (method === 'POST' && pathname === 'bots/auto-create') {
-      if (isCliAuthenticated) {
+      if (!isOwnerWebSession) {
         return ok({ ok: false, error: 'owner_web_session_required' }, 403)
       }
       const body = bodyRecord(request.body)
@@ -515,7 +524,7 @@ export async function dispatchLarkApiRequest(
     }
 
     if (method === 'POST' && pathname === 'bots/import-existing') {
-      if (isCliAuthenticated) {
+      if (!isOwnerWebSession) {
         return ok({ ok: false, error: 'owner_web_session_required' }, 403)
       }
       const body = bodyRecord(request.body)
@@ -524,7 +533,7 @@ export async function dispatchLarkApiRequest(
     }
 
     if (method === 'POST' && pathname === 'bots') {
-      if (isCliAuthenticated) {
+      if (!isOwnerWebSession) {
         return ok({ ok: false, error: 'owner_web_session_required' }, 403)
       }
       const body = bodyRecord(request.body)
@@ -560,7 +569,7 @@ export async function dispatchLarkApiRequest(
     if (segments[0] === 'bots' && segments[1]) {
       const botId = segments[1]
       if (method === 'PUT' && segments.length === 2) {
-        if (isCliAuthenticated) {
+        if (!isOwnerWebSession) {
           return ok({ ok: false, error: 'owner_web_session_required' }, 403)
         }
         const prev = manager.store.getBot(botId)
@@ -592,7 +601,7 @@ export async function dispatchLarkApiRequest(
         })
       }
       if (method === 'DELETE' && segments.length === 2) {
-        if (isCliAuthenticated) {
+        if (!isOwnerWebSession) {
           return ok({ ok: false, error: 'owner_web_session_required' }, 403)
         }
         const existed = manager.store.deleteBot(botId)
@@ -636,7 +645,7 @@ export async function dispatchLarkApiRequest(
         return ok({ ok: true, count: chats.length })
       }
       if (method === 'POST' && segments[2] === 'dream') {
-        if (isCliAuthenticated) {
+        if (!isOwnerWebSession) {
           return ok({ ok: false, error: 'owner_web_session_required' }, 403)
         }
         const bot = manager.store.getBot(botId)
@@ -761,7 +770,7 @@ export async function dispatchLarkApiRequest(
     }
 
     if (method === 'DELETE' && pathname === 'triage-sessions') {
-      if (isCliAuthenticated) {
+      if (!isOwnerWebSession) {
         return ok({ ok: false, error: 'owner_web_session_required' }, 403)
       }
       const botId = url.searchParams.get('botId')?.trim() || undefined
@@ -770,7 +779,7 @@ export async function dispatchLarkApiRequest(
     }
 
     if (method === 'DELETE' && segments[0] === 'triage-sessions' && segments[1] && segments.length === 2) {
-      if (isCliAuthenticated) {
+      if (!isOwnerWebSession) {
         return ok({ ok: false, error: 'owner_web_session_required' }, 403)
       }
       const deleted = manager.store.deleteTriageSession?.(segments[1]) ?? false
@@ -850,7 +859,7 @@ export async function dispatchLarkApiRequest(
         return ok({ ok: true, reminder: updated })
       }
       if (method === 'POST' && segments[2] === 'approve' && segments.length === 3) {
-        if (isCliAuthenticated) {
+        if (!isOwnerWebSession) {
           return ok({ ok: false, error: 'owner_web_session_required' }, 403)
         }
         const approved = await manager.reminders.approve(reminderId)
@@ -876,7 +885,7 @@ export async function dispatchLarkApiRequest(
 
     // ── Local Directory Browser (Owner Web/Desktop session strictly required) ─
     if (pathname === 'fs/dirs') {
-      if (isCliAuthenticated) {
+      if (!isOwnerWebSession) {
         return ok({ ok: false, error: 'owner_web_session_required' }, 403)
       }
       if (method === 'GET') {
@@ -897,7 +906,7 @@ export async function dispatchLarkApiRequest(
 
     // ── Runtime Profiles (Owner Web/Desktop session strictly required) ────
     if (segments[0] === 'runtime-profiles') {
-      if (principalKind !== 'owner' || isCliAuthenticated) {
+      if (!isOwnerWebSession) {
         return ok({ ok: false, error: 'owner_web_session_required' }, 403)
       }
       if (method === 'GET' && segments.length === 1) {

@@ -7,7 +7,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { LarkPlatformManager } from '@dsh-lark/lark-core'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { LarkBridgeManager } from '../src/bridge-manager.js'
-import { ensureCliAuthEndpoint } from '../src/cli-support.js'
+import { ensureCliAuthEndpoint, OPERATOR_TOKEN_HEADER } from '../src/cli-support.js'
 import { createLarkHttpHandler, type ConnectionAdmitter } from '../src/http-api.js'
 import { RuntimeCatalog } from '../src/runtime-catalog.js'
 import { handleSlashCommand } from '../src/slash-commands.js'
@@ -834,6 +834,141 @@ describe('LarkBridgeStore, RuntimeCatalog, CLI Auth & HTTP API', () => {
       store.listEvents(20).some((e) => e.kind === 'lifecycle' && e.summary.includes('已补齐基线事件')),
     ).toBe(true)
 
+    await manager.stop()
+  })
+
+  it('enforces owner-only auth boundaries against operator tokens and non-owner principals across all privileged endpoints', async () => {
+    const dir = makeTempDir()
+    const validDir = makeTempDir()
+    const store = new LarkBridgeStore(dir)
+    store.upsertBot({
+      id: 'bot-sec',
+      name: '安全测试助手',
+      enabled: false,
+      larkAppId: 'cli_sec_test',
+      larkAppSecret: 'sec_test_1',
+      defaultWorkingDir: validDir,
+    })
+
+    const fakeCtx = {
+      logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn() },
+      sessions: { get: () => undefined },
+      llm: { listProviders: () => [] },
+      on: () => () => {},
+      get: () => undefined,
+    } as unknown as Context
+
+    const manager = new LarkBridgeManager(
+      fakeCtx,
+      {
+        dataDir: dir,
+        publicBaseUrl: 'http://127.0.0.1:3880',
+        idleSweepIntervalMs: 0,
+        maxAuditEvents: 50,
+        autoInstallCliAndSkill: false,
+      },
+      store,
+    )
+    const mem = manager.memory.upsert({
+      botId: 'bot-sec',
+      scope: 'bot',
+      type: 'project',
+      title: '安全回归测试条目',
+      content: '用于验证 operator 与非 owner 无法执行物理删除。',
+    })
+
+    const viewerAdmitter: ConnectionAdmitter = {
+      admit: () => ({ peer: { principal: { kind: 'viewer' } } }),
+    }
+    const handler = createLarkHttpHandler(fakeCtx, viewerAdmitter, manager)
+    const opHeaders = { [OPERATOR_TOKEN_HEADER]: manager.operatorAuth.token }
+    const cliAndOpHeaders = {
+      authorization: `Bearer ${manager.cliAuth.token}`,
+      [OPERATOR_TOKEN_HEADER]: manager.operatorAuth.token,
+    }
+
+    // 1. Pure operator token can access health, lifecycle, and diagnostics
+    expect((await invokeHandler(handler, { url: '/api/lark-bridge/health', headers: opHeaders })).status).toBe(200)
+    expect((await invokeHandler(handler, { url: '/api/lark-bridge/lifecycle/status', headers: opHeaders })).status).toBe(200)
+    expect((await invokeHandler(handler, { url: '/api/lark-bridge/diagnostics', headers: opHeaders })).status).toBe(200)
+    expect(
+      (
+        await invokeHandler(handler, {
+          method: 'POST',
+          url: '/api/lark-bridge/lifecycle/drain',
+          headers: opHeaders,
+          body: { reason: 'test-drain' },
+        })
+      ).status,
+    ).toBe(200)
+    expect(
+      (
+        await invokeHandler(handler, {
+          method: 'POST',
+          url: '/api/lark-bridge/lifecycle/resume-intake',
+          headers: opHeaders,
+        })
+      ).status,
+    ).toBe(200)
+
+    // 2. Pure operator token is blocked fail-closed from business and owner-only endpoints
+    const operatorBlockedCases: Array<{ method: string; url: string; body?: unknown }> = [
+      { method: 'GET', url: '/api/lark-bridge/fs/dirs' },
+      { method: 'POST', url: '/api/lark-bridge/fs/dirs', body: { parentPath: validDir, name: 'x' } },
+      { method: 'GET', url: '/api/lark-bridge/auth/status' },
+      { method: 'POST', url: '/api/lark-bridge/bots', body: { name: 'X', larkAppId: 'cli_x', larkAppSecret: 's', defaultWorkingDir: validDir } },
+      { method: 'POST', url: '/api/lark-bridge/bots/auto-create', body: {} },
+      { method: 'POST', url: '/api/lark-bridge/bots/import-existing', body: {} },
+      { method: 'PUT', url: '/api/lark-bridge/bots/bot-sec', body: { name: 'Hacked' } },
+      { method: 'DELETE', url: '/api/lark-bridge/bots/bot-sec' },
+      { method: 'POST', url: '/api/lark-bridge/bots/bot-sec/dream', body: {} },
+      { method: 'DELETE', url: '/api/lark-bridge/triage-sessions' },
+      { method: 'DELETE', url: '/api/lark-bridge/triage-sessions/sess-1' },
+      { method: 'POST', url: '/api/lark-bridge/reminders/rem-1/approve' },
+      { method: 'POST', url: '/api/lark-bridge/console-login/issue', body: {} },
+      { method: 'DELETE', url: `/api/lark-bridge/memory/${encodeURIComponent(mem.entry.id)}?hard=1` },
+      { method: 'GET', url: '/api/lark-bridge/bots' },
+      { method: 'POST', url: '/api/lark-bridge/agent/send', body: { text: 'blocked' } },
+    ]
+    for (const c of operatorBlockedCases) {
+      const res = await invokeHandler(handler, { ...c, headers: opHeaders })
+      expect(res.status, `operator ${c.method} ${c.url}`).toBe(403)
+      expect(res.json.error).toBe('operator_scope_forbidden')
+    }
+
+    // 3. Non-owner web principal (`viewer`) and CLI+operator dual headers are blocked on all owner-only endpoints
+    const ownerOnlyCases: Array<{ method: string; url: string; body?: unknown; expectedError?: string }> = [
+      { method: 'GET', url: '/api/lark-bridge/fs/dirs' },
+      { method: 'POST', url: '/api/lark-bridge/fs/dirs', body: { parentPath: validDir, name: 'x' } },
+      { method: 'GET', url: '/api/lark-bridge/auth/status' },
+      { method: 'POST', url: '/api/lark-bridge/bots', body: { name: 'X', larkAppId: 'cli_x', larkAppSecret: 's', defaultWorkingDir: validDir } },
+      { method: 'POST', url: '/api/lark-bridge/bots/auto-create', body: {} },
+      { method: 'POST', url: '/api/lark-bridge/bots/import-existing', body: {} },
+      { method: 'PUT', url: '/api/lark-bridge/bots/bot-sec', body: { name: 'Hacked' } },
+      { method: 'DELETE', url: '/api/lark-bridge/bots/bot-sec' },
+      { method: 'POST', url: '/api/lark-bridge/bots/bot-sec/dream', body: {} },
+      { method: 'DELETE', url: '/api/lark-bridge/triage-sessions' },
+      { method: 'DELETE', url: '/api/lark-bridge/triage-sessions/sess-1' },
+      { method: 'POST', url: '/api/lark-bridge/reminders/rem-1/approve' },
+      { method: 'POST', url: '/api/lark-bridge/console-login/issue', body: {} },
+      { method: 'POST', url: '/api/lark-bridge/viewer/rotate-secret' },
+      { method: 'GET', url: '/api/lark-bridge/runtime-profiles' },
+      { method: 'POST', url: '/api/lark-bridge/diagnostics/split-brain/bot-sec/clear' },
+      { method: 'POST', url: '/api/lark-bridge/desktop/open-ack', body: {}, expectedError: 'owner_session_required' },
+      { method: 'DELETE', url: `/api/lark-bridge/memory/${encodeURIComponent(mem.entry.id)}?hard=1` },
+    ]
+    for (const c of ownerOnlyCases) {
+      const viewerRes = await invokeHandler(handler, c)
+      expect(viewerRes.status, `viewer ${c.method} ${c.url}`).toBe(403)
+      expect(viewerRes.json.error).toBe(c.expectedError ?? 'owner_web_session_required')
+
+      const dualRes = await invokeHandler(handler, { ...c, headers: cliAndOpHeaders })
+      expect(dualRes.status, `cli+op ${c.method} ${c.url}`).toBe(403)
+      expect(dualRes.json.error).toBe(c.expectedError ?? 'owner_web_session_required')
+    }
+
+    // Memory entry must still exist intact after blocked hard-delete attempts
+    expect(manager.memory.get(mem.entry.id, { recordRecall: false })?.id).toBe(mem.entry.id)
     await manager.stop()
   })
 })
