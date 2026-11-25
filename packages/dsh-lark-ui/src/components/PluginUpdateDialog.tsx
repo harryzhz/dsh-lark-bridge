@@ -18,17 +18,88 @@ import type {
 import { GroupTitle, SettingRow } from './fields.js'
 
 const ACTIVE_OP_STATES = new Set(['queued', 'verifying', 'draining', 'removing', 'installing', 'restoring'])
+const SELF_RELOAD_MARKER_TTL_MS = 3 * 60_000
 export const PENDING_SELF_RELOAD_STORAGE_KEY = 'dsh-lark-bridge:pending-self-reload'
 
-function markPendingSelfReload(operationId: string): void {
+export interface PendingSelfReloadMarker {
+  readonly operationId: string
+  readonly tab?: string
+  readonly wasMounted?: boolean
+  readonly at: number
+}
+
+export function markPendingSelfReload(operationId: string, tab?: string): void {
   try {
-    window.sessionStorage.setItem(
-      PENDING_SELF_RELOAD_STORAGE_KEY,
-      JSON.stringify({ operationId, at: Date.now() }),
-    )
+    const payload: PendingSelfReloadMarker = {
+      operationId,
+      ...(tab ? { tab } : {}),
+      wasMounted: true,
+      at: Date.now(),
+    }
+    window.sessionStorage.setItem(PENDING_SELF_RELOAD_STORAGE_KEY, JSON.stringify(payload))
   } catch {
     // Ignore storage restriction.
   }
+}
+
+export function clearPendingSelfReloadMarker(): void {
+  try {
+    window.sessionStorage.removeItem(PENDING_SELF_RELOAD_STORAGE_KEY)
+  } catch {
+    // Ignore storage restriction.
+  }
+}
+
+export function hasActivePendingSelfReload(): boolean {
+  try {
+    const raw = window.sessionStorage.getItem(PENDING_SELF_RELOAD_STORAGE_KEY)
+    if (!raw) return false
+    const parsed = JSON.parse(raw) as Partial<PendingSelfReloadMarker>
+    return (
+      typeof parsed.operationId === 'string' &&
+      typeof parsed.at === 'number' &&
+      Date.now() - parsed.at < SELF_RELOAD_MARKER_TTL_MS
+    )
+  } catch {
+    return false
+  }
+}
+
+export function consumePendingSelfReloadMarker(): PendingSelfReloadMarker | undefined {
+  try {
+    const raw = window.sessionStorage.getItem(PENDING_SELF_RELOAD_STORAGE_KEY)
+    if (!raw) return undefined
+    window.sessionStorage.removeItem(PENDING_SELF_RELOAD_STORAGE_KEY)
+    const parsed = JSON.parse(raw) as Partial<PendingSelfReloadMarker>
+    if (
+      typeof parsed.operationId === 'string' &&
+      typeof parsed.at === 'number' &&
+      Date.now() - parsed.at < SELF_RELOAD_MARKER_TTL_MS
+    ) {
+      return {
+        operationId: parsed.operationId,
+        ...(typeof parsed.tab === 'string' ? { tab: parsed.tab } : {}),
+        ...(typeof parsed.wasMounted === 'boolean' ? { wasMounted: parsed.wasMounted } : {}),
+        at: parsed.at,
+      }
+    }
+  } catch {
+    // Ignore storage error.
+  }
+  return undefined
+}
+
+function isDrainTimeoutFailure(op: PluginUpdateOperation): boolean {
+  if (op.status !== 'failed') return false
+  if (op.failureCode === 'drain_timeout') return true
+  const text = `${op.message ?? ''} ${op.error ?? ''}`
+  return /排空超时|外部 Agent 会话运行中|--force/.test(text)
+}
+
+function resolveRetryTarget(op: PluginUpdateOperation): ManagedPluginId | 'all' {
+  if (op.targetSelector) return op.targetSelector
+  if (op.items.length === 1 && op.items[0]) return op.items[0].id
+  return 'all'
 }
 
 function opStateLabel(status: PluginUpdateOperation['status']): {
@@ -43,7 +114,7 @@ function opStateLabel(status: PluginUpdateOperation['status']): {
     case 'draining':
       return { label: '排空在途任务', tone: 'warning' }
     case 'removing':
-      return { label: '卸载旧版', tone: 'info' }
+      return { label: '准备切换', tone: 'info' }
     case 'installing':
       return { label: '安装热重载', tone: 'info' }
     case 'restoring':
@@ -71,21 +142,29 @@ function sourceTagTone(kind: ManagedPluginStatus['sourceKind']): 'success' | 'in
   }
 }
 
+type PendingForceAction =
+  | { readonly kind: 'preempt-drain'; readonly operationId: string }
+  | { readonly kind: 'start-force'; readonly target: ManagedPluginId | 'all'; readonly label: string }
+
 export function PluginUpdateDialog({
   open,
   overview,
+  activeTab,
   onClose,
   onCheck,
   onUpdated,
 }: {
   open: boolean
   overview: PluginUpdatesOverview | null
+  activeTab?: string
   onClose: () => void
   onCheck: (force?: boolean) => Promise<PluginUpdatesOverview | null>
   onUpdated: (message: string, ok: boolean) => Promise<void>
 }) {
   const [checking, setChecking] = useState(false)
   const [starting, setStarting] = useState(false)
+  const [forcingDrain, setForcingDrain] = useState(false)
+  const [pendingForce, setPendingForce] = useState<PendingForceAction | null>(null)
   const [operation, setOperation] = useState<PluginUpdateOperation | null>(overview?.operation ?? null)
   const [reconnecting, setReconnecting] = useState(false)
   const [actionError, setActionError] = useState('')
@@ -107,6 +186,7 @@ export function PluginUpdateDialog({
     if (!open) {
       setActionError('')
       setReconnecting(false)
+      setPendingForce(null)
       return
     }
     void onCheck(false)
@@ -128,21 +208,25 @@ export function PluginUpdateDialog({
         setOperation(next)
         if (!ACTIVE_OP_STATES.has(next.status) && settledNotifiedRef.current !== next.operationId) {
           settledNotifiedRef.current = next.operationId
+          clearPendingSelfReloadMarker()
+          setPendingForce(null)
           await onCheck(true)
           await onUpdated(next.message, next.status === 'succeeded')
         }
       } catch {
         if (cancelled) return
-        // During self-reload (`removeBundle` -> `installBundle`), `/api/lark-bridge-rpc` briefly returns 404/network error.
+        // During bridge self-swap (`removeBundle` -> `installBundle`), `/api/lark-bridge-rpc` is
+        // briefly unregistered while the host holds the client graph to keep this UI mounted.
         misses += 1
         setReconnecting(true)
         if (misses >= 60) {
+          clearPendingSelfReloadMarker()
           setActionError('等待新版本恢复超时，请刷新页面查看当前插件状态')
           setReconnecting(false)
         }
       }
     }
-    const timer = window.setInterval(() => void poll(), 1500)
+    const timer = window.setInterval(() => void poll(), 1200)
     return () => {
       cancelled = true
       window.clearInterval(timer)
@@ -152,8 +236,14 @@ export function PluginUpdateDialog({
   if (!open) return null
 
   const plugins = overview?.plugins ?? []
-  const isBusy = checking || starting || Boolean(activeOpId)
+  const isBusy = checking || starting || forcingDrain || Boolean(activeOpId)
   const updatableHotPlugins = plugins.filter((p) => p.updateAvailable && p.hotReloadSupported)
+  const inFlightTurns = overview?.inFlightTurns ?? 0
+  const activeExternalAgents = overview?.activeExternalAgents ?? 0
+  const hasActiveWorkload = inFlightTurns > 0 || activeExternalAgents > 0
+  const workloadParts: string[] = []
+  if (inFlightTurns > 0) workloadParts.push(`${inFlightTurns} 个飞书回合`)
+  if (activeExternalAgents > 0) workloadParts.push(`${activeExternalAgents} 个外部会话`)
 
   const handleCheck = async () => {
     setChecking(true)
@@ -167,14 +257,18 @@ export function PluginUpdateDialog({
     }
   }
 
-  const handleUpdate = async (target: ManagedPluginId | 'all') => {
+  const handleUpdate = async (target: ManagedPluginId | 'all', options: { force?: boolean } = {}) => {
     setStarting(true)
     setActionError('')
     setReconnecting(false)
+    setPendingForce(null)
     try {
-      const op = await bridgeApi.startPluginUpdate({ target })
+      const op = await bridgeApi.startPluginUpdate({
+        target,
+        ...(options.force ? { force: true } : {}),
+      })
       if (op.items.some((item) => item.id === 'bridge')) {
-        markPendingSelfReload(op.operationId)
+        markPendingSelfReload(op.operationId, activeTab)
       }
       setOperation(op)
     } catch (err) {
@@ -184,7 +278,29 @@ export function PluginUpdateDialog({
     }
   }
 
+  const handlePreemptDrain = async (operationId: string) => {
+    setForcingDrain(true)
+    setActionError('')
+    setPendingForce(null)
+    try {
+      const res = await bridgeApi.forcePluginUpdateDrain(operationId)
+      if (res.operation) {
+        setOperation(res.operation)
+      }
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setForcingDrain(false)
+    }
+  }
+
   const opMeta = operation ? opStateLabel(operation.status) : null
+  const showDrainPreempt = operation?.status === 'draining' && !reconnecting
+  const showForceRetry =
+    Boolean(operation && !activeOpId && isDrainTimeoutFailure(operation) && updatableHotPlugins.length > 0)
+  const retryTarget = operation ? resolveRetryTarget(operation) : 'all'
+  const defaultForceTarget: ManagedPluginId | 'all' =
+    updatableHotPlugins.length === 1 && updatableHotPlugins[0] ? updatableHotPlugins[0].id : 'all'
 
   return (
     <Modal open onClose={onClose} title="插件版本与热更新" headless className="fb-schedule-dialog fb-update-dialog">
@@ -227,14 +343,68 @@ export function PluginUpdateDialog({
           </Button>
         </SettingRow>
 
+        {hasActiveWorkload && !activeOpId && updatableHotPlugins.length > 0 && (
+          <div className="fb-update-busy-banner">
+            <span>
+              当前有 {workloadParts.join('、')} 运行中，普通更新会先等待排空
+            </span>
+            {pendingForce?.kind !== 'start-force' && (
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={isBusy}
+                onClick={() =>
+                  setPendingForce({
+                    kind: 'start-force',
+                    target: defaultForceTarget,
+                    label: defaultForceTarget === 'all' ? '全部插件' : updatableHotPlugins[0]?.displayName || '所选插件',
+                  })
+                }
+              >
+                强制更新
+              </Button>
+            )}
+          </div>
+        )}
+
+        {pendingForce?.kind === 'start-force' && !showForceRetry && (
+          <div className="fb-update-force-confirm" style={{ marginBottom: 10 }}>
+            <span>
+              确认跳过排空并强制热更新「{pendingForce.label}」？进行中的会话可能短暂中断（飞书回合会自动恢复）。
+            </span>
+            <div className="fb-update-force-confirm-btns">
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={starting}
+                onClick={() => setPendingForce(null)}
+              >
+                取消
+              </Button>
+              <Button
+                size="sm"
+                variant="primary"
+                disabled={starting}
+                onClick={() => void handleUpdate(pendingForce.target, { force: true })}
+              >
+                {starting ? '启动中…' : '确认强制更新'}
+              </Button>
+            </div>
+          </div>
+        )}
+
         {actionError && <div className="fb-update-error">{actionError}</div>}
 
         {operation && opMeta && (
           <div className="fb-update-op-card">
             <div className="fb-update-op-head">
-              <Tag tone={opMeta.tone}>{opMeta.label}</Tag>
+              <Tag tone={reconnecting ? 'info' : opMeta.tone}>
+                {reconnecting ? '热重载切换中' : opMeta.label}
+              </Tag>
               <span className="fb-update-op-msg">
-                {reconnecting ? '正在热重载新版插件，等待服务恢复连接…' : operation.message}
+                {reconnecting
+                  ? '正在安装新版插件并无缝切换，当前界面保持可见，请稍候…'
+                  : operation.message}
               </span>
             </div>
             {operation.items.length > 0 && (
@@ -254,6 +424,97 @@ export function PluginUpdateDialog({
                     </span>
                   </div>
                 ))}
+              </div>
+            )}
+
+            {showDrainPreempt && (
+              <div className="fb-update-op-actions">
+                {pendingForce?.kind === 'preempt-drain' ? (
+                  <div className="fb-update-force-confirm">
+                    <span>跳过等待将立即开始热重载，进行中的会话可能短暂中断，确认继续？</span>
+                    <div className="fb-update-force-confirm-btns">
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={forcingDrain}
+                        onClick={() => setPendingForce(null)}
+                      >
+                        继续等待
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="primary"
+                        disabled={forcingDrain}
+                        onClick={() => void handlePreemptDrain(operation.operationId)}
+                      >
+                        {forcingDrain ? '执行中…' : '确认强制更新'}
+                      </Button>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <span className="fb-update-plugin-hint">如无需等待当前任务结束，可立即跳过排空</span>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={forcingDrain}
+                      onClick={() =>
+                        setPendingForce({ kind: 'preempt-drain', operationId: operation.operationId })
+                      }
+                    >
+                      跳过等待，强制更新
+                    </Button>
+                  </>
+                )}
+              </div>
+            )}
+
+            {showForceRetry && (
+              <div className="fb-update-op-actions">
+                {pendingForce?.kind === 'start-force' ? (
+                  <div className="fb-update-force-confirm">
+                    <span>强制重试将跳过等待在途会话排空（飞书回合会自动恢复），确认继续？</span>
+                    <div className="fb-update-force-confirm-btns">
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={starting}
+                        onClick={() => setPendingForce(null)}
+                      >
+                        取消
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="primary"
+                        disabled={starting}
+                        onClick={() => void handleUpdate(pendingForce.target, { force: true })}
+                      >
+                        {starting ? '启动中…' : '确认强制更新'}
+                      </Button>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <span className="fb-update-plugin-hint">存在活跃会话导致排空超时，可选择跳过等待直接热更新</span>
+                    <Button
+                      size="sm"
+                      variant="primary"
+                      disabled={isBusy}
+                      onClick={() =>
+                        setPendingForce({
+                          kind: 'start-force',
+                          target: retryTarget,
+                          label:
+                            retryTarget === 'all'
+                              ? '全部待更新插件'
+                              : operation.items[0]?.displayName || '目标插件',
+                        })
+                      }
+                    >
+                      强制重试更新
+                    </Button>
+                  </>
+                )}
               </div>
             )}
           </div>

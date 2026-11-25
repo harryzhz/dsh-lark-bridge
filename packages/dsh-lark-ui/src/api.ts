@@ -359,6 +359,11 @@ export const bridgeApi = {
     force?: boolean
     allowMigrateLocal?: boolean
   } = {}) => (await post<{ operation: PluginUpdateOperation }>('/plugins/update', options)).operation,
+  forcePluginUpdateDrain: async (operationId?: string) =>
+    post<{ ok: boolean; forced: boolean; operation?: PluginUpdateOperation }>(
+      '/plugins/update/force',
+      operationId ? { operationId } : {},
+    ),
   pluginUpdateStatus: async (operationId?: string) =>
     (
       await request<{ operation?: PluginUpdateOperation }>(

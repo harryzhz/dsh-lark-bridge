@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { bridgeApi } from './api.js'
+import { hasActivePendingSelfReload } from './components/PluginUpdateDialog.js'
 import { FALLBACK_LISTENER_TEMPLATES, FALLBACK_TRIAGE_DEFAULTS } from './presets.js'
 import { updateSessionFilterRuntimes } from './session-model-filter.js'
 import type {
@@ -141,7 +142,9 @@ export function useBridgeData(): BridgeData & {
       }))
       setError('')
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
+      if (!hasActivePendingSelfReload()) {
+        setError(err instanceof Error ? err.message : String(err))
+      }
     }
   }, [])
 

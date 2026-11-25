@@ -18,6 +18,7 @@ import {
   classifySourceSpec,
   compareSemver,
   dispatchLarkApiRequest,
+  holdClientModulesDuringSwap,
   isNewerVersion,
   parseSha256Sums,
   relocateStaleModuleUrl,
@@ -649,5 +650,255 @@ describe('PluginUpdateService release detection & restart-free hot update', () =
     // Temporarily missing symlink during removeBundle -> no throw, returns undefined
     unlinkSync(symlinkPath)
     expect(relocateStaleModuleUrl(v1Url, undefined, staleMap)).toBeUndefined()
+  })
+
+  it('supports immediate force update (bypassing drain wait) and mid-drain force preemption via POST /plugins/update/force', async () => {
+    const profileDir = makeTempDir('dsh-prof-')
+    const dataDir = makeTempDir('dsh-data-')
+    const tarballBytes = Buffer.from('fake-bridge-tgz-v0.4.4')
+    const sha = createHash('sha256').update(tarballBytes).digest('hex')
+
+    writeProfileFixtures(
+      profileDir,
+      {
+        '@harryzhz/dsh-lark-bridge':
+          'https://github.com/harryzhz/dsh-lark-bridge/releases/download/v0.4.3/harryzhz-dsh-lark-bridge-0.4.3.tgz',
+        '@harryzhz/dsh-external-agents':
+          'https://github.com/harryzhz/dsh-external-agents/releases/download/v0.4.1/harryzhz-dsh-external-agents-0.4.1.tgz',
+      },
+      {
+        '@harryzhz/dsh-lark-bridge': '0.4.3',
+        '@harryzhz/dsh-external-agents': '0.4.1',
+      },
+    )
+
+    const fetchImpl: FetchLike = async (url) => {
+      if (url.endsWith('/harryzhz/dsh-lark-bridge/releases/latest')) {
+        return new Response(
+          JSON.stringify({
+            tag_name: 'v0.4.4',
+            assets: [
+              {
+                name: 'harryzhz-dsh-lark-bridge-0.4.4.tgz',
+                browser_download_url:
+                  'https://github.com/harryzhz/dsh-lark-bridge/releases/download/v0.4.4/harryzhz-dsh-lark-bridge-0.4.4.tgz',
+                digest: `sha256:${sha}`,
+              },
+            ],
+          }),
+          { status: 200 },
+        )
+      }
+      if (url.endsWith('/harryzhz/dsh-external-agents/releases/latest')) {
+        return new Response(
+          JSON.stringify({
+            tag_name: 'v0.4.1',
+            assets: [
+              {
+                name: 'harryzhz-dsh-external-agents-0.4.1.tgz',
+                browser_download_url:
+                  'https://github.com/harryzhz/dsh-external-agents/releases/download/v0.4.1/harryzhz-dsh-external-agents-0.4.1.tgz',
+              },
+            ],
+          }),
+          { status: 200 },
+        )
+      }
+      return new Response(tarballBytes, { status: 200 })
+    }
+
+    const removed: string[] = []
+    const pm: HostPluginManagerLike = {
+      listBundles: vi.fn(async (): Promise<HostBundleInfoLike[]> => [
+        { name: '@harryzhz/dsh-lark-bridge', version: '0.4.3', enabled: true, installed: true, removable: true },
+        { name: '@harryzhz/dsh-external-agents', version: '0.4.1', enabled: true, installed: true, removable: true },
+      ]),
+      removeBundle: vi.fn(async (name): Promise<HostChangeResultLike> => {
+        removed.push(name)
+        return { changed: true, application: 'applied', stage: 'remove' }
+      }),
+      installBundle: vi.fn(async (): Promise<HostChangeResultLike> => ({
+        changed: true,
+        application: 'applied',
+        stage: 'enable',
+      })),
+    }
+
+    const busyStatus = {
+      phase: 'running' as const,
+      draining: false,
+      drained: false,
+      activeTurns: [],
+      activeTriageCount: 0,
+      activeRemindersCount: 0,
+      activeDreamingCount: 0,
+      totalInFlight: 1,
+      persistedPendingTurns: 1,
+      pid: process.pid,
+      startedAtMs: Date.now(),
+    }
+
+    const waitForDrain = vi.fn(async (_timeoutMs?: number, signal?: AbortSignal) => {
+      await new Promise<void>((resolve) => {
+        if (signal?.aborted) return resolve()
+        const timer = setTimeout(resolve, 60)
+        signal?.addEventListener(
+          'abort',
+          () => {
+            clearTimeout(timer)
+            resolve()
+          },
+          { once: true },
+        )
+      })
+      return { ...busyStatus, draining: true, drained: false }
+    })
+
+    const lifecycle: PluginUpdateLifecycleHost = {
+      getLifecycleStatus: vi.fn(() => busyStatus),
+      beginDrain: vi.fn(async () => ({ ...busyStatus, draining: true })),
+      waitForDrain,
+      cancelDrain: vi.fn(async () => busyStatus),
+      countActiveExternalAgents: vi.fn(() => 1),
+    }
+
+    const service = new PluginUpdateService({
+      ctx: makeFakeContext({
+        profileContext: { name: 'web', dir: profileDir },
+        pluginManager: pm,
+        hmr: { runExclusive: vi.fn(), reconcileProfile: vi.fn() },
+      }),
+      dataDir,
+      lifecycle,
+      fetchImpl,
+      runningBridgeVersion: '0.4.3',
+    })
+
+    // 1. Overview reports active workload counts
+    const overview = await service.getOverview({ check: true })
+    expect(overview.inFlightTurns).toBe(1)
+    expect(overview.activeExternalAgents).toBe(1)
+
+    // 2. Normal update fails with structured `drain_timeout` failureCode
+    const op1 = await service.startUpdate({ target: 'all', drainTimeoutMs: 50 })
+    const settled1 = await waitForSettledOp(service, op1.operationId)
+    expect(settled1.status).toBe('failed')
+    expect(settled1.failureCode).toBe('drain_timeout')
+    expect(settled1.targetSelector).toBe('all')
+    expect(removed).toEqual([])
+
+    // 3. Force update with target='all' bypasses waitForDrain completely AND only updates bridge (not up-to-date external-agents)
+    waitForDrain.mockClear()
+    const op2 = await service.startUpdate({ target: 'all', force: true })
+    const settled2 = await waitForSettledOp(service, op2.operationId)
+    expect(settled2.status).toBe('succeeded')
+    expect(settled2.forced).toBe(true)
+    expect(waitForDrain).not.toHaveBeenCalled()
+    expect(removed).toEqual(['@harryzhz/dsh-lark-bridge'])
+
+    // 4. Mid-drain force preemption via POST /plugins/update/force wakes waitForDrain and succeeds
+    removed.length = 0
+    waitForDrain.mockImplementationOnce(
+      async (_timeoutMs?: number, signal?: AbortSignal) =>
+        await new Promise((resolve) => {
+          signal?.addEventListener(
+            'abort',
+            () => resolve({ ...busyStatus, draining: true, drained: false }),
+            { once: true },
+          )
+        }),
+    )
+    const op3 = await service.startUpdate({ target: 'bridge', drainTimeoutMs: 10_000 })
+    const waitDrainingDeadline = Date.now() + 3000
+    while (Date.now() < waitDrainingDeadline) {
+      if (service.getOperation(op3.operationId)?.status === 'draining') break
+      await new Promise((r) => setTimeout(r, 20))
+    }
+    expect(service.getOperation(op3.operationId)?.status).toBe('draining')
+
+    const fakeManager = {
+      pluginUpdater: service,
+    } as unknown as import('../src/index.js').LarkBridgeManager
+    const fakeCtx = makeFakeContext({})
+    // CLI token is blocked (403)
+    const cliPreempt = await dispatchLarkApiRequest(fakeCtx, fakeManager, {
+      method: 'POST',
+      path: '/plugins/update/force',
+      body: { operationId: op3.operationId },
+      isCliAuthenticated: true,
+      principalKind: 'cli',
+    })
+    expect(cliPreempt.status).toBe(403)
+
+    // Owner session preempts drain immediately (200)
+    const ownerPreempt = await dispatchLarkApiRequest(fakeCtx, fakeManager, {
+      method: 'POST',
+      path: '/plugins/update/force',
+      body: { operationId: op3.operationId },
+      isCliAuthenticated: false,
+      principalKind: 'owner',
+    })
+    expect(ownerPreempt.status).toBe(200)
+    expect((ownerPreempt.payload as { forced?: boolean }).forced).toBe(true)
+
+    const settled3 = await waitForSettledOp(service, op3.operationId)
+    expect(settled3.status).toBe('succeeded')
+    expect(settled3.forced).toBe(true)
+    expect(removed).toEqual(['@harryzhz/dsh-lark-bridge'])
+  })
+
+  it('holds intermediate client-module deletion during bridge self-swap and converges cleanly on release', async () => {
+    const sources = new Map<string, { packageName: string }>()
+    const table = new Map<string, string>()
+    const dirty = new Set<string>()
+    const reconcileCalls: string[] = []
+    const flushMock = vi.fn()
+
+    class FakeClientModules {
+      sources = sources
+      dirty = dirty
+      reconcilePackage(packageName: string): boolean {
+        reconcileCalls.push(packageName)
+        let hasSource = false
+        for (const s of this.sources.values()) {
+          if (s.packageName === packageName) hasSource = true
+        }
+        if (!hasSource) return table.delete(packageName)
+        table.set(packageName, 'updated')
+        return true
+      }
+      flush = flushMock
+    }
+
+    const cm = new FakeClientModules()
+    sources.set('base\0@harryzhz/dsh-lark-bridge', { packageName: '@harryzhz/dsh-lark-bridge' })
+    table.set('@harryzhz/dsh-lark-bridge', 'v0.4.3')
+
+    const ctx = makeFakeContext({ clientModules: cm })
+    const release = holdClientModulesDuringSwap(ctx, ['@harryzhz/dsh-lark-bridge'])
+
+    // 1. Simulate removeBundle disposing bridge: source disappears, but hold keeps table intact & returns false
+    sources.clear()
+    expect(cm.reconcilePackage('@harryzhz/dsh-lark-bridge')).toBe(false)
+    expect(table.get('@harryzhz/dsh-lark-bridge')).toBe('v0.4.3')
+    expect(reconcileCalls).toEqual([])
+
+    // 2. Simulate installBundle activating new bridge: source reappears -> delegates immediately to publish new rev
+    sources.set('base\0@harryzhz/dsh-lark-bridge', { packageName: '@harryzhz/dsh-lark-bridge' })
+    expect(cm.reconcilePackage('@harryzhz/dsh-lark-bridge')).toBe(true)
+    expect(table.get('@harryzhz/dsh-lark-bridge')).toBe('updated')
+    expect(reconcileCalls).toEqual(['@harryzhz/dsh-lark-bridge'])
+
+    // 3. Release restores prototype cleanly and does NOT force redundant flush when active source exists
+    await release()
+    expect(flushMock).not.toHaveBeenCalled()
+
+    // 4. Failure path: if release runs while package is genuinely missing, converges via flush()
+    const releaseFail = holdClientModulesDuringSwap(ctx, ['@harryzhz/dsh-lark-bridge'])
+    sources.clear()
+    expect(cm.reconcilePackage('@harryzhz/dsh-lark-bridge')).toBe(false)
+    await releaseFail()
+    expect(dirty.has('@harryzhz/dsh-lark-bridge')).toBe(true)
+    expect(flushMock).toHaveBeenCalledTimes(1)
   })
 })
