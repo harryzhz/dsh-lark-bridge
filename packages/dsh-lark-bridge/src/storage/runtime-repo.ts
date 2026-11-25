@@ -466,6 +466,27 @@ export class RuntimeRepo {
       .run(now, sessionId)
   }
 
+  listActiveManagedSessions(): LarkManagedSession[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM managed_sessions
+         WHERE archived_at_ms IS NULL
+         ORDER BY created_at_ms ASC`,
+      )
+      .all() as Array<{
+      session_id: string
+      bot_id: string
+      chat_id: string
+      route_key: string | null
+      trigger: string | null
+      created_at_ms: number
+      last_activity_ms: number
+      idle_close_ms: number | null
+      archived_at_ms: number | null
+    }>
+    return rows.map((r) => this.hydrateManagedSession(r))
+  }
+
   listExpiredManagedSessions(now = Date.now()): LarkManagedSession[] {
     const rows = this.db
       .prepare(

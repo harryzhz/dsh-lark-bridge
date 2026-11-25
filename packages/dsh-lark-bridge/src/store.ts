@@ -278,6 +278,10 @@ export class LarkBridgeStore {
     this.runtimeRepo.markSessionArchived(sessionId, now)
   }
 
+  listActiveManagedSessions(): LarkManagedSession[] {
+    return this.runtimeRepo.listActiveManagedSessions()
+  }
+
   listExpiredManagedSessions(now = Date.now()): LarkManagedSession[] {
     return this.runtimeRepo.listExpiredManagedSessions(now)
   }

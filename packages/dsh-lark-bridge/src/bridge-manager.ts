@@ -321,6 +321,7 @@ export class LarkBridgeManager {
       })
     }
 
+    this.disposers.push(this.workspaces.install())
     this.schedules.start()
     this.dreaming.start(this.config.idleSweepIntervalMs > 0 ? 60_000 : 0)
     await this.reminders.recoverStaleRunningReminders().catch((err) => {
@@ -328,11 +329,13 @@ export class LarkBridgeManager {
         `[lark-bridge] stale reminder recovery warning: ${err instanceof Error ? err.message : String(err)}`,
       )
     })
-    this.reminders.start(this.config.idleSweepIntervalMs > 0 ? 30_000 : 0)
     this.disposers.push(this.titleGuard.install())
     await this.workspaces.reconcileBindings()
 
     await this.connections.startAllEnabled()
+    if (!this.disposed) {
+      this.reminders.start(this.config.idleSweepIntervalMs > 0 ? 30_000 : 0)
+    }
     this.phase = 'running'
 
     await this.inbound.recoverStalePendingTurns().catch((err) => {
