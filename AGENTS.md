@@ -16,7 +16,7 @@
 
 - **防腐层与能力驱动**：`packages/lark-core` 不得依赖任何 `@deepseek-ai/*` 包；桥接层与前端统一经 `RuntimeCatalog` / `/api/lark-bridge/runtimes` 动态读取 DSH 原生预设与可选 `ctx.externalRuntimes`，禁止硬编码引擎分支或各 Agent 私有记忆文件路径。
 - **鉴权与会话安全**：`/api/lark-bridge/*` 与 `/api/lark-bridge-rpc` 必须显式执行 `ctx.connection.admit(req)` 或受限 CLI Bearer Token 的 fail-closed 鉴权；敏感端点（如 `/fs/dirs`）严格限定 Owner，绝不向飞书消息泄露主 `launchToken`。
-- **UI 规范一致**：修改 `packages/dsh-lark-ui` 必须遵守 [docs/guidelines/ui.md](./docs/guidelines/ui.md)（复用 DSH 原生组件与 `--dsw-*` 令牌、所有主页 Tab 共用统一 `.fb-container` 尺寸严禁单页铺满或变宽、右侧控件单一对齐、禁止同级双弹框叠层）。
+- **UI 规范一致**：修改 `packages/dsh-lark-ui` 必须遵守 [docs/guidelines/ui.md](./docs/guidelines/ui.md)（复用 DSH 原生组件与 `--dsw-*` 令牌、所有主页 Tab 共用统一自适应 `.fb-container` 在大屏下展宽且切换零位移严禁单页特例、右侧控件单一对齐、禁止同级双弹框叠层）。
 - **开源与隐私红线**：仓库面向 GitHub 公开，严禁提交真实凭据、运行期状态文件、真实飞书 ID（`cli_*`/`ou_*`/`oc_*`/`on_*`/`om_*`）、宿主机真实路径、未脱敏媒体资源或非公开内部信息，提交前必过 `pnpm run check:privacy`（详见 [SECURITY.md](./SECURITY.md)）。
 
 ## 文档索引（按任务按需阅读）
