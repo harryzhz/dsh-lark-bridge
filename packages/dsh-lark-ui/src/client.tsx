@@ -195,89 +195,93 @@ function LarkBridgePage() {
   const runningBridgeVer = bridgePluginStatus?.runningVersion ?? bridgePluginStatus?.installedVersion
   const updatableCount = data.pluginUpdates?.updatableCount ?? 0
 
+  const isWorkspaceTab = tab === 'memory'
+
   return (
-    <div className="fb-page">
-      <div className="fb-container">
-        <header className="fb-header">
-          <h1 className="fb-title">
-            <LarkTitleIcon size={24} />
-            <span>飞书桥接</span>
-          </h1>
-          <div className="fb-actions">
-            <Button
-              variant="outline"
-              icon={<PluginUpdateIcon size={16} />}
-              onClick={() => {
-                setUpdateOpen(true)
-              }}
-            >
-              {updatableCount > 0 ? (
-                <>
-                  <span>有更新</span>
-                  <span className="fb-update-btn-dot" aria-hidden="true" />
-                </>
-              ) : runningBridgeVer ? (
-                `v${runningBridgeVer}`
-              ) : (
-                '检查更新'
-              )}
-            </Button>
-            <Button
-              variant="outline"
-              icon={<ShieldAuthIcon size={16} />}
-              onClick={() => {
-                void data.refreshAuth()
-                setAuthOpen(true)
-              }}
-            >
-              {opIdentity ? `已认证 · ${opIdentity.userName}` : '飞书认证'}
-            </Button>
-            {tab === 'bots' && (
-              <Button variant="primary" icon={<IconPlusOutlineRegular size={16} />} onClick={() => setEditingBot('new')}>
-                新增智能体
-              </Button>
-            )}
-            {tab === 'groups' && (
-              <Button variant="outline" icon={<IconRefreshOutlineRegular size={16} />} disabled={syncing || data.bots.length === 0} onClick={syncChats}>
-                同步群聊
-              </Button>
-            )}
-            {tab === 'memory' && (
+    <div className="fb-page" data-workspace={isWorkspaceTab ? '' : undefined}>
+      <div className="fb-container" data-workspace={isWorkspaceTab ? '' : undefined}>
+        <div className={isWorkspaceTab ? 'fb-workspace-chrome' : undefined}>
+          <header className="fb-header">
+            <h1 className="fb-title">
+              <LarkTitleIcon size={24} />
+              <span>飞书桥接</span>
+            </h1>
+            <div className="fb-actions">
               <Button
-                variant="primary"
-                icon={<IconPlusOutlineRegular size={16} />}
-                disabled={data.bots.length === 0}
+                variant="outline"
+                icon={<PluginUpdateIcon size={16} />}
                 onClick={() => {
-                  const defaultBotId =
-                    resolveEffectiveBotId(memoryBotId, data.bots) || data.bots[0]?.id
-                  setMemoryDialog({
-                    mode: 'create',
-                    ...(defaultBotId ? { defaultBotId } : {}),
-                  })
+                  setUpdateOpen(true)
                 }}
               >
-                新增记忆
+                {updatableCount > 0 ? (
+                  <>
+                    <span>有更新</span>
+                    <span className="fb-update-btn-dot" aria-hidden="true" />
+                  </>
+                ) : runningBridgeVer ? (
+                  `v${runningBridgeVer}`
+                ) : (
+                  '检查更新'
+                )}
               </Button>
-            )}
-          </div>
-        </header>
+              <Button
+                variant="outline"
+                icon={<ShieldAuthIcon size={16} />}
+                onClick={() => {
+                  void data.refreshAuth()
+                  setAuthOpen(true)
+                }}
+              >
+                {opIdentity ? `已认证 · ${opIdentity.userName}` : '飞书认证'}
+              </Button>
+              {tab === 'bots' && (
+                <Button variant="primary" icon={<IconPlusOutlineRegular size={16} />} onClick={() => setEditingBot('new')}>
+                  新增智能体
+                </Button>
+              )}
+              {tab === 'groups' && (
+                <Button variant="outline" icon={<IconRefreshOutlineRegular size={16} />} disabled={syncing || data.bots.length === 0} onClick={syncChats}>
+                  同步群聊
+                </Button>
+              )}
+              {tab === 'memory' && (
+                <Button
+                  variant="primary"
+                  icon={<IconPlusOutlineRegular size={16} />}
+                  disabled={data.bots.length === 0}
+                  onClick={() => {
+                    const defaultBotId =
+                      resolveEffectiveBotId(memoryBotId, data.bots) || data.bots[0]?.id
+                    setMemoryDialog({
+                      mode: 'create',
+                      ...(defaultBotId ? { defaultBotId } : {}),
+                    })
+                  }}
+                >
+                  新增记忆
+                </Button>
+              )}
+            </div>
+          </header>
 
-        <nav className="fb-tabs" aria-label="飞书桥接">
-          {TABS.map((t) => (
-            <button
-              key={t.key}
-              type="button"
-              className="fb-tab"
-              aria-current={tab === t.key ? 'page' : undefined}
-              onClick={() => setTab(t.key)}
-            >
-              {t.icon}
-              <span>{t.label}</span>
-            </button>
-          ))}
-        </nav>
+          <nav className="fb-tabs" aria-label="飞书桥接">
+            {TABS.map((t) => (
+              <button
+                key={t.key}
+                type="button"
+                className="fb-tab"
+                aria-current={tab === t.key ? 'page' : undefined}
+                onClick={() => setTab(t.key)}
+              >
+                {t.icon}
+                <span>{t.label}</span>
+              </button>
+            ))}
+          </nav>
 
-        {data.error && <div className="fb-card fb-empty">无法连接桥接服务：{data.error}</div>}
+          {data.error && <div className="fb-card fb-empty">无法连接桥接服务：{data.error}</div>}
+        </div>
 
         {tab === 'overview' && (
           <OverviewView

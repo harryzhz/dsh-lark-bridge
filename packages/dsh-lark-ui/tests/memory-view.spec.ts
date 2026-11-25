@@ -21,13 +21,20 @@ vi.mock('@deepseek-ai/dsh-client-ui-primitives', () => {
 
 import { bridgeApi, configureBridgeTransport } from '../src/api.js'
 import {
+  buildMemoryHierarchy,
+  collectTopMemoryTags,
   countMemoriesByHistoryStatus,
   countMemoriesByType,
-  filterMemoryEntries,
+  filterAndSortMemories,
+  findSupersededPredecessors,
+  isSameMemoryNav,
   MEMORY_HISTORY_FILTERS,
-  MEMORY_TYPE_FILTERS,
-  partitionActiveMemories,
+  MEMORY_SORT_OPTIONS,
+  MEMORY_TYPE_META,
+  MEMORY_TYPE_ORDER,
   resolveMemoryScopeLabel,
+  resolveNavHeading,
+  summarizeMemoryExcerpt,
 } from '../src/views/MemoryView.js'
 import type { MemoryEntry } from '../src/types.js'
 
@@ -50,7 +57,7 @@ function makeEntry(overrides: Partial<MemoryEntry> & Pick<MemoryEntry, 'id' | 't
   }
 }
 
-describe('MemoryView helpers & memory API transport', () => {
+describe('MemoryView three-column helpers & memory API transport', () => {
   const bots = [
     { id: 'bot-a', name: '研发助手' },
     { id: 'bot-b', name: '值班助手' },
@@ -71,6 +78,7 @@ describe('MemoryView helpers & memory API transport', () => {
       tags: ['release', 'ops'],
       pinned: true,
       recallCount: 4,
+      lastVerifiedAtMs: 3000,
     }),
     makeEntry({
       id: 'mem-2',
@@ -79,8 +87,10 @@ describe('MemoryView helpers & memory API transport', () => {
       scope: 'chat',
       scopeId: 'oc_dev',
       title: '群内回复结论先行',
-      content: '先给核心结论与数字，再补充推导细节。',
-      tags: ['style'],
+      content: '- 先给核心结论与数字\n- 再补充 `推导细节` 与 **验证结果**',
+      tags: ['style', 'ops'],
+      recallCount: 9,
+      lastVerifiedAtMs: 5000,
     }),
     makeEntry({
       id: 'mem-3',
@@ -91,6 +101,8 @@ describe('MemoryView helpers & memory API transport', () => {
       title: '采用双时态纠偏策略',
       content: '推翻旧结论时保留 superseded 审计链。',
       tags: ['memory'],
+      recallCount: 2,
+      lastVerifiedAtMs: 4000,
     }),
     makeEntry({
       id: 'mem-4',
@@ -100,8 +112,10 @@ describe('MemoryView helpers & memory API transport', () => {
       scopeId: 'oc_ops',
       title: '值班手册与看板入口',
       content: '参考 https://ops.example.com/runbook 排查超时告警。',
-      tags: ['runbook'],
+      tags: ['runbook', 'ops'],
       pinned: true,
+      recallCount: 15,
+      lastVerifiedAtMs: 2500,
     }),
     makeEntry({
       id: 'mem-5',
@@ -112,6 +126,7 @@ describe('MemoryView helpers & memory API transport', () => {
       content: '早期以 JSON 文件作为主存储。',
       status: 'superseded',
       supersededBy: 'mem-3',
+      supersededAtMs: 3800,
       supersedeReason: '2026-11-20 已迁移至 SQLite WAL',
     }),
     makeEntry({
@@ -126,10 +141,15 @@ describe('MemoryView helpers & memory API transport', () => {
     }),
   ]
 
-  it('resolves human-readable scope labels for bot, synced group, unknown chat, and workspace', () => {
-    expect(resolveMemoryScopeLabel(entries[0]!, groups).label).toBe('全局')
+  it('resolves human-readable scope labels with 全局记忆 at root', () => {
+    expect(resolveMemoryScopeLabel(entries[0]!, groups)).toEqual({
+      label: '全局记忆',
+      shortLabel: '全局记忆',
+      fullTitle: '智能体全局（该智能体所有群聊与私聊可见）',
+    })
     expect(resolveMemoryScopeLabel(entries[1]!, groups)).toEqual({
       label: '群聊 · 研发协作群',
+      shortLabel: '研发协作群',
       fullTitle: '研发协作群 (oc_dev)',
     })
     expect(
@@ -140,13 +160,36 @@ describe('MemoryView helpers & memory API transport', () => {
     ).toBe('群聊 · oc_unknown')
     expect(resolveMemoryScopeLabel(entries[2]!, groups)).toEqual({
       label: '工作区 · repo-alpha',
+      shortLabel: 'repo-alpha',
       fullTitle: '/Users/demo/repo-alpha',
     })
   })
 
-  it('computes accurate counts for active types and history statuses', () => {
+  it('builds scope hierarchy with global count, workspaces, and chats sorted deterministically', () => {
+    const active = entries.filter((e) => e.status === 'active')
+    const hierarchy = buildMemoryHierarchy(active, groups)
+    expect(hierarchy).toEqual({
+      globalCount: 1,
+      workspaceTotal: 1,
+      workspaces: [{ scopeId: '/Users/demo/repo-alpha', label: 'repo-alpha', fullTitle: '/Users/demo/repo-alpha', count: 1 }],
+      chatTotal: 2,
+      chats: [
+        { scopeId: 'oc_ops', label: '线上告警群', fullTitle: '线上告警群 (oc_ops)', count: 1 },
+        { scopeId: 'oc_dev', label: '研发协作群', fullTitle: '研发协作群 (oc_dev)', count: 1 },
+      ],
+    })
+  })
+
+  it('computes category counts, history counts, and top tags', () => {
     const active = entries.filter((e) => e.status === 'active')
     const history = entries.filter((e) => e.status !== 'active')
+    expect(MEMORY_TYPE_ORDER).toEqual(['feedback', 'user', 'project', 'reference'])
+    expect(MEMORY_TYPE_ORDER.map((t) => MEMORY_TYPE_META[t].label)).toEqual([
+      '纠偏与规范',
+      '用户偏好',
+      '项目决策',
+      '外部参考',
+    ])
     expect(countMemoriesByType(active)).toEqual({
       feedback: 1,
       user: 1,
@@ -157,110 +200,187 @@ describe('MemoryView helpers & memory API transport', () => {
       superseded: 1,
       archived: 1,
     })
-    expect(MEMORY_TYPE_FILTERS.map((f) => f.label)).toEqual(['全部', '纠偏', '偏好', '决策', '参考'])
     expect(MEMORY_HISTORY_FILTERS.map((f) => f.label)).toEqual(['全部', '已纠偏', '已归档'])
+    expect(MEMORY_SORT_OPTIONS.map((o) => o.label)).toEqual(['按优先级', '按最近核验', '按召回次数'])
+    expect(collectTopMemoryTags(active, 3)).toEqual([
+      { tag: 'ops', count: 3 },
+      { tag: 'memory', count: 1 },
+      { tag: 'release', count: 1 },
+    ])
   })
 
-  it('filters entries by bot scope, pane, semantic type, history status, and rich search fields', () => {
+  it('filters by nav node (all, pinned, type, scope, tag, history), search query, and sort modes', () => {
+    // Priority sort: pinned feedback (mem-1) -> pinned reference (mem-4) -> user (mem-2) -> project (mem-3)
     expect(
-      filterMemoryEntries({
+      filterAndSortMemories({
         entries,
         botId: '',
-        pane: 'active',
-        typeFilter: 'all',
+        nav: { kind: 'all' },
         historyFilter: 'all',
         query: '',
+        sortBy: 'priority',
         bots,
         groups,
       }).map((e) => e.id),
-    ).toEqual(['mem-1', 'mem-2', 'mem-3', 'mem-4'])
+    ).toEqual(['mem-1', 'mem-4', 'mem-2', 'mem-3'])
 
+    // Recent sort: mem-2 (5000) -> mem-3 (4000) -> mem-1 (3000) -> mem-4 (2500)
     expect(
-      filterMemoryEntries({
+      filterAndSortMemories({
+        entries,
+        botId: '',
+        nav: { kind: 'all' },
+        historyFilter: 'all',
+        query: '',
+        sortBy: 'recent',
+        bots,
+        groups,
+      }).map((e) => e.id),
+    ).toEqual(['mem-2', 'mem-3', 'mem-1', 'mem-4'])
+
+    // Recall sort: mem-4 (15) -> mem-2 (9) -> mem-1 (4) -> mem-3 (2)
+    expect(
+      filterAndSortMemories({
+        entries,
+        botId: '',
+        nav: { kind: 'all' },
+        historyFilter: 'all',
+        query: '',
+        sortBy: 'recall',
+        bots,
+        groups,
+      }).map((e) => e.id),
+    ).toEqual(['mem-4', 'mem-2', 'mem-1', 'mem-3'])
+
+    // Pinned view
+    expect(
+      filterAndSortMemories({
+        entries,
+        botId: '',
+        nav: { kind: 'pinned' },
+        historyFilter: 'all',
+        query: '',
+        sortBy: 'priority',
+        bots,
+        groups,
+      }).map((e) => e.id),
+    ).toEqual(['mem-1', 'mem-4'])
+
+    // Category view scoped to bot-a
+    expect(
+      filterAndSortMemories({
         entries,
         botId: 'bot-a',
-        pane: 'active',
-        typeFilter: 'user',
+        nav: { kind: 'type', type: 'user' },
         historyFilter: 'all',
         query: '',
+        sortBy: 'priority',
         bots,
         groups,
       }).map((e) => e.id),
     ).toEqual(['mem-2'])
 
-    // Matches resolved Chinese group name & tags & workspace leaf
+    // Scope hierarchy view: global / workspace leaf / chat leaf
     expect(
-      filterMemoryEntries({
+      filterAndSortMemories({
         entries,
         botId: '',
-        pane: 'active',
-        typeFilter: 'all',
+        nav: { kind: 'scope', scope: 'bot' },
         historyFilter: 'all',
-        query: '研发协作群',
+        query: '',
+        sortBy: 'priority',
         bots,
         groups,
       }).map((e) => e.id),
-    ).toEqual(['mem-2'])
+    ).toEqual(['mem-1'])
 
     expect(
-      filterMemoryEntries({
+      filterAndSortMemories({
         entries,
         botId: '',
-        pane: 'active',
-        typeFilter: 'all',
+        nav: { kind: 'scope', scope: 'workspace', scopeId: '/Users/demo/repo-alpha' },
         historyFilter: 'all',
-        query: 'repo-alpha',
+        query: '',
+        sortBy: 'priority',
         bots,
         groups,
       }).map((e) => e.id),
     ).toEqual(['mem-3'])
 
     expect(
-      filterMemoryEntries({
+      filterAndSortMemories({
         entries,
         botId: '',
-        pane: 'active',
-        typeFilter: 'all',
+        nav: { kind: 'scope', scope: 'chat', scopeId: 'oc_dev' },
         historyFilter: 'all',
-        query: 'runbook',
+        query: '',
+        sortBy: 'priority',
         bots,
         groups,
       }).map((e) => e.id),
-    ).toEqual(['mem-4'])
+    ).toEqual(['mem-2'])
 
-    // History pane filters by superseded/archived and matches supersedeReason
+    // Tag view + search query
     expect(
-      filterMemoryEntries({
+      filterAndSortMemories({
         entries,
         botId: '',
-        pane: 'history',
-        typeFilter: 'all',
+        nav: { kind: 'tag', tag: 'ops' },
+        historyFilter: 'all',
+        query: '研发协作群',
+        sortBy: 'priority',
+        bots,
+        groups,
+      }).map((e) => e.id),
+    ).toEqual(['mem-2'])
+
+    // History view with sub-status & supersedeReason search
+    expect(
+      filterAndSortMemories({
+        entries,
+        botId: '',
+        nav: { kind: 'history' },
         historyFilter: 'superseded',
         query: 'sqlite',
+        sortBy: 'recent',
         bots,
         groups,
       }).map((e) => e.id),
     ).toEqual(['mem-5'])
 
     expect(
-      filterMemoryEntries({
+      filterAndSortMemories({
         entries,
         botId: 'bot-b',
-        pane: 'history',
-        typeFilter: 'all',
+        nav: { kind: 'history' },
         historyFilter: 'archived',
         query: '',
+        sortBy: 'recent',
         bots,
         groups,
       }).map((e) => e.id),
     ).toEqual(['mem-6'])
   })
 
-  it('partitions active memories cleanly into pinned core memories and regular memories', () => {
-    const active = entries.filter((e) => e.status === 'active')
-    const { pinned, normal } = partitionActiveMemories(active)
-    expect(pinned.map((e) => e.id)).toEqual(['mem-1', 'mem-4'])
-    expect(normal.map((e) => e.id)).toEqual(['mem-2', 'mem-3'])
+  it('resolves nav headings, nav equality, clean excerpts, and superseded predecessors', () => {
+    expect(resolveNavHeading({ kind: 'all' }, groups)).toBe('全部有效')
+    expect(resolveNavHeading({ kind: 'scope', scope: 'bot' }, groups)).toBe('全局记忆')
+    expect(resolveNavHeading({ kind: 'scope', scope: 'workspace', scopeId: '/Users/demo/repo-alpha' }, groups)).toBe(
+      '工作区 · repo-alpha',
+    )
+    expect(resolveNavHeading({ kind: 'scope', scope: 'chat', scopeId: 'oc_dev' }, groups)).toBe('群聊 · 研发协作群')
+    expect(resolveNavHeading({ kind: 'tag', tag: 'ops' }, groups)).toBe('#ops')
+
+    expect(isSameMemoryNav({ kind: 'tag', tag: 'OPS' }, { kind: 'tag', tag: 'ops' })).toBe(true)
+    expect(
+      isSameMemoryNav(
+        { kind: 'scope', scope: 'chat', scopeId: 'oc_dev' },
+        { kind: 'scope', scope: 'chat' },
+      ),
+    ).toBe(false)
+
+    expect(summarizeMemoryExcerpt(entries[1]!.content)).toBe('先给核心结论与数字 再补充 推导细节 与 验证结果')
+    expect(findSupersededPredecessors('mem-3', entries).map((e) => e.id)).toEqual(['mem-5'])
   })
 
   it('supports bot-less memory listing and supersede RPC calls via bridgeApi', async () => {
