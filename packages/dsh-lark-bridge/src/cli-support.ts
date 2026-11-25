@@ -177,22 +177,51 @@ export function resolveBundledAssetPaths(baseDir = __dirname): BundledAssetPaths
   }
 }
 
+export function isDefaultDshHomeDataDir(dataDir: string, homeDir = homedir()): boolean {
+  return resolve(dataDir) === resolve(homeDir, '.dsh', 'lark-bridge')
+}
+
+export interface InstallLocalCliOptions {
+  readonly logger?: { info?: (msg: string) => void; warn?: (msg: string) => void }
+  readonly baseDir?: string
+  readonly homeDir?: string
+  readonly agentsHome?: string
+  /**
+   * Mirror CLI wrapper into `~/.local/bin` and Agent skill into `$AGENTS_HOME/skills/lark-bridge`.
+   * Defaults to `isDefaultDshHomeDataDir(dataDir, homeDir)` so secondary isolated `DSH_HOME`
+   * instances (e.g. E2E/staging) still install `<dataDir>/bin/lark-bridge` without overwriting
+   * host-global `~/.local/bin/lark-bridge` or `~/.agents/skills/lark-bridge`.
+   */
+  readonly syncGlobalPaths?: boolean
+}
+
 export function buildCliWrapperContent(options: {
   readonly endpointFile: string
   readonly cliEntry: string
   readonly execPath?: string
   readonly isElectron?: boolean
   readonly platform?: NodeJS.Platform
+  /**
+   * When true (used for host-global `~/.local/bin/lark-bridge`), yield to caller's `DSH_HOME`
+   * or `LARK_BRIDGE_ENDPOINT_FILE` so `DSH_HOME=~/.dsh-e2e lark-bridge ...` targets that home.
+   * When false (default, used for instance-local `<dataDir>/bin/lark-bridge`), bind to this
+   * instance unless `LARK_BRIDGE_ENDPOINT_FILE` is explicitly set.
+   */
+  readonly respectDshHome?: boolean
 }): { readonly fileName: string; readonly content: string } {
   const execPath = options.execPath ?? process.execPath
   const isElectron = options.isElectron ?? 'electron' in process.versions
   const platform = options.platform ?? process.platform
+  const respectDshHome = options.respectDshHome ?? false
 
   if (platform === 'win32') {
+    const endpointLine = respectDshHome
+      ? `if not defined LARK_BRIDGE_ENDPOINT_FILE if not defined DSH_HOME set "LARK_BRIDGE_ENDPOINT_FILE=${options.endpointFile}"`
+      : `if not defined LARK_BRIDGE_ENDPOINT_FILE set "LARK_BRIDGE_ENDPOINT_FILE=${options.endpointFile}"`
     const lines = [
       '@echo off',
       'setlocal',
-      `set "LARK_BRIDGE_ENDPOINT_FILE=${options.endpointFile}"`,
+      endpointLine,
       ...(isElectron ? ['set "ELECTRON_RUN_AS_NODE=1"'] : []),
       `"${execPath}" "${options.cliEntry}" %*`,
       '',
@@ -200,9 +229,21 @@ export function buildCliWrapperContent(options: {
     return { fileName: 'lark-bridge.cmd', content: lines.join('\r\n') }
   }
 
+  const endpointLines = respectDshHome
+    ? [
+        'if [ -z "${LARK_BRIDGE_ENDPOINT_FILE:-}" ] && [ -z "${DSH_HOME:-}" ]; then',
+        `  export LARK_BRIDGE_ENDPOINT_FILE="${options.endpointFile}"`,
+        'fi',
+      ]
+    : [
+        'if [ -z "${LARK_BRIDGE_ENDPOINT_FILE:-}" ]; then',
+        `  export LARK_BRIDGE_ENDPOINT_FILE="${options.endpointFile}"`,
+        'fi',
+      ]
+
   const lines = [
     '#!/bin/sh',
-    `export LARK_BRIDGE_ENDPOINT_FILE="${options.endpointFile}"`,
+    ...endpointLines,
     ...(isElectron ? ['export ELECTRON_RUN_AS_NODE=1'] : []),
     `exec "${execPath}" "${options.cliEntry}" "$@"`,
     '',
@@ -210,44 +251,91 @@ export function buildCliWrapperContent(options: {
   return { fileName: 'lark-bridge', content: lines.join('\n') }
 }
 
+function writeWrapperFile(
+  binDir: string,
+  fileName: string,
+  content: string,
+  logger?: { info?: (msg: string) => void; warn?: (msg: string) => void },
+): void {
+  try {
+    const targetBin = join(binDir, fileName)
+    if (!existsSync(targetBin) || readFileSync(targetBin, 'utf8') !== content) {
+      atomicWrite(targetBin, content, 0o755)
+      if (process.platform !== 'win32') {
+        chmodSync(targetBin, 0o755)
+      }
+    }
+  } catch (err) {
+    logger?.warn?.(
+      `[lark-bridge] skipped CLI wrapper in ${binDir}: ${err instanceof Error ? err.message : String(err)}`,
+    )
+  }
+}
+
 export function installLocalCliAndSkill(
   dataDir: string,
   endpointFile: string,
-  logger?: { info?: (msg: string) => void; warn?: (msg: string) => void },
+  loggerOrOptions?:
+    | { info?: (msg: string) => void; warn?: (msg: string) => void }
+    | InstallLocalCliOptions,
   baseDir?: string,
 ): void {
-  const { cliEntry, skillSource } = resolveBundledAssetPaths(baseDir)
+  const isOptionsBag =
+    Boolean(loggerOrOptions) &&
+    typeof loggerOrOptions === 'object' &&
+    ('syncGlobalPaths' in loggerOrOptions ||
+      'homeDir' in loggerOrOptions ||
+      'agentsHome' in loggerOrOptions ||
+      'baseDir' in loggerOrOptions ||
+      'logger' in loggerOrOptions)
+  const opts: InstallLocalCliOptions = isOptionsBag
+    ? (loggerOrOptions as InstallLocalCliOptions)
+    : {
+        logger: loggerOrOptions as
+          | { info?: (msg: string) => void; warn?: (msg: string) => void }
+          | undefined,
+        baseDir,
+      }
+
+  const homeDir = opts.homeDir ?? homedir()
+  const syncGlobal = opts.syncGlobalPaths ?? isDefaultDshHomeDataDir(dataDir, homeDir)
+  const { cliEntry, skillSource } = resolveBundledAssetPaths(opts.baseDir)
 
   if (cliEntry) {
-    const { fileName, content } = buildCliWrapperContent({ endpointFile, cliEntry })
-    for (const binDir of [join(dataDir, 'bin'), join(homedir(), '.local', 'bin')]) {
-      try {
-        const targetBin = join(binDir, fileName)
-        if (!existsSync(targetBin) || readFileSync(targetBin, 'utf8') !== content) {
-          atomicWrite(targetBin, content, 0o755)
-          if (process.platform !== 'win32') {
-            chmodSync(targetBin, 0o755)
-          }
-        }
-      } catch (err) {
-        logger?.warn?.(
-          `[lark-bridge] skipped CLI wrapper in ${binDir}: ${err instanceof Error ? err.message : String(err)}`,
-        )
-      }
+    const instanceWrapper = buildCliWrapperContent({
+      endpointFile,
+      cliEntry,
+      respectDshHome: false,
+    })
+    writeWrapperFile(join(dataDir, 'bin'), instanceWrapper.fileName, instanceWrapper.content, opts.logger)
+
+    if (syncGlobal) {
+      const globalWrapper = buildCliWrapperContent({
+        endpointFile,
+        cliEntry,
+        respectDshHome: true,
+      })
+      writeWrapperFile(
+        join(homeDir, '.local', 'bin'),
+        globalWrapper.fileName,
+        globalWrapper.content,
+        opts.logger,
+      )
     }
   }
 
-  if (skillSource) {
+  if (skillSource && syncGlobal) {
     try {
       const skillBody = readFileSync(skillSource, 'utf8')
-      const agentsHome = process.env.AGENTS_HOME?.trim() || join(homedir(), '.agents')
+      const agentsHome =
+        opts.agentsHome?.trim() || process.env.AGENTS_HOME?.trim() || join(homeDir, '.agents')
       const destSkill = join(agentsHome, 'skills', 'lark-bridge', 'SKILL.md')
       if (!existsSync(destSkill) || readFileSync(destSkill, 'utf8') !== skillBody) {
         atomicWrite(destSkill, skillBody)
-        logger?.info?.(`[lark-bridge] synced skill -> ${destSkill}`)
+        opts.logger?.info?.(`[lark-bridge] synced skill -> ${destSkill}`)
       }
     } catch (err) {
-      logger?.warn?.(
+      opts.logger?.warn?.(
         `[lark-bridge] failed to sync lark-bridge skill: ${err instanceof Error ? err.message : String(err)}`,
       )
     }

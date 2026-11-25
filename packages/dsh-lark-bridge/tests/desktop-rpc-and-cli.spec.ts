@@ -10,8 +10,11 @@ import { LarkBridgeManager } from '../src/bridge-manager.js'
 import {
   buildCliWrapperContent,
   ensureCliAuthEndpoint,
+  installLocalCliAndSkill,
+  isDefaultDshHomeDataDir,
   resolveBundledAssetPaths,
 } from '../src/cli-support.js'
+import { resolveDataDir } from '../src/storage/db-cli.js'
 import {
   LARK_BRIDGE_RPC_ENDPOINT,
   LARK_BRIDGE_RPC_PATH,
@@ -201,6 +204,72 @@ describe('Desktop Connection RPC handler & cross-platform CLI support', () => {
     const located = resolveBundledAssetPaths(join(pkgDir, 'dist'))
     expect(located.cliEntry).toBe(join(pkgDir, 'dist', 'lark-bridge.mjs'))
     expect(located.skillSource).toBe(join(pkgDir, 'skills', 'lark-bridge', 'SKILL.md'))
+  })
+
+  it('isolates non-default DSH_HOME instances from overwriting host-global CLI/skill paths', () => {
+    const fakeHome = makeTempDir()
+    const pkgDir = makeTempDir()
+    mkdirSync(join(pkgDir, 'dist'), { recursive: true })
+    mkdirSync(join(pkgDir, 'skills', 'lark-bridge'), { recursive: true })
+    writeFileSync(join(pkgDir, 'dist', 'lark-bridge.mjs'), '#!/usr/bin/env node\n', 'utf8')
+    writeFileSync(join(pkgDir, 'skills', 'lark-bridge', 'SKILL.md'), '# skill v1\n', 'utf8')
+
+    const defaultDataDir = join(fakeHome, '.dsh', 'lark-bridge')
+    const e2eDataDir = join(fakeHome, '.dsh-e2e', 'lark-bridge')
+    const defaultEndpoint = join(defaultDataDir, 'cli-endpoint.json')
+    const e2eEndpoint = join(e2eDataDir, 'cli-endpoint.json')
+
+    expect(isDefaultDshHomeDataDir(defaultDataDir, fakeHome)).toBe(true)
+    expect(isDefaultDshHomeDataDir(e2eDataDir, fakeHome)).toBe(false)
+
+    // 1. Default ~/.dsh instance installs both instance-local and host-global wrapper + skill.
+    installLocalCliAndSkill(defaultDataDir, defaultEndpoint, {
+      baseDir: join(pkgDir, 'dist'),
+      homeDir: fakeHome,
+      agentsHome: join(fakeHome, '.agents'),
+    })
+    const globalBin = join(fakeHome, '.local', 'bin', process.platform === 'win32' ? 'lark-bridge.cmd' : 'lark-bridge')
+    const defaultLocalBin = join(defaultDataDir, 'bin', process.platform === 'win32' ? 'lark-bridge.cmd' : 'lark-bridge')
+    const globalSkill = join(fakeHome, '.agents', 'skills', 'lark-bridge', 'SKILL.md')
+
+    expect(existsSync(defaultLocalBin)).toBe(true)
+    expect(existsSync(globalBin)).toBe(true)
+    expect(readFileSync(globalBin, 'utf8')).toContain('DSH_HOME')
+    expect(readFileSync(globalBin, 'utf8')).toContain(defaultEndpoint)
+    expect(readFileSync(defaultLocalBin, 'utf8')).not.toContain('DSH_HOME')
+    expect(readFileSync(globalSkill, 'utf8')).toBe('# skill v1\n')
+
+    // 2. Secondary isolated ~/.dsh-e2e instance installs only its own private bin, preserving global bin & skill.
+    writeFileSync(join(pkgDir, 'skills', 'lark-bridge', 'SKILL.md'), '# skill e2e-override\n', 'utf8')
+    installLocalCliAndSkill(e2eDataDir, e2eEndpoint, {
+      baseDir: join(pkgDir, 'dist'),
+      homeDir: fakeHome,
+      agentsHome: join(fakeHome, '.agents'),
+    })
+    const e2eLocalBin = join(e2eDataDir, 'bin', process.platform === 'win32' ? 'lark-bridge.cmd' : 'lark-bridge')
+    expect(existsSync(e2eLocalBin)).toBe(true)
+    expect(readFileSync(e2eLocalBin, 'utf8')).toContain(e2eEndpoint)
+    expect(readFileSync(globalBin, 'utf8')).toContain(defaultEndpoint)
+    expect(readFileSync(globalBin, 'utf8')).not.toContain(e2eEndpoint)
+    expect(readFileSync(globalSkill, 'utf8')).toBe('# skill v1\n')
+
+    // 3. resolveDataDir follows precedence: explicit flag > LARK_BRIDGE_ENDPOINT_FILE > DSH_HOME.
+    const prevEndpoint = process.env.LARK_BRIDGE_ENDPOINT_FILE
+    const prevDshHome = process.env.DSH_HOME
+    try {
+      process.env.DSH_HOME = join(fakeHome, '.dsh')
+      process.env.LARK_BRIDGE_ENDPOINT_FILE = e2eEndpoint
+      expect(resolveDataDir()).toBe(e2eDataDir)
+      expect(resolveDataDir(defaultDataDir)).toBe(defaultDataDir)
+      delete process.env.LARK_BRIDGE_ENDPOINT_FILE
+      process.env.DSH_HOME = join(fakeHome, '.dsh-e2e')
+      expect(resolveDataDir()).toBe(e2eDataDir)
+    } finally {
+      if (prevEndpoint === undefined) delete process.env.LARK_BRIDGE_ENDPOINT_FILE
+      else process.env.LARK_BRIDGE_ENDPOINT_FILE = prevEndpoint
+      if (prevDshHome === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = prevDshHome
+    }
   })
 
   it('issues loopback-only Desktop session handoff tickets without leaking launchToken and enforces strict defenses', async () => {

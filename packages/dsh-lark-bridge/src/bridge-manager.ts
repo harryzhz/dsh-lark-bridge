@@ -299,7 +299,12 @@ export class LarkBridgeManager {
 
     this.sessionViewer.attachToHost()
     if (this.config.autoInstallCliAndSkill !== false) {
-      installLocalCliAndSkill(this.config.dataDir, this.cliAuth.endpointFile, this.ctx.logger)
+      installLocalCliAndSkill(this.config.dataDir, this.cliAuth.endpointFile, {
+        logger: this.ctx.logger,
+        ...(this.config.syncGlobalCliAndSkill !== undefined
+          ? { syncGlobalPaths: this.config.syncGlobalCliAndSkill }
+          : {}),
+      })
     }
 
     this.schedules.start()

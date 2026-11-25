@@ -66,8 +66,11 @@ export { resolveDataDir }
 
 function resolveDataDir(rawFlag?: string): string {
   if (rawFlag && rawFlag.trim()) return resolve(rawFlag.trim())
-  const dshHome = process.env.DSH_HOME?.trim() || join(homedir(), '.dsh')
-  return join(dshHome, 'lark-bridge')
+  const endpointFile = process.env.LARK_BRIDGE_ENDPOINT_FILE?.trim()
+  if (endpointFile) return dirname(resolve(endpointFile))
+  const dshHome = process.env.DSH_HOME?.trim()
+  if (dshHome) return join(resolve(dshHome), 'lark-bridge')
+  return join(homedir(), '.dsh', 'lark-bridge')
 }
 
 function assertNotLiveLocked(dataDir: string, force: boolean, action: string): void {
