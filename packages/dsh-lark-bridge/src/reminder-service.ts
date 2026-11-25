@@ -11,11 +11,13 @@ import {
 } from '@deepseek-ai/dsh-session'
 import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
 import {
+  MAX_DELEGATION_CHAIN_WINDOW_MS,
   MAX_REMINDER_CHAIN_DEPTH,
   MAX_REMINDER_CHAIN_WINDOW_MS,
   MAX_REMINDER_PROMPT_CHARS,
   MAX_REMINDER_RESTART_RETRIES,
   MIN_CHAINED_REMINDER_BACKOFF_SECONDS,
+  MIN_DELEGATION_CHAIN_BACKOFF_SECONDS,
   RESTART_RETRY_DELAY_MS,
   STALE_REMINDER_RETRY_WINDOW_MS,
   applyQuietHoursDeferral,
@@ -26,11 +28,13 @@ import {
   expandWorkingDir,
   extractReminderTriggerOutput,
   leafDirectoryName,
+  normalizeReminderMentions,
   resolveEffectiveAgentRuntime,
   resolveEffectiveWorkingDir,
   resolveEffectiveWorkspaceName,
   type LarkBotConfig,
   type LarkReminderItem,
+  type LarkReminderKind,
   type LarkReminderMention,
   type LarkReminderOrigin,
   type LarkReminderWorktreeMeta,
@@ -54,6 +58,7 @@ export interface CreateReminderInput {
   readonly userName?: string
   readonly replyToMessageId?: string
   readonly deliveryMode?: 'thread' | 'chat' | 'p2p'
+  readonly kind?: LarkReminderKind
   readonly title: string
   readonly prompt: string
   readonly reason?: string
@@ -61,6 +66,7 @@ export interface CreateReminderInput {
   readonly afterSeconds?: number
   readonly workingDir?: string
   readonly mentions?: readonly LarkReminderMention[]
+  readonly ccMentions?: readonly LarkReminderMention[]
   readonly worktree?: LarkReminderWorktreeMeta
   readonly creationMode?: ReminderCreationMode
   readonly urgency?: ReminderUrgency
@@ -71,6 +77,8 @@ export interface UpdateReminderInput {
   readonly prompt?: string
   readonly reason?: string
   readonly at?: string
+  readonly mentions?: readonly LarkReminderMention[]
+  readonly ccMentions?: readonly LarkReminderMention[]
 }
 
 export interface ReminderServiceHost {
@@ -79,6 +87,7 @@ export interface ReminderServiceHost {
   readonly runtimes: RuntimeCatalog
   readonly workspaces: WorkspaceGrouping
   readonly onActivityChange?: () => void
+  resolveMemberName?(botId: string, chatId: string, openId: string): Promise<string | undefined>
   runTurn(agent: Agent, content: ContentBlock[]): Promise<string>
   sendOriginCard(
     origin: LarkReminderOrigin,
@@ -90,7 +99,7 @@ export interface ReminderServiceHost {
     readonly sessionId: string
     readonly markdown: string
     readonly isError: boolean
-  }): Promise<{ readonly messageId?: string }>
+  }): Promise<{ readonly messageId?: string; readonly deliveredMarkdown?: string }>
 }
 
 export function parseReminderTargetIso(
@@ -313,12 +322,47 @@ export class ProactiveReminderService {
     )
     const scheduledAt = quietAdjusted.scheduledAt
 
-    const chainMeta = this.validateReminderChainAndDedup({
+    const chainInfo = this.validateReminderChainAndDedup({
       sourceSessionId: input.sessionId?.trim() || undefined,
       origin,
       scheduledAt,
       nowMs,
+      ...(input.kind ? { requestedKind: input.kind } : {}),
     })
+    const { chainMeta, parent, effectiveKind } = chainInfo
+
+    const rawMentions =
+      input.mentions && input.mentions.length > 0 ? input.mentions : parent?.mentions
+    const rawCcMentions =
+      input.ccMentions !== undefined ? input.ccMentions : parent?.ccMentions
+    const normalizedMentions = normalizeReminderMentions(rawMentions)
+    const ownerIds = new Set(normalizedMentions.map((m) => m.openId))
+    const normalizedCcMentions = normalizeReminderMentions(rawCcMentions, ownerIds)
+
+    if (origin.chatType === 'group' && normalizedMentions.length === 0) {
+      throw new Error(
+        '群聊提醒必须至少指定一位主负责人（--mention <openId:姓名>），禁止无 @ 群发；请先运行 lark-bridge members --query <姓名> 查询本群成员真实 open_id',
+      )
+    }
+
+    const hydrateMentionNames = async (
+      list: readonly LarkReminderMention[],
+    ): Promise<LarkReminderMention[]> => {
+      if (origin.chatType !== 'group' || !origin.chatId || !this.host.resolveMemberName) {
+        return [...list]
+      }
+      return Promise.all(
+        list.map(async (m) => {
+          if (m.name.trim()) return m
+          const resolved = await this.host
+            .resolveMemberName!(origin.botId, origin.chatId!, m.openId)
+            .catch(() => undefined)
+          return resolved?.trim() ? { ...m, name: resolved.trim() } : m
+        }),
+      )
+    }
+    const hydratedMentions = await hydrateMentionNames(normalizedMentions)
+    const hydratedCcMentions = await hydrateMentionNames(normalizedCcMentions)
 
     const mode: ReminderCreationMode =
       input.creationMode ?? bot.experimental.proactive.reminderCreationMode ?? 'silent'
@@ -330,6 +374,7 @@ export class ProactiveReminderService {
 
     let item: LarkReminderItem = this.host.store.upsertReminder({
       id,
+      ...(effectiveKind === 'delegation' ? { kind: 'delegation' as const } : {}),
       title,
       prompt,
       ...(input.reason?.trim() ? { reason: input.reason.trim() } : {}),
@@ -337,7 +382,8 @@ export class ProactiveReminderService {
       status: initialStatus,
       origin,
       ...(validatedWorkingDir ? { workingDir: validatedWorkingDir } : {}),
-      mentions: input.mentions ?? [],
+      mentions: hydratedMentions,
+      ccMentions: hydratedCcMentions,
       ...(input.worktree ? { worktree: input.worktree } : {}),
       ...(urgency === 'high' ? { urgency } : {}),
       ...(quietAdjusted.deferredFrom ? { deferredFromScheduledAt: quietAdjusted.deferredFrom } : {}),
@@ -401,11 +447,26 @@ export class ProactiveReminderService {
     const nextStatus =
       existing.status === 'archived' && patch.at ? 'scheduled' : existing.status
 
+    const nextMentions =
+      patch.mentions !== undefined
+        ? normalizeReminderMentions(patch.mentions)
+        : existing.mentions
+    if (existing.origin.chatType === 'group' && patch.mentions !== undefined && nextMentions.length === 0) {
+      throw new Error('群聊提醒必须至少保留一位主负责人（--mention <openId:姓名>）')
+    }
+    const ownerIds = new Set(nextMentions.map((m) => m.openId))
+    const nextCcMentions =
+      patch.ccMentions !== undefined
+        ? normalizeReminderMentions(patch.ccMentions, ownerIds)
+        : normalizeReminderMentions(existing.ccMentions, ownerIds)
+
     const updated = this.host.store.upsertReminder({
       ...existing,
       ...(patch.title?.trim() ? { title: patch.title.trim() } : {}),
       ...(patch.prompt?.trim() ? { prompt: patch.prompt.trim() } : {}),
       ...(patch.reason !== undefined ? { reason: patch.reason.trim() || undefined } : {}),
+      mentions: nextMentions,
+      ccMentions: nextCcMentions,
       scheduledAt: nextScheduledAt,
       status: nextStatus,
       ...(nextStatus === 'scheduled' ? { resolution: undefined, archivedAtMs: undefined } : {}),
@@ -820,7 +881,7 @@ export class ProactiveReminderService {
         return silentArchived
       }
 
-      await this.host.deliverReminderOutput({
+      const delivered = await this.host.deliverReminderOutput({
         item,
         sessionId,
         markdown: output,
@@ -832,7 +893,7 @@ export class ProactiveReminderService {
         status: 'archived',
         resolution: 'reminded',
         lastSessionId: sessionId,
-        resultSummary: output.replace(/\s+/g, ' ').slice(0, 100),
+        resultSummary: (delivered.deliveredMarkdown ?? output).replace(/\s+/g, ' ').slice(0, 100),
         updatedAtMs: finishedMs,
         archivedAtMs: finishedMs,
       })
@@ -888,15 +949,18 @@ export class ProactiveReminderService {
     readonly origin: LarkReminderOrigin
     readonly scheduledAt: string
     readonly nowMs: number
-  }):
-    | {
-        readonly rootReminderId: string
-        readonly parentReminderId: string
-        readonly chainDepth: number
-        readonly chainStartedAtMs: number
-      }
-    | undefined {
-    const { sourceSessionId, origin, scheduledAt, nowMs } = input
+    readonly requestedKind?: LarkReminderKind
+  }): {
+    readonly parent?: LarkReminderItem
+    readonly effectiveKind: LarkReminderKind
+    readonly chainMeta?: {
+      readonly rootReminderId: string
+      readonly parentReminderId: string
+      readonly chainDepth: number
+      readonly chainStartedAtMs: number
+    }
+  } {
+    const { sourceSessionId, origin, scheduledAt, nowMs, requestedKind } = input
     let parent: LarkReminderItem | undefined
     if (sourceSessionId) {
       const activeId = this.activeReminderSessions.get(sourceSessionId)?.reminderId
@@ -904,6 +968,9 @@ export class ProactiveReminderService {
         ? this.host.store.getReminder(activeId)
         : this.host.store.listReminders('all').find((r) => r.lastSessionId === sourceSessionId)
     }
+
+    const effectiveKind: LarkReminderKind =
+      requestedKind === 'delegation' || parent?.kind === 'delegation' ? 'delegation' : 'general'
 
     let chainMeta:
       | {
@@ -925,18 +992,22 @@ export class ProactiveReminderService {
         )
       }
 
+      const maxWindowMs =
+        effectiveKind === 'delegation' ? MAX_DELEGATION_CHAIN_WINDOW_MS : MAX_REMINDER_CHAIN_WINDOW_MS
       const scheduledMs = Date.parse(scheduledAt)
-      if (scheduledMs - chainStartedAtMs > MAX_REMINDER_CHAIN_WINDOW_MS) {
-        const hours = Math.round(MAX_REMINDER_CHAIN_WINDOW_MS / 3_600_000)
+      if (scheduledMs - chainStartedAtMs > maxWindowMs) {
+        const hours = Math.round(maxWindowMs / 3_600_000)
         throw new Error(
           `该提醒链已超过最长自动续查窗口（${hours} 小时），禁止继续自动续查；请直接向负责人同步现状并由人工决定后续动作`,
         )
       }
 
+      const backoffSchedule =
+        effectiveKind === 'delegation'
+          ? MIN_DELEGATION_CHAIN_BACKOFF_SECONDS
+          : MIN_CHAINED_REMINDER_BACKOFF_SECONDS
       const minBackoffSec =
-        MIN_CHAINED_REMINDER_BACKOFF_SECONDS[
-          Math.min(nextDepth - 1, MIN_CHAINED_REMINDER_BACKOFF_SECONDS.length - 1)
-        ] ?? 1800
+        backoffSchedule[Math.min(nextDepth - 1, backoffSchedule.length - 1)] ?? 1800
       if (scheduledMs - nowMs < minBackoffSec * 1000 - 5_000) {
         const minMins = Math.round(minBackoffSec / 60)
         throw new Error(
@@ -970,7 +1041,11 @@ export class ProactiveReminderService {
       }
     }
 
-    return chainMeta
+    return {
+      ...(parent ? { parent } : {}),
+      effectiveKind,
+      ...(chainMeta ? { chainMeta } : {}),
+    }
   }
 
   private async resolveOrigin(input: CreateReminderInput): Promise<LarkReminderOrigin> {

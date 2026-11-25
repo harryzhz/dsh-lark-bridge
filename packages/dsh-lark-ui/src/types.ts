@@ -49,6 +49,7 @@ export interface BotDreamingConfig {
 export interface BotProactiveConfig {
   remindersEnabled: boolean
   reminderCreationMode: ReminderCreationMode
+  delegationFollowupEnabled?: boolean
   quietHoursEnabled?: boolean
   quietHoursStart?: string
   quietHoursEnd?: string
@@ -233,8 +234,11 @@ export interface ReminderWorktreeMeta {
   prUrl?: string
 }
 
+export type ReminderKind = 'general' | 'delegation'
+
 export interface ReminderItem {
   id: string
+  kind?: ReminderKind
   title: string
   prompt: string
   reason?: string
@@ -244,6 +248,7 @@ export interface ReminderItem {
   origin: ReminderOrigin
   workingDir?: string
   mentions: ReminderMention[]
+  ccMentions?: ReminderMention[]
   worktree?: ReminderWorktreeMeta
   confirmMessageId?: string
   lastSessionId?: string

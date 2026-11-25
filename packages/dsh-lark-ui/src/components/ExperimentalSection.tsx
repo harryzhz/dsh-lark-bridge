@@ -148,6 +148,19 @@ export function ExperimentalSection({
   const isRunning = runningNow || dreamState?.status === 'running'
   const statusView = buildDreamStatusPresentation(dreamState, runError, isRunning)
 
+  const defaultQuietWindowPatch = () => {
+    const isUntouchedLegacy =
+      !proactive.quietHoursEnabled &&
+      proactive.quietHoursStart === '23:00' &&
+      proactive.quietHoursEnd === '09:00'
+    return {
+      quietHoursStart:
+        !proactive.quietHoursStart || isUntouchedLegacy ? '00:00' : proactive.quietHoursStart,
+      quietHoursEnd:
+        !proactive.quietHoursEnd || isUntouchedLegacy ? '08:00' : proactive.quietHoursEnd,
+    }
+  }
+
   return (
     <>
       <GroupTitle>Dreaming 与长期记忆</GroupTitle>
@@ -297,6 +310,26 @@ export function ExperimentalSection({
             />
           </SettingRow>
           <SettingRow
+            title="委派事项跟进"
+            desc="静默记录群内 A @ B 明确指派，逾期提醒负责人并 cc 发起人（已回应未给结果自动顺延复查）"
+          >
+            <Switch
+              label="委派事项跟进"
+              checked={Boolean(proactive.delegationFollowupEnabled)}
+              onChange={(delegationFollowupEnabled) =>
+                patchProactive({
+                  delegationFollowupEnabled,
+                  ...(delegationFollowupEnabled && !proactive.quietHoursEnabled
+                    ? {
+                        quietHoursEnabled: true,
+                        ...defaultQuietWindowPatch(),
+                      }
+                    : {}),
+                })
+              }
+            />
+          </SettingRow>
+          <SettingRow
             title="夜间免打扰"
             desc="非紧急提醒落在静默时段时自动顺延至结束时刻"
           >
@@ -306,8 +339,7 @@ export function ExperimentalSection({
               onChange={(quietHoursEnabled) =>
                 patchProactive({
                   quietHoursEnabled,
-                  ...(proactive.quietHoursStart ? {} : { quietHoursStart: '23:00' }),
-                  ...(proactive.quietHoursEnd ? {} : { quietHoursEnd: '09:00' }),
+                  ...(quietHoursEnabled ? defaultQuietWindowPatch() : {}),
                 })
               }
             />
@@ -316,17 +348,17 @@ export function ExperimentalSection({
             <NestedSettings>
               <SettingRow title="开始时间" desc="本地时间（HH:MM）">
                 <TextField
-                  value={proactive.quietHoursStart || '23:00'}
+                  value={proactive.quietHoursStart || '00:00'}
                   onChange={(quietHoursStart) => patchProactive({ quietHoursStart })}
-                  placeholder="23:00"
+                  placeholder="00:00"
                   mono
                 />
               </SettingRow>
               <SettingRow title="结束时间" desc="本地时间（HH:MM）">
                 <TextField
-                  value={proactive.quietHoursEnd || '09:00'}
+                  value={proactive.quietHoursEnd || '08:00'}
                   onChange={(quietHoursEnd) => patchProactive({ quietHoursEnd })}
-                  placeholder="09:00"
+                  placeholder="08:00"
                   mono
                 />
               </SettingRow>

@@ -97,7 +97,9 @@ export function filterReminders(
       r.prompt.toLowerCase().includes(q) ||
       (r.origin.chatName ?? '').toLowerCase().includes(q) ||
       (r.origin.userName ?? '').toLowerCase().includes(q) ||
-      (r.origin.botName ?? '').toLowerCase().includes(q)
+      (r.origin.botName ?? '').toLowerCase().includes(q) ||
+      r.mentions.some((m) => (m.name || m.openId).toLowerCase().includes(q)) ||
+      (r.ccMentions ?? []).some((m) => (m.name || m.openId).toLowerCase().includes(q))
     )
   })
 }
@@ -286,6 +288,10 @@ function RemindersList({
           item.mentions.length > 0
             ? `@${item.mentions.map((m) => m.name || m.openId).join('、')}`
             : null
+        const ccText =
+          item.ccMentions && item.ccMentions.length > 0
+            ? `cc @${item.ccMentions.map((m) => m.name || m.openId).join('、')}`
+            : null
 
         return (
           <div key={item.id} className="fb-item">
@@ -294,6 +300,7 @@ function RemindersList({
               <div className="fb-item-title">
                 <span>{item.title}</span>
                 <Tag tone={badge.tone}>{badge.label}</Tag>
+                {item.kind === 'delegation' && <Tag tone="info">委派跟进</Tag>}
                 {item.urgency === 'high' && <Tag tone="warning">高优</Tag>}
                 <Tag tone="quiet">{formatReminderOrigin(item)}</Tag>
                 {item.worktree && <Tag tone="info">{`分支 · ${item.worktree.branch}`}</Tag>}
@@ -307,6 +314,7 @@ function RemindersList({
                     : null,
                   item.retryCount && item.retryCount > 0 ? `重启补跑 #${item.retryCount}` : null,
                   mentionText,
+                  ccText,
                   item.resultSummary || item.reason || null,
                 ]
                   .filter(Boolean)

@@ -7,6 +7,7 @@ import {
   buildReplyCard,
   buildRouteKey,
   expandWorkingDir,
+  formatReminderOutputWithMentions,
   resolveEffectiveAgentRuntime,
   resolveEffectiveCardBot,
   resolveEffectiveWorkingDir,
@@ -621,35 +622,66 @@ export class AgentToolFacade {
     await this.host.connections.transportFor(bot).patchMessageCard(messageId, card)
   }
 
+  async resolveMemberName(
+    botId: string,
+    _chatId: string,
+    openId: string,
+  ): Promise<string | undefined> {
+    const cleanOpenId = openId.trim()
+    if (!cleanOpenId) return undefined
+    const transport = this.host.connections.getTransport(botId)
+    if (!transport) return undefined
+    const cached = transport.getCachedUserName?.(cleanOpenId)?.trim()
+    if (cached && cached !== cleanOpenId) return cached
+    const summary = await transport.resolveUserSummary?.(cleanOpenId).catch(() => undefined)
+    const name = summary?.name?.trim()
+    return name && name !== cleanOpenId ? name : undefined
+  }
+
   async deliverReminderOutput(input: {
     readonly item: LarkReminderItem
     readonly sessionId: string
     readonly markdown: string
     readonly isError: boolean
-  }): Promise<{ readonly messageId?: string }> {
+  }): Promise<{ readonly messageId?: string; readonly deliveredMarkdown?: string }> {
     const { item, sessionId, isError } = input
     const bot = this.host.store.getBot(item.origin.botId)
     if (!bot) return {}
     const transport = this.host.connections.transportFor(bot)
 
-    let markdown = input.markdown.trim()
-    if (item.origin.chatType === 'group' && item.mentions.length > 0) {
-      const missingMentions = item.mentions.filter(
-        (m) => m.openId.trim() && !markdown.includes(`id="${m.openId.trim()}"`),
-      )
-      if (missingMentions.length > 0) {
-        const prefix = missingMentions
-          .map((m) => `<at id="${m.openId.trim()}">${m.name.trim() || ''}</at>`)
-          .join(' ')
-        markdown = `${prefix}\n\n${markdown}`
+    let effectiveMentions = item.mentions
+    if (
+      item.origin.chatType === 'group' &&
+      effectiveMentions.length === 0 &&
+      item.origin.chatId &&
+      !/<at\s+(?:user_id|id)\s*=/i.test(input.markdown) &&
+      bot.adminUsers.length > 0
+    ) {
+      // Best-effort safety net for legacy pre-upgrade group reminders created without mentions:
+      // if any configured bot admin is a member of the target group, mention them instead of sending bare.
+      const members = await this.host.connections
+        .listGroupMembers(bot.id, item.origin.chatId)
+        .catch(() => [])
+      const adminInGroup = members.find((m) => bot.adminUsers.includes(m.openId))
+      if (adminInGroup) {
+        effectiveMentions = [{ openId: adminInGroup.openId, name: adminInGroup.name }]
       }
     }
+
+    const markdown = formatReminderOutputWithMentions({
+      chatType: item.origin.chatType,
+      markdown: input.markdown,
+      mentions: effectiveMentions,
+      ccMentions: item.ccMentions,
+    })
 
     const cardTitle = isError
       ? `提醒事项异常 · ${item.title}`
       : item.worktree
         ? `主动跟进与代码待审 · ${item.title}`
-        : `主动跟进提醒 · ${item.title}`
+        : item.kind === 'delegation'
+          ? `委派事项跟进 · ${item.title}`
+          : `主动跟进提醒 · ${item.title}`
 
     if (item.origin.chatType === 'p2p' && item.origin.userOpenId) {
       const card = buildReplyCard({
@@ -665,7 +697,7 @@ export class AgentToolFacade {
         msgType: 'interactive',
         content: JSON.stringify(card),
       })
-      return { ...(sent.messageId ? { messageId: sent.messageId } : {}) }
+      return { ...(sent.messageId ? { messageId: sent.messageId } : {}), deliveredMarkdown: markdown }
     }
 
     if (!item.origin.chatId) return {}
@@ -720,6 +752,6 @@ export class AgentToolFacade {
         )
       }
     }
-    return { ...(sent.messageId ? { messageId: sent.messageId } : {}) }
+    return { ...(sent.messageId ? { messageId: sent.messageId } : {}), deliveredMarkdown: markdown }
   }
 }

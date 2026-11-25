@@ -148,6 +148,7 @@ export interface ActiveTurnRecord {
   readonly replyMode: GroupReplyMode
   readonly trigger: string
   readonly allowSilentEmptyReply: boolean
+  readonly silentOnly?: boolean
   readonly reactionId?: string
   readonly startedAtMs: number
   readonly transport: LarkBotTransport
@@ -1224,6 +1225,7 @@ export class InboundPipeline {
         replyMode: decision.replyMode,
         trigger: decision.trigger,
         allowSilentEmptyReply: decision.allowSilentEmptyReply,
+        ...(decision.silentOnly ? { silentOnly: true } : {}),
         ...(reactionId ? { reactionId } : {}),
         startedAtMs: startedMs,
         transport,
@@ -1424,6 +1426,7 @@ export class InboundPipeline {
                 autoCloseAfterCompletion: batchItems.every(
                   (i) => i.decision.autoCloseAfterCompletion,
                 ),
+                silentOnly: batchItems.every((i) => Boolean(i.decision.silentOnly)),
               }
 
         this.host.titleGuard.ensureCleanSessionTitle(
@@ -1489,10 +1492,10 @@ export class InboundPipeline {
                 this.touchActiveTurnActivity(item.activeTurn, timestampMs)
               }
             },
-            ...(effectiveDecision.sendIntermediateMessages
+            ...(effectiveDecision.sendIntermediateMessages && !effectiveDecision.silentOnly
               ? {
                   onIntermediate: async (stepText) => {
-                    if (isSilenced() || isBatchCancelled()) return
+                    if (effectiveDecision.silentOnly || isSilenced() || isBatchCancelled()) return
                     const sent = await this.deliverIntermediateReply(
                       bot,
                       transport,
@@ -1679,8 +1682,9 @@ export class InboundPipeline {
         })
     const hasFinalText = normalizedReply.length > 0
     const isSilentSkip =
-      (Boolean(silencedItem) || (effectiveDecision.allowSilentEmptyReply && !hasFinalText)) &&
-      intermediateSentCount === 0
+      Boolean(effectiveDecision.silentOnly) ||
+      ((Boolean(silencedItem) || (effectiveDecision.allowSilentEmptyReply && !hasFinalText)) &&
+        intermediateSentCount === 0)
 
     if (isSilentSkip) {
       this.host.store.recordMetric({
@@ -1692,7 +1696,9 @@ export class InboundPipeline {
         ? silencedItem.activeTurn.silenceReason
           ? `工具显式静默：${silencedItem.activeTurn.silenceReason}`
           : '工具显式静默，已跳过回复'
-        : '判断无需回复，已静默'
+        : effectiveDecision.silentOnly
+          ? '委派跟进后台观察完成，已静默跳过回复'
+          : '判断无需回复，已静默'
       this.host.store.recordEvent({
         botId: bot.id,
         chatId: latestItem.msg.chatId,
@@ -2242,7 +2248,10 @@ export class InboundPipeline {
 
     if (this.host.isDisposed()) return { handled: true }
 
-    if (result.verdict.action === 'silent') {
+    if (
+      result.verdict.action === 'silent' ||
+      (decision.silentOnly && result.verdict.action === 'quick_reply')
+    ) {
       this.host.store.recordMetric({ botId: bot.id, chatId: msg.chatId, kind: 'silent_skip' })
       this.host.store.recordEvent({
         botId: bot.id,
@@ -2258,7 +2267,12 @@ export class InboundPipeline {
       return { handled: true }
     }
 
-    if (result.verdict.action === 'quick_reply' && !hasActiveWorker && result.verdict.replyText) {
+    if (
+      !decision.silentOnly &&
+      result.verdict.action === 'quick_reply' &&
+      !hasActiveWorker &&
+      result.verdict.replyText
+    ) {
       const replyText = normalizeReplyText(result.verdict.replyText, { allowSilentSentinel: true })
       if (replyText) {
         const sent = await transport.sendReply({
@@ -2618,9 +2632,10 @@ export class InboundPipeline {
   }
 
   private shouldNotifyInterruptedTurn(
-    turn: Pick<LarkPendingTurn, 'trigger' | 'allowSilentEmptyReply'>,
+    turn: Pick<LarkPendingTurn, 'trigger' | 'allowSilentEmptyReply'> & { readonly silentOnly?: boolean },
     intermediateSentCount = 0,
   ): boolean {
+    if (turn.silentOnly) return false
     if (turn.trigger === 'listener' && turn.allowSilentEmptyReply && intermediateSentCount === 0) {
       return false
     }

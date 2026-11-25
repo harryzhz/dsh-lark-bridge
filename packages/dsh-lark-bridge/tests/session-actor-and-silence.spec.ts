@@ -506,4 +506,97 @@ describe('SessionActor invariants, structured silence control & SessionTitleGuar
     dispose()
     store.close()
   })
+
+  it('hard-suppresses Feishu replies and reactions for silentOnly A @ B delegation observation even when agent emits prose', async () => {
+    const dir = makeTempDir()
+    const store = new LarkBridgeStore(dir)
+    const runtime = createMockRuntimeCtx()
+    const manager = new LarkBridgeManager(
+      runtime.ctx,
+      {
+        dataDir: dir,
+        publicBaseUrl: 'http://127.0.0.1:3880',
+        idleSweepIntervalMs: 0,
+        maxAuditEvents: 200,
+        autoInstallCliAndSkill: false,
+      },
+      store,
+    )
+
+    store.upsertBot({
+      id: 'bot-del-obs',
+      name: 'ObserverBot',
+      larkAppId: 'cli_del_obs',
+      larkAppSecret: 'mock-secret-value',
+      defaultWorkingDir: dir,
+      agentPreset: 'standard',
+      receivedReactionEmoji: 'OnIt',
+      experimental: {
+        dreaming: { enabled: false },
+        proactive: {
+          remindersEnabled: true,
+          delegationFollowupEnabled: true,
+          reminderCreationMode: 'silent',
+        },
+      },
+    })
+    store.upsertGroup({
+      botId: 'bot-del-obs',
+      chatId: 'oc_del_chat',
+      chatName: '协作群',
+      enabled: true,
+    })
+
+    const addReaction = vi.fn().mockResolvedValue('rx_should_not_exist')
+    const sendReply = vi.fn().mockResolvedValue({ messageId: 'om_should_not_send' })
+    const fakeTransport = {
+      state: { botOpenId: 'ou_bot_obs', connected: true },
+      addReaction,
+      removeReaction: vi.fn().mockResolvedValue(undefined),
+      sendReply,
+    } as unknown as LarkBotTransport
+
+    let observedSessionId = ''
+    const turnEntered = new Promise<void>((resolve) => {
+      runtime.setOnTurnStarted((sid) => {
+        observedSessionId = sid
+        resolve()
+      })
+    })
+
+    const msg: InboundLarkMessage = {
+      botId: 'bot-del-obs',
+      larkAppId: 'cli_del_obs',
+      botOpenId: 'ou_bot_obs',
+      messageId: 'om_del_in_1',
+      chatId: 'oc_del_chat',
+      chatType: 'group',
+      msgType: 'text',
+      senderOpenId: 'ou_alex',
+      senderType: 'user',
+      text: '@_user_1 帮我评审一下这个 PR',
+      rawContent: '{"text":"@_user_1 帮我评审一下这个 PR"}',
+      mentions: [{ key: '@_user_1', openId: 'ou_bob', name: 'Bob' }],
+      imageKeys: [],
+      createTimeMs: Date.now(),
+    }
+
+    const turnPromise = manager.inbound.handleInbound('bot-del-obs', fakeTransport, msg)
+    await turnEntered
+
+    // Even if the model forgets to call `lark-bridge silence` and emits text,
+    // silentOnly guarantees zero emoji reaction, zero chat reply, and clean session disposal!
+    runtime.finishCurrentTurn('好的，我已经在后台帮你记下提醒了。')
+    await turnPromise
+
+    expect(addReaction).not.toHaveBeenCalled()
+    expect(sendReply).not.toHaveBeenCalled()
+    expect(runtime.disposedSessions).toContain(observedSessionId)
+    expect(store.listBindings()).toHaveLength(0)
+    const silentEvent = store.listEvents(10).find((e) => e.kind === 'silent_skip')
+    expect(silentEvent?.summary).toContain('委派跟进后台观察完成')
+
+    await manager.stop()
+    store.close()
+  })
 })

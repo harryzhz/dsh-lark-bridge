@@ -108,15 +108,16 @@ export const ReminderCreationModeSchema = z.enum(['silent', 'notify', 'confirm']
 export const BotProactiveConfigSchema = z.object({
   remindersEnabled: z.boolean().default(false),
   reminderCreationMode: ReminderCreationModeSchema.default('silent'),
+  delegationFollowupEnabled: z.boolean().default(false),
   quietHoursEnabled: z.boolean().default(false),
   quietHoursStart: z
     .string()
-    .default('23:00')
-    .transform((v) => normalizeHHMM(v, '23:00')),
+    .default('00:00')
+    .transform((v) => normalizeHHMM(v, '00:00')),
   quietHoursEnd: z
     .string()
-    .default('09:00')
-    .transform((v) => normalizeHHMM(v, '09:00')),
+    .default('08:00')
+    .transform((v) => normalizeHHMM(v, '08:00')),
   autoCodeEnabled: z.boolean().default(false),
   branchPrefix: z
     .string()
@@ -127,9 +128,10 @@ export const BotProactiveConfigSchema = z.object({
 export const DEFAULT_BOT_PROACTIVE_CONFIG: z.output<typeof BotProactiveConfigSchema> = {
   remindersEnabled: false,
   reminderCreationMode: 'silent',
+  delegationFollowupEnabled: false,
   quietHoursEnabled: false,
-  quietHoursStart: '23:00',
-  quietHoursEnd: '09:00',
+  quietHoursStart: '00:00',
+  quietHoursEnd: '08:00',
   autoCodeEnabled: false,
   branchPrefix: 'agent/',
 }
@@ -773,6 +775,8 @@ export type RoutingDecision =
       readonly receivedReactionEmoji?: string
       readonly allowSilentEmptyReply: boolean
       readonly autoCloseAfterCompletion: boolean
+      readonly silentOnly?: boolean
+      readonly delegationFollowup?: boolean
       readonly idleCloseMs?: number
       readonly roleReminder?: string
       readonly turnReminders: readonly string[]

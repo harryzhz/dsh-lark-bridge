@@ -15,6 +15,7 @@ import {
   ROUTE_MESSAGE_TOOL_SCHEMA,
   buildTriageSystemPrompt,
   buildTriageUserMessage,
+  extractPeerUserMentions,
   parseTriageVerdict,
   type AgentRoutingDecision,
   type EffectiveRouterConfig,
@@ -802,6 +803,7 @@ export class LlmTriageService {
       toolCalls: run.toolCalls,
       text: run.assembledText,
       hasActiveWorker: input.hasActiveWorker,
+      ...(input.decision.silentOnly ? { silentOnly: true } : {}),
     })
     const triageSessionId = await this.recorder?.record({
       bot: input.bot,
@@ -865,6 +867,15 @@ export class LlmTriageService {
           ? input.bot.role.systemPrompt.trim()
           : ''
 
+    const delegationFollowupEnabled = Boolean(
+      input.bot.experimental.proactive.remindersEnabled &&
+        input.bot.experimental.proactive.delegationFollowupEnabled,
+    )
+    const silentOnly = Boolean(input.decision.silentOnly)
+    const peerMentions = extractPeerUserMentions(input.msg)
+      .map((m) => m.name?.trim() || m.openId?.trim() || '')
+      .filter(Boolean)
+
     const system = buildTriageSystemPrompt({
       botName: input.bot.name,
       ...(roleName ? { botRoleName: roleName } : {}),
@@ -873,12 +884,14 @@ export class LlmTriageService {
       hasActiveWorker: input.hasActiveWorker,
       trigger: input.decision.trigger,
       ...(input.decision.listenerName ? { listenerName: input.decision.listenerName } : {}),
-      ...(input.decision.trigger === 'listener' && input.group?.listener?.prompt
+      ...(input.decision.trigger === 'listener' && !silentOnly && input.group?.listener?.prompt
         ? { listenerPrompt: input.group.listener.prompt }
         : {}),
       ...(input.routerConfig.systemPrompt
         ? { systemPromptTemplate: input.routerConfig.systemPrompt }
         : {}),
+      ...(delegationFollowupEnabled ? { delegationFollowupEnabled: true } : {}),
+      ...(silentOnly ? { silentOnly: true } : {}),
     })
 
     const userText = buildTriageUserMessage({
@@ -889,6 +902,7 @@ export class LlmTriageService {
       trigger: input.decision.trigger,
       ...(input.decision.listenerName ? { listenerName: input.decision.listenerName } : {}),
       ...(input.senderName ? { senderName: input.senderName } : {}),
+      ...(peerMentions.length > 0 ? { peerMentions } : {}),
       senderType: input.msg.senderType,
       msgType: input.msg.msgType,
       userText: input.decision.userText,
@@ -896,6 +910,8 @@ export class LlmTriageService {
       ...(attachedImageCount > 0 ? { attachedImageCount } : {}),
       hasActiveWorker: input.hasActiveWorker,
       workerBusy: input.workerBusy,
+      ...(silentOnly ? { silentOnly: true } : {}),
+      ...(delegationFollowupEnabled ? { delegationFollowupEnabled: true } : {}),
       ...(lastWorkerReply ? { lastWorkerReply } : {}),
       recentMessages,
       recentMessageCount: input.routerConfig.recentMessageCount,

@@ -90,23 +90,35 @@ lark-bridge message om_xxx --raw --download-dir ./.dsh-lark-bridge/attachments/q
 
 ### 5. 一次性跟进提醒（`reminder`）与隔离工作树（`worktree`）
 
-`reminder` 单次到期触发后自动归档，默认继承创建会话的群聊/话题或私聊路由；创建前先 `reminder list` 去重，系统硬限制单链最多续查 3 次且总跨度 ≤ 6 小时、单条指令 ≤ 2400 字（禁止用作无限小时级轮询）：
+`reminder` 单次到期触发后自动归档，默认继承创建会话的群聊/话题或私聊路由；**群聊提醒必须至少指定一位主负责人（`--mention <open_id:负责人>`），禁止无 `@` 群发**，有需要周知的发起人或关注人时使用 `--cc <open_id:抄送人>`（可重复传参）。创建前先 `reminder list` 去重，系统硬限制单链最多续查 3 次（普通提醒总跨度 ≤ 6 小时、委派跟进 `--kind delegation` 总跨度 ≤ 24 小时）、单条指令 ≤ 2400 字（禁止用作无限小时级轮询）：
 
 ```bash
 # 查看待触发（active）或已归档（archived）提醒事项
 lark-bridge reminder list [--status active|archived|all]
 
-# 按时间点核查（已完成或已延期时务必约定调 lark-bridge silence 静默）
+# 按时间点核查（群聊必填 --mention 负责人，可选 --cc 抄送关注人）
 lark-bridge reminder create \
   --title "核查下午发版结果" \
   --at "<YYYY-MM-DD HH:mm>" \
   --mention "<open_id>:<负责人>" \
-  --prompt '运行 lark-bridge history --limit 20 并检查部署状态：已完成或群内已同步延期则调用 lark-bridge silence --reason "已闭环" 静默；未完成则简短提醒负责人。'
+  [--cc "<open_id>:<关注人>"] \
+  --prompt '运行 lark-bridge history --limit 20 并检查部署状态：已完成或群内已同步延期则调用 lark-bridge silence --reason "已闭环" 静默；未完成则简短提醒负责人并 cc 关注人。'
+
+# 群内 A@B 委派事项跟进（--kind delegation；无明确时间则紧急故障 600s、常规协作/CR/审批 3600s）
+lark-bridge reminder create \
+  --kind delegation \
+  --title "跟进 PR 评审与合入" \
+  --after 3600 \
+  --mention "<B_open_id>:<负责人B>" \
+  --cc "<A_open_id>:<发起人A>" \
+  --prompt '同时运行 lark-bridge history --limit 20 与 lark-bridge history --thread none --limit 20 检查进展：已闭环则调 lark-bridge silence 静默；若 B 已回应（如“收到/在看”）但尚未给出结果则顺延复查并静默；仍无进展则温和提醒 B 并 cc A。'
 
 # 按相对秒数复查（P0 紧急止损复查需穿透免打扰时加 --urgency high）
 lark-bridge reminder create \
   --title "复查降级恢复情况" \
   --after 1800 \
+  --mention "<open_id>:<值班负责人>" \
+  [--cc "<open_id>:<关注人>"] \
   [--urgency high] \
   --prompt '检查近 30 分钟错误率与群内通报：指标已恢复且无遗留开关则调用 lark-bridge silence --reason "指标已恢复" 静默；异常持续则同步数据提醒值班人。'
 
@@ -114,6 +126,7 @@ lark-bridge reminder create \
 lark-bridge reminder create \
   --title "提审修复分支" \
   --at "<YYYY-MM-DD 10:00>" \
+  --mention "<open_id>:<评审负责人>" \
   --worktree "<workingDir>/.worktrees/<slug>" \
   --branch "agent/<slug>" \
   [--pr "<prUrl>"] \

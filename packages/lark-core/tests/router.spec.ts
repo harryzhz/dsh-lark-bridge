@@ -29,6 +29,7 @@ import {
   extractReminderTriggerOutput,
   formatMarkdownForLarkCard,
   formatMarkdownForLarkPost,
+  formatReminderOutputWithMentions,
   generateDefaultBotIconPng,
   hasInjectedPromptMarkup,
   hasVisibleText,
@@ -757,9 +758,10 @@ describe('decideLarkRouting, <user_message> format, memberOverrides & title inte
     expect(defaultBot.experimental.proactive).toEqual({
       remindersEnabled: false,
       reminderCreationMode: 'silent',
+      delegationFollowupEnabled: false,
       quietHoursEnabled: false,
-      quietHoursStart: '23:00',
-      quietHoursEnd: '09:00',
+      quietHoursStart: '00:00',
+      quietHoursEnd: '08:00',
       autoCodeEnabled: false,
       branchPrefix: 'agent/',
     })
@@ -915,9 +917,10 @@ describe('decideLarkRouting, <user_message> format, memberOverrides & title inte
     expect(triggerPrompt).toContain('<system_reminder>\n<reminder_trigger reminder_id="rem-1"')
     expect(triggerPrompt).not.toContain('lark_reminder_trigger')
     expect(triggerPrompt).toContain('bot_id="dsh-bot"')
-    expect(triggerPrompt).toContain('- 关注人员：Alex Chen(open_id="ou_owner")')
+    expect(triggerPrompt).toContain('- 主负责人（必 @）：Alex Chen(open_id="ou_owner")')
     expect(triggerPrompt).not.toContain('- 群成员：')
     expect(triggerPrompt).toContain('lark-bridge members --query <姓名>')
+    expect(triggerPrompt).toContain('群聊提醒严禁无 @ 群发')
     expect(triggerPrompt).toContain('rem-sib-10「同源事项 10」')
     expect(triggerPrompt).not.toContain('rem-sib-11')
     expect(triggerPrompt).toContain('另有 2 条待触发')
@@ -959,6 +962,189 @@ describe('decideLarkRouting, <user_message> format, memberOverrides & title inte
       buildReminderNoticeCard(item, '2026-11-22 17:00'),
     )
     expect(noticeCardStr).toContain('lark_reminder_cancel')
+    expect(noticeCardStr).toContain('Alex Chen')
+
+    // Delegation reminder prompt, proactive directive & mention/cc delivery formatting
+    const delegationProactive = composeProactiveSessionReminder({
+      botId: bot.id,
+      workingDir: workDir,
+      config: {
+        ...bot.experimental.proactive,
+        remindersEnabled: true,
+        delegationFollowupEnabled: true,
+        quietHoursEnabled: true,
+        quietHoursStart: '00:00',
+        quietHoursEnd: '08:00',
+      },
+    })
+    expect(delegationProactive).toContain('delegation="on"')
+    expect(delegationProactive).toContain('--kind delegation')
+    expect(delegationProactive).toContain('紧急故障 10m')
+    expect(delegationProactive).toContain('免打扰 00:00–08:00')
+
+    const delegationItem = LarkReminderItemSchema.parse({
+      ...item,
+      id: 'rem-del-1',
+      kind: 'delegation',
+      mentions: [{ openId: 'ou_bob', name: 'Bob' }],
+      ccMentions: [{ openId: 'ou_alex', name: 'Alex' }],
+    })
+    const delegationTrigger = composeReminderTriggerPrompt({
+      item: delegationItem,
+      currentLocalTimeStr: '2026-11-22 17:00',
+    })
+    expect(delegationTrigger).toContain('kind="delegation"')
+    expect(delegationTrigger).toContain('- 主负责人（必 @）：Bob(open_id="ou_bob")')
+    expect(delegationTrigger).toContain('- 抄送关注（cc）：Alex(open_id="ou_alex")')
+    expect(delegationTrigger).toContain('lark-bridge history --thread none --limit 20')
+    expect(delegationTrigger).toContain('尚未给出最终结果')
+
+    expect(
+      formatReminderOutputWithMentions({
+        chatType: 'group',
+        markdown: '登录超时排查暂未看到进展，方便确认下当前状态吗？',
+        mentions: [{ openId: 'ou_bob', name: 'Bob' }],
+        ccMentions: [
+          { openId: 'ou_bob', name: 'Bob' },
+          { openId: 'ou_alex', name: 'Alex' },
+        ],
+      }),
+    ).toBe(
+      '<at id="ou_bob">Bob</at>\n\n登录超时排查暂未看到进展，方便确认下当前状态吗？\n\ncc <at id="ou_alex">Alex</at>',
+    )
+
+    expect(
+      formatReminderOutputWithMentions({
+        chatType: 'group',
+        markdown: '<at id="ou_bob">Bob</at> 麻烦同步下 PR 进展（cc <at id="ou_alex">Alex</at>）',
+        mentions: [{ openId: 'ou_bob', name: 'Bob' }],
+        ccMentions: [{ openId: 'ou_alex', name: 'Alex' }],
+      }),
+    ).toBe('<at id="ou_bob">Bob</at> 麻烦同步下 PR 进展（cc <at id="ou_alex">Alex</at>）')
+
+    expect(
+      formatReminderOutputWithMentions({
+        chatType: 'p2p',
+        markdown: '私聊提醒内容',
+        mentions: [{ openId: 'ou_bob', name: 'Bob' }],
+        ccMentions: [{ openId: 'ou_alex', name: 'Alex' }],
+      }),
+    ).toBe('私聊提醒内容')
+  })
+
+  it('routes A @ B peer delegation messages silently when bot delegationFollowupEnabled is on, without affecting disabled/self/all/bare mentions', () => {
+    const bot = createBot({
+      experimental: {
+        dreaming: { enabled: false },
+        proactive: {
+          remindersEnabled: true,
+          delegationFollowupEnabled: true,
+          reminderCreationMode: 'silent',
+        },
+      },
+    })
+    const offBot = createBot({
+      experimental: {
+        dreaming: { enabled: false },
+        proactive: {
+          remindersEnabled: true,
+          delegationFollowupEnabled: false,
+          reminderCreationMode: 'silent',
+        },
+      },
+    })
+
+    const peerDelegationMsg = createMessage({
+      messageId: 'om_del_1',
+      senderOpenId: 'ou_alex',
+      text: '@_user_1 帮我看下这个 PR 能不能合入',
+      mentions: [{ key: '@_user_1', openId: 'ou_bob', name: 'Bob' }],
+    })
+
+    // Disabled bot ignores peer mentions when no group listener is configured
+    expect(
+      decideLarkRouting(offBot, peerDelegationMsg, { hasActiveSessionForRoute: () => false }),
+    ).toEqual({ action: 'ignore', reason: 'no_matching_rule' })
+
+    // Enabled bot routes A @ B to Branch 6 silent-only delegation observer (no reaction, no chat reply)
+    const d1 = decideLarkRouting(bot, peerDelegationMsg, { hasActiveSessionForRoute: () => false })
+    expect(d1.action).toBe('agent')
+    if (d1.action === 'agent') {
+      expect(d1.trigger).toBe('listener')
+      expect(d1.sessionMode).toBe('per_message')
+      expect(d1.replyMode).toBe('new-topic')
+      expect(d1.silentOnly).toBe(true)
+      expect(d1.delegationFollowup).toBe(true)
+      expect(d1.receivedReactionEmoji).toBeUndefined()
+      expect(d1.listenerName).toBe('委派事项跟进')
+      expect(d1.promptText).toContain('<delegation_followup mode="silent_only"')
+    }
+
+    // Self-mention, @all, bare @B without text, and bot sender do NOT trigger Branch 6
+    const selfMsg = createMessage({
+      senderOpenId: 'ou_alex',
+      text: '@_user_1 记个笔记',
+      mentions: [{ key: '@_user_1', openId: 'ou_alex', name: 'Alex' }],
+    })
+    expect(decideLarkRouting(bot, selfMsg, { hasActiveSessionForRoute: () => false }).action).toBe('ignore')
+
+    const allMsg = createMessage({
+      senderOpenId: 'ou_alex',
+      text: '@_all 大家下午三点开会',
+      mentions: [{ key: '@_all', openId: 'all', name: '所有人' }],
+    })
+    expect(decideLarkRouting(bot, allMsg, { hasActiveSessionForRoute: () => false }).action).toBe('ignore')
+
+    const bareMsg = createMessage({
+      senderOpenId: 'ou_alex',
+      text: '@_user_1',
+      mentions: [{ key: '@_user_1', openId: 'ou_bob', name: 'Bob' }],
+    })
+    expect(decideLarkRouting(bot, bareMsg, { hasActiveSessionForRoute: () => false }).action).toBe('ignore')
+
+    // Group with top_level listener: reply-level A @ B misses listener -> cleanly falls through to Branch 6!
+    const topLevelGroup = LarkGroupConfigSchema.parse({
+      key: `${bot.id}:oc_team_dev`,
+      botId: bot.id,
+      chatId: 'oc_team_dev',
+      enabled: true,
+      listener: {
+        enabled: true,
+        name: '告警排查',
+        prompt: '仅响应告警',
+        scope: 'top_level',
+      },
+    })
+    const replyDelegationMsg = createMessage({
+      messageId: 'om_del_reply',
+      rootId: 'om_alert_root',
+      parentId: 'om_alert_root',
+      senderOpenId: 'ou_alex',
+      text: '@_user_1 这个限流告警麻烦看下',
+      mentions: [{ key: '@_user_1', openId: 'ou_bob', name: 'Bob' }],
+    })
+    const dReply = decideLarkRouting(bot, replyDelegationMsg, {
+      groupConfig: topLevelGroup,
+      hasActiveSessionForRoute: () => false,
+    })
+    expect(dReply.action).toBe('agent')
+    if (dReply.action === 'agent') {
+      expect(dReply.silentOnly).toBe(true)
+      expect(dReply.delegationFollowup).toBe(true)
+      expect(dReply.promptText).toContain('<delegation_followup mode="silent_only"')
+    }
+
+    // Group with matched listener: appends assist delegation guidance without forcing silentOnly
+    const dMatchedListener = decideLarkRouting(bot, peerDelegationMsg, {
+      groupConfig: topLevelGroup,
+      hasActiveSessionForRoute: () => false,
+    })
+    expect(dMatchedListener.action).toBe('agent')
+    if (dMatchedListener.action === 'agent') {
+      expect(dMatchedListener.silentOnly).toBeUndefined()
+      expect(dMatchedListener.delegationFollowup).toBe(true)
+      expect(dMatchedListener.promptText).toContain('<delegation_followup mode="assist"')
+    }
   })
 
   it('converts Markdown into Lark post (`tag: md`) and Card 2.0 markdown while fixing malformed bold & preserving code/URLs', () => {

@@ -629,7 +629,8 @@ export class SessionCoordinator {
         setup: async (agentCtx, agent) => {
           await launch.mountPreset(agentCtx, agent)
           const isP2p = msg.chatType === 'p2p'
-          const replyAnchor = msg.rootId ?? msg.threadId ?? msg.messageId
+          const replyAnchor =
+            msg.rootId ?? (msg.threadId?.startsWith('om_') ? msg.threadId : undefined) ?? msg.messageId
           appendPluginRecord(agent.session, LARK_ORIGIN_RECORD_TYPE, {
             botId: bot.id,
             botName: bot.name,

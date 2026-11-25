@@ -47,6 +47,21 @@ export function ReminderEditDialog({
         ? `群话题 · ${target.origin.chatName || target.origin.chatId || '飞书群'}`
         : `群聊 · ${target.origin.chatName || target.origin.chatId || '飞书群'}`
 
+  const ownerLabel =
+    target.mentions.length > 0
+      ? target.mentions.map((m) => `@${m.name || m.openId}`).join('、')
+      : ''
+  const ccLabel =
+    target.ccMentions && target.ccMentions.length > 0
+      ? target.ccMentions.map((m) => `@${m.name || m.openId}`).join('、')
+      : ''
+  const stakeholderSummary = [
+    ownerLabel ? `主负责人 ${ownerLabel}` : null,
+    ccLabel ? `抄送 cc ${ccLabel}` : null,
+  ]
+    .filter(Boolean)
+    .join(' · ')
+
   const submit = async () => {
     if (!title.trim() || !at.trim() || !prompt.trim()) {
       setError('请填写提醒标题、触发时间与唤醒指令')
@@ -77,7 +92,14 @@ export function ReminderEditDialog({
             编辑提醒事项
           </div>
           <div className="fb-schedule-dialog-sub">
-            {`投递目标：${originLabel} · 仅触发一次，触发后自动归档`}
+            {[
+              `投递目标：${originLabel}`,
+              target.kind === 'delegation' ? '委派跟进' : null,
+              stakeholderSummary || null,
+              '仅触发一次，触发后自动归档',
+            ]
+              .filter(Boolean)
+              .join(' · ')}
           </div>
         </div>
         <button type="button" className="fb-icon-btn" aria-label="关闭" onClick={onClose}>

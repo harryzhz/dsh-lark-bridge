@@ -90,9 +90,10 @@ export const DEFAULT_DREAMING_CONFIG: BotDreamingConfig = {
 export const DEFAULT_PROACTIVE_CONFIG: BotProactiveConfig = {
   remindersEnabled: false,
   reminderCreationMode: 'silent',
+  delegationFollowupEnabled: false,
   quietHoursEnabled: false,
-  quietHoursStart: '23:00',
-  quietHoursEnd: '09:00',
+  quietHoursStart: '00:00',
+  quietHoursEnd: '08:00',
   autoCodeEnabled: false,
   branchPrefix: 'agent/',
 }
