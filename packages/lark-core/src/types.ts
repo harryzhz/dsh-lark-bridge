@@ -761,6 +761,7 @@ export type RoutingDecision =
       readonly action: 'agent'
       readonly trigger: 'p2p' | 'mention' | 'active-thread' | 'substitute' | 'listener'
       readonly routeKey: string
+      readonly ephemeralHandoffRouteKey?: string
       readonly workingDir: string
       readonly workspaceName: string
       readonly chatName?: string
@@ -789,6 +790,7 @@ export interface RoutingRuntimeContext {
   readonly groupConfig?: LarkGroupConfig
   readonly chatName?: string
   readonly hasActiveSessionForRoute: (routeKey: string) => boolean
+  readonly isRouteBoundToNativeThread?: (routeKey: string) => boolean
   readonly hasEphemeralRouterThread?: (routeKey: string) => boolean
   readonly getRouteTrigger?: (routeKey: string) => string | undefined
   readonly hasRouteReplied?: (routeKey: string) => boolean

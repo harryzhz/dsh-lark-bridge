@@ -70,7 +70,7 @@ flowchart LR
 | 群聊 · 斜杠命令（`@Bot /status` 等） | `groupSessionMode === 'chat'` 时用 `chat`，否则按 `thread` 规则解析 | 同绑定透明解析（在原引用或新话题内发 `/new` 均作用于同一会话） |
 | 定时任务 / 提醒事项推送后回写 | 发回原话题时用 `replyToMessageId`；群内直发时用 `sent.messageId` | 若飞书返回 `sent.threadId`，同步挂为别名；替换同路由旧会话时安全释放空闲旧句柄 |
 
-> **CLI 与提醒锚点跟随**：当会话因话题升级新增了新的 `om_*` 路由别名时，`resolveAgentContext(sessionId)` 与提醒溯源会优先取最新的 `om_*` 锚点，确保 `lark-bridge history` / `lark-bridge send` / 提醒推送直接落入当前活跃话题。
+> **CLI 与提醒锚点跟随**：正在执行互动回合的会话（`ExecutingTurnContext`）会以当前执行回合的真实消息/话题上下文为第一真相，确保 `lark-bridge send` / `lark-bridge history` / 提醒创建精准命中当前话题（兼容 `sessionMode: chat`、`per_message` 与历史多别名绑定）；无活跃执行回合时再回退读取持久化绑定的最新 `om_*` 锚点。
 
 ---
 
@@ -313,16 +313,17 @@ sequenceDiagram
 
     B->>F: M4 (om_msg_4): 按群配置 new-topic\n调用 reply(message_id=om_msg_3, reply_in_thread=true)
     Note over F: 飞书以 M3 为根建新话题 omt_topic_1\n返回 M4: rootId=om_msg_3, threadId=omt_topic_1
-    B->>S: syncReplyRouteAliases() 自动追加别名:\n...:om_msg_3 -> S1 与 ...:omt_topic_1 -> S1\n(主列表仍为 1 条 S1 记录)
+    B->>S: promoteBindingRoute() 将主绑定原子迁移至 ...:om_msg_3\n解绑原主群流锚点 ...:om_msg_1，并挂别名 ...:omt_topic_1 -> S1\n(主列表仍为 1 条 S1 记录，且单会话至多归属一个原生话题)
 
     U->>F: M5 (om_msg_5): 在新话题内免@追问 "帮我拉下分支"
     F->>B: msgId=om_msg_5, rootId=om_msg_3, threadId=omt_topic_1
-    B->>S: 经 routeAliases 解析 ...:om_msg_3 -> 主绑定 S1\n命中分支 3 (active-thread) -> 继续复用 S1
+    B->>S: 命中主绑定 ...:om_msg_3 -> S1\n命中分支 3 (active-thread) -> 继续复用 S1
 ```
 
 **关联保障**：
-- 在该新话题中执行 `lark-bridge history` / `lark-bridge send` 或创建提醒时，`extractBindingReplyAnchor()` 会自动取最新 `om_*` 锚点（`om_msg_3`），精准命中新话题；
-- 在该新话题中发 `@Bot /new` 或在控制台点击「结束并归档」时，`deleteBinding()` 会按主绑定一次性清理 `om_msg_1`、`om_msg_3`、`omt_topic_1` 全部键并释放 `S1` 句柄。
+- **单会话单原生话题不变量**：一旦主群流普通引用链升级为飞书原生话题（`omt_*`），主绑定原子迁移至新话题根并解绑旧主群流根；若后续或并发有其他成员在主群流继续引用原消息 `M1`/`M2` 发起新分支（`!msg.threadId` 且 `replyMode = new-topic`），各自按 `msg.messageId` 独立建会话与话题（分流轻回复上下文以非破坏性 `peek` 共享），彻底杜绝多个独立飞书话题串入同一会话；
+- **执行回合优先锚定**：在话题内执行 `lark-bridge send` / `lark-bridge history` 或创建提醒时，优先读取当前执行中回合的真实话题锚点，即使历史会话存在多别名或全群共享模式也不会串发到其他话题；
+- 在该新话题中发 `@Bot /new` 或在控制台点击「结束并归档」时，`deleteBinding()` 会一次性清理 `om_msg_3` 与 `omt_topic_1` 并释放 `S1` 句柄。
 
 ---
 

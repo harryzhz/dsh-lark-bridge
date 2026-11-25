@@ -1221,9 +1221,9 @@ describe('LarkBridgeManager prompt injection, title hygiene & auto-archiving', (
     })
     expect(store.listBindings()).toHaveLength(1)
     expect(store.listBindings()[0]?.sessionId).toBe(s1)
-    expect(store.listBindings()[0]?.aliasRouteKeys).toEqual(
-      expect.arrayContaining(['cli_collab:oc_collab:om_m3', 'cli_collab:oc_collab:omt_promoted_1']),
-    )
+    expect(store.listBindings()[0]?.routeKey).toBe('cli_collab:oc_collab:om_m3')
+    expect(store.listBindings()[0]?.aliasRouteKeys).toEqual(['cli_collab:oc_collab:omt_promoted_1'])
+    expect(store.getBinding('cli_collab:oc_collab:om_m1')).toBeUndefined()
     expect(manager.resolveAgentContext(s1).replyToMessageId).toBe('om_m3')
 
     // 3. M5 ("你帮我拉下", un-mentioned, inside promoted topic: rootId=om_m3, threadId=omt_promoted_1)

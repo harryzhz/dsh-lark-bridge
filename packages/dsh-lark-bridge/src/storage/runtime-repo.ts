@@ -272,6 +272,18 @@ export class RuntimeRepo {
         return false
       }
 
+      // Invariant: one thread-scoped session binding may own at most one native Feishu thread (`omt_*`).
+      const aliasScope = cleanAlias.split(':').slice(2).join(':')
+      if (aliasScope.startsWith('omt_')) {
+        const currentKeys = [primaryKey, ...this.listAliasesForPrimary(primaryKey)]
+        const existingThreads = currentKeys
+          .map((k) => k.split(':').slice(2).join(':'))
+          .filter((scope) => scope.startsWith('omt_'))
+        if (existingThreads.length > 0 && !existingThreads.includes(aliasScope)) {
+          return false
+        }
+      }
+
       this.db
         .prepare(
           `INSERT INTO binding_aliases (alias_route_key, primary_route_key)
@@ -280,6 +292,53 @@ export class RuntimeRepo {
         )
         .run(cleanAlias, primaryKey)
       return true
+    })
+  }
+
+  /**
+   * Atomically transfers a binding's primary routeKey to a newly promoted native-thread root
+   * (`newPrimaryRouteKey`) and detaches all pre-promotion main-stream route keys/aliases so
+   * sibling quote replies on the old main-stream root can never hijack this promoted thread.
+   */
+  promoteBindingRoute(
+    oldRouteKey: string,
+    newPrimaryRouteKey: string,
+  ): LarkSessionBinding | undefined {
+    const cleanNext = newPrimaryRouteKey.trim()
+    if (!cleanNext) return undefined
+    return this.db.transaction(() => {
+      const primaryKey = this.resolvePrimaryRouteKey(oldRouteKey)
+      const row = this.db
+        .prepare('SELECT * FROM session_bindings WHERE route_key = ?')
+        .get(primaryKey) as unknown as BindingRow | undefined
+      if (!row) return undefined
+      if (primaryKey === cleanNext) {
+        return this.hydrateBinding(row, this.listAliasesForPrimary(primaryKey))
+      }
+
+      const conflict = this.db
+        .prepare('SELECT session_id FROM session_bindings WHERE route_key = ?')
+        .get(cleanNext) as { session_id?: string } | undefined
+      if (conflict && conflict.session_id !== row.session_id) {
+        return undefined
+      }
+
+      // Clear old pre-promotion aliases referencing `primaryKey` (and any stale alias for `cleanNext`).
+      this.db.prepare('DELETE FROM binding_aliases WHERE primary_route_key = ?').run(primaryKey)
+      this.db.prepare('DELETE FROM binding_aliases WHERE alias_route_key = ?').run(cleanNext)
+      this.db
+        .prepare('UPDATE session_bindings SET route_key = ? WHERE route_key = ?')
+        .run(cleanNext, primaryKey)
+      this.db
+        .prepare(
+          'UPDATE managed_sessions SET route_key = ? WHERE session_id = ? AND route_key = ?',
+        )
+        .run(cleanNext, row.session_id, primaryKey)
+
+      const updated = this.db
+        .prepare('SELECT * FROM session_bindings WHERE route_key = ?')
+        .get(cleanNext) as unknown as BindingRow | undefined
+      return updated ? this.hydrateBinding(updated, this.listAliasesForPrimary(cleanNext)) : undefined
     })
   }
 

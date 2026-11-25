@@ -261,6 +261,7 @@ export class LarkBridgeManager {
       runtimes: this.runtimes,
       workspaces: this.workspaces,
       onActivityChange: notifyActivityChange,
+      getExecutingTurnContext: (sessionId) => this.inbound.getExecutingTurnContext(sessionId),
       resolveMemberName: (botId, chatId, openId) =>
         this.facade.resolveMemberName(botId, chatId, openId),
       runTurn: (agent, content) =>

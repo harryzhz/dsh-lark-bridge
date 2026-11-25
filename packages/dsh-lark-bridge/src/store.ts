@@ -234,6 +234,13 @@ export class LarkBridgeStore {
     return this.runtimeRepo.bindRouteAlias(routeKey, aliasRouteKey)
   }
 
+  promoteBindingRoute(
+    oldRouteKey: string,
+    newPrimaryRouteKey: string,
+  ): LarkSessionBinding | undefined {
+    return this.runtimeRepo.promoteBindingRoute(oldRouteKey, newPrimaryRouteKey)
+  }
+
   touchBinding(routeKey: string, now = Date.now()): void {
     this.runtimeRepo.touchBinding(routeKey, now)
   }

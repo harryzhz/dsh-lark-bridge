@@ -87,6 +87,17 @@ export interface ReminderServiceHost {
   readonly runtimes: RuntimeCatalog
   readonly workspaces: WorkspaceGrouping
   readonly onActivityChange?: () => void
+  getExecutingTurnContext?(sessionId: string):
+    | {
+        readonly botId: string
+        readonly larkAppId: string
+        readonly chatType: 'p2p' | 'group'
+        readonly chatId: string
+        readonly chatName?: string
+        readonly routeKey: string
+        readonly replyToMessageId?: string
+      }
+    | undefined
   resolveMemberName?(botId: string, chatId: string, openId: string): Promise<string | undefined>
   runTurn(agent: Agent, content: ContentBlock[]): Promise<string>
   sendOriginCard(
@@ -1053,8 +1064,32 @@ export class ProactiveReminderService {
     let sessionOrigin: LarkOriginRecord | undefined
 
     if (sid) {
+      const executingTurn = this.host.getExecutingTurnContext?.(sid)
       const binding = this.host.store.listBindings().find((b) => b.sessionId === sid)
-      if (binding) {
+      if (executingTurn) {
+        const bot = this.host.store.getBot(executingTurn.botId)
+        const isP2p = executingTurn.chatType === 'p2p'
+        sessionOrigin = {
+          botId: executingTurn.botId,
+          botName: bot?.name ?? binding?.botName ?? executingTurn.botId,
+          larkAppId: bot?.larkAppId ?? executingTurn.larkAppId,
+          chatType: isP2p ? 'p2p' : 'group',
+          chatId: executingTurn.chatId,
+          ...(executingTurn.chatName
+            ? { chatName: executingTurn.chatName }
+            : binding?.chatName
+              ? { chatName: binding.chatName }
+              : {}),
+          ...(executingTurn.replyToMessageId
+            ? { replyToMessageId: executingTurn.replyToMessageId }
+            : {}),
+          ...(binding?.userOpenId ? { userOpenId: binding.userOpenId } : {}),
+          ...(binding?.userName ? { userName: binding.userName } : {}),
+          workspaceName: binding?.workspaceName ?? '',
+          routeKey: executingTurn.routeKey,
+          trigger: binding?.trigger ?? 'mention',
+        }
+      } else if (binding) {
         const isP2p = binding.chatType === 'p2p' || binding.trigger === 'p2p'
         const threadReply = extractThreadReplyId(binding.routeKey, binding.aliasRouteKeys)
         sessionOrigin = {
