@@ -70,7 +70,7 @@
 
 ### 2.4 正式环境 GitHub Release 安装与免重启热更新
 - 正式 DSH Web 服务应从 GitHub Release `.tgz` 安装并保持 DSH 原生 `hmr` 启用，不再挂载本地开发源码目录：
-  - 日常迭代 PR 合入 `main` 后**不直接替换或重启正式 Web**；待发布新 GitHub Release（推送 `vX.Y.Z` tag 触发 `Release Plugin` workflow）后，在凌晨低峰自动检查或由负责人显式要求时执行免重启热更新。
+  - 日常迭代 PR 合入 `main` 后**不直接替换或重启正式 Web**；只要本次相对上一 `v*` tag 包含可发布产物/代码变更，`Release Plugin` workflow 会自动递增版本号（默认 patch，如 `0.4.0 → 0.4.1`；提交信息含 `[minor]` / `[major]` 时对应递增）、验证打包、推送 `vX.Y.Z` tag 并自动发布 GitHub Release（纯文档/CI/单测改动自动跳过，亦可手动 `workflow_dispatch` 或推送 `v*` tag 触发）。正式环境在凌晨低峰自动检查或由负责人显式要求时执行免重启热更新。
   - **UI 一键更新**：在「飞书桥接」工作台顶栏点击版本/更新按钮（或概览页新版本提示），点击「更新」即可原地完成 SHA256 校验、在途任务排空、旧版卸载、新版安装与热重载，无需重启 DSH Web。
   - **CLI 免重启更新**：
     ```bash
