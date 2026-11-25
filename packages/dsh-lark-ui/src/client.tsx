@@ -2,6 +2,7 @@ import { useState, type ComponentType, type ReactNode } from 'react'
 import {
   Button,
   IconAlarmClockOutlineRegular,
+  IconDatabaseOutlineRegular,
   IconGaugeOutlineRegular,
   IconNewChatOutlineRegular,
   IconPlusOutlineRegular,
@@ -12,9 +13,11 @@ import {
 import { bridgeApi, configureBridgeTransport, type BridgeConnectionRpcLike } from './api.js'
 import { BotConfigDialog } from './components/BotConfigDialog.js'
 import { ConfirmDialog, type ConfirmRequest } from './components/ConfirmDialog.js'
+import { resolveEffectiveBotId } from './components/fields.js'
 import { GroupConfigDialog } from './components/GroupConfigDialog.js'
 import { LarkAuthDialog } from './components/LarkAuthDialog.js'
 import { LarkSidebarIcon, LarkTitleIcon, RobotTabIcon, ShieldAuthIcon } from './components/LarkLogo.js'
+import { MemoryEditDialog, type MemoryDialogRequest } from './components/MemoryEditDialog.js'
 import { ReminderEditDialog } from './components/ReminderEditDialog.js'
 import { ScheduleConfigDialog } from './components/ScheduleConfigDialog.js'
 import { installSessionModelFilter } from './session-model-filter.js'
@@ -32,6 +35,7 @@ import { ensureLarkUiStyles } from './styles.js'
 import type { BotConfig, BotRecord, GroupView, ReminderItem, ScheduleView } from './types.js'
 import { BotsView } from './views/BotsView.js'
 import { GroupsView } from './views/GroupsView.js'
+import { MemoryView } from './views/MemoryView.js'
 import { OverviewView } from './views/OverviewView.js'
 import { SchedulesView } from './views/SchedulesView.js'
 import { SessionsView } from './views/SessionsView.js'
@@ -39,7 +43,7 @@ import { SessionsView } from './views/SessionsView.js'
 const PANEL_ID = 'lark-bridge'
 const SCHEDULE_PANEL_ID = 'schedules'
 
-type Tab = 'overview' | 'bots' | 'groups' | 'schedules' | 'sessions'
+type Tab = 'overview' | 'bots' | 'groups' | 'schedules' | 'sessions' | 'memory'
 
 const TABS: ReadonlyArray<{ key: Tab; label: string; icon: ReactNode }> = [
   { key: 'overview', label: '概览', icon: <IconGaugeOutlineRegular size={16} /> },
@@ -47,6 +51,7 @@ const TABS: ReadonlyArray<{ key: Tab; label: string; icon: ReactNode }> = [
   { key: 'groups', label: '群聊', icon: <IconUsersOutlineRegular size={16} /> },
   { key: 'schedules', label: '自动化', icon: <IconAlarmClockOutlineRegular size={16} /> },
   { key: 'sessions', label: '会话', icon: <IconNewChatOutlineRegular size={16} /> },
+  { key: 'memory', label: '记忆库', icon: <IconDatabaseOutlineRegular size={16} /> },
 ]
 
 let openDshSession: ((sessionId: string) => Promise<SessionActivationResult>) | undefined
@@ -59,6 +64,10 @@ function LarkBridgePage() {
   const [editingGroup, setEditingGroup] = useState<GroupView | null>(null)
   const [editingSchedule, setEditingSchedule] = useState<ScheduleView | null>(null)
   const [editingReminder, setEditingReminder] = useState<ReminderItem | null>(null)
+  const [memoryDialog, setMemoryDialog] = useState<MemoryDialogRequest | null>(null)
+  const [memoryBotId, setMemoryBotId] = useState('')
+  const [memoryRevision, setMemoryRevision] = useState(0)
+  const [memoryFocusId, setMemoryFocusId] = useState<string | null>(null)
   const [authOpen, setAuthOpen] = useState(false)
   const [confirm, setConfirm] = useState<ConfirmRequest | null>(null)
   const [toast, setToast] = useState<{ text: string; ok: boolean } | null>(null)
@@ -134,6 +143,23 @@ function LarkBridgePage() {
             {tab === 'groups' && (
               <Button variant="outline" icon={<IconRefreshOutlineRegular size={16} />} disabled={syncing || data.bots.length === 0} onClick={syncChats}>
                 同步群聊
+              </Button>
+            )}
+            {tab === 'memory' && (
+              <Button
+                variant="primary"
+                icon={<IconPlusOutlineRegular size={16} />}
+                disabled={data.bots.length === 0}
+                onClick={() => {
+                  const defaultBotId =
+                    resolveEffectiveBotId(memoryBotId, data.bots) || data.bots[0]?.id
+                  setMemoryDialog({
+                    mode: 'create',
+                    ...(defaultBotId ? { defaultBotId } : {}),
+                  })
+                }}
+              >
+                新增记忆
               </Button>
             )}
           </div>
@@ -273,6 +299,22 @@ function LarkBridgePage() {
             }
           />
         )}
+        {tab === 'memory' && (
+          <MemoryView
+            bots={data.bots}
+            groups={data.groups}
+            selectedBotId={memoryBotId}
+            onSelectedBotIdChange={setMemoryBotId}
+            revision={memoryRevision}
+            focusEntryId={memoryFocusId}
+            onFocusHandled={() => setMemoryFocusId(null)}
+            onOpenDialog={setMemoryDialog}
+            onConfirm={setConfirm}
+            onToast={(text, ok = true) => setToast({ text, ok })}
+            onDataChanged={data.refresh}
+            onOpenSession={handleOpenSession}
+          />
+        )}
       </div>
 
       <BotConfigDialog
@@ -345,6 +387,21 @@ function LarkBridgePage() {
         onSave={async (id, patch) => {
           await bridgeApi.updateReminder(id, patch)
           setToast({ text: '提醒事项已更新', ok: true })
+          await data.refresh()
+        }}
+      />
+      <MemoryEditDialog
+        request={memoryDialog}
+        bots={data.bots}
+        groups={data.groups}
+        onClose={() => setMemoryDialog(null)}
+        onSaved={async (message, focusId, savedBotId) => {
+          setToast({ text: message, ok: true })
+          if (savedBotId && memoryBotId && memoryBotId !== savedBotId) {
+            setMemoryBotId(savedBotId)
+          }
+          setMemoryRevision((v) => v + 1)
+          if (focusId) setMemoryFocusId(focusId)
           await data.refresh()
         }}
       />

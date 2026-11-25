@@ -6,7 +6,7 @@
 > - 领域协议与纯函数（零 DSH 依赖）：[packages/lark-core/src/memory.ts](../../packages/lark-core/src/memory.ts)、[packages/lark-core/src/dreaming.ts](../../packages/lark-core/src/dreaming.ts)
 > - 存储迁移与仓储：[packages/dsh-lark-bridge/src/storage/migrations/003-memory.ts](../../packages/dsh-lark-bridge/src/storage/migrations/003-memory.ts)、[packages/dsh-lark-bridge/src/storage/memory-repo.ts](../../packages/dsh-lark-bridge/src/storage/memory-repo.ts)
 > - 服务编排、首轮注入与 HTTP 路由：[packages/dsh-lark-bridge/src/memory-service.ts](../../packages/dsh-lark-bridge/src/memory-service.ts)、[packages/dsh-lark-bridge/src/inbound-pipeline.ts](../../packages/dsh-lark-bridge/src/inbound-pipeline.ts)、[packages/dsh-lark-bridge/src/http-memory-routes.ts](../../packages/dsh-lark-bridge/src/http-memory-routes.ts)、[packages/dsh-lark-bridge/src/dreaming-service.ts](../../packages/dsh-lark-bridge/src/dreaming-service.ts)
-> - CLI、技能文档与控制台 UI：[packages/dsh-bundle/bin/lark-bridge.mjs](../../packages/dsh-bundle/bin/lark-bridge.mjs)、[skills/lark-bridge/SKILL.md](../../skills/lark-bridge/SKILL.md)、[packages/dsh-lark-ui/src/components/BotMemoryPanel.tsx](../../packages/dsh-lark-ui/src/components/BotMemoryPanel.tsx)、[packages/dsh-lark-ui/src/components/ExperimentalSection.tsx](../../packages/dsh-lark-ui/src/components/ExperimentalSection.tsx)
+> - CLI、技能文档与控制台 UI：[packages/dsh-bundle/bin/lark-bridge.mjs](../../packages/dsh-bundle/bin/lark-bridge.mjs)、[skills/lark-bridge/SKILL.md](../../skills/lark-bridge/SKILL.md)、[packages/dsh-lark-ui/src/views/MemoryView.tsx](../../packages/dsh-lark-ui/src/views/MemoryView.tsx)、[packages/dsh-lark-ui/src/components/MemoryEditDialog.tsx](../../packages/dsh-lark-ui/src/components/MemoryEditDialog.tsx)、[packages/dsh-lark-ui/src/components/ExperimentalSection.tsx](../../packages/dsh-lark-ui/src/components/ExperimentalSection.tsx)
 
 ---
 
@@ -53,7 +53,7 @@ flowchart TB
 
     subgraph Surfaces["交互与工具面"]
         CLI["lark-bridge memory CLI\nlist / search / get / upsert / supersede / forget"]
-        UI["BotMemoryPanel & ExperimentalSection\n原位单弹窗子视图 + 统计标签"]
+        UI["MemoryView & MemoryEditDialog\n主页独立记忆库标签页 + 分类/历史筛选与双时态纠偏"]
     end
 
     Core --> Inbound
@@ -280,12 +280,15 @@ flowchart TD
 
 ## 7. 控制台交互与展示
 
-遵守 [docs/guidelines/ui.md](../guidelines/ui.md) 的「单弹窗原位下钻」与「单控件右对齐」规范：
+遵守 [docs/guidelines/ui.md](../guidelines/ui.md) 的统一双层工具栏、单控件右对齐与防双层遮罩规范：
 
+- **插件主页 → 记忆库标签页**（[MemoryView.tsx](../../packages/dsh-lark-ui/src/views/MemoryView.tsx)，位于「会话」右侧）：
+  - 顶部采用与其他列表页一致的双层工具栏：左侧 `<CountSegmentedSwitch>` 切换 **`有效记忆`** / **`历史记录`**，右侧 `<FilterTabs>` 按语义四分类（`全部 / 纠偏 / 偏好 / 决策 / 参考`）或历史状态（`全部 / 已纠偏 / 已归档`）筛选；第二层 `<ListFilterBar>` 提供全文关键词搜索与多智能体作用域过滤，右上角提供 **`新增记忆`** 主入口。
+  - 有效记忆自动区分 **`核心置顶`**（首轮优先注入）与 **`长期记忆`**，每条记忆支持正文原位展开/收起、一键置顶切换、群聊名称与工作区短路径解析、标签点击反筛、召回与核验时间展示、来源会话跳转、双时态替代链跳转及只读 `MEMORY.md` 路径复制。
+  - 永久删除接入统一 `<ConfirmDialog>` 二次确认，避免误删。
+- **新增 / 编辑 / 纠偏替代弹窗**（[MemoryEditDialog.tsx](../../packages/dsh-lark-ui/src/components/MemoryEditDialog.tsx)）：
+  - 支持新增、编辑与原子双时态纠偏替代（`POST /memory/:id/supersede`）；作用域选 `指定群聊` 时直接从已同步群聊列表选取（并兼容手动 `chat_id`），选 `指定工作区` 时复用 `<DirectoryField>` 目录选择器，标题与正文提供实时字数统计。
 - **智能体配置 → 实验性 → Dreaming 与长期记忆**（[ExperimentalSection.tsx](../../packages/dsh-lark-ui/src/components/ExperimentalSection.tsx)）：
-  - 顶部精简状态卡片仅保留单句说明与唯一主操作 **`立即整理`**；最近一次整理记录附带状态点、记账摘要与同行无边框轻链接 **`查看会话 ›`**。
-  - 卡片正下方以原生 `<SettingRow>` 呈现一级入口 **`长期记忆库`**（右侧柔和钻取控件 **`N 条 ›`**，数据来自 `GET /api/lark-bridge/bots` 附带的 `activeMemoryCount`）。
-- **原位记忆管理子视图**（[BotMemoryPanel.tsx](../../packages/dsh-lark-ui/src/components/BotMemoryPanel.tsx)）：
-  - 通过 `ConfigDialog.subview` 原位切换，无双层遮罩；左侧支持「新增记忆」「有效 / 全部」筛选与实时搜索，右侧支持四分类、三级作用域、标题、正文、标签、置信度、置顶开关、软归档与 Owner 物理删除，底部展示磁盘 `MEMORY.md` 路径。
+  - 聚焦 Dreaming 离线整理策略配置（定时、触发阈值、提炼范围、清理纠偏开关）与 **`立即整理`** 触发，最近一次整理记录附带状态点、记账摘要与同行无边框轻链接 **`查看会话 ›`**。
 - **会话 → Dreaming 列表**（[SessionsView.tsx](../../packages/dsh-lark-ui/src/views/SessionsView.tsx)）：
   - 依据 `LarkDreamSession.memoryStats` 与 `outcome` 直接渲染绿色 **`新增 X · 纠偏 Y`** 或中性 **`无新增记忆`** 标签，打开会话前即可一目了然看到真实产出。

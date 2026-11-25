@@ -159,7 +159,7 @@ export class MemoryRepo {
   }
 
   list(options: MemoryQueryOptions = {}): LarkMemoryEntry[] {
-    const limit = Math.min(200, Math.max(1, Math.floor(options.limit ?? 100)))
+    const limit = Math.min(500, Math.max(1, Math.floor(options.limit ?? 100)))
     const query = options.query?.trim() ?? ''
     if (query) {
       return this.search(query, { ...options, limit })
@@ -185,7 +185,7 @@ export class MemoryRepo {
     const query = rawQuery.trim()
     if (!query) return this.list(options)
 
-    const limit = Math.min(200, Math.max(1, Math.floor(options.limit ?? 20)))
+    const limit = Math.min(500, Math.max(1, Math.floor(options.limit ?? 20)))
     const ftsQuery = buildFtsMatchQuery(query)
     if (ftsQuery) {
       try {
