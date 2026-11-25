@@ -57,6 +57,7 @@ export interface LarkBridgeConfig {
   readonly idleSweepIntervalMs: number
   readonly maxAuditEvents: number
   readonly autoInstallCliAndSkill?: boolean
+  readonly syncGlobalCliAndSkill?: boolean
   readonly enableInstanceLock?: boolean
   readonly instanceLockWaitMs?: number
 }

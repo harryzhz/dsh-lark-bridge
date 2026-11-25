@@ -57,31 +57,52 @@ function resolveDshBin(explicitBin) {
   }
 }
 
-function installCliAndSkillAssets(dshHome) {
+function installCliAndSkillAssets(dshHome, options = {}) {
   const dataDir = join(dshHome, 'lark-bridge')
   const endpointFile = join(dataDir, 'cli-endpoint.json')
-  const wrapper = [
+  const syncGlobal =
+    options.syncGlobal ?? resolve(dshHome) === resolve(homedir(), '.dsh')
+
+  const instanceWrapper = [
     '#!/bin/sh',
-    `export LARK_BRIDGE_ENDPOINT_FILE="${endpointFile}"`,
+    'if [ -z "${LARK_BRIDGE_ENDPOINT_FILE:-}" ]; then',
+    `  export LARK_BRIDGE_ENDPOINT_FILE="${endpointFile}"`,
+    'fi',
     `exec "${process.execPath}" "${larkBridgeCliEntry}" "$@"`,
     '',
   ].join('\n')
 
-  for (const binDir of [join(dataDir, 'bin'), join(homedir(), '.local', 'bin')]) {
-    mkdirSync(binDir, { recursive: true })
-    const dest = join(binDir, 'lark-bridge')
-    writeFileSync(dest, wrapper, { encoding: 'utf8', mode: 0o755 })
-    chmodSync(dest, 0o755)
-  }
-  console.log(`Installed CLI binary: ${join(homedir(), '.local', 'bin', 'lark-bridge')}`)
+  const localBinDir = join(dataDir, 'bin')
+  mkdirSync(localBinDir, { recursive: true })
+  const localDest = join(localBinDir, 'lark-bridge')
+  writeFileSync(localDest, instanceWrapper, { encoding: 'utf8', mode: 0o755 })
+  chmodSync(localDest, 0o755)
+  console.log(`Installed instance CLI binary: ${localDest}`)
 
-  if (existsSync(larkBridgeSkillSource)) {
-    const agentsHome = process.env.AGENTS_HOME?.trim() || join(homedir(), '.agents')
-    const skillDestDir = join(agentsHome, 'skills', 'lark-bridge')
-    mkdirSync(skillDestDir, { recursive: true })
-    const skillDest = join(skillDestDir, 'SKILL.md')
-    writeFileSync(skillDest, readFileSync(larkBridgeSkillSource, 'utf8'), 'utf8')
-    console.log(`Installed Agent skill: ${skillDest}`)
+  if (syncGlobal) {
+    const globalWrapper = [
+      '#!/bin/sh',
+      'if [ -z "${LARK_BRIDGE_ENDPOINT_FILE:-}" ] && [ -z "${DSH_HOME:-}" ]; then',
+      `  export LARK_BRIDGE_ENDPOINT_FILE="${endpointFile}"`,
+      'fi',
+      `exec "${process.execPath}" "${larkBridgeCliEntry}" "$@"`,
+      '',
+    ].join('\n')
+    const globalBinDir = join(homedir(), '.local', 'bin')
+    mkdirSync(globalBinDir, { recursive: true })
+    const globalDest = join(globalBinDir, 'lark-bridge')
+    writeFileSync(globalDest, globalWrapper, { encoding: 'utf8', mode: 0o755 })
+    chmodSync(globalDest, 0o755)
+    console.log(`Installed global CLI binary: ${globalDest}`)
+
+    if (existsSync(larkBridgeSkillSource)) {
+      const agentsHome = process.env.AGENTS_HOME?.trim() || join(homedir(), '.agents')
+      const skillDestDir = join(agentsHome, 'skills', 'lark-bridge')
+      mkdirSync(skillDestDir, { recursive: true })
+      const skillDest = join(skillDestDir, 'SKILL.md')
+      writeFileSync(skillDest, readFileSync(larkBridgeSkillSource, 'utf8'), 'utf8')
+      console.log(`Installed Agent skill: ${skillDest}`)
+    }
   }
 }
 

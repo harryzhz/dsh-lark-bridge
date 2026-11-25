@@ -41,6 +41,7 @@ export const Config: z<Partial<LarkBridgeConfig>, LarkBridgeConfig> = z.object({
   idleSweepIntervalMs: z.number().min(0).default(5 * 60_000),
   maxAuditEvents: z.number().min(20).max(10_000).default(2000),
   autoInstallCliAndSkill: z.boolean().default(true),
+  syncGlobalCliAndSkill: z.boolean(),
 }) as z<Partial<LarkBridgeConfig>, LarkBridgeConfig>
 
 export async function apply(ctx: Context, rawConfig: LarkBridgeConfig): Promise<void> {
@@ -136,9 +137,11 @@ export {
   ensureCliAuthEndpoint,
   ensureOperatorAuth,
   installLocalCliAndSkill,
+  isDefaultDshHomeDataDir,
   resolveBundledAssetPaths,
   type BundledAssetPaths,
   type CliAuthEndpoint,
+  type InstallLocalCliOptions,
   type OperatorAuthToken,
 } from './cli-support.js'
 export { DreamingService, type DreamingHost } from './dreaming-service.js'
