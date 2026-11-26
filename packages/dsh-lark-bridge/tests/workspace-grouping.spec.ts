@@ -434,4 +434,176 @@ describe('WorkspaceGrouping startup readiness & managed session reconciliation',
     await manager.stop()
     store.close()
   })
+
+  it('retries transient attachSession and archiveSession failures on subsequent reconcileBindings and skips already-attached bindings', async () => {
+    const dataDir = makeTempDir()
+    const workDir = makeTempDir('dsh-lark-retry-')
+    const store = new LarkBridgeStore(dataDir)
+
+    store.upsertBot({
+      id: 'bot-retry',
+      name: 'BotRetry',
+      enabled: true,
+      larkAppId: 'cli_ws_retry',
+      larkAppSecret: 'sec_ws_retry',
+      defaultWorkingDir: workDir,
+      workspaceName: 'retry-ws',
+    })
+    store.upsertBinding({
+      routeKey: 'cli_ws_retry:oc_1:om_1',
+      sessionId: 'session-already-in-ws',
+      botId: 'bot-retry',
+      larkAppId: 'cli_ws_retry',
+      chatType: 'group',
+      chatId: 'oc_1',
+      workspaceName: 'retry-ws',
+      agentPreset: 'codex',
+      workingDir: workDir,
+      trigger: 'mention',
+      hasReplied: true,
+      createdAtMs: Date.now() - 10_000,
+      lastActivityMs: Date.now() - 5_000,
+    })
+
+    const fake = createFakeWorkspaceRegistry()
+    const ws = await fake.registry.create(workDir, 'retry-ws')
+    ws.sessionIds.push('session-already-in-ws')
+    ws.attachSession.mockClear()
+
+    // First attach fails transiently (e.g., header persistence race); second succeeds.
+    ws.attachSession.mockRejectedValueOnce(new Error('transient persistence race'))
+    // First archive fails transiently; second succeeds.
+    fake.registry.archiveSession.mockRejectedValueOnce(new Error('transient lock busy'))
+
+    const ctx = {
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      sessions: { get: () => undefined },
+      get: (key: string) => {
+        if (key === 'workspaceRegistry') return fake.registry
+        return undefined
+      },
+    } as unknown as Context
+
+    const grouping = new WorkspaceGrouping(ctx, store)
+
+    await grouping.attachSession(workDir, 'retry-ws', 'session-transient-attach')
+    expect(ws.sessionIds).not.toContain('session-transient-attach')
+
+    const archivedFirst = await grouping.archiveSession('session-transient-archive')
+    expect(archivedFirst).toBe(false)
+    expect(fake.archivedSessionIds).not.toContain('session-transient-archive')
+
+    // Periodic reconcile flushes both transient failures and skips the already-attached binding.
+    await grouping.reconcileBindings()
+
+    expect(ws.sessionIds).toContain('session-transient-attach')
+    expect(fake.archivedSessionIds).toContain('session-transient-archive')
+    expect(ws.attachSession).not.toHaveBeenCalledWith('session-already-in-ws')
+
+    store.close()
+  })
+
+  it('eagerly attaches scheduled turn sessions at user/message start before turn/end completes', async () => {
+    const dataDir = makeTempDir()
+    const workDir = makeTempDir('dsh-lark-sched-')
+    const store = new LarkBridgeStore(dataDir)
+
+    store.upsertBot({
+      id: 'bot-s',
+      name: 'BotS',
+      enabled: true,
+      larkAppId: 'cli_ws_s',
+      larkAppSecret: 'sec_ws_s',
+      defaultWorkingDir: workDir,
+      workspaceName: 'sched-ws',
+    })
+    store.upsertScheduleBinding({
+      scheduleId: 'sched-1',
+      enabled: true,
+      targets: [{ botId: 'bot-s', chatId: 'oc_sched' }],
+      deliveryMode: 'chat',
+      notifyOn: 'non_empty',
+    })
+
+    const fake = createFakeWorkspaceRegistry()
+    const listeners = new Set<(session: Session, event: SessionEvent) => void>()
+
+    const ctx = {
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      get: (key: string) => {
+        if (key === 'workspaceRegistry') return fake.registry
+        if (key === 'schedule') {
+          return {
+            catalog: async () => [
+              {
+                id: 'sched-1',
+                kind: 'daily',
+                title: 'Daily Check',
+                prompt: 'check',
+                status: 'active',
+                scheduledAt: new Date().toISOString(),
+                target: { kind: 'new', create: { cwd: workDir } },
+                involvedSessionIds: ['session-sched-running'],
+                lastDelivery: {
+                  scheduledAt: new Date().toISOString(),
+                  deliveredAt: new Date().toISOString(),
+                  messageId: 'msg-sched-1',
+                  targetSessionId: 'session-sched-running',
+                },
+              },
+            ],
+            view: async () => ({ code: 'schedule_not_found' }),
+            run: async () => ({ code: 'schedule_not_found' }),
+          }
+        }
+        return undefined
+      },
+      inject: vi.fn(() => ({ dispose: vi.fn() })),
+      on: (event: string, fn: (session: Session, event: SessionEvent) => void) => {
+        if (event === 'session/event') listeners.add(fn)
+        return () => listeners.delete(fn)
+      },
+      sessions: { get: () => undefined },
+      llm: {
+        listProviders: () => [],
+        listConfigurableProviders: () => [],
+        listModels: async () => [],
+      },
+      agents: { get: () => undefined },
+    } as unknown as Context
+
+    const manager = new LarkBridgeManager(
+      ctx,
+      {
+        dataDir,
+        publicBaseUrl: 'http://127.0.0.1:3880',
+        idleSweepIntervalMs: 0,
+        maxAuditEvents: 100,
+        autoInstallCliAndSkill: false,
+      },
+      store,
+    )
+
+    await manager.start()
+
+    const session = {
+      id: 'session-sched-running',
+      header: { cwd: workDir },
+      snapshotEvents: () => [],
+    } as unknown as Session
+
+    for (const fn of listeners) {
+      fn(session, { type: 'turn/start', data: { turn: 1 } } as unknown as SessionEvent)
+      fn(session, {
+        type: 'user/message',
+        data: { id: 'msg-sched-1', source: { kind: 'schedule' }, content: [] },
+      } as unknown as SessionEvent)
+    }
+
+    await flushMicrotasks()
+    expect(fake.byPath.get(workDir)?.sessionIds).toContain('session-sched-running')
+
+    await manager.stop()
+    store.close()
+  })
 })

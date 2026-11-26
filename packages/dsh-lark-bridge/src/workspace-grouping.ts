@@ -12,6 +12,7 @@ type Workspace = Awaited<ReturnType<WorkspaceRegistry['create']>>
 interface PendingAttachment {
   readonly workingDir: string
   readonly title: string
+  readonly attempts: number
 }
 
 interface HeaderCwdLookup {
@@ -21,6 +22,7 @@ interface HeaderCwdLookup {
 
 const MAX_PENDING_QUEUE = 256
 const MAX_DEFERRED_WARNINGS = 5
+const MAX_RETRY_ATTEMPTS = 5
 
 /**
  * Keeps Lark-originated sessions inside their configured DSH sidebar workspace
@@ -28,12 +30,13 @@ const MAX_DEFERRED_WARNINGS = 5
  *
  * Because `dsh-workspace` initializes asynchronously (scanning stored session
  * headers before Cordis marks `workspaceRegistry` active) and may be absent in
- * headless profiles, attachments/archives requested before readiness are queued
- * and flushed automatically once `workspaceRegistry` activates.
+ * headless profiles, attachments/archives requested before readiness — or those
+ * hitting transient failures — are queued and retried automatically on readiness
+ * and periodic reconciliation sweeps.
  */
 export class WorkspaceGrouping {
   private readonly pendingAttachments = new Map<string, PendingAttachment>()
-  private readonly pendingArchives = new Set<string>()
+  private readonly pendingArchives = new Map<string, number>()
   private activeRegistry?: WorkspaceRegistry
   private reconcileTail: Promise<void> = Promise.resolve()
   private deferredWarnCount = 0
@@ -86,31 +89,27 @@ export class WorkspaceGrouping {
     if (!resolvedDir) return
     const registry = this.registry()
     if (!registry) {
-      this.enqueuePendingAttachment(sessionId, resolvedDir, title)
+      this.enqueuePendingAttachment(sessionId, resolvedDir, title, 0, true)
       return
     }
-    await this.attachNow(registry, resolvedDir, title, sessionId)
+    const ok = await this.attachNow(registry, resolvedDir, title, sessionId)
+    if (!ok) {
+      this.enqueuePendingAttachment(sessionId, resolvedDir, title, 1, false)
+    }
   }
 
   async archiveSession(sessionId: string): Promise<boolean> {
     const registry = this.registry()
     if (!registry) {
-      this.enqueuePendingArchive(sessionId)
+      this.enqueuePendingArchive(sessionId, 0, true)
       return false
     }
-    const branded = brandString<SessionId>(sessionId)
-    if (registry.archivedSessionIds?.includes(branded)) {
-      this.pendingArchives.delete(sessionId)
+    const result = await this.archiveNow(registry, sessionId)
+    if (result === 'failed') {
+      this.enqueuePendingArchive(sessionId, 1, false)
       return false
     }
-    try {
-      await registry.archiveSession(branded, { stopActivity: true })
-      this.pendingArchives.delete(sessionId)
-      return true
-    } catch (err) {
-      this.warn(`archiveSession(${sessionId})`, err)
-      return false
-    }
+    return result === 'archived'
   }
 
   listArchivedSessionIds(): string[] {
@@ -183,7 +182,7 @@ export class WorkspaceGrouping {
 
     const { attachedIds, archivedIds } = this.snapshotMembership(registry)
 
-    // 1. Flush attachments deferred before `workspaceRegistry` became ready.
+    // 1. Flush attachments deferred before `workspaceRegistry` became ready or after transient errors.
     const deferredAttachments = [...this.pendingAttachments.entries()]
     this.pendingAttachments.clear()
     for (const [sessionId, entry] of deferredAttachments) {
@@ -191,13 +190,28 @@ export class WorkspaceGrouping {
       const ok = await this.attachNow(registry, entry.workingDir, entry.title, sessionId)
       if (ok) {
         attachedIds.add(sessionId)
+      } else {
+        const nextAttempts = entry.attempts + 1
+        if (nextAttempts < MAX_RETRY_ATTEMPTS) {
+          const header = nextAttempts >= 2 ? await this.readSessionHeaderCwd(sessionId) : undefined
+          if (!header?.missing) {
+            this.enqueuePendingAttachment(
+              sessionId,
+              entry.workingDir,
+              entry.title,
+              nextAttempts,
+              false,
+            )
+          }
+        }
       }
     }
 
-    // 2. Reconcile active route bindings.
+    // 2. Reconcile active route bindings (skipping sessions already accounted in a workspace).
     const seenSessionIds = new Set<string>()
     for (const binding of this.store.listBindings()) {
       seenSessionIds.add(binding.sessionId)
+      if (attachedIds.has(binding.sessionId)) continue
       const ok = await this.attachNow(
         registry,
         binding.workingDir,
@@ -226,12 +240,18 @@ export class WorkspaceGrouping {
       }
     }
 
-    // 4. Flush archives deferred before `workspaceRegistry` became ready (after attaching
-    //    so archived sessions preserve their workspace slot).
-    const deferredArchives = [...this.pendingArchives]
+    // 4. Flush archives deferred before `workspaceRegistry` became ready or after transient errors
+    //    (after attaching so archived sessions preserve their workspace slot).
+    const deferredArchives = [...this.pendingArchives.entries()]
     this.pendingArchives.clear()
-    for (const sessionId of deferredArchives) {
-      await this.archiveSession(sessionId)
+    for (const [sessionId, attempts] of deferredArchives) {
+      if (archivedIds.has(sessionId)) continue
+      const result = await this.archiveNow(registry, sessionId)
+      if (result === 'archived' || result === 'already_archived') {
+        archivedIds.add(sessionId)
+      } else if (attempts + 1 < MAX_RETRY_ATTEMPTS) {
+        this.enqueuePendingArchive(sessionId, attempts + 1, false)
+      }
     }
   }
 
@@ -285,7 +305,7 @@ export class WorkspaceGrouping {
         : this.store.resolveBotWorkspaceName(bot!)
       : ''
 
-    return { workingDir: targetDir, title }
+    return { workingDir: targetDir, title, attempts: 0 }
   }
 
   private async readSessionHeaderCwd(sessionId: string): Promise<HeaderCwdLookup> {
@@ -335,13 +355,38 @@ export class WorkspaceGrouping {
     }
   }
 
-  private enqueuePendingAttachment(sessionId: string, workingDir: string, title: string): void {
+  private async archiveNow(
+    registry: WorkspaceRegistry,
+    sessionId: string,
+  ): Promise<'archived' | 'already_archived' | 'failed'> {
+    const branded = brandString<SessionId>(sessionId)
+    if (registry.archivedSessionIds?.includes(branded)) {
+      this.pendingArchives.delete(sessionId)
+      return 'already_archived'
+    }
+    try {
+      await registry.archiveSession(branded, { stopActivity: true })
+      this.pendingArchives.delete(sessionId)
+      return 'archived'
+    } catch (err) {
+      this.warn(`archiveSession(${sessionId})`, err)
+      return 'failed'
+    }
+  }
+
+  private enqueuePendingAttachment(
+    sessionId: string,
+    workingDir: string,
+    title: string,
+    attempts: number,
+    warnDeferred: boolean,
+  ): void {
     if (!this.pendingAttachments.has(sessionId) && this.pendingAttachments.size >= MAX_PENDING_QUEUE) {
       const oldest = this.pendingAttachments.keys().next().value
       if (oldest !== undefined) this.pendingAttachments.delete(oldest)
     }
-    this.pendingAttachments.set(sessionId, { workingDir, title })
-    if (this.deferredWarnCount < MAX_DEFERRED_WARNINGS) {
+    this.pendingAttachments.set(sessionId, { workingDir, title, attempts })
+    if (warnDeferred && this.deferredWarnCount < MAX_DEFERRED_WARNINGS) {
       this.deferredWarnCount += 1
       this.ctx.logger?.warn?.(
         `[lark-bridge] workspaceRegistry not ready; deferred attachSession(${sessionId}) to "${title || workingDir}"`,
@@ -349,13 +394,13 @@ export class WorkspaceGrouping {
     }
   }
 
-  private enqueuePendingArchive(sessionId: string): void {
+  private enqueuePendingArchive(sessionId: string, attempts: number, warnDeferred: boolean): void {
     if (!this.pendingArchives.has(sessionId) && this.pendingArchives.size >= MAX_PENDING_QUEUE) {
-      const oldest = this.pendingArchives.values().next().value
+      const oldest = this.pendingArchives.keys().next().value
       if (oldest !== undefined) this.pendingArchives.delete(oldest)
     }
-    this.pendingArchives.add(sessionId)
-    if (this.deferredWarnCount < MAX_DEFERRED_WARNINGS) {
+    this.pendingArchives.set(sessionId, attempts)
+    if (warnDeferred && this.deferredWarnCount < MAX_DEFERRED_WARNINGS) {
       this.deferredWarnCount += 1
       this.ctx.logger?.warn?.(
         `[lark-bridge] workspaceRegistry not ready; deferred archiveSession(${sessionId})`,

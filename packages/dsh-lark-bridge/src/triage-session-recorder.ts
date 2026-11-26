@@ -140,10 +140,8 @@ export class TriageSessionRecorder {
         await handle.close().catch(() => {})
       }
 
-      await this.workspaces
-        .attachSession(resolvedCwd, input.decision.workspaceName, sessionId)
-        .catch(() => {})
-      await this.workspaces.archiveSession(sessionId).catch(() => {})
+      await this.workspaces.attachSession(resolvedCwd, input.decision.workspaceName, sessionId)
+      await this.workspaces.archiveSession(sessionId)
 
       const entry: LarkTriageSession = {
         sessionId,
