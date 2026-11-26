@@ -834,4 +834,97 @@ describe('Smart triage config, per-group overrides & protocol', () => {
       }),
     ).toEqual({ action: 'quick_reply', reason: '代答简单问候', replyText: '在的，请讲' })
   })
+
+  it('injects active_chat_listeners into listener triage prompts and parses listener debounceSeconds defaults', () => {
+    const systemPrompt = buildTriageSystemPrompt({
+      botName: 'TriageBot',
+      hasActiveWorker: false,
+      trigger: 'listener',
+      listenerName: '工作日常',
+      listenerPrompt: '关注技术问题',
+    })
+    expect(systemPrompt).toContain('<active_chat_listeners>')
+    expect(systemPrompt).toContain('避免同话题并发重复拉起')
+
+    const userMessage = buildTriageUserMessage({
+      botName: 'TriageBot',
+      trigger: 'listener',
+      senderName: 'Sam',
+      senderType: 'user',
+      userText: '补一张日志截图',
+      hasActiveWorker: false,
+      recentMessages: [],
+      activeChatListeners: [
+        { senderName: 'Alex', preview: '线上节点启动报错，排查模型目录', elapsedSec: 42 },
+      ],
+    })
+    expect(userMessage).toContain('active_chat_listeners=1')
+    expect(userMessage).toContain('<active_chat_listeners>')
+    expect(userMessage).toContain('[Alex · 已运行 42s] 线上节点启动报错，排查模型目录')
+
+    // Non-listener triggers should not emit active_chat_listeners noise
+    const mentionUserMessage = buildTriageUserMessage({
+      botName: 'TriageBot',
+      trigger: 'mention',
+      senderName: 'Sam',
+      senderType: 'user',
+      userText: '帮我看下报错',
+      hasActiveWorker: false,
+      recentMessages: [],
+      activeChatListeners: [
+        { senderName: 'Alex', preview: '另一条旁听讨论', elapsedSec: 12 },
+      ],
+    })
+    expect(mentionUserMessage).not.toContain('active_chat_listeners=')
+    expect(mentionUserMessage).not.toContain('<active_chat_listeners>')
+
+    const bot = makeBot()
+    const group = LarkGroupConfigSchema.parse({
+      key: 'bot-triage:oc_team',
+      botId: 'bot-triage',
+      chatId: 'oc_team',
+      listener: {
+        enabled: true,
+        name: '工作日常',
+        prompt: '排查问题',
+        senderTypes: ['user'],
+      },
+    })
+    expect(group.listener.debounceSeconds).toBe(5)
+
+    const topLevelDecision = decideLarkRouting(bot, makeMsg(), {
+      groupConfig: group,
+      hasActiveSessionForRoute: () => false,
+    })
+    expect(topLevelDecision.action).toBe('agent')
+    if (topLevelDecision.action === 'agent') {
+      expect(topLevelDecision.listenerDebounceMs).toBe(5000)
+    }
+
+    // Native thread replies bypass listener debounce
+    const threadGroup = LarkGroupConfigSchema.parse({
+      key: 'bot-triage:oc_team',
+      botId: 'bot-triage',
+      chatId: 'oc_team',
+      listener: {
+        enabled: true,
+        scope: 'all',
+        name: '工作日常',
+        prompt: '排查问题',
+        senderTypes: ['user'],
+      },
+    })
+    const threadDecision = decideLarkRouting(
+      bot,
+      makeMsg({ threadId: 'omt_1', rootId: 'om_root' }),
+      {
+        groupConfig: threadGroup,
+        hasActiveSessionForRoute: () => false,
+      },
+    )
+    expect(threadDecision.action).toBe('agent')
+    if (threadDecision.action === 'agent') {
+      expect(threadDecision.listenerDebounceMs).toBeUndefined()
+    }
+  })
 })

@@ -937,6 +937,9 @@ export function decideLarkRouting(
         userText,
         promptText: composeTurnPrompt(turnReminders, userText),
         ...(listener.name ? { listenerName: listener.name } : {}),
+        ...(!msg.threadId && listener.debounceSeconds > 0
+          ? { listenerDebounceMs: listener.debounceSeconds * 1000 }
+          : {}),
       }
     }
     listenerIgnoreReason = check.reason ?? 'listener_filtered'

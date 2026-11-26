@@ -45,6 +45,7 @@ import {
 import { assertExistingWorkingDirectory } from './fs-browser.js'
 import type { MemoryService } from './memory-service.js'
 import type { RuntimeCatalog } from './runtime-catalog.js'
+import type { ConcurrencyLease, RuntimeConcurrencyLimiter } from './runtime-concurrency.js'
 import type { LarkBridgeStore } from './store.js'
 import { LARK_ORIGIN_RECORD_TYPE, type LarkOriginRecord } from './types.js'
 import type { WorkspaceGrouping } from './workspace-grouping.js'
@@ -89,6 +90,9 @@ export interface ReminderServiceHost {
   readonly runtimes: RuntimeCatalog
   readonly workspaces: WorkspaceGrouping
   readonly memory?: MemoryService
+  readonly runtimeLimiter?: RuntimeConcurrencyLimiter
+  readonly shutdownSignal?: AbortSignal
+  readonly dispatchStaggerMs?: number
   readonly onActivityChange?: () => void
   getExecutingTurnContext?(sessionId: string):
     | {
@@ -176,6 +180,8 @@ export class ProactiveReminderService {
   private sweepTimer: ReturnType<typeof setInterval> | null = null
   private nextDueTimer: ReturnType<typeof setTimeout> | null = null
   private readonly runningIds = new Set<string>()
+  private readonly staggerPendingIds = new Set<string>()
+  private readonly staggerTimers = new Set<ReturnType<typeof setTimeout>>()
   private readonly sessionHandles = new Map<string, AgentHandle>()
   private readonly activeReminderSessions = new Map<
     string,
@@ -190,12 +196,21 @@ export class ProactiveReminderService {
     return this.runningIds.size
   }
 
+  private clearStaggerTimers(): void {
+    for (const timer of this.staggerTimers) {
+      clearTimeout(timer)
+    }
+    this.staggerTimers.clear()
+    this.staggerPendingIds.clear()
+  }
+
   pauseDispatch(): void {
     this.dispatchPaused = true
     if (this.nextDueTimer) {
       clearTimeout(this.nextDueTimer)
       this.nextDueTimer = null
     }
+    this.clearStaggerTimers()
   }
 
   resumeDispatch(): void {
@@ -216,6 +231,7 @@ export class ProactiveReminderService {
 
   async stop(): Promise<void> {
     this.disposed = true
+    this.clearStaggerTimers()
     if (this.sweepTimer) {
       clearInterval(this.sweepTimer)
       this.sweepTimer = null
@@ -615,25 +631,49 @@ export class ProactiveReminderService {
         (item) =>
           item.status === 'scheduled' &&
           !this.runningIds.has(item.id) &&
+          !this.staggerPendingIds.has(item.id) &&
           Date.parse(item.scheduledAt) <= nowMs,
       )
       .sort((a, b) => Date.parse(a.scheduledAt) - Date.parse(b.scheduledAt))
 
-    const slots = Math.max(0, MAX_CONCURRENT_REMINDERS - this.runningIds.size)
-    const batch = due.slice(0, slots)
-
-    // Launch due reminders concurrently up to MAX_CONCURRENT_REMINDERS without blocking
-    // `rearmNextDueTimer` or stalling sibling due reminders behind a multi-minute turn.
-    await Promise.all(
-      batch.map(async (item) => {
-        const { completion } = await this.startReminderExecution(item, nowMs)
-        void completion.finally(() => {
-          if (!this.disposed) {
-            void this.tick(Math.max(Date.now(), nowMs))
-          }
-        })
-      }),
+    const slots = Math.max(
+      0,
+      MAX_CONCURRENT_REMINDERS - (this.runningIds.size + this.staggerPendingIds.size),
     )
+    const batch = due.slice(0, slots)
+    const staggerMs = Math.max(0, this.host.dispatchStaggerMs ?? 0)
+
+    const launchItem = async (item: LarkReminderItem, triggerNowMs: number) => {
+      if (this.disposed || this.dispatchPaused || this.runningIds.has(item.id)) return
+      const fresh = this.host.store.getReminder(item.id)
+      if (!fresh || fresh.status !== 'scheduled') return
+      const { completion } = await this.startReminderExecution(fresh, triggerNowMs)
+      void completion.finally(() => {
+        if (!this.disposed) {
+          void this.tick(Math.max(Date.now(), triggerNowMs))
+        }
+      })
+    }
+
+    // Launch the first due reminder immediately and stagger simultaneous siblings so a
+    // cluster of same-minute reminders never bursts upstream rate limits together.
+    const immediate: LarkReminderItem[] = []
+    batch.forEach((item, idx) => {
+      if (idx === 0 || staggerMs <= 0) {
+        immediate.push(item)
+        return
+      }
+      this.staggerPendingIds.add(item.id)
+      const timer = setTimeout(() => {
+        this.staggerTimers.delete(timer)
+        this.staggerPendingIds.delete(item.id)
+        void launchItem(item, Math.max(Date.now(), nowMs))
+      }, idx * staggerMs)
+      timer.unref?.()
+      this.staggerTimers.add(timer)
+    })
+
+    await Promise.all(immediate.map((item) => launchItem(item, nowMs)))
 
     this.rearmNextDueTimer(nowMs)
   }
@@ -831,6 +871,7 @@ export class ProactiveReminderService {
         bot,
         handle,
         sessionId,
+        runtimeKey: runtime.agentPreset,
         prompt,
         startedMs,
       })
@@ -877,16 +918,29 @@ export class ProactiveReminderService {
     readonly bot: LarkBotConfig
     readonly handle: AgentHandle
     readonly sessionId: string
+    readonly runtimeKey: string
     readonly prompt: string
     readonly startedMs: number
   }): Promise<LarkReminderItem> {
-    const { item, bot, handle, sessionId, prompt, startedMs } = input
+    const { item, bot, handle, sessionId, runtimeKey, prompt, startedMs } = input
     const controlState: { reminderId: string; silenced: boolean; reason?: string } = {
       reminderId: item.id,
       silenced: false,
     }
     this.activeReminderSessions.set(sessionId, controlState)
+    let runtimeLease: ConcurrencyLease | undefined
     try {
+      if (this.host.runtimeLimiter) {
+        runtimeLease = await this.host.runtimeLimiter.acquire({
+          runtimeKey,
+          priority: 'background',
+          ...(this.host.shutdownSignal ? { signal: this.host.shutdownSignal } : {}),
+          isAborted: () => this.disposed,
+        })
+        if (!runtimeLease) {
+          return this.host.store.getReminder(item.id) ?? item
+        }
+      }
       const replyText = await this.host.runTurn(handle.agent, [{ type: 'text', text: prompt }])
       const finishedMs = Date.now()
       const durationMs = finishedMs - startedMs
@@ -984,6 +1038,7 @@ export class ProactiveReminderService {
       })
       return failed
     } finally {
+      runtimeLease?.release()
       this.activeReminderSessions.delete(sessionId)
       this.runningIds.delete(item.id)
       this.host.onActivityChange?.()

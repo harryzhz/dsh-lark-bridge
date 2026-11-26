@@ -188,6 +188,7 @@ export {
   type CoalescedMessageItem,
   type RouterHandoffTurn,
   type TriageAction,
+  type TriageActiveListenerSummary,
   type TriageHistoryEntry,
   type TriagePromptInput,
   type TriagePromptVariable,

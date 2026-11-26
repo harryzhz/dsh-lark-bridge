@@ -378,6 +378,7 @@ export interface GroupListenerRule {
   memberOverrides: Record<string, boolean>
   includeKeywords: string[]
   excludeKeywords: string[]
+  debounceSeconds?: number
 }
 
 export interface GroupConfig {

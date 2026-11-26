@@ -23,6 +23,7 @@ import {
   type LarkBotConfig,
   type LarkGroupConfig,
   type RouterHandoffTurn,
+  type TriageActiveListenerSummary,
   type TriageHistoryEntry,
   type TriageQuotedMessage,
   type TriageVerdict,
@@ -71,6 +72,7 @@ export interface EvaluateTriageInput {
   ) => Promise<{ readonly blocks: readonly ContentBlock[]; readonly failedCount: number }>
   readonly hasActiveWorker: boolean
   readonly workerBusy: boolean
+  readonly activeChatListeners?: readonly TriageActiveListenerSummary[]
   readonly traceId: string
   readonly signal?: AbortSignal
 }
@@ -1067,6 +1069,9 @@ export class LlmTriageService {
       ...(attachedImageCount > 0 ? { attachedImageCount } : {}),
       hasActiveWorker: input.hasActiveWorker,
       workerBusy: input.workerBusy,
+      ...(input.activeChatListeners && input.activeChatListeners.length > 0
+        ? { activeChatListeners: input.activeChatListeners }
+        : {}),
       ...(silentOnly ? { silentOnly: true } : {}),
       ...(delegationFollowupEnabled ? { delegationFollowupEnabled: true } : {}),
       ...(lastWorkerReply ? { lastWorkerReply } : {}),
