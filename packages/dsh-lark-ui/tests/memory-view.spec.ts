@@ -21,21 +21,28 @@ vi.mock('@deepseek-ai/dsh-client-ui-primitives', () => {
 
 import { bridgeApi, configureBridgeTransport } from '../src/api.js'
 import {
+  buildMemoryGraph,
   buildMemoryHierarchy,
+  collectMemoryLinkedItems,
   collectTopMemoryTags,
+  computeGraphNeighborhood,
   countMemoriesByHistoryStatus,
   countMemoriesByType,
+  DEFAULT_MEMORY_GRAPH_SETTINGS,
   filterAndSortMemories,
   findSupersededPredecessors,
   isSameMemoryNav,
+  matchGraphSearch,
   MEMORY_HISTORY_FILTERS,
   MEMORY_SORT_OPTIONS,
   MEMORY_TYPE_META,
   MEMORY_TYPE_ORDER,
   resolveMemoryScopeLabel,
+  resolveMemoryViewMode,
   resolveNavHeading,
   summarizeMemoryExcerpt,
 } from '../src/views/MemoryView.js'
+import { buildSimNodes, stepGraphPhysics } from '../src/views/memory-graph-engine.js'
 import type { MemoryEntry } from '../src/types.js'
 
 function makeEntry(overrides: Partial<MemoryEntry> & Pick<MemoryEntry, 'id' | 'title'>): MemoryEntry {
@@ -426,5 +433,119 @@ describe('MemoryView three-column helpers & memory API transport', () => {
         content: '统一存储于 lark-bridge.db。',
       },
     })
+  })
+
+  it('defaults to graph view mode and builds bipartite Obsidian-style memory graph with supersede, tag hubs, and semantic links', () => {
+    expect(resolveMemoryViewMode()).toBe('graph')
+    expect(resolveMemoryViewMode('unknown')).toBe('graph')
+    expect(resolveMemoryViewMode('columns')).toBe('columns')
+
+    const graphEntries: MemoryEntry[] = [
+      ...entries,
+      makeEntry({
+        id: 'mem-7',
+        botId: 'bot-a',
+        type: 'reference',
+        title: '热更新灰度指标检查流程',
+        content: '发布灰度阶段持续观察 P95 指标与错误率 10 分钟无异常再放量。',
+        tags: [],
+        createdAtMs: 3200,
+      }),
+    ]
+
+    const graph = buildMemoryGraph(graphEntries, DEFAULT_MEMORY_GRAPH_SETTINGS)
+    expect(graph.memoryCount).toBe(7)
+    // Only tags shared by >= 2 entries become hub nodes ("ops" is shared by mem-1, mem-2, mem-4)
+    expect(graph.tagHubCount).toBe(1)
+    expect(graph.nodes.some((n) => n.id === 'tag:ops' && n.nodeKind === 'tag')).toBe(true)
+    expect(graph.nodes.some((n) => n.id === 'tag:release')).toBe(false)
+
+    // Explicit directed supersede edge from mem-5 -> mem-3
+    const supersedeEdge = graph.edges.find((e) => e.kind === 'supersede')
+    expect(supersedeEdge).toMatchObject({
+      source: 'mem-5',
+      target: 'mem-3',
+      directed: true,
+    })
+
+    // Untagged mem-7 connects to mem-1 via lexical TF-IDF semantic similarity
+    expect(
+      graph.edges.some(
+        (e) =>
+          e.kind === 'semantic' &&
+          ((e.source === 'mem-1' && e.target === 'mem-7') || (e.source === 'mem-7' && e.target === 'mem-1')),
+      ),
+    ).toBe(true)
+
+    // Neighborhood of mem-1 includes 1-hop tag:ops + mem-7 and 2-hop sibling memories mem-2, mem-4 via tag:ops
+    const nb = computeGraphNeighborhood('mem-1', graph.nodes, graph.edges)
+    expect(nb.hop1Nodes.has('tag:ops')).toBe(true)
+    expect(nb.hop1Nodes.has('mem-7')).toBe(true)
+    expect(nb.hop2Nodes.has('mem-2')).toBe(true)
+    expect(nb.hop2Nodes.has('mem-4')).toBe(true)
+    expect(nb.hop2Nodes.has('mem-6')).toBe(false)
+
+    // Search matches both tag hub nodes and memory nodes
+    const botsById = new Map(bots.map((b) => [b.id, b]))
+    expect(matchGraphSearch(graph.nodes, '', botsById, groups)).toBeNull()
+    const tagSearch = matchGraphSearch(graph.nodes, '#ops', botsById, groups)
+    expect(tagSearch?.has('tag:ops')).toBe(true)
+    expect(tagSearch?.has('mem-1')).toBe(false)
+    const keywordSearch = matchGraphSearch(graph.nodes, 'ops', botsById, groups)
+    expect(keywordSearch?.has('tag:ops')).toBe(true)
+    expect(keywordSearch?.has('mem-1')).toBe(true)
+
+    // Linked items for drawer list direct semantic/supersede links first, then shared-tag siblings
+    const linked = collectMemoryLinkedItems('mem-1', graph.nodes, graph.edges)
+    expect(linked[0]?.entry.id).toBe('mem-7')
+    expect(linked[0]?.kind).toBe('semantic')
+    expect(linked.slice(1).map((item) => item.entry.id).sort()).toEqual(['mem-2', 'mem-4'])
+
+    // Disabling tag hubs falls back to direct shared-tag edges; disabling history hides superseded/archived
+    const directGraph = buildMemoryGraph(graphEntries, {
+      showTags: false,
+      showHistory: false,
+      showSemantic: false,
+      pinnedOnly: false,
+    })
+    expect(directGraph.tagHubCount).toBe(0)
+    expect(directGraph.memoryCount).toBe(5)
+    expect(directGraph.edges.some((e) => e.kind === 'tag')).toBe(true)
+    expect(directGraph.edges.some((e) => e.kind === 'supersede')).toBe(false)
+
+    // Pinned-only filter keeps only active pinned memories
+    const pinnedGraph = buildMemoryGraph(graphEntries, {
+      ...DEFAULT_MEMORY_GRAPH_SETTINGS,
+      pinnedOnly: true,
+    })
+    expect(pinnedGraph.memoryCount).toBe(2)
+
+    // Physics simulation stays finite and deterministic on empty & populated graphs
+    const emptySim = buildSimNodes(buildMemoryGraph([], DEFAULT_MEMORY_GRAPH_SETTINGS))
+    stepGraphPhysics({
+      simNodes: emptySim,
+      edges: [],
+      settings: DEFAULT_MEMORY_GRAPH_SETTINGS,
+      alpha: 0.85,
+      draggingNodeId: null,
+      warmup: true,
+    })
+    expect(emptySim.size).toBe(0)
+
+    const sim = buildSimNodes(graph)
+    for (let i = 0; i < 30; i++) {
+      stepGraphPhysics({
+        simNodes: sim,
+        edges: graph.edges,
+        settings: DEFAULT_MEMORY_GRAPH_SETTINGS,
+        alpha: 0.85,
+        draggingNodeId: null,
+        warmup: true,
+      })
+    }
+    for (const node of sim.values()) {
+      expect(Number.isFinite(node.x)).toBe(true)
+      expect(Number.isFinite(node.y)).toBe(true)
+    }
   })
 })
