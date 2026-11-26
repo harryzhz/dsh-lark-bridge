@@ -42,6 +42,7 @@ import {
   formatCompactNumber,
   formatDeltaBadge,
   formatLatencyMs,
+  formatSenderRankMeta,
   formatSubMs,
   formatTokens,
   formatUptime,
@@ -57,7 +58,7 @@ import { OverviewView } from './OverviewView.js'
 
 export type CockpitPane = 'overview' | 'insights' | 'monitor'
 type ConsumptionTab = 'models' | 'agents'
-type RankingTab = 'bots' | 'chats'
+type RankingTab = 'bots' | 'chats' | 'senders'
 
 const POLL_IDLE_MS = 15_000
 const POLL_BACKFILL_MS = 3_000
@@ -76,9 +77,11 @@ function InsightsPane({
   const [consumptionTab, setConsumptionTab] = useState<ConsumptionTab>('models')
   const [rankTab, setRankTab] = useState<RankingTab>('chats')
   const [expandedRankKey, setExpandedRankKey] = useState<string>('')
+  const [showAllSenders, setShowAllSenders] = useState(false)
   const { product, series } = payload
   const { tokens, sessions, traffic, triage, proactive } = product
   const agentBreakdowns = product.agents ?? []
+  const senderRanking = product.senderRanking ?? []
 
   const tokenSpark = useMemo(() => series.map((p) => p.totalTokens), [series])
   const sessionSpark = useMemo(() => series.map((p) => p.sessions), [series])
@@ -124,12 +127,15 @@ function InsightsPane({
   const maxTriggerTokens = Math.max(0, ...product.triggers.map((t) => t.totalTokens))
   const maxTriggerCount = Math.max(1, ...product.triggers.map((t) => t.count))
   const visibleChatRanking = product.chatRanking.slice(0, 7)
+  const visibleSenderRanking = showAllSenders ? senderRanking : senderRanking.slice(0, 7)
   const maxChatRankTokens = Math.max(0, ...visibleChatRanking.map((c) => c.totalTokens))
+  const maxSenderRankTokens = Math.max(0, ...senderRanking.map((u) => u.totalTokens))
   const maxBotRankTokens = Math.max(0, ...product.botRanking.map((b) => b.totalTokens))
 
   const handleRankTabChange = (next: RankingTab) => {
     setRankTab(next)
     setExpandedRankKey('')
+    setShowAllSenders(false)
   }
 
   const toggleRankExpand = (key: string) => {
@@ -516,7 +522,9 @@ function InsightsPane({
               <span className="fb-obs-panel-sub fb-mono">
                 {rankTab === 'chats'
                   ? `TOP ${visibleChatRanking.length} · TOKEN`
-                  : `${product.botRanking.length} BOTS · TOKEN`}
+                  : rankTab === 'senders'
+                    ? `${senderRanking.length} USERS · TOKEN`
+                    : `${product.botRanking.length} BOTS · TOKEN`}
               </span>
             </div>
             <FilterTabs
@@ -524,13 +532,151 @@ function InsightsPane({
               value={rankTab}
               options={[
                 { value: 'chats' as const, label: '群聊 / 私聊', count: product.chatRanking.length },
+                { value: 'senders' as const, label: '触发人', count: senderRanking.length },
                 { value: 'bots' as const, label: '智能体', count: product.botRanking.length },
               ]}
               onChange={handleRankTabChange}
             />
           </div>
 
-          {rankTab === 'bots' ? (
+          {rankTab === 'senders' ? (
+            visibleSenderRanking.length === 0 ? (
+              <div className="fb-obs-empty-inline">
+                {payload.backfill.running
+                  ? '正在索引历史会话触发人，完成后自动呈现'
+                  : '当前周期暂无触发人数据'}
+              </div>
+            ) : (
+              <div className="fb-obs-rank-list fb-num">
+                {visibleSenderRanking.map((u) => {
+                  const rowKey = `sender:${u.senderId}`
+                  const expanded = expandedRankKey === rowKey
+                  const barPct =
+                    maxSenderRankTokens > 0
+                      ? Math.max(3, (u.totalTokens / maxSenderRankTokens) * 100)
+                      : 0
+                  const nonCacheInput = (u.inputTokens ?? 0) + (u.cacheWriteTokens ?? 0)
+                  const topModels = u.topModels ?? []
+                  const topBots = u.topBots ?? []
+                  const detailSummaryParts = [
+                    u.llmSteps > 0 ? `步数 ${formatCompactNumber(u.llmSteps)}` : '',
+                    u.activeChats > 0 ? `活跃渠道 ${u.activeChats}` : '',
+                    topBots.length > 0
+                      ? `智能体 ${topBots.map((tb) => tb.botName).join(' · ')}`
+                      : '',
+                    u.silentSkipped > 0 ? `静默 ${u.silentSkipped}` : '',
+                    u.errors > 0 ? `异常 ${u.errors}` : '',
+                    u.lastActiveMs > 0 ? `最近 ${formatTime(u.lastActiveMs)}` : '',
+                  ].filter(Boolean)
+                  return (
+                    <div
+                      key={u.senderId}
+                      className="fb-obs-rank-item"
+                      data-expanded={expanded ? '' : undefined}
+                    >
+                      <button
+                        type="button"
+                        className="fb-obs-rank-row"
+                        aria-expanded={expanded}
+                        onClick={() => toggleRankExpand(rowKey)}
+                      >
+                        <Avatar
+                          src={u.avatarUrl}
+                          name={u.senderName}
+                          kind={u.senderType === 'bot' ? 'bot' : 'user'}
+                          size="sm"
+                        />
+                        <div className="fb-obs-rank-main">
+                          <div className="fb-obs-rank-title">
+                            <span title={u.senderName}>{u.senderName}</span>
+                            {u.senderType === 'bot' && <Tag tone="neutral">机器人</Tag>}
+                          </div>
+                          <div className="fb-obs-rank-meta">{formatSenderRankMeta(u)}</div>
+                        </div>
+                        <div className="fb-obs-rank-side fb-mono">
+                          <strong>{formatTokens(u.totalTokens)}</strong>
+                          {barPct > 0 ? (
+                            <div className="fb-obs-mini-track fb-obs-rank-track">
+                              <div className="fb-obs-mini-fill" style={{ width: `${barPct}%` }} />
+                            </div>
+                          ) : (
+                            <span className="fb-obs-muted">{formatLatencyMs(u.avgLatencyMs)}</span>
+                          )}
+                        </div>
+                        <span className="fb-obs-rank-chevron" aria-hidden="true">
+                          ›
+                        </span>
+                      </button>
+
+                      {expanded && (
+                        <div className="fb-obs-rank-detail">
+                          <div className="fb-obs-rank-detail-grid fb-mono">
+                            <span>
+                              <em className="fb-obs-muted">缓存读取</em>{' '}
+                              {formatTokens(u.cacheReadTokens ?? 0)}
+                            </span>
+                            <span>
+                              <em className="fb-obs-muted">非缓存输入</em>{' '}
+                              {formatTokens(nonCacheInput)}
+                            </span>
+                            <span>
+                              <em className="fb-obs-muted">输出</em>{' '}
+                              {formatTokens(u.outputTokens ?? 0)}
+                            </span>
+                            <span>
+                              <em className="fb-obs-muted">缓存命中</em> {u.cacheHitRate}%
+                              {u.avgLatencyMs > 0
+                                ? ` · 均耗 ${formatLatencyMs(u.avgLatencyMs)}`
+                                : ''}
+                            </span>
+                          </div>
+                          {topModels.length > 0 && (
+                            <div className="fb-obs-rank-models">
+                              {topModels.map((tm) => {
+                                const ml = resolveObservabilityModelLabel(
+                                  tm.model,
+                                  tm.agentPreset,
+                                  runtimes,
+                                  models,
+                                  resolveModelDisplayName,
+                                )
+                                return (
+                                  <span
+                                    key={tm.model}
+                                    className="fb-obs-rank-model-chip fb-mono"
+                                    title={tm.model}
+                                  >
+                                    <span>{ml.label}</span>
+                                    <em className="fb-obs-muted">
+                                      {formatTokens(tm.totalTokens)}
+                                    </em>
+                                  </span>
+                                )
+                              })}
+                            </div>
+                          )}
+                          {detailSummaryParts.length > 0 && (
+                            <div className="fb-obs-rank-meta">
+                              {detailSummaryParts.join(' · ')}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )
+                })}
+                {senderRanking.length > 7 && (
+                  <button
+                    type="button"
+                    className="fb-obs-rank-more"
+                    onClick={() => setShowAllSenders((v) => !v)}
+                  >
+                    {showAllSenders ? '收起列表' : `查看全部 ${senderRanking.length} 位触发人`}
+                  </button>
+                )}
+              </div>
+            )
+          ) : rankTab === 'bots' ? (
             product.botRanking.length === 0 ? (
               <div className="fb-obs-empty-inline">暂无智能体数据</div>
             ) : (
@@ -1178,8 +1324,9 @@ export function ObservabilityView({
   const [windowKey, setWindowKey] = useState<ObservabilityWindow>('24h')
   const [botId, setBotId] = useState('')
   const [chatId, setChatId] = useState('')
+  const [senderId, setSenderId] = useState('')
   const effectiveBotId = resolveEffectiveBotId(botId, bots)
-  const swrKey = `${windowKey}|${effectiveBotId}|${chatId}`
+  const swrKey = `${windowKey}|${effectiveBotId}|${chatId}|${senderId}`
   const [payload, setPayload] = useState<ObservabilityPayload | null>(
     () => OBSERVABILITY_SWR_CACHE.get(swrKey) ?? null,
   )
@@ -1201,6 +1348,7 @@ export function ObservabilityView({
           window: windowKey,
           ...(effectiveBotId ? { botId: effectiveBotId } : {}),
           ...(chatId ? { chatId } : {}),
+          ...(senderId ? { senderId } : {}),
           ...(opts.refreshStorage ? { refreshStorage: true } : {}),
         })
         OBSERVABILITY_SWR_CACHE.set(swrKey, res)
@@ -1213,7 +1361,7 @@ export function ObservabilityView({
         setRefreshing(false)
       }
     },
-    [windowKey, effectiveBotId, chatId, swrKey],
+    [windowKey, effectiveBotId, chatId, senderId, swrKey],
   )
 
   useEffect(() => {
@@ -1244,6 +1392,24 @@ export function ObservabilityView({
     const exists = (payload?.filters.chats ?? []).some((c) => c.chatId === chatId)
     return exists ? chatId : ''
   }, [chatId, payload?.filters.chats])
+
+  const senderOptions = useMemo(() => {
+    const senders = payload?.filters.senders ?? []
+    return [
+      { value: '', label: '全部触发人' },
+      ...senders.map((s) => ({
+        value: s.senderId,
+        label: s.senderType === 'bot' ? `${s.senderName}（机器人）` : s.senderName,
+      })),
+    ]
+  }, [payload?.filters.senders])
+
+  const effectiveSenderId = useMemo(() => {
+    if (!senderId) return ''
+    const senders = payload?.filters.senders
+    if (!senders) return senderId
+    return senders.some((s) => s.senderId === senderId) ? senderId : ''
+  }, [senderId, payload?.filters.senders])
 
   const handleBotChange = (nextBotId: string) => {
     setBotId(nextBotId)
@@ -1341,13 +1507,21 @@ export function ObservabilityView({
                 onChange={setChatId}
               />
 
-              {(effectiveBotId || effectiveChatId) && (
+              <SelectMenu
+                size="sm"
+                value={effectiveSenderId}
+                options={senderOptions}
+                onChange={setSenderId}
+              />
+
+              {(effectiveBotId || effectiveChatId || effectiveSenderId) && (
                 <Button
                   size="sm"
                   variant="ghost"
                   onClick={() => {
                     setBotId('')
                     setChatId('')
+                    setSenderId('')
                   }}
                 >
                   重置筛选

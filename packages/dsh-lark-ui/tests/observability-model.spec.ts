@@ -8,6 +8,7 @@ import {
   formatBytes,
   formatDeltaBadge,
   formatLatencyMs,
+  formatSenderRankMeta,
   formatSubMs,
   formatTokens,
   formatUptime,
@@ -97,6 +98,38 @@ describe('observability-model pure helpers', () => {
     expect(resolveTriggerLabel('substitute')).toBe('代答模式')
     expect(resolveErrorCodeLabel('rate_limited')).toBe('上游限流 / 429')
     expect(resolveTableLabel('telemetry_usage_events')).toBe('遥测明细事件')
+    expect(resolveTableLabel('telemetry_sender_profiles')).toBe('触发人档案缓存')
+
+    expect(
+      formatSenderRankMeta({
+        sessions: 3,
+        inbound: 5,
+        replied: 4,
+        llmSteps: 12,
+        errors: 1,
+        cacheHitRate: 78.5,
+      }),
+    ).toBe('会话 3 · 触发 5 · 回复 4 · 异常 1')
+    expect(
+      formatSenderRankMeta({
+        sessions: 2,
+        inbound: 0,
+        replied: 0,
+        llmSteps: 18,
+        errors: 0,
+        cacheHitRate: 64.2,
+      }),
+    ).toBe('会话 2 · 步数 18 · 缓存 64.2%')
+    expect(
+      formatSenderRankMeta({
+        sessions: 0,
+        inbound: 0,
+        replied: 0,
+        llmSteps: 0,
+        errors: 0,
+        cacheHitRate: 0,
+      }),
+    ).toBe('暂无明细')
 
     expect(splitTelemetryVerb('GET /observability')).toEqual({ verb: 'GET', target: '/observability' })
     expect(splitTelemetryVerb('SELECT telemetry_usage_events')).toEqual({

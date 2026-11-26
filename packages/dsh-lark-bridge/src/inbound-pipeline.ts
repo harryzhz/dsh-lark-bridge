@@ -252,6 +252,10 @@ export interface InboundPipelineHost {
     readonly chatType?: 'group' | 'p2p'
     readonly triageSessionId?: string
     readonly traceId?: string
+    readonly senderOpenId?: string
+    readonly senderUnionId?: string
+    readonly senderName?: string
+    readonly senderType?: 'user' | 'bot'
     readonly action: 'silent' | 'quick_reply' | 'handoff'
     readonly fallback?: boolean
     readonly errorCode?: string
@@ -627,7 +631,14 @@ export class InboundPipeline {
         this.recordIgnoredGroupContext(bot, transport, msg, groupConfig)
       }
       if (decision.reason !== 'no_matching_rule' && decision.reason !== 'self_message') {
-        this.host.store.recordMetric({ botId: bot.id, chatId: msg.chatId, kind: 'ignored' })
+        const senderMeta = this.resolveTelemetrySender(bot.id, transport, msg)
+        this.host.store.recordMetric({
+          botId: bot.id,
+          chatId: msg.chatId,
+          chatType: msg.chatType,
+          ...senderMeta,
+          kind: 'ignored',
+        })
         this.host.store.recordEvent({
           botId: bot.id,
           chatId: msg.chatId,
@@ -785,7 +796,7 @@ export class InboundPipeline {
     )
 
     if (!cachedName && msg.senderType === 'user' && msg.senderOpenId) {
-      void this.resolveSenderName(transport, msg).then((resolvedName) => {
+      void this.resolveSenderName(bot.id, transport, msg).then((resolvedName) => {
         if (!resolvedName || this.host.isDisposed()) return
         this.host.triage?.context.recordChatMessage(
           chatScopeKey,
@@ -1079,8 +1090,22 @@ export class InboundPipeline {
     if (turn.reactionId) {
       await transport.removeReaction(turn.messageId, turn.reactionId).catch(() => {})
     }
+    const recoveredSender = this.resolveTelemetrySender(
+      turn.botId,
+      transport,
+      turn.inboundMsg,
+      turn.senderName,
+    )
     if (isSilent) {
-      this.host.store.recordMetric({ botId: turn.botId, chatId: turn.chatId, kind: 'silent_skip' })
+      this.host.store.recordMetric({
+        botId: turn.botId,
+        chatId: turn.chatId,
+        ...(turn.inboundMsg?.chatType ? { chatType: turn.inboundMsg.chatType } : {}),
+        ...(turn.sessionId ? { sessionId: turn.sessionId } : {}),
+        trigger: turn.trigger,
+        ...recoveredSender,
+        kind: 'silent_skip',
+      })
       this.host.store.recordEvent({
         botId: turn.botId,
         chatId: turn.chatId,
@@ -1118,6 +1143,10 @@ export class InboundPipeline {
     this.host.store.recordMetric({
       botId: turn.botId,
       chatId: turn.chatId,
+      ...(turn.inboundMsg?.chatType ? { chatType: turn.inboundMsg.chatType } : {}),
+      ...(turn.sessionId ? { sessionId: turn.sessionId } : {}),
+      trigger: turn.trigger,
+      ...recoveredSender,
       ...(turn.chatName ? { chatName: turn.chatName } : {}),
       kind: 'replied',
       latencyMs: Date.now() - turn.startedAtMs,
@@ -1149,11 +1178,13 @@ export class InboundPipeline {
       decision.chatName || this.host.store.resolveChatName(bot.id, msg.chatId)
     const chatName = resolvedChatName ? { chatName: resolvedChatName } : {}
     if (!recovery) {
+      const inboundSender = this.resolveTelemetrySender(bot.id, transport, msg)
       this.host.store.recordMetric({
         botId: bot.id,
         chatId: msg.chatId,
         chatType: msg.chatType,
         trigger: decision.trigger,
+        ...inboundSender,
         ...chatName,
         kind: 'inbound',
         now: startedMs,
@@ -1214,7 +1245,7 @@ export class InboundPipeline {
       }
 
       const [senderName, prefetchedQuote] = await Promise.all([
-        this.resolveSenderName(transport, msg),
+        this.resolveSenderName(bot.id, transport, msg),
         msg.parentId
           ? mediaCache.prefetchQuotedMessage(transport, msg.parentId, {
               signal: msgCancelController.signal,
@@ -1901,10 +1932,20 @@ export class InboundPipeline {
       ((Boolean(silencedItem) || (effectiveDecision.allowSilentEmptyReply && !hasFinalText)) &&
         intermediateSentCount === 0)
 
+    const replySender = this.resolveTelemetrySender(
+      bot.id,
+      transport,
+      latestItem.msg,
+      latestItem.senderName,
+    )
     if (isSilentSkip) {
       this.host.store.recordMetric({
         botId: bot.id,
         chatId: latestItem.msg.chatId,
+        chatType: latestItem.msg.chatType,
+        sessionId: acquired.sessionId,
+        trigger: effectiveDecision.trigger,
+        ...replySender,
         kind: 'silent_skip',
       })
       const silentSummary = silencedItem
@@ -1981,6 +2022,7 @@ export class InboundPipeline {
         chatType: latestItem.msg.chatType,
         sessionId: acquired.sessionId,
         trigger: effectiveDecision.trigger,
+        ...replySender,
         ...chatName,
         kind: 'replied',
         latencyMs,
@@ -2214,7 +2256,21 @@ export class InboundPipeline {
         replyText: `${errorMsg}，可重新回复继续。`,
       })
     } else {
-      this.host.store.recordMetric({ botId: bot.id, chatId: msg.chatId, kind: 'error' })
+      const failSender = this.resolveTelemetrySender(
+        bot.id,
+        transport,
+        targetMsg,
+        latestItem?.senderName ?? targetTurn.senderName,
+      )
+      this.host.store.recordMetric({
+        botId: bot.id,
+        chatId: msg.chatId,
+        chatType: targetMsg.chatType,
+        ...(trackedSessionId ? { sessionId: trackedSessionId } : {}),
+        trigger: targetDecision.trigger,
+        ...failSender,
+        kind: 'error',
+      })
       this.host.store.recordEvent({
         botId: bot.id,
         chatId: msg.chatId,
@@ -2469,12 +2525,17 @@ export class InboundPipeline {
 
     if (this.host.isDisposed()) return { handled: true }
 
+    const triageSender = this.resolveTelemetrySender(bot.id, transport, msg, senderName)
     this.host.onTriageRecorded?.({
       botId: bot.id,
       chatId: msg.chatId,
       chatType: msg.chatType === 'p2p' ? 'p2p' : 'group',
       ...(result.triageSessionId ? { triageSessionId: result.triageSessionId } : {}),
       traceId,
+      ...(msg.senderOpenId ? { senderOpenId: msg.senderOpenId } : {}),
+      ...(msg.senderUnionId ? { senderUnionId: msg.senderUnionId } : {}),
+      ...(triageSender.senderName ? { senderName: triageSender.senderName } : {}),
+      ...(triageSender.senderType ? { senderType: triageSender.senderType } : {}),
       action: result.verdict.action,
       ...(result.verdict.fallback ? { fallback: true } : {}),
       ...(result.errorCode ? { errorCode: result.errorCode } : {}),
@@ -2494,6 +2555,7 @@ export class InboundPipeline {
         chatType: msg.chatType,
         ...(result.triageSessionId ? { sessionId: result.triageSessionId } : {}),
         trigger: decision.trigger,
+        ...triageSender,
         kind: 'silent_skip',
       })
       this.host.store.recordEvent({
@@ -2570,6 +2632,7 @@ export class InboundPipeline {
           chatType: msg.chatType,
           ...(result.triageSessionId ? { sessionId: result.triageSessionId } : {}),
           trigger: 'triage',
+          ...triageSender,
           ...chatName,
           kind: 'replied',
           latencyMs,
@@ -2621,7 +2684,53 @@ export class InboundPipeline {
     }
   }
 
+  private resolveTelemetrySender(
+    botId: string,
+    transport: LarkBotTransport,
+    msg?: InboundLarkMessage,
+    resolvedName?: string,
+  ): {
+    readonly senderId?: string
+    readonly senderName?: string
+    readonly senderType?: 'user' | 'bot'
+  } {
+    if (!msg) {
+      const fallbackName = resolvedName?.trim()
+      return fallbackName ? { senderName: fallbackName, senderType: 'user' } : {}
+    }
+    const openId = msg.senderOpenId?.trim() || ''
+    const cached =
+      openId && typeof transport.getCachedUserProfile === 'function'
+        ? transport.getCachedUserProfile(openId)
+        : undefined
+    const unionId = msg.senderUnionId?.trim() || cached?.unionId?.trim() || ''
+    const senderType: 'user' | 'bot' = msg.senderType === 'bot' ? 'bot' : 'user'
+    const peerBot =
+      senderType === 'bot' && openId
+        ? this.host.connections.listBotStatuses?.().find((s) => s.botOpenId === openId)
+        : undefined
+    const cleanName = resolvedName?.trim() || cached?.name?.trim() || peerBot?.name?.trim() || ''
+    const avatarUrl = cached?.avatarUrl || peerBot?.avatarUrl
+    const senderId = unionId || openId
+    if (openId && (unionId || cleanName || avatarUrl)) {
+      this.host.store.upsertSenderProfile?.({
+        botId,
+        openId,
+        ...(unionId ? { unionId } : {}),
+        ...(cleanName ? { name: cleanName } : {}),
+        ...(avatarUrl ? { avatarUrl } : {}),
+        senderType,
+      })
+    }
+    return {
+      ...(senderId ? { senderId } : {}),
+      ...(cleanName ? { senderName: cleanName } : {}),
+      ...(senderId || cleanName ? { senderType } : {}),
+    }
+  }
+
   private async resolveSenderName(
+    botId: string,
     transport: LarkBotTransport,
     msg: InboundLarkMessage,
   ): Promise<string | undefined> {
@@ -2633,10 +2742,19 @@ export class InboundPipeline {
       return undefined
     }
     const summary = await transport.resolveUserSummary(msg.senderOpenId).catch(() => undefined)
-    if (summary?.name && summary.name !== msg.senderOpenId) {
-      return summary.name
+    const cleanName = summary?.name && summary.name !== msg.senderOpenId ? summary.name : undefined
+    const unionId = msg.senderUnionId?.trim() || summary?.unionId?.trim() || undefined
+    if (unionId || cleanName || summary?.avatarUrl) {
+      this.host.store.upsertSenderProfile?.({
+        botId,
+        openId: msg.senderOpenId,
+        ...(unionId ? { unionId } : {}),
+        ...(cleanName ? { name: cleanName } : {}),
+        ...(summary?.avatarUrl ? { avatarUrl: summary.avatarUrl } : {}),
+        senderType: 'user',
+      })
     }
-    return undefined
+    return cleanName
   }
 
   private async hydrateTriageContextIfNeeded(input: {
@@ -2934,6 +3052,8 @@ export class InboundPipeline {
       | 'reactionId'
       | 'sessionId'
       | 'traceId'
+      | 'inboundMsg'
+      | 'senderName'
     >
     readonly intermediateSentCount: number
     readonly auditSummary: string
@@ -2945,7 +3065,21 @@ export class InboundPipeline {
     if (input.removeReaction !== false && turn.reactionId) {
       tasks.push(transport.removeReaction(turn.messageId, turn.reactionId).catch(() => {}))
     }
-    this.host.store.recordMetric({ botId: turn.botId, chatId: turn.chatId, kind: 'error' })
+    const interruptedSender = this.resolveTelemetrySender(
+      turn.botId,
+      transport,
+      turn.inboundMsg,
+      turn.senderName,
+    )
+    this.host.store.recordMetric({
+      botId: turn.botId,
+      chatId: turn.chatId,
+      ...(turn.inboundMsg?.chatType ? { chatType: turn.inboundMsg.chatType } : {}),
+      ...(turn.sessionId ? { sessionId: turn.sessionId } : {}),
+      trigger: turn.trigger,
+      ...interruptedSender,
+      kind: 'error',
+    })
     this.host.store.recordEvent({
       botId: turn.botId,
       chatId: turn.chatId,

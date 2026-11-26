@@ -166,6 +166,7 @@ export interface SendLarkReplyResult {
 
 interface CachedUserDetail {
   readonly openId: string
+  readonly unionId?: string
   readonly name: string
   readonly enName?: string
   readonly email?: string
@@ -580,6 +581,24 @@ export class LarkBotTransport {
     const cached = this.userCache.get(key)
     if (!cached || now - cached.cachedAtMs >= USER_DETAIL_TTL_MS) return undefined
     return cached.name && cached.name !== key ? cached.name : undefined
+  }
+
+  /** Zero-network-cost lookup of cached Feishu user profile metadata (name, unionId, avatar). */
+  getCachedUserProfile(
+    openId: string | undefined,
+    now = Date.now(),
+  ): { readonly openId: string; readonly unionId?: string; readonly name?: string; readonly avatarUrl?: string } | undefined {
+    const key = openId?.trim()
+    if (!key) return undefined
+    const cached = this.userCache.get(key)
+    if (!cached || now - cached.cachedAtMs >= USER_DETAIL_TTL_MS) return undefined
+    const cleanName = cached.name && cached.name !== key ? cached.name : undefined
+    return {
+      openId: cached.openId,
+      ...(cached.unionId ? { unionId: cached.unionId } : {}),
+      ...(cleanName ? { name: cleanName } : {}),
+      ...(cached.avatarUrl ? { avatarUrl: cached.avatarUrl } : {}),
+    }
   }
 
   async fetchBotProfile(): Promise<LarkBotProfile> {
@@ -1269,12 +1288,15 @@ export class LarkBotTransport {
   async resolveUserSummary(
     openId: string,
     fallbackName?: string,
-  ): Promise<{ openId: string; name: string; email?: string; avatarUrl?: string } | undefined> {
+  ): Promise<
+    { openId: string; unionId?: string; name: string; email?: string; avatarUrl?: string } | undefined
+  > {
     if (!openId.trim()) return undefined
     const detail = await this.lookupUserDetail(openId.trim(), fallbackName)
     if (!detail) return undefined
     return {
       openId: detail.openId,
+      ...(detail.unionId ? { unionId: detail.unionId } : {}),
       name: detail.name,
       ...(detail.email ? { email: detail.email } : {}),
       ...(detail.avatarUrl ? { avatarUrl: detail.avatarUrl } : {}),
@@ -1486,8 +1508,10 @@ export class LarkBotTransport {
         const u = res.data?.user
         if (u) {
           const avatarUrl = u.avatar?.avatar_72 || u.avatar?.avatar_240 || u.avatar?.avatar_origin
+          const unionId = typeof u.union_id === 'string' && u.union_id.trim() ? u.union_id.trim() : undefined
           const detail: CachedUserDetail = {
             openId,
+            ...(unionId ? { unionId } : {}),
             name: u.name || fallbackName || openId,
             ...(u.en_name ? { enName: u.en_name } : {}),
             ...(u.email || u.enterprise_email ? { email: u.enterprise_email || u.email } : {}),
@@ -1555,6 +1579,7 @@ export class LarkBotTransport {
       ...(typeof message.thread_id === 'string' && message.thread_id ? { threadId: message.thread_id } : {}),
       msgType,
       ...(typeof senderId.open_id === 'string' && senderId.open_id ? { senderOpenId: senderId.open_id } : {}),
+      ...(typeof senderId.union_id === 'string' && senderId.union_id ? { senderUnionId: senderId.union_id } : {}),
       senderType,
       text: parsedContent.text,
       rawContent,

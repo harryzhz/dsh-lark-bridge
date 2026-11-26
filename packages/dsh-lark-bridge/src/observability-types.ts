@@ -12,6 +12,9 @@ export interface TelemetryUsageEventInput {
   readonly chatId?: string
   readonly chatType?: 'group' | 'p2p' | 'internal' | ''
   readonly sessionId?: string
+  readonly senderId?: string
+  readonly senderName?: string
+  readonly senderType?: 'user' | 'bot' | ''
   readonly trigger?: string
   readonly agentPreset?: string
   readonly provider?: string
@@ -177,10 +180,58 @@ export interface ObservabilityChatRow {
   readonly lastActiveMs: number
 }
 
+export interface TelemetrySenderProfileRecord {
+  readonly botId: string
+  readonly openId: string
+  readonly unionId?: string
+  readonly name?: string
+  readonly avatarUrl?: string
+  readonly senderType?: 'user' | 'bot'
+  readonly updatedAtMs?: number
+}
+
 export interface ObservabilityChatFilterOption {
   readonly chatId: string
   readonly chatName: string
   readonly chatType: 'group' | 'p2p'
+  readonly botIds: readonly string[]
+}
+
+export interface ObservabilitySenderBotSummary {
+  readonly botId: string
+  readonly botName: string
+  readonly totalTokens: number
+}
+
+export interface ObservabilitySenderRow {
+  readonly senderId: string
+  readonly senderName: string
+  readonly senderType: 'user' | 'bot'
+  readonly avatarUrl?: string
+  readonly sessions: number
+  readonly activeChats: number
+  readonly inbound: number
+  readonly replied: number
+  readonly silentSkipped: number
+  readonly errors: number
+  readonly llmSteps: number
+  readonly totalTokens: number
+  readonly inputTokens?: number
+  readonly cacheReadTokens?: number
+  readonly cacheWriteTokens?: number
+  readonly outputTokens?: number
+  readonly topModels?: readonly ObservabilityRankModelSummary[]
+  readonly topBots?: readonly ObservabilitySenderBotSummary[]
+  readonly cacheHitRate: number
+  readonly avgLatencyMs: number
+  readonly lastActiveMs: number
+}
+
+export interface ObservabilitySenderFilterOption {
+  readonly senderId: string
+  readonly senderName: string
+  readonly senderType: 'user' | 'bot'
+  readonly avatarUrl?: string
   readonly botIds: readonly string[]
 }
 
@@ -263,7 +314,9 @@ export interface ObservabilityPayload {
   readonly filters: {
     readonly botId: string
     readonly chatId: string
+    readonly senderId: string
     readonly chats: readonly ObservabilityChatFilterOption[]
+    readonly senders: readonly ObservabilitySenderFilterOption[]
   }
   readonly backfill: {
     readonly running: boolean
@@ -334,6 +387,7 @@ export interface ObservabilityPayload {
     }
     readonly botRanking: readonly ObservabilityBotRow[]
     readonly chatRanking: readonly ObservabilityChatRow[]
+    readonly senderRanking: readonly ObservabilitySenderRow[]
   }
   readonly technical: {
     readonly sla: {

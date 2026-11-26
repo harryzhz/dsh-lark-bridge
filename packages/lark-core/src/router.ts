@@ -251,6 +251,7 @@ export function composeLarkContextReminder(input: LarkConversationContextInput):
       : []),
     ...(msg.parentId ? [`quoted_message_id="${escapeXmlAttr(msg.parentId)}"`] : []),
     ...(msg.senderOpenId ? [`sender_open_id="${escapeXmlAttr(msg.senderOpenId)}"`] : []),
+    ...(msg.senderUnionId ? [`sender_union_id="${escapeXmlAttr(msg.senderUnionId)}"`] : []),
     ...(input.senderName ? [`sender_name="${escapeXmlAttr(input.senderName)}"`] : []),
     `sender_type="${msg.senderType}"`,
   ]
