@@ -214,6 +214,12 @@ async function apiRequest(endpoint, method, path, body, extraHeaders) {
   })
   const data = await res.json().catch(() => ({}))
   if (!res.ok || data.ok === false) {
+    if (res.status === 401) {
+      const detail = data.error ? ` (${data.error})` : ''
+      throw new Error(
+        `本机桥接接口认证失败（HTTP 401${detail}，并非飞书用户未授权）：请检查 cli-endpoint.json 是否指向当前运行的 DSH 实例、是否存在多实例冲突，或升级 @harryzhz/dsh-lark-bridge 至最新版本。`,
+      )
+    }
     throw new Error(data.error || `HTTP ${res.status}`)
   }
   return data

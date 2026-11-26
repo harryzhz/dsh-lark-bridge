@@ -28,7 +28,7 @@ import { LARK_VIEW_RPC_PATH, LARK_VIEW_STREAM_PATH } from './session-viewer.js'
 import type { LarkScheduleDeliveryMode, LarkScheduleNotifyOn } from './types.js'
 
 export interface ConnectionAdmitter extends LoopbackConnectionAuth {
-  admit(req: IncomingMessage): { peer: unknown } | { rejection: 401 | 403 }
+  admit(req: IncomingMessage): { peer: unknown } | { rejection: 401 | 403 | 503 }
 }
 
 /** Shared `/api` exact Fetch route used by Web and Desktop UI clients via `ctx.connection.rpc`. */
@@ -1256,6 +1256,88 @@ export async function dispatchLarkApiRequest(
   }
 }
 
+async function handlePublicNavigationEndpoint(
+  requestPath: string,
+  req: IncomingMessage,
+  res: ServerResponse,
+  connection: ConnectionAdmitter,
+  manager: LarkBridgeManager,
+): Promise<boolean> {
+  const advertisedOrigin = manager.getAdvertisedWebOrigin?.() ?? ''
+  const resolveAuthenticatedUrl = (baseUrl: string): string | undefined =>
+    manager.resolveAuthenticatedEntryUrl?.(baseUrl)
+  if (requestPath === LARK_SESSION_OPEN_PATH) {
+    await handleSessionOpen(req, res, {
+      liveOrigin: manager.getLiveWebOrigin?.() ?? '',
+      advertisedOrigin,
+      connection,
+      resolveAuthenticatedUrl,
+      handoff: manager.sessionHandoff,
+      ...(manager.sessionViewer ? { viewer: manager.sessionViewer } : {}),
+    })
+    return true
+  }
+  if (requestPath === LARK_CONSOLE_LOGIN_PATH) {
+    await handleConsoleLogin(req, res, {
+      liveOrigin: manager.getLiveWebOrigin?.() ?? '',
+      advertisedOrigin,
+      connection,
+      resolveAuthenticatedUrl,
+      handoff: manager.consoleLogin,
+      onAudit: (ev) => {
+        manager.store.recordEvent({
+          botId: ev.botId,
+          kind: 'lifecycle',
+          summary: ev.summary,
+        })
+      },
+    })
+    return true
+  }
+  return false
+}
+
+/**
+ * Pre-authorization `webserver/request` waterfall handler for DSH 0.2.3-alpha.2+.
+ * Handles `GET`/`HEAD` top-level browser navigations to `/api/lark-bridge/open`
+ * and `/api/lark-bridge/console-login` before outer `webserver/authorize` rejects
+ * `Sec-Fetch-Site: cross-site` clicks coming from Feishu Web. Both endpoints
+ * enforce their own strict Host allowlist, top-level document checks, and HMAC
+ * ticket verification; all `POST` and API requests continue through `next()`.
+ */
+export function createLarkNavigationRequestHandler(
+  connection: ConnectionAdmitter,
+  manager: LarkBridgeManager,
+): (
+  req: IncomingMessage,
+  res: ServerResponse,
+  next: () => Promise<void>,
+) => Promise<void> {
+  return async (req, res, next) => {
+    if (req.socket?.destroyed || res.destroyed) return
+    const method = (req.method ?? 'GET').toUpperCase()
+    if (method !== 'GET' && method !== 'HEAD') {
+      await next()
+      return
+    }
+    let requestPath = ''
+    try {
+      requestPath = new URL(req.url ?? '/', 'http://127.0.0.1').pathname
+    } catch {
+      await next()
+      return
+    }
+    if (
+      requestPath !== LARK_SESSION_OPEN_PATH &&
+      requestPath !== LARK_CONSOLE_LOGIN_PATH
+    ) {
+      await next()
+      return
+    }
+    await handlePublicNavigationEndpoint(requestPath, req, res, connection, manager)
+  }
+}
+
 export function createLarkHttpHandler(
   ctx: Context,
   connection: ConnectionAdmitter,
@@ -1264,30 +1346,7 @@ export function createLarkHttpHandler(
   return async (req: IncomingMessage, res: ServerResponse) => {
     const requestPath = new URL(req.url ?? '/', 'http://127.0.0.1').pathname
     const advertisedOrigin = manager.getAdvertisedWebOrigin?.() ?? ''
-    if (requestPath === LARK_SESSION_OPEN_PATH) {
-      await handleSessionOpen(req, res, {
-        liveOrigin: manager.getLiveWebOrigin?.() ?? '',
-        advertisedOrigin,
-        connection,
-        handoff: manager.sessionHandoff,
-        ...(manager.sessionViewer ? { viewer: manager.sessionViewer } : {}),
-      })
-      return
-    }
-    if (requestPath === LARK_CONSOLE_LOGIN_PATH) {
-      await handleConsoleLogin(req, res, {
-        liveOrigin: manager.getLiveWebOrigin?.() ?? '',
-        advertisedOrigin,
-        connection,
-        handoff: manager.consoleLogin,
-        onAudit: (ev) => {
-          manager.store.recordEvent({
-            botId: ev.botId,
-            kind: 'lifecycle',
-            summary: ev.summary,
-          })
-        },
-      })
+    if (await handlePublicNavigationEndpoint(requestPath, req, res, connection, manager)) {
       return
     }
     if (requestPath === LARK_VIEW_RPC_PATH) {
@@ -1324,7 +1383,12 @@ export function createLarkHttpHandler(
       if ('rejection' in admission) {
         sendJson(res, admission.rejection, {
           ok: false,
-          error: admission.rejection === 401 ? 'unauthorized' : 'forbidden',
+          error:
+            admission.rejection === 401
+              ? 'unauthorized'
+              : admission.rejection === 503
+                ? 'authentication_unavailable'
+                : 'forbidden',
         })
         return
       }

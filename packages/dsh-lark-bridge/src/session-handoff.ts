@@ -5,7 +5,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 export const LARK_SESSION_OPEN_PATH = '/api/lark-bridge/open'
 
 export interface LoopbackConnectionAuth {
-  admit(req: IncomingMessage): { peer: unknown } | { rejection: 401 | 403 }
+  admit(req: IncomingMessage): { peer: unknown } | { rejection: 401 | 403 | 503 }
   authenticatedUrl?(baseUrl: string): string
 }
 
@@ -484,12 +484,21 @@ export async function handleSessionOpen(
     readonly liveOrigin: string
     readonly advertisedOrigin?: string
     readonly connection: LoopbackConnectionAuth
+    readonly resolveAuthenticatedUrl?: (baseUrl: string) => string | undefined
     readonly handoff?: LoopbackSessionHandoff
     readonly viewer?: SessionViewerRenderer
     readonly focusApp?: () => void
   },
 ): Promise<void> {
-  const { liveOrigin, advertisedOrigin = '', connection, handoff, viewer, focusApp } = options
+  const {
+    liveOrigin,
+    advertisedOrigin = '',
+    connection,
+    resolveAuthenticatedUrl,
+    handoff,
+    viewer,
+    focusApp,
+  } = options
   const pureLoopback =
     Boolean(liveOrigin) &&
     isLoopbackOrigin(liveOrigin) &&
@@ -499,6 +508,7 @@ export async function handleSessionOpen(
     await handleLoopbackSessionOpen(req, res, {
       liveOrigin,
       connection,
+      ...(resolveAuthenticatedUrl ? { resolveAuthenticatedUrl } : {}),
       ...(handoff ? { handoff } : {}),
       ...(focusApp ? { focusApp } : {}),
     })
@@ -590,6 +600,7 @@ export async function handleLoopbackSessionOpen(
   options: {
     readonly liveOrigin: string
     readonly connection: LoopbackConnectionAuth
+    readonly resolveAuthenticatedUrl?: (baseUrl: string) => string | undefined
     readonly handoff?: LoopbackSessionHandoff
     readonly focusApp?: () => void
   },
@@ -660,13 +671,20 @@ export async function handleLoopbackSessionOpen(
   let targetUrl: string
   if (alreadyAuthed) {
     targetUrl = `/${sessionHash}`
-  } else if (typeof connection.authenticatedUrl === 'function') {
-    const authed = new URL(connection.authenticatedUrl(liveOrigin))
-    authed.hash = sessionHash
-    targetUrl = `${authed.pathname}${authed.search}${authed.hash}`
   } else {
-    sendPlainText(res, 401, 'dsh web authentication required\n')
-    return
+    const resolvedAuthUrl =
+      options.resolveAuthenticatedUrl?.(liveOrigin) ??
+      (typeof connection.authenticatedUrl === 'function'
+        ? connection.authenticatedUrl(liveOrigin)
+        : undefined)
+    if (resolvedAuthUrl) {
+      const authed = new URL(resolvedAuthUrl)
+      authed.hash = sessionHash
+      targetUrl = `${authed.pathname}${authed.search}${authed.hash}`
+    } else {
+      sendPlainText(res, 401, 'dsh web authentication required\n')
+      return
+    }
   }
 
   sendHtml(res, method, renderSessionBounceHtml(targetUrl))

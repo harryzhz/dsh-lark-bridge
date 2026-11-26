@@ -85,7 +85,15 @@ function normalizeHttpOrigin(raw: string): string {
   return /^https?:\/\//i.test(trimmed) ? trimmed : ''
 }
 
-export function ensureCliAuthEndpoint(dataDir: string, publicBaseUrl: string): CliAuthEndpoint {
+export interface EnsureCliAuthOptions {
+  readonly deferWrite?: boolean
+}
+
+export function ensureCliAuthEndpoint(
+  dataDir: string,
+  publicBaseUrl: string,
+  options?: EnsureCliAuthOptions,
+): CliAuthEndpoint {
   const endpointFile = join(dataDir, 'cli-endpoint.json')
   let token = ''
   let persistedBaseUrl = ''
@@ -122,7 +130,7 @@ export function ensureCliAuthEndpoint(dataDir: string, publicBaseUrl: string): C
     )
   }
 
-  if (currentBase) {
+  if (currentBase && !options?.deferWrite) {
     persistEndpoint(currentBase)
   }
 
