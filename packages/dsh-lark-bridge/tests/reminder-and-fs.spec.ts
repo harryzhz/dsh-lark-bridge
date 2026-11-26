@@ -20,6 +20,7 @@ vi.mock('@deepseek-ai/dsh-session', async (importOriginal) => {
 import { LarkBridgeManager } from '../src/bridge-manager.js'
 import { ensureCliAuthEndpoint } from '../src/cli-support.js'
 import { createLarkHttpHandler, type ConnectionAdmitter } from '../src/http-api.js'
+import { MemoryService } from '../src/memory-service.js'
 import { ProactiveReminderService } from '../src/reminder-service.js'
 import { RuntimeCatalog } from '../src/runtime-catalog.js'
 import { LarkBridgeStore } from '../src/store.js'
@@ -1233,5 +1234,151 @@ describe('Local directory picker HTTP API & lark-bridge worktree CLI', () => {
       encoding: 'utf8',
     }).trim()
     expect(statusOut).toBe('')
+  })
+
+  it('injects bot/group <role> and query-aware scoped <memory> into reminder trigger prompts without empty-memory bloat or cross-chat leakage', async () => {
+    const dataDir = makeTempDir()
+    const workDir = makeTempDir()
+    const store = new LarkBridgeStore(dataDir)
+    const memory = new MemoryService(dataDir, store)
+
+    store.upsertBot({
+      id: 'dsh-agent',
+      name: '工程助手',
+      enabled: true,
+      larkAppId: 'cli_agent',
+      larkAppSecret: 'sec_agent',
+      defaultWorkingDir: workDir,
+      role: {
+        enabled: true,
+        name: '研发协作助手',
+        systemPrompt: '沟通简洁直接，结论先行。',
+      },
+      experimental: {
+        dreaming: { enabled: true },
+        proactive: {
+          remindersEnabled: true,
+          reminderCreationMode: 'silent',
+        },
+      },
+    })
+    store.upsertGroup({
+      botId: 'dsh-agent',
+      chatId: 'oc_release',
+      chatName: '发版协同群',
+      enabled: true,
+      role: {
+        mode: 'append',
+        name: '',
+        systemPrompt: '本群发版核查必须先核对灰度错误率。',
+      },
+    })
+
+    const submittedPrompts: string[] = []
+    const fakeCtx = {
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      agents: {
+        create: vi.fn(async ({ sessionId, setup }: { sessionId: string; setup?: (c: unknown, a: unknown) => void }) => {
+          const agent = {
+            session: { id: sessionId, header: { cwd: workDir, agentPreset: 'codex' } },
+          }
+          setup?.({}, agent)
+          return { agent, dispose: vi.fn(async () => {}) }
+        }),
+      },
+      get: () => undefined,
+    } as unknown as Context
+
+    const reminders = new ProactiveReminderService({
+      ctx: fakeCtx,
+      store,
+      runtimes: new RuntimeCatalog(fakeCtx),
+      workspaces: {
+        attachSession: vi.fn(async () => {}),
+        archiveSession: vi.fn(async () => true),
+      } as unknown as WorkspaceGrouping,
+      memory,
+      runTurn: vi.fn(async (_agent, content) => {
+        submittedPrompts.push(content.map((b) => ('text' in b ? b.text : '')).join('\n'))
+        return REMINDER_SILENT_SENTINEL
+      }),
+      sendOriginCard: vi.fn(async () => ({ messageId: 'om_card_1' })),
+      patchOriginCard: vi.fn(async () => {}),
+      deliverReminderOutput: vi.fn(async () => ({ messageId: 'om_out_1' })),
+    })
+
+    // 1. Empty memory store: injects <role> + <reminder_trigger>, omits <memory> even when dreaming is enabled
+    const emptyMemItem = await reminders.create({
+      botId: 'dsh-agent',
+      chatId: 'oc_release',
+      title: '核查下午发版',
+      prompt: '检查群内发版状态，未完成则同步最新进展',
+      afterSeconds: 300,
+      mentions: [{ openId: 'ou_dev_1', name: 'Sam' }],
+    })
+    await reminders.runNow(emptyMemItem.id)
+    expect(submittedPrompts[0]?.match(/<system_reminder>/g)).toHaveLength(1)
+    expect(submittedPrompts[0]).toContain('<role name="研发协作助手">')
+    expect(submittedPrompts[0]).toContain('本群发版核查必须先核对灰度错误率。')
+    expect(submittedPrompts[0]).not.toContain('<memory ')
+    expect(submittedPrompts[0]).toContain('<reminder_trigger ')
+
+    // 2. Seed bot feedback, current-chat, workspace, and other-chat memories
+    memory.upsert({
+      botId: 'dsh-agent',
+      scope: 'bot',
+      type: 'feedback',
+      title: '群聊跟进提醒措辞：禁止将语气提示词念进正文',
+      content: '群聊跟进评审进展时直接说人话，严禁把提示词中的语气标签字面写进消息正文。',
+      tags: ['reminder', '跟进', '评审'],
+    })
+    memory.upsert({
+      botId: 'dsh-agent',
+      scope: 'chat',
+      scopeId: 'oc_release',
+      type: 'project',
+      title: '发版群灰度门槛为错误率低于千分之一',
+      content: '发版核查需确认灰度窗口满 15 分钟且错误率低于 0.1%。',
+    })
+    memory.upsert({
+      botId: 'dsh-agent',
+      scope: 'workspace',
+      scopeId: workDir,
+      type: 'reference',
+      title: '发布回滚手册位于 docs/runbook.md',
+      content: '异常时按 docs/runbook.md 执行回滚。',
+    })
+    memory.upsert({
+      botId: 'dsh-agent',
+      scope: 'chat',
+      scopeId: 'oc_other_secret',
+      type: 'feedback',
+      title: '其他群专属机密流程',
+      content: '禁止泄露到其他群。',
+    })
+
+    const seededItem = await reminders.create({
+      botId: 'dsh-agent',
+      chatId: 'oc_release',
+      kind: 'delegation',
+      title: '跟进 PR 评审进展',
+      prompt: '核查话题与主群消息流，无进展则直接 @ Sam 询问当前评审进展',
+      afterSeconds: 300,
+      mentions: [{ openId: 'ou_dev_1', name: 'Sam' }],
+      ccMentions: [{ openId: 'ou_pm_1', name: 'Taylor' }],
+    })
+    await reminders.runNow(seededItem.id)
+
+    const promptWithMemory = submittedPrompts[1] ?? ''
+    expect(promptWithMemory.match(/<system_reminder>/g)).toHaveLength(1)
+    expect(promptWithMemory.indexOf('<role ')).toBeLessThan(promptWithMemory.indexOf('<memory '))
+    expect(promptWithMemory.indexOf('<memory ')).toBeLessThan(promptWithMemory.indexOf('<reminder_trigger '))
+    expect(promptWithMemory).toContain('群聊跟进提醒措辞：禁止将语气提示词念进正文')
+    // Query-aware expansion surfaces the feedback content inline because title/prompt hit 跟进 + 评审
+    expect(promptWithMemory).toContain('直接说人话')
+    expect(promptWithMemory).toContain('发版群灰度门槛为错误率低于千分之一')
+    expect(promptWithMemory).toContain('发布回滚手册位于 docs/runbook.md')
+    expect(promptWithMemory).not.toContain('其他群专属机密流程')
+    expect(promptWithMemory).not.toContain('温和')
   })
 })

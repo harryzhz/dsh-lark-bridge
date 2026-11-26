@@ -5,7 +5,7 @@ description: DSH 飞书桥接（dsh-lark-bridge）辅助技能与 CLI。用于�
 
 # lark-bridge — 飞书桥接工具指南
 
-会话首轮与自动化任务通过两级 `<system_reminder>`（内含 `<role>`、`<proactive>`、`<lark_context>`、`<substitute>`、`<listener>`、`<schedule>`、`<reminder_trigger>`、`<dream_job>` 等子标签）提供会话元数据与协作约束，并通过环境变量注入 `lark-bridge` CLI。
+会话首轮与自动化任务通过两级 `<system_reminder>`（内含 `<role>`、`<proactive>`、`<memory>`、`<lark_context>`、`<substitute>`、`<listener>`、`<schedule>`、`<reminder_trigger>`、`<dream_job>` 等子标签）提供会话元数据与协作约束，并通过环境变量注入 `lark-bridge` CLI。
 
 ## 一、使用边界
 
@@ -102,7 +102,7 @@ lark-bridge reminder create \
   --at "<YYYY-MM-DD HH:mm>" \
   --mention "<open_id>:<负责人>" \
   [--cc "<open_id>:<关注人>"] \
-  --prompt '运行 lark-bridge history --limit 20 并检查部署状态：已完成或群内已同步延期则调用 lark-bridge silence --reason "已闭环" 静默；未完成则简短提醒负责人并 cc 关注人。'
+  --prompt '运行 lark-bridge history --limit 20 并检查部署状态：已完成或群内已同步延期则调用 lark-bridge silence --reason "已闭环" 静默；未完成则 @ 负责人同步当前部署状态并询问发布安排，cc 关注人。'
 
 # 群内 A@B 委派事项跟进（--kind delegation；无明确时间则紧急故障 600s、常规协作/CR/审批 3600s）
 lark-bridge reminder create \
@@ -111,7 +111,7 @@ lark-bridge reminder create \
   --after 3600 \
   --mention "<B_open_id>:<负责人B>" \
   --cc "<A_open_id>:<发起人A>" \
-  --prompt '同时运行 lark-bridge history --limit 20 与 lark-bridge history --thread none --limit 20 检查进展：已闭环则调 lark-bridge silence 静默；若 B 已回应（如“收到/在看”）但尚未给出结果则顺延复查并静默；仍无进展则温和提醒 B 并 cc A。'
+  --prompt '同时运行 lark-bridge history --limit 20 与 lark-bridge history --thread none --limit 20 检查进展：已闭环则调 lark-bridge silence 静默；若 B 已回应（如“收到/在看”）但尚未给出结果则顺延复查并静默；仍无进展则直接 @ B 询问当前进展或是否需要协助，并 cc A。'
 
 # 按相对秒数复查（P0 紧急止损复查需穿透免打扰时加 --urgency high）
 lark-bridge reminder create \
@@ -120,7 +120,7 @@ lark-bridge reminder create \
   --mention "<open_id>:<值班负责人>" \
   [--cc "<open_id>:<关注人>"] \
   [--urgency high] \
-  --prompt '检查近 30 分钟错误率与群内通报：指标已恢复且无遗留开关则调用 lark-bridge silence --reason "指标已恢复" 静默；异常持续则同步数据提醒值班人。'
+  --prompt '检查近 30 分钟错误率与群内通报：指标已恢复且无遗留开关则调用 lark-bridge silence --reason "指标已恢复" 静默；异常持续则直接 @ 值班人同步当前错误率与遗留开关状态。'
 
 # 关联隔离工作树分支/PR 做错峰提审提醒
 lark-bridge reminder create \

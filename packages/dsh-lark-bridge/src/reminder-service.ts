@@ -25,6 +25,7 @@ import {
   buildReminderNoticeCard,
   buildReminderStatusCard,
   composeReminderTriggerPrompt,
+  composeRoleReminder,
   expandWorkingDir,
   extractReminderTriggerOutput,
   leafDirectoryName,
@@ -42,6 +43,7 @@ import {
   type ReminderUrgency,
 } from '@dsh-lark/lark-core'
 import { assertExistingWorkingDirectory } from './fs-browser.js'
+import type { MemoryService } from './memory-service.js'
 import type { RuntimeCatalog } from './runtime-catalog.js'
 import type { LarkBridgeStore } from './store.js'
 import { LARK_ORIGIN_RECORD_TYPE, type LarkOriginRecord } from './types.js'
@@ -86,6 +88,7 @@ export interface ReminderServiceHost {
   readonly store: LarkBridgeStore
   readonly runtimes: RuntimeCatalog
   readonly workspaces: WorkspaceGrouping
+  readonly memory?: MemoryService
   readonly onActivityChange?: () => void
   getExecutingTurnContext?(sessionId: string):
     | {
@@ -721,10 +724,31 @@ export class ProactiveReminderService {
           scheduledAt: formatFriendlyLocalTime(r.scheduledAt),
         }))
 
+      const roleReminder = composeRoleReminder(bot, group)
+      const memoryQueryText =
+        [item.title, item.prompt, item.reason]
+          .map((s) => s?.trim() ?? '')
+          .filter(Boolean)
+          .join('\n') || undefined
+      const memoryReminder = this.host.memory?.composeFirstTurnReminder(
+        {
+          botId: bot.id,
+          ...(item.origin.chatId ? { chatId: item.origin.chatId } : {}),
+          workingDir,
+        },
+        {
+          includeWhenEmpty: false,
+          ...(memoryQueryText ? { queryText: memoryQueryText } : {}),
+          nowMs,
+        },
+      )
+
       const prompt = composeReminderTriggerPrompt({
         item,
         currentLocalTimeStr: formatFriendlyLocalTime(new Date(nowMs).toISOString()),
         ...(siblingActiveReminders.length > 0 ? { siblingActiveReminders } : {}),
+        ...(roleReminder ? { roleReminder } : {}),
+        ...(memoryReminder ? { memoryReminder } : {}),
       })
 
       const launch = await this.host.runtimes.resolveAgentLaunch({

@@ -13,6 +13,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { LarkBridgeManager } from '../src/bridge-manager.js'
 import { OPERATOR_TOKEN_HEADER } from '../src/cli-support.js'
 import { createLarkHttpHandler, type ConnectionAdmitter } from '../src/http-api.js'
+import { MemoryService } from '../src/memory-service.js'
 import {
   ScheduleNotifier,
   type HostScheduleService,
@@ -1016,5 +1017,253 @@ describe('ScheduleNotifier, <system_reminder><schedule> injection & /api/lark-br
     } finally {
       await new Promise<void>((resolveClose) => server.close(() => resolveClose()))
     }
+  })
+
+  it('injects <role> and scoped <memory> on first turn of fresh single-bot schedule sessions without duplicating reused sessions or leaking cross-group rules', async () => {
+    const dir = makeTempDir()
+    const repoDir = makeTempDir()
+    const store = new LarkBridgeStore(dir)
+    const memory = new MemoryService(dir, store)
+
+    store.upsertBot({
+      id: 'dsh-bot',
+      name: 'DSH-Bot',
+      larkAppId: 'cli_123',
+      larkAppSecret: 'sec',
+      defaultWorkingDir: repoDir,
+      role: {
+        enabled: true,
+        name: '运维巡检助手',
+        systemPrompt: '巡检报告结论先行，禁止编造指标。',
+      },
+      experimental: {
+        dreaming: { enabled: true },
+        proactive: { remindersEnabled: true },
+      },
+    })
+    store.upsertGroup({
+      botId: 'dsh-bot',
+      chatId: 'oc_ops',
+      chatName: '研发值班群',
+      enabled: true,
+      role: {
+        mode: 'append',
+        name: '',
+        systemPrompt: '值班群告警必须附带排查建议。',
+      },
+    })
+    store.upsertGroup({
+      botId: 'dsh-bot',
+      chatId: 'oc_team',
+      chatName: '研发协作群',
+      enabled: true,
+      role: {
+        mode: 'append',
+        name: '',
+        systemPrompt: '协作群仅汇报阻塞项。',
+      },
+    })
+
+    memory.upsert({
+      botId: 'dsh-bot',
+      scope: 'bot',
+      type: 'feedback',
+      title: '巡检报告禁止贴内部字段名',
+      content: '输出巡检结论时用自然语言表述异常原因，不要罗列底层表字段名。',
+      tags: ['巡检', 'report'],
+    })
+    memory.upsert({
+      botId: 'dsh-bot',
+      scope: 'chat',
+      scopeId: 'oc_ops',
+      type: 'project',
+      title: '值班群专属升级联系人',
+      content: 'P0 故障升级通知主值班。',
+    })
+    memory.upsert({
+      botId: 'dsh-bot',
+      scope: 'chat',
+      scopeId: 'oc_team',
+      type: 'project',
+      title: '协作群专属周报口径',
+      content: '仅统计核心交付。',
+    })
+    memory.upsert({
+      botId: 'dsh-bot',
+      scope: 'workspace',
+      scopeId: repoDir,
+      type: 'reference',
+      title: '健康检查命令为 lark-bridge doctor',
+      content: '巡检先跑 lark-bridge doctor。',
+    })
+
+    store.upsertScheduleBinding({
+      scheduleId: 'sched-single',
+      enabled: true,
+      targets: [{ botId: 'dsh-bot', chatId: 'oc_ops' }],
+      deliveryMode: 'chat',
+      notifyOn: 'non_empty',
+    })
+    store.upsertScheduleBinding({
+      scheduleId: 'sched-multi',
+      enabled: true,
+      targets: [
+        { botId: 'dsh-bot', chatId: 'oc_ops' },
+        { botId: 'dsh-bot', chatId: 'oc_team' },
+      ],
+      deliveryMode: 'chat',
+      notifyOn: 'non_empty',
+    })
+    store.upsertScheduleBinding({
+      scheduleId: 'sched-reused',
+      enabled: true,
+      targets: [{ botId: 'dsh-bot', chatId: 'oc_ops' }],
+      deliveryMode: 'chat',
+      notifyOn: 'non_empty',
+    })
+
+    const catalogEntries: ScheduleEntryLike[] = [
+      {
+        id: 'sched-single',
+        kind: 'daily',
+        title: '每日巡检',
+        prompt: '执行每日服务健康巡检并汇报异常',
+        status: 'active',
+        scheduledAt: '2026-11-26T07:00:00.000Z',
+        time: '07:00:00',
+        target: { kind: 'new', create: { cwd: repoDir } },
+        involvedSessionIds: [],
+      },
+      {
+        id: 'sched-multi',
+        kind: 'daily',
+        title: '跨群公告巡检',
+        prompt: '汇总巡检结果广播给各群',
+        status: 'active',
+        scheduledAt: '2026-11-26T08:00:00.000Z',
+        time: '08:00:00',
+        target: { kind: 'new', create: { cwd: repoDir } },
+        involvedSessionIds: [],
+      },
+      {
+        id: 'sched-reused',
+        kind: 'every',
+        title: '复用旧会话巡检',
+        prompt: '检查状态',
+        status: 'active',
+        scheduledAt: '2026-11-26T09:00:00.000Z',
+        everySeconds: 3600,
+        target: { kind: 'session', sessionId: 'sess-existing-1' },
+        involvedSessionIds: ['sess-existing-1'],
+      },
+    ]
+
+    const fakeCtx = {
+      logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn() },
+      sessions: { get: () => undefined },
+      on: () => () => {},
+      get: (name: string) =>
+        name === 'schedule'
+          ? ({
+              catalog: async () => catalogEntries,
+              view: async ({ id }: { id: string }) =>
+                catalogEntries.find((e) => e.id === id) ?? { code: 'schedule_not_found' },
+              run: async ({ id }: { id: string }) =>
+                catalogEntries.find((e) => e.id === id) ?? { code: 'schedule_not_found' },
+            } satisfies HostScheduleService)
+          : undefined,
+    } as unknown as Context
+
+    const notifier = new ScheduleNotifier({
+      ctx: fakeCtx,
+      store,
+      workspaces: { attachSession: vi.fn(), archiveSession: vi.fn() } as unknown as WorkspaceGrouping,
+      memory,
+      sendScheduleMessage: vi.fn().mockResolvedValue(undefined),
+    })
+    await notifier.refreshScheduleContextCache()
+
+    const makeSchedMsg = (id: string, prompt: string): UserMessage =>
+      ({
+        id: `msg-${id}`,
+        role: 'user',
+        source: { kind: 'schedule' },
+        content: [
+          {
+            type: 'text',
+            text: `[SCHEDULE REMINDER]\nschedule_id_json: "${id}"\nreminder_prompt_json: "${prompt}"`,
+          },
+        ],
+      }) as unknown as UserMessage
+
+    // 1. Fresh single-group session gets <role> (bot + group) + <memory> (bot + ops + workspace, no team) + <schedule>
+    const freshSession = {
+      id: 'sess-sched-fresh',
+      header: { cwd: repoDir },
+      snapshotEvents: () => [],
+    } as unknown as Session
+    const enriched1 = notifier.enrichScheduleUserMessage(
+      freshSession.id,
+      makeSchedMsg('sched-single', '执行每日服务健康巡检'),
+      freshSession,
+    )
+    const text1 = (enriched1.content[0] as { text: string }).text
+    expect(text1.match(/<system_reminder>/g)).toHaveLength(1)
+    expect(text1.indexOf('<role ')).toBeLessThan(text1.indexOf('<memory '))
+    expect(text1.indexOf('<memory ')).toBeLessThan(text1.indexOf('<schedule '))
+    expect(text1).toContain('值班群告警必须附带排查建议。')
+    expect(text1).toContain('巡检报告禁止贴内部字段名')
+    expect(text1).toContain('不要罗列底层表字段名')
+    expect(text1).toContain('值班群专属升级联系人')
+    expect(text1).toContain('健康检查命令为 lark-bridge doctor')
+    expect(text1).not.toContain('协作群专属周报口径')
+
+    // 2. Subsequent turn on the same session must NOT re-inject <role> or <memory>
+    const enrichedSecondTurn = notifier.enrichScheduleUserMessage(
+      freshSession.id,
+      makeSchedMsg('sched-single', '二次巡检'),
+      freshSession,
+    )
+    const text2 = (enrichedSecondTurn.content[0] as { text: string }).text
+    expect(text2).toContain('<system_reminder>\n<schedule schedule_id="sched-single"')
+    expect(text2).not.toContain('<role ')
+    expect(text2).not.toContain('<memory ')
+
+    // 3. Reused existing session (`target.kind === 'session'` or existing user/message) skips <role> and <memory>
+    const reusedSession = {
+      id: 'sess-existing-1',
+      header: { cwd: repoDir },
+      snapshotEvents: () => [{ type: 'user/message' }],
+    } as unknown as Session
+    const enrichedReused = notifier.enrichScheduleUserMessage(
+      reusedSession.id,
+      makeSchedMsg('sched-reused', '检查状态'),
+      reusedSession,
+    )
+    const textReused = (enrichedReused.content[0] as { text: string }).text
+    expect(textReused).toContain('<system_reminder>\n<schedule schedule_id="sched-reused"')
+    expect(textReused).not.toContain('<role ')
+    expect(textReused).not.toContain('<memory ')
+
+    // 4. Multi-group broadcast injects bot-level <role> + bot/workspace <memory>, blocking chat-scoped leakage
+    const multiSession = {
+      id: 'sess-sched-multi',
+      header: { cwd: repoDir },
+      snapshotEvents: () => [],
+    } as unknown as Session
+    const enrichedMulti = notifier.enrichScheduleUserMessage(
+      multiSession.id,
+      makeSchedMsg('sched-multi', '汇总巡检结果'),
+      multiSession,
+    )
+    const textMulti = (enrichedMulti.content[0] as { text: string }).text
+    expect(textMulti.match(/<system_reminder>/g)).toHaveLength(1)
+    expect(textMulti).toContain('巡检报告结论先行，禁止编造指标。')
+    expect(textMulti).not.toContain('值班群告警必须附带排查建议。')
+    expect(textMulti).not.toContain('协作群仅汇报阻塞项。')
+    expect(textMulti).toContain('巡检报告禁止贴内部字段名')
+    expect(textMulti).toContain('健康检查命令为 lark-bridge doctor')
+    expect(textMulti).not.toContain('值班群专属升级联系人')
+    expect(textMulti).not.toContain('协作群专属周报口径')
   })
 })

@@ -992,12 +992,24 @@ describe('decideLarkRouting, <user_message> format, memberOverrides & title inte
     const delegationTrigger = composeReminderTriggerPrompt({
       item: delegationItem,
       currentLocalTimeStr: '2026-11-22 17:00',
+      roleReminder: '<role name="工程助手">\n直接、克制地推进事项。\n</role>',
+      memoryReminder: '<memory bot_id="dsh-bot" active="1">\n- [mem-1] feedback: 群聊跟进直接说人话\n</memory>',
     })
+    expect(delegationTrigger.match(/<system_reminder>/g)).toHaveLength(1)
+    expect(delegationTrigger).toContain('<system_reminder>\n<role name="工程助手">')
+    expect(delegationTrigger.indexOf('<role ')).toBeLessThan(delegationTrigger.indexOf('<memory '))
+    expect(delegationTrigger.indexOf('<memory ')).toBeLessThan(delegationTrigger.indexOf('<reminder_trigger '))
     expect(delegationTrigger).toContain('kind="delegation"')
     expect(delegationTrigger).toContain('- 主负责人（必 @）：Bob(open_id="ou_bob")')
     expect(delegationTrigger).toContain('- 抄送关注（cc）：Alex(open_id="ou_alex")')
     expect(delegationTrigger).toContain('lark-bridge history --thread none --limit 20')
     expect(delegationTrigger).toContain('尚未给出最终结果')
+    expect(delegationTrigger).toContain('勿将系统或提醒指令中的语气要求字面写进正文')
+    expect(delegationTrigger).not.toContain('温和')
+    expect(delegationTrigger).not.toContain('确认口吻')
+    expect(triggerPrompt).not.toContain('温和')
+    expect(p2pTriggerPrompt).toContain('勿将系统或提醒指令中的语气要求字面写进正文')
+    expect(hasInjectedPromptMarkup('<memory bot_id="dsh-bot" active="1">')).toBe(true)
 
     expect(
       formatReminderOutputWithMentions({
