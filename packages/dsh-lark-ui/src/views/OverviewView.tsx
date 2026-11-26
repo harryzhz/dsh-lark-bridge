@@ -188,16 +188,31 @@ export function OverviewView({
           }
         />
         <KpiCard
-          label="平均响应"
+          label="24H 对话响应"
           value={formatLatencyMs(summary.avgLatencyMs)}
           tag={summary.p95LatencyMs > 0 ? `P95 ${formatLatencyMs(summary.p95LatencyMs)}` : '24H'}
           spark={latencySpark}
           sparkTone="warn"
-          foot={
-            summary.p95LatencyMs > 0
-              ? `P95 ${formatLatencyMs(summary.p95LatencyMs)} · 成功率 ${summary.successRate24h}%`
-              : '近 24 小时暂无延迟样本'
-          }
+          foot={(() => {
+            const interactiveSamples = summary.interactiveLatencySamples24h ?? 0
+            const queuedReplies = summary.queuedReplies24h ?? 0
+            const avgQueueWait = summary.avgQueueWaitMs24h ?? 0
+            const avgExec = summary.avgExecMs24h ?? 0
+            const proactiveSamples = summary.proactiveSamples24h ?? 0
+            const proactiveAvg = summary.proactiveAvgLatencyMs24h ?? 0
+            if (summary.avgLatencyMs <= 0 && summary.p95LatencyMs <= 0) {
+              return proactiveSamples > 0
+                ? `仅后台任务 ${proactiveSamples} 次（均耗 ${formatLatencyMs(proactiveAvg)}）`
+                : '近 24 小时暂无对话样本'
+            }
+            if (queuedReplies > 0 && avgQueueWait >= 500) {
+              return `含排队均 ${formatLatencyMs(avgQueueWait)} · 执行均 ${formatLatencyMs(avgExec)}`
+            }
+            if (proactiveSamples > 0) {
+              return `实时对话${interactiveSamples > 0 ? ` ${interactiveSamples} 次` : ''} · 后台均 ${formatLatencyMs(proactiveAvg)}`
+            }
+            return `实时对话${interactiveSamples > 0 ? ` ${interactiveSamples} 次` : ''} · 成功率 ${summary.successRate24h}%`
+          })()}
         />
       </div>
 

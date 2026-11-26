@@ -982,13 +982,13 @@ function MonitorPane({
           foot={`异常 ${sla.totalErrors} · 回退 ${sla.triageFallbackRate}% · 工具失败 ${sla.toolErrorRate}%`}
         />
         <KpiCard
-          label="端到端回复耗时"
+          label="对话回复耗时"
           value={formatLatencyMs(latency.p50Ms)}
           unit={`/ ${formatLatencyMs(latency.p95Ms)}`}
           delta={formatDeltaBadge(latency.deltaP95Pct, { invertGood: true })}
           spark={p95Spark}
           sparkTone="warn"
-          foot={`含推理与工具 · P99 ${formatLatencyMs(latency.p99Ms)} · 样本 ${latency.samples}`}
+          foot={`实时对话 · P99 ${formatLatencyMs(latency.p99Ms)} · 样本 ${latency.samples}`}
         />
         <KpiCard
           label="运行时与连接"
@@ -1049,7 +1049,7 @@ function MonitorPane({
         <section className="fb-card fb-obs-panel">
           <div className="fb-obs-panel-head">
             <div className="fb-obs-panel-title-wrap">
-              <h2 className="fb-obs-panel-title">Agent 端到端回复耗时分布</h2>
+              <h2 className="fb-obs-panel-title">实时对话回复耗时分布</h2>
               <span className="fb-obs-panel-sub fb-mono">{latency.samples} SAMPLES</span>
             </div>
           </div>
@@ -1076,6 +1076,28 @@ function MonitorPane({
 
           <div className="fb-obs-divider" />
 
+          {(latency.breakdown?.exec.samples ?? 0) > 0 && (
+            <div className="fb-obs-kv-row fb-num">
+              <span className="fb-obs-muted">排队等待 / 主引擎执行</span>
+              <span className="fb-mono">
+                {(latency.breakdown?.queueWait.queuedCount ?? 0) > 0
+                  ? `排队均 ${formatLatencyMs(latency.breakdown!.queueWait.avgMs)}（${latency.breakdown!.queueWait.queuedCount} 次）· `
+                  : '无明显排队 · '}
+                执行均 {formatLatencyMs(latency.breakdown!.exec.avgMs)} · P95{' '}
+                {formatLatencyMs(latency.breakdown!.exec.p95Ms)}
+              </span>
+            </div>
+          )}
+          {(latency.breakdown?.proactive.samples ?? 0) > 0 && (
+            <div className="fb-obs-kv-row fb-num">
+              <span className="fb-obs-muted">后台任务耗时（单列）</span>
+              <span className="fb-mono">
+                均值 {formatLatencyMs(latency.breakdown!.proactive.avgMs)} · P95{' '}
+                {formatLatencyMs(latency.breakdown!.proactive.p95Ms)} ·{' '}
+                {latency.breakdown!.proactive.samples} 次
+              </span>
+            </div>
+          )}
           <div className="fb-obs-kv-row fb-num">
             <span className="fb-obs-muted">智能分流网关延迟</span>
             <span className="fb-mono">

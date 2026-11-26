@@ -607,6 +607,12 @@ export interface CockpitPayload {
     successRate24h: number
     avgLatencyMs: number
     p95LatencyMs: number
+    interactiveLatencySamples24h?: number
+    avgQueueWaitMs24h?: number
+    avgExecMs24h?: number
+    queuedReplies24h?: number
+    proactiveAvgLatencyMs24h?: number
+    proactiveSamples24h?: number
   }
   alerts?: DiagnosticAlert[]
   hourlySeries: Array<{
@@ -1267,6 +1273,27 @@ export interface ObservabilityPayload {
       maxMs: number
       deltaP95Pct: number | null
       histogram: ObservabilityLatencyBucket[]
+      breakdown?: {
+        queueWait: {
+          samples: number
+          queuedCount: number
+          avgMs: number
+          p95Ms: number
+          maxMs: number
+        }
+        exec: {
+          samples: number
+          avgMs: number
+          p95Ms: number
+          maxMs: number
+        }
+        proactive: {
+          samples: number
+          avgMs: number
+          p95Ms: number
+          maxMs: number
+        }
+      }
     }
     connections: {
       onlineBots: number

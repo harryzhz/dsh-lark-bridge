@@ -941,9 +941,12 @@ export class ProactiveReminderService {
           return this.host.store.getReminder(item.id) ?? item
         }
       }
+      const execStartedMs = Date.now()
       const replyText = await this.host.runTurn(handle.agent, [{ type: 'text', text: prompt }])
       const finishedMs = Date.now()
       const durationMs = finishedMs - startedMs
+      const execMs = Math.max(0, finishedMs - execStartedMs)
+      const queueWaitMs = Math.min(durationMs, Math.max(0, Math.round(runtimeLease?.waitMs ?? 0)))
       this.host.store.touchManagedSession?.(sessionId, finishedMs)
 
       const output = controlState.silenced ? undefined : extractReminderTriggerOutput(replyText)
@@ -965,6 +968,9 @@ export class ProactiveReminderService {
         this.host.store.recordMetric({
           botId: bot.id,
           ...(item.origin.chatId ? { chatId: item.origin.chatId } : {}),
+          chatType: item.origin.chatType,
+          sessionId,
+          trigger: 'reminder',
           kind: 'silent_skip',
         })
         this.host.store.recordEvent({
@@ -1002,6 +1008,8 @@ export class ProactiveReminderService {
         trigger: 'reminder',
         kind: 'replied',
         latencyMs: durationMs,
+        queueWaitMs,
+        execMs,
       })
       this.host.store.recordEvent({
         botId: bot.id,

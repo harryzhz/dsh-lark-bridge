@@ -1549,4 +1549,227 @@ describe('ObservabilityRepo, ObservabilityService & HTTP endpoints', () => {
 
     store.close()
   })
+
+  it('aligns cockpit latency to 24h interactive replies, excludes proactive background jobs, and splits queueWaitMs vs execMs', async () => {
+    const dataDir = makeTempDir('lark-obs-p1-split-')
+    const store = new LarkBridgeStore(dataDir)
+    const nowMs = Date.UTC(2026, 10, 26, 15, 30, 0)
+
+    store.upsertBot({
+      id: 'bot-fast',
+      name: 'Fast Bot',
+      larkAppId: 'cli_fast',
+      larkAppSecret: 'sec_fast',
+      defaultWorkingDir: '/Users/demo/fast',
+      agentPreset: 'codex',
+    })
+    store.upsertBot({
+      id: 'bot-heavy',
+      name: 'Heavy Bot',
+      larkAppId: 'cli_heavy',
+      larkAppSecret: 'sec_heavy',
+      defaultWorkingDir: '/Users/demo/heavy',
+      agentPreset: 'agy',
+    })
+
+    // 1. Stale 48h-old heavy turn on bot-heavy (must NOT pollute 24h cockpit KPI or bot-heavy 24h avg)
+    store.recordMetric({
+      botId: 'bot-heavy',
+      chatId: 'oc_dev',
+      chatType: 'group',
+      sessionId: 'sess-stale',
+      trigger: 'mention',
+      kind: 'replied',
+      latencyMs: 3_600_000, // 60 minutes, 48h ago
+      queueWaitMs: 0,
+      execMs: 3_600_000,
+      now: nowMs - 48 * 3_600_000,
+    })
+
+    // 2. Proactive background tasks in last 24h (reminder + schedule + dreaming) must NOT pollute interactive latency
+    store.recordMetric({
+      botId: 'bot-fast',
+      chatId: 'oc_ops',
+      chatType: 'group',
+      sessionId: 'sess-rem-1',
+      trigger: 'reminder',
+      kind: 'replied',
+      latencyMs: 600_000, // 10 min reminder
+      queueWaitMs: 30_000,
+      execMs: 570_000,
+      now: nowMs - 2 * 3_600_000,
+    })
+    store.recordMetric({
+      botId: 'bot-heavy',
+      chatId: 'oc_dev',
+      chatType: 'group',
+      sessionId: 'sess-sched-1',
+      trigger: 'schedule',
+      kind: 'replied',
+      latencyMs: 900_000, // 15 min schedule
+      now: nowMs - 3_600_000,
+    })
+    store.recordUsageEvent({
+      id: 'dream:sess-dream-1',
+      timestampMs: nowMs - 3_600_000,
+      recordKind: 'proactive',
+      botId: 'bot-heavy',
+      chatId: 'dream:internal',
+      chatType: 'internal',
+      sessionId: 'sess-dream-1',
+      trigger: 'dreaming',
+      outcome: 'completed',
+      latencyMs: 1_200_000, // 20 min dreaming
+    })
+
+    // Verify telemetryRepo excluded proactive latency from hourly_buckets & bot_metrics
+    const botFastMetrics = store.telemetryRepo.listBotMetricsMap().get('bot-fast')
+    expect(botFastMetrics?.latenciesMs ?? []).toEqual([])
+
+    // 3. Interactive replies in last 24h with explicit queueWaitMs vs execMs breakdown
+    store.recordMetric({
+      botId: 'bot-fast',
+      chatId: 'oc_ops',
+      chatType: 'group',
+      sessionId: 'sess-i1',
+      senderId: 'ou_u1',
+      senderName: 'Alex',
+      senderType: 'user',
+      trigger: 'mention',
+      kind: 'replied',
+      latencyMs: 4_000,
+      queueWaitMs: 0,
+      execMs: 4_000,
+      now: nowMs - 3_600_000,
+    })
+    store.recordMetric({
+      botId: 'bot-fast',
+      chatId: 'oc_ops',
+      chatType: 'group',
+      sessionId: 'sess-i2',
+      senderId: 'ou_u1',
+      senderName: 'Alex',
+      senderType: 'user',
+      trigger: 'active-thread',
+      kind: 'replied',
+      latencyMs: 26_000,
+      queueWaitMs: 12_000,
+      execMs: 14_000,
+      now: nowMs - 1_800_000,
+    })
+    store.recordMetric({
+      botId: 'bot-fast',
+      chatId: 'oc_ops',
+      chatType: 'group',
+      sessionId: 'sess-i3',
+      senderId: 'ou_u1',
+      senderName: 'Alex',
+      senderType: 'user',
+      trigger: 'triage',
+      kind: 'replied',
+      latencyMs: 3_000,
+      queueWaitMs: 0,
+      execMs: 3_000,
+      now: nowMs - 600_000,
+    })
+
+    const statuses = [
+      {
+        botId: 'bot-fast',
+        name: 'Fast Bot',
+        larkAppId: 'cli_fast',
+        enabled: true,
+        connected: true,
+        activeBindings: 1,
+      },
+      {
+        botId: 'bot-heavy',
+        name: 'Heavy Bot',
+        larkAppId: 'cli_heavy',
+        enabled: true,
+        connected: true,
+        activeBindings: 0,
+      },
+    ]
+
+    // Cockpit projection uses 24h interactive window only: [3000, 4000, 26000] -> avg 11000, p95 26000
+    const cockpit = store.buildCockpit(statuses, (sid) => `/s/${sid}`, nowMs)
+    expect(cockpit.summary.avgLatencyMs).toBe(11_000)
+    expect(cockpit.summary.p95LatencyMs).toBe(26_000)
+    expect(cockpit.summary.interactiveLatencySamples24h).toBe(3)
+    expect(cockpit.summary.queuedReplies24h).toBe(1)
+    expect(cockpit.summary.avgQueueWaitMs24h).toBe(4_000)
+    expect(cockpit.summary.avgExecMs24h).toBe(7_000)
+    expect(cockpit.summary.proactiveSamples24h).toBe(3)
+    expect(cockpit.summary.proactiveAvgLatencyMs24h).toBe(900_000)
+
+    const fastRow = cockpit.botRows.find((b) => b.botId === 'bot-fast')
+    const heavyRow = cockpit.botRows.find((b) => b.botId === 'bot-heavy')
+    expect(fastRow?.avgLatencyMs).toBe(11_000)
+    expect(heavyRow?.avgLatencyMs).toBe(0)
+
+    // Observability payload splits interactive latency vs queueWait / exec / proactive
+    const fakeCtx = { get: () => undefined } as unknown as Context
+    const svc = new ObservabilityService({
+      ctx: fakeCtx,
+      dataDir,
+      store,
+      startedAtMs: nowMs - 3_600_000,
+      enableBackgroundTimers: false,
+      listBotStatuses: () => statuses,
+      getTransportDiagnostics: () => undefined,
+      listSplitBrainAlerts: () => [],
+      getLifecycleStatus: () => ({
+        phase: 'running',
+        draining: false,
+        drained: true,
+        activeTurns: [],
+        activeTriageCount: 0,
+        activeRemindersCount: 0,
+        activeDreamingCount: 0,
+        totalInFlight: 0,
+        persistedPendingTurns: 0,
+        pid: process.pid,
+        startedAtMs: nowMs - 3_600_000,
+      }),
+      getConcurrencyStats: () => ({ activeActors: 0, queuedTurns: 0 }),
+      getDiagnosticAlerts: () => [],
+      getConfiguredScheduleCount: () => 0,
+    })
+
+    const obs = await svc.getPayload({ window: '24h', nowMs })
+    expect(obs.technical.latency.samples).toBe(3)
+    expect(obs.technical.latency.avgMs).toBe(11_000)
+    expect(obs.technical.latency.p50Ms).toBe(4_000)
+    expect(obs.technical.latency.p95Ms).toBe(26_000)
+    expect(obs.technical.latency.breakdown?.queueWait).toMatchObject({
+      samples: 3,
+      queuedCount: 1,
+      avgMs: 4_000,
+      p95Ms: 12_000,
+      maxMs: 12_000,
+    })
+    expect(obs.technical.latency.breakdown?.exec).toMatchObject({
+      samples: 3,
+      avgMs: 7_000,
+      p95Ms: 14_000,
+      maxMs: 14_000,
+    })
+    expect(obs.technical.latency.breakdown?.proactive).toMatchObject({
+      samples: 3,
+      avgMs: 900_000,
+      p95Ms: 1_200_000,
+      maxMs: 1_200_000,
+    })
+
+    // Rankings exclude proactive latency from interactive avgLatencyMs
+    const opsChat = obs.product.chatRanking.find((c) => c.chatId === 'oc_ops')
+    expect(opsChat?.avgLatencyMs).toBe(11_000)
+    const fastBotRank = obs.product.botRanking.find((b) => b.botId === 'bot-fast')
+    const heavyBotRank = obs.product.botRanking.find((b) => b.botId === 'bot-heavy')
+    expect(fastBotRank?.avgLatencyMs).toBe(11_000)
+    expect(heavyBotRank?.avgLatencyMs).toBe(0)
+
+    store.close()
+  })
 })

@@ -22,6 +22,8 @@ export interface TelemetryUsageEventInput {
   readonly outcome?: string
   readonly errorCode?: string
   readonly latencyMs?: number
+  readonly queueWaitMs?: number
+  readonly execMs?: number
   readonly inputTokens?: number
   readonly outputTokens?: number
   readonly cacheReadTokens?: number
@@ -410,6 +412,27 @@ export interface ObservabilityPayload {
       readonly maxMs: number
       readonly deltaP95Pct: number | null
       readonly histogram: readonly ObservabilityLatencyBucket[]
+      readonly breakdown?: {
+        readonly queueWait: {
+          readonly samples: number
+          readonly queuedCount: number
+          readonly avgMs: number
+          readonly p95Ms: number
+          readonly maxMs: number
+        }
+        readonly exec: {
+          readonly samples: number
+          readonly avgMs: number
+          readonly p95Ms: number
+          readonly maxMs: number
+        }
+        readonly proactive: {
+          readonly samples: number
+          readonly avgMs: number
+          readonly p95Ms: number
+          readonly maxMs: number
+        }
+      }
     }
     readonly connections: {
       readonly onlineBots: number
