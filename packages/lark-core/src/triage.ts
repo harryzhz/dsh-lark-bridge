@@ -43,6 +43,12 @@ export interface TriageQuotedMessage {
   readonly imageCount: number
 }
 
+export interface TriageActiveListenerSummary {
+  readonly senderName?: string
+  readonly preview: string
+  readonly elapsedSec: number
+}
+
 export interface TriagePromptInput {
   readonly botName: string
   readonly botRoleName?: string
@@ -61,6 +67,7 @@ export interface TriagePromptInput {
   readonly attachedImageCount?: number
   readonly hasActiveWorker: boolean
   readonly workerBusy?: boolean
+  readonly activeChatListeners?: readonly TriageActiveListenerSummary[]
   readonly silentOnly?: boolean
   readonly delegationFollowupEnabled?: boolean
   readonly lastWorkerReply?: string
@@ -327,6 +334,7 @@ function triggerGuideOf(
       '## 触发信号：群主动监听（旁听）',
       `- 用户并未 @ 本智能体${botLabel}，请严格参照下方监听规则过滤噪音；无关讨论与常规状态同步直接 \`silent\`，符合规则需要核实或执行的 \`handoff\`。`,
       `- **严防错认 @ 对象**：若消息或 \`peer_mentions\` 提及了其他成员或其他智能体${peerLabel}，严禁误认为在呼叫本智能体，也**禁止使用 \`quick_reply\` 抢答**；除命中业务监听规则或委派跟进需 \`handoff\` 外，一律 \`silent\`。`,
+      '- **避免同话题并发重复拉起**：若 `<active_chat_listeners>` 显示本群已有正在处理同一讨论/故障的主会话，且当前消息只是成员间的连续补充、确认、回复或配套报错截图（未显式 `@` 本智能体），直接选 `silent` 避免重复拉起并发主会话；仅当出现明确独立的新故障或新诉求时再选 `handoff`。',
       ...(options?.delegationFollowupEnabled ? [delegationNote] : []),
     ].join('\n')
   }
@@ -477,8 +485,33 @@ export function buildTriageUserMessage(input: TriagePromptInput): string {
     ...(input.attachedImageCount && input.attachedImageCount > 0
       ? [`images=${input.attachedImageCount}`]
       : []),
+    ...(input.trigger === 'listener' && input.activeChatListeners && input.activeChatListeners.length > 0
+      ? [`active_chat_listeners=${input.activeChatListeners.length}`]
+      : []),
   ]
   sections.push(`<triage_meta ${metaParts.join(' ')} />`)
+
+  if (
+    input.trigger === 'listener' &&
+    input.activeChatListeners &&
+    input.activeChatListeners.length > 0
+  ) {
+    const activeLines = input.activeChatListeners.slice(0, 3).map((item) => {
+      const who = item.senderName?.trim() || '成员'
+      const elapsed = Math.max(0, Math.round(item.elapsedSec))
+      const preview = item.preview.replace(/\s+/g, ' ').trim()
+      const clipped = preview.length > 80 ? `${preview.slice(0, 80)}…` : preview || '[空消息]'
+      return `- [${who} · 已运行 ${elapsed}s] ${clipped}`
+    })
+    sections.push(
+      [
+        '<active_chat_listeners>',
+        `当前群聊已有 ${input.activeChatListeners.length} 个主动监听主会话正在后台处理（避免为同一讨论串的后续碎片重复拉起并发会话）：`,
+        ...activeLines,
+        '</active_chat_listeners>',
+      ].join('\n'),
+    )
+  }
 
   const includeLastReply = input.includeLastReply !== false
   if (includeLastReply && input.hasActiveWorker && input.lastWorkerReply?.trim()) {

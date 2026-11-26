@@ -49,6 +49,10 @@ import type { ObservabilityPayload, ObservabilityWindow } from './observability-
 import { PluginUpdateService } from './plugin-updater.js'
 import { ProactiveReminderService } from './reminder-service.js'
 import { RuntimeCatalog } from './runtime-catalog.js'
+import {
+  DEFAULT_MAX_CONCURRENT_TURNS_PER_RUNTIME,
+  RuntimeConcurrencyLimiter,
+} from './runtime-concurrency.js'
 import { ScheduleNotifier, type ScheduleCreateInputLike } from './schedule-notifier.js'
 import { SessionCoordinator } from './session-coordinator.js'
 import { LoopbackSessionHandoff, isLoopbackOrigin } from './session-handoff.js'
@@ -117,6 +121,7 @@ export class LarkBridgeManager {
   readonly sessionViewer: LarkSessionViewerService
   readonly connections: BotConnectionPool
   readonly sessions: SessionCoordinator
+  readonly runtimeLimiter: RuntimeConcurrencyLimiter
   readonly triage: LlmTriageService
   readonly inbound: InboundPipeline
   readonly facade: AgentToolFacade
@@ -195,6 +200,10 @@ export class LarkBridgeManager {
       disposeReminderHandle: (sessionId) => this.reminders.disposeSessionHandle(sessionId),
     })
 
+    this.runtimeLimiter = new RuntimeConcurrencyLimiter(
+      config.maxConcurrentTurnsPerRuntime ?? DEFAULT_MAX_CONCURRENT_TURNS_PER_RUNTIME,
+    )
+
     this.titleGuard = new SessionTitleGuard(ctx, store, this.workspaces, (sid) =>
       this.sessions.archiveManagedSession(sid),
     )
@@ -234,6 +243,11 @@ export class LarkBridgeManager {
       runtimes: this.runtimes,
       connections: this.connections,
       sessions: this.sessions,
+      runtimeLimiter: this.runtimeLimiter,
+      listenerDebounceEnabled: config.idleSweepIntervalMs > 0,
+      ...(config.listenerDebounceOverrideMs !== undefined
+        ? { listenerDebounceOverrideMs: config.listenerDebounceOverrideMs }
+        : {}),
       memory: this.memory,
       triage: this.triage,
       titleGuard: this.titleGuard,
@@ -287,6 +301,10 @@ export class LarkBridgeManager {
       runtimes: this.runtimes,
       workspaces: this.workspaces,
       memory: this.memory,
+      runtimeLimiter: this.runtimeLimiter,
+      shutdownSignal: this.shutdownController.signal,
+      dispatchStaggerMs:
+        config.reminderDispatchStaggerMs ?? (config.idleSweepIntervalMs > 0 ? 3_000 : 0),
       onActivityChange: notifyActivityChange,
       getExecutingTurnContext: (sessionId) => this.inbound.getExecutingTurnContext(sessionId),
       resolveMemberName: (botId, chatId, openId) =>
@@ -366,7 +384,14 @@ export class LarkBridgeManager {
       },
       listSplitBrainAlerts: () => this.splitBrain.listAlerts(),
       getLifecycleStatus: () => this.getLifecycleStatus(),
-      getConcurrencyStats: () => this.sessions.getRuntimeConcurrencyStats(),
+      getConcurrencyStats: () => {
+        const sessionStats = this.sessions.getRuntimeConcurrencyStats()
+        const limiterStats = this.runtimeLimiter.getStats()
+        return {
+          activeActors: sessionStats.activeActors,
+          queuedTurns: sessionStats.queuedTurns + limiterStats.queued,
+        }
+      },
       getDiagnosticAlerts: () => this.getDiagnostics().alerts,
       getConfiguredScheduleCount: () =>
         this.store.listScheduleBindings().filter((s) => s.enabled).length,
@@ -527,6 +552,7 @@ export class LarkBridgeManager {
       this.drainReason = options.reason?.trim() || 'operator_drain'
       this.reminders.pauseDispatch()
       this.dreaming.pauseDispatch()
+      this.inbound.flushListenerDebounce()
       await this.connections.pauseAllInbound()
       this.store.recordEvent({
         botId: 'system',
@@ -596,6 +622,7 @@ export class LarkBridgeManager {
     // 1. Snapshot recoverable in-flight turns to SQLite BEFORE aborting handles so
     //    no turn is prematurely failed or stripped of its Feishu reaction.
     await this.inbound.suspendActiveTurnsForShutdown()
+    this.runtimeLimiter.dispose()
     this.shutdownController.abort()
     this.sessionHandoff.dispose()
     this.consoleLogin.dispose()

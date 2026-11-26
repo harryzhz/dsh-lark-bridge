@@ -60,6 +60,12 @@ export interface LarkBridgeConfig {
   readonly syncGlobalCliAndSkill?: boolean
   readonly enableInstanceLock?: boolean
   readonly instanceLockWaitMs?: number
+  /** Max concurrent heavy Agent turns per runtime preset (`0` = unlimited, default `3`). */
+  readonly maxConcurrentTurnsPerRuntime?: number
+  /** Delay between simultaneously due proactive reminders to avoid upstream 429 bursts. */
+  readonly reminderDispatchStaggerMs?: number
+  /** Optional override for top-level passive listener debounce window (ms). */
+  readonly listenerDebounceOverrideMs?: number
 }
 
 export interface LarkSessionBinding {

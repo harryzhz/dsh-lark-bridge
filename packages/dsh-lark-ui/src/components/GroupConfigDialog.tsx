@@ -688,6 +688,16 @@ function ListenerSection({
           <SettingRow title="回复后结束会话" desc="关闭后话题内可免 @ 继续跟进">
             <Switch label="回复后结束会话" checked={rule.autoCloseAfterCompletion} onChange={(autoCloseAfterCompletion) => patch({ autoCloseAfterCompletion })} />
           </SettingRow>
+          <SettingRow title="连续消息防抖" desc="合并窗口内同群连续新消息后再统一判断（0 表示关闭）">
+            <NumberField
+              value={rule.debounceSeconds ?? 5}
+              min={0}
+              onChange={(secs) =>
+                patch({ debounceSeconds: Math.min(30, Math.max(0, Math.round(secs))) })
+              }
+              suffix="秒"
+            />
+          </SettingRow>
         </>
       )}
     </>

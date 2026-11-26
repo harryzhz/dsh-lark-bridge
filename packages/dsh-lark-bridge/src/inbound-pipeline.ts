@@ -30,10 +30,15 @@ import {
   type RecalledLarkMessageEvent,
   type RouterHandoffTurn,
   type SendLarkReplyResult,
+  type TriageActiveListenerSummary,
   type TriageHistoryEntry,
 } from '@dsh-lark/lark-core'
 import type { BotConnectionPool } from './bot-connection-pool.js'
 import type { IssuedConsoleLoginLink } from './console-login.js'
+import {
+  ListenerDebounceBuffer,
+  type DebouncedListenerEntry,
+} from './listener-debounce.js'
 import {
   InboundMediaCache,
   type ImageRefTarget,
@@ -41,6 +46,7 @@ import {
 } from './media-intake.js'
 import type { MemoryService } from './memory-service.js'
 import type { RuntimeCatalog } from './runtime-catalog.js'
+import type { ConcurrencyLease, RuntimeConcurrencyLimiter } from './runtime-concurrency.js'
 import {
   bindingHasNativeThread,
   type AcquiredAgent,
@@ -239,6 +245,9 @@ export interface InboundPipelineHost {
   readonly runtimes: RuntimeCatalog
   readonly connections: BotConnectionPool
   readonly sessions: SessionCoordinator
+  readonly runtimeLimiter?: RuntimeConcurrencyLimiter
+  readonly listenerDebounceEnabled?: boolean
+  readonly listenerDebounceOverrideMs?: number
   readonly memory?: MemoryService
   readonly triage?: LlmTriageService
   readonly titleGuard: SessionTitleGuard
@@ -290,12 +299,48 @@ interface QueuedWorkerTurnItem {
   readonly activeTurn: ActiveTurnRecord
   readonly cancelController: AbortController
   readonly mediaCache: InboundMediaCache
+  readonly extraImageTargets?: readonly ImageRefTarget[]
   readonly prefetchedQuote?: PrefetchedQuotedMessage
   readonly traceId: string
   readonly senderName?: string
   readonly handoffTurns?: readonly RouterHandoffTurn[]
   readonly triageNote?: string
   readonly recoveryReminder?: string
+}
+
+interface DebouncedInboundItem {
+  readonly bot: LarkBotConfig
+  readonly transport: LarkBotTransport
+  readonly msg: InboundLarkMessage
+  readonly decision: AgentDecision
+  readonly groupConfig: LarkGroupConfig | undefined
+  readonly traceId: string
+  readonly receivedAtMs: number
+}
+
+interface DebouncedTurnRunOptions {
+  readonly extraImageTargets?: readonly ImageRefTarget[]
+  readonly debouncedCount?: number
+  readonly startedAtMs?: number
+}
+
+function composeDebouncedListenerUserText(
+  items: ReadonlyArray<{
+    readonly messageId: string
+    readonly senderName?: string
+    readonly senderOpenId?: string
+    readonly text: string
+  }>,
+): string {
+  if (items.length === 0) return ''
+  if (items.length === 1) return items[0]!.text
+  const lines = [`以下 ${items.length} 条群内连续消息在短时间内相继到达，请结合上下文统一判断并处理：`]
+  for (let i = 0; i < items.length; i += 1) {
+    const item = items[i]!
+    const who = item.senderName || item.senderOpenId || '成员'
+    lines.push(`[${i + 1}] ${who} (message_id="${item.messageId}"): ${item.text || '[空消息]'}`)
+  }
+  return lines.join('\n')
 }
 
 function createTraceId(): string {
@@ -315,9 +360,13 @@ export class InboundPipeline {
   private readonly inflightCancels = new Set<InflightCancelEntry>()
   private readonly recoveringTurnIds = new Set<string>()
   private readonly recoveryTasks = new Set<Promise<void>>()
+  private readonly listenerDebounce: ListenerDebounceBuffer<DebouncedInboundItem>
 
   constructor(private readonly host: InboundPipelineHost) {
     this.dedup.hydrate(host.store.listSeenMessages?.() ?? [])
+    this.listenerDebounce = new ListenerDebounceBuffer<DebouncedInboundItem>((entries) =>
+      this.flushDebouncedListeners(entries),
+    )
   }
 
   getExecutingTurnContext(sessionId: string): ExecutingTurnContext | undefined {
@@ -325,12 +374,16 @@ export class InboundPipeline {
     return sid ? this.executingTurnBySession.get(sid) : undefined
   }
 
+  flushListenerDebounce(): void {
+    this.listenerDebounce.flushAll()
+  }
+
   getActiveCount(): number {
     let active = 0
     for (const turn of this.activeTurns.values()) {
       if (!turn.settled) active += 1
     }
-    return active + this.recoveringTurnIds.size
+    return active + this.recoveringTurnIds.size + this.listenerDebounce.pendingCount
   }
 
   listActiveTurnSummaries(nowMs = Date.now()): ActiveTurnSummary[] {
@@ -469,6 +522,12 @@ export class InboundPipeline {
     let cancelled = 0
     const abortedControllers = new Set<AbortController>()
 
+    const droppedDebounced = this.listenerDebounce.cancelScope(normalizedBotId, normalizedChatId)
+    if (droppedDebounced > 0) {
+      cancelled += droppedDebounced
+      this.host.onActivityChange?.()
+    }
+
     for (const turn of this.activeTurns.values()) {
       if (turn.settled || turn.botId !== normalizedBotId) continue
       if (normalizedChatId && turn.chatId !== normalizedChatId) continue
@@ -551,6 +610,17 @@ export class InboundPipeline {
 
     const reason = createRecalledAbortError()
     let matchedAny = false
+
+    if (this.listenerDebounce.cancelMessage(botId, messageId)) {
+      matchedAny = true
+      this.host.onActivityChange?.()
+      this.host.store.recordEvent({
+        botId,
+        chatId: event.chatId,
+        kind: 'lifecycle',
+        summary: '原消息已撤回，已取消防抖缓冲中的监听消息',
+      })
+    }
 
     for (const turn of this.activeTurns.values()) {
       if (turn.settled || turn.botId !== botId || turn.messageId !== messageId) continue
@@ -710,7 +780,205 @@ export class InboundPipeline {
     }
 
     this.host.store.rememberSeenMessage?.(dedupKey)
+    const effectiveDebounceMs = this.resolveEffectiveListenerDebounceMs(decision)
+    if (decision.trigger === 'listener' && !msg.threadId && effectiveDebounceMs > 0) {
+      const bucketKey = `${bot.id}:${msg.chatId}:${msg.senderType}:${decision.silentOnly ? 'delegation' : 'listener'}`
+      const pending = this.listenerDebounce.enqueue({
+        bucketKey,
+        botId: bot.id,
+        chatId: msg.chatId,
+        messageId: msg.messageId,
+        debounceMs: effectiveDebounceMs,
+        payload: {
+          bot,
+          transport,
+          msg,
+          decision,
+          groupConfig,
+          traceId,
+          receivedAtMs: Date.now(),
+        },
+      })
+      this.host.onActivityChange?.()
+      await pending
+      return
+    }
     await this.runAgentTurn(bot, transport, msg, decision, groupConfig, traceId)
+  }
+
+  private resolveEffectiveListenerDebounceMs(decision: AgentDecision): number {
+    if (decision.trigger !== 'listener') return 0
+    const ruleMs = decision.listenerDebounceMs ?? 0
+    if (ruleMs <= 0) return 0
+    if (this.host.listenerDebounceOverrideMs !== undefined) {
+      return Math.max(0, Math.floor(this.host.listenerDebounceOverrideMs))
+    }
+    if (this.host.listenerDebounceEnabled === false) return 0
+    return ruleMs
+  }
+
+  private async flushDebouncedListeners(
+    entries: readonly DebouncedListenerEntry<DebouncedInboundItem>[],
+  ): Promise<void> {
+    this.host.onActivityChange?.()
+    if (entries.length === 0 || this.host.isDisposed()) return
+
+    const live: DebouncedInboundItem[] = []
+    for (const entry of entries) {
+      const item = entry.payload
+      if (!this.host.connections.isActiveTransport(item.bot.id, item.transport)) continue
+      if (this.isMessageRecalled(item.bot.id, item.msg.messageId)) continue
+      if (this.getDisabledScope(item.bot.id, item.msg.chatType, item.msg.chatId)) continue
+      live.push(item)
+    }
+    if (live.length === 0) return
+
+    if (live.length === 1) {
+      const single = live[0]!
+      await this.runAgentTurn(
+        single.bot,
+        single.transport,
+        single.msg,
+        single.decision,
+        single.groupConfig,
+        single.traceId,
+        undefined,
+        { startedAtMs: single.receivedAtMs },
+      )
+      return
+    }
+
+    const head = live[0]!
+    const tail = live[live.length - 1]!
+    const senderNames = await Promise.all(
+      live.map((item) => this.resolveSenderName(item.bot.id, item.transport, item.msg)),
+    )
+
+    const mergedUserText = composeDebouncedListenerUserText(
+      live.map((item, idx) => ({
+        messageId: item.msg.messageId,
+        ...(senderNames[idx] ? { senderName: senderNames[idx] } : {}),
+        ...(item.msg.senderOpenId ? { senderOpenId: item.msg.senderOpenId } : {}),
+        text: item.decision.userText,
+      })),
+    )
+
+    const seenReminders = new Set<string>()
+    const mergedReminders: string[] = []
+    for (const item of live) {
+      for (const r of item.decision.turnReminders) {
+        if (!seenReminders.has(r)) {
+          seenReminders.add(r)
+          mergedReminders.push(r)
+        }
+      }
+    }
+
+    const seenMentions = new Set<string>()
+    const mergedMentions = [...tail.msg.mentions]
+    for (const m of tail.msg.mentions) {
+      seenMentions.add(m.openId || m.key)
+    }
+    for (let i = 0; i < live.length - 1; i += 1) {
+      for (const m of live[i]!.msg.mentions) {
+        const key = m.openId || m.key
+        if (!seenMentions.has(key)) {
+          seenMentions.add(key)
+          mergedMentions.push(m)
+        }
+      }
+    }
+
+    const extraImageTargets: ImageRefTarget[] = []
+    for (let i = 0; i < live.length - 1; i += 1) {
+      const item = live[i]!
+      for (const imageKey of item.msg.imageKeys) {
+        extraImageTargets.push({ messageId: item.msg.messageId, imageKey })
+      }
+      if (this.host.triage && item.msg.chatType === 'group') {
+        this.host.triage.context.recordChatMessage(
+          `chat:${item.bot.id}:${item.msg.chatId}`,
+          {
+            role: 'user',
+            ...(senderNames[i] ? { senderName: senderNames[i] } : {}),
+            text: item.decision.userText,
+            timestampMs: item.receivedAtMs,
+            messageId: item.msg.messageId,
+          },
+          { now: item.receivedAtMs },
+        )
+      }
+    }
+
+    const mergedMsg: InboundLarkMessage = {
+      ...tail.msg,
+      mentions: mergedMentions,
+    }
+    const mergedDecision: AgentDecision = {
+      ...tail.decision,
+      allowSilentEmptyReply: live.every((i) => i.decision.allowSilentEmptyReply),
+      autoCloseAfterCompletion: live.every((i) => i.decision.autoCloseAfterCompletion),
+      ...(live.every((i) => Boolean(i.decision.silentOnly)) ? { silentOnly: true } : {}),
+      turnReminders: mergedReminders,
+      userText: mergedUserText,
+      promptText: composeTurnPrompt(mergedReminders, mergedUserText),
+    }
+
+    const resolvedChatName =
+      mergedDecision.chatName || this.host.store.resolveChatName(tail.bot.id, tail.msg.chatId)
+    this.host.store.recordEvent({
+      botId: tail.bot.id,
+      chatId: tail.msg.chatId,
+      ...(resolvedChatName ? { chatName: resolvedChatName } : {}),
+      routeKey: mergedDecision.routeKey,
+      traceId: tail.traceId,
+      kind: 'lifecycle',
+      summary: `主动监听防抖合并 ${live.length} 条连续消息`,
+    })
+
+    await this.runAgentTurn(
+      tail.bot,
+      tail.transport,
+      mergedMsg,
+      mergedDecision,
+      tail.groupConfig,
+      tail.traceId,
+      undefined,
+      {
+        ...(extraImageTargets.length > 0 ? { extraImageTargets } : {}),
+        debouncedCount: live.length,
+        startedAtMs: head.receivedAtMs,
+      },
+    )
+  }
+
+  private listActiveChatListeners(
+    botId: string,
+    chatId: string,
+    excludeMessageId: string,
+    nowMs = Date.now(),
+  ): TriageActiveListenerSummary[] {
+    const out: Array<TriageActiveListenerSummary & { readonly startedAtMs: number }> = []
+    for (const turn of this.activeTurns.values()) {
+      if (turn.settled) continue
+      if (turn.botId !== botId || turn.chatId !== chatId) continue
+      if (turn.trigger !== 'listener') continue
+      if (turn.messageId === excludeMessageId) continue
+      const rawPreview =
+        turn.inboundMsg?.text?.trim() ||
+        (turn.inboundMsg && turn.inboundMsg.imageKeys.length > 0 ? '[图片消息]' : '[监听消息]')
+      const cleanPreview = rawPreview.replace(/\s+/g, ' ').trim()
+      out.push({
+        ...(turn.senderName ? { senderName: turn.senderName } : {}),
+        preview: cleanPreview.length > 80 ? `${cleanPreview.slice(0, 80)}…` : cleanPreview,
+        elapsedSec: Math.max(0, Math.round((nowMs - turn.startedAtMs) / 1000)),
+        startedAtMs: turn.startedAtMs,
+      })
+    }
+    return out
+      .sort((a, b) => b.startedAtMs - a.startedAtMs)
+      .slice(0, 3)
+      .map(({ startedAtMs: _ignore, ...rest }) => rest)
   }
 
   private resolveDecisionForMessage(
@@ -1006,6 +1274,7 @@ export class InboundPipeline {
    * and reported as interrupted.
    */
   async suspendActiveTurnsForShutdown(): Promise<void> {
+    this.listenerDebounce.dispose()
     const nowMs = Date.now()
     const recoverable: ActiveTurnRecord[] = []
     const nonRecoverable: ActiveTurnRecord[] = []
@@ -1172,8 +1441,9 @@ export class InboundPipeline {
     groupConfig: LarkGroupConfig | undefined,
     traceId: string,
     recovery?: RecoveryRunContext,
+    debounced?: DebouncedTurnRunOptions,
   ): Promise<void> {
-    const startedMs = recovery?.startedAtMs ?? Date.now()
+    const startedMs = recovery?.startedAtMs ?? debounced?.startedAtMs ?? Date.now()
     const resolvedChatName =
       decision.chatName || this.host.store.resolveChatName(bot.id, msg.chatId)
     const chatName = resolvedChatName ? { chatName: resolvedChatName } : {}
@@ -1276,6 +1546,9 @@ export class InboundPipeline {
           groupConfig,
           routerConfig,
           mediaCache,
+          ...(debounced?.extraImageTargets?.length
+            ? { extraImageTargets: debounced.extraImageTargets }
+            : {}),
           ...(prefetchedQuote ? { prefetchedQuote } : {}),
           ...(senderName ? { senderName } : {}),
           ...(resolvedChatName ? { resolvedChatName } : {}),
@@ -1369,6 +1642,8 @@ export class InboundPipeline {
       let acquiredRef: AcquiredAgent | undefined
       let leaderRegistered = false
       let releaseTurnSlot: (() => void) | undefined
+      let runtimeLease: ConcurrencyLease | undefined
+      let disposeBatchCancel: (() => void) | undefined
       let finishBatch: (() => void) | undefined
       let shouldDisposeEphemeral = false
       let shouldArchiveEphemeral = false
@@ -1379,6 +1654,9 @@ export class InboundPipeline {
           activeTurn,
           cancelController: msgCancelController,
           mediaCache,
+          ...(debounced?.extraImageTargets?.length
+            ? { extraImageTargets: debounced.extraImageTargets }
+            : {}),
           ...(prefetchedQuote ? { prefetchedQuote } : {}),
           traceId,
           ...(senderName ? { senderName } : {}),
@@ -1459,6 +1737,9 @@ export class InboundPipeline {
           activeTurn,
           cancelController: msgCancelController,
           mediaCache,
+          ...(debounced?.extraImageTargets?.length
+            ? { extraImageTargets: debounced.extraImageTargets }
+            : {}),
           ...(prefetchedQuote ? { prefetchedQuote } : {}),
           traceId,
           ...(senderName ? { senderName } : {}),
@@ -1596,6 +1877,80 @@ export class InboundPipeline {
         const batchSize = batchItems.length
         let effectiveDecision: AgentDecision = buildEffectiveDecision(batchItems)
 
+        const batchCancelController = new AbortController()
+        const cancelListeners: Array<{ readonly signal: AbortSignal; readonly fn: () => void }> = []
+        const evaluateBatchCancelSignal = (source: AbortSignal) => {
+          if (batchCancelController.signal.aborted) return
+          if (this.isSignalDisabled(source)) {
+            batchCancelController.abort(source.reason)
+            return
+          }
+          // In a coalesced batch, a single member recalling their message must not abort
+          // other members' valid messages; only abort when every item in the batch is recalled.
+          if (batchItems.every((i) => this.isTurnRecalled(bot.id, i))) {
+            batchCancelController.abort(source.reason)
+          }
+        }
+        for (const item of batchItems) {
+          const sig = item.cancelController.signal
+          if (sig.aborted) {
+            evaluateBatchCancelSignal(sig)
+          } else {
+            const fn = () => evaluateBatchCancelSignal(sig)
+            sig.addEventListener('abort', fn, { once: true })
+            cancelListeners.push({ signal: sig, fn })
+          }
+        }
+        const linkedCancel = {
+          signal: batchCancelController.signal,
+          dispose: () => {
+            for (const entry of cancelListeners) {
+              entry.signal.removeEventListener('abort', entry.fn)
+            }
+            cancelListeners.length = 0
+          },
+        }
+        disposeBatchCancel = linkedCancel.dispose
+        const isSilenced = () => batchItems.some((i) => i.activeTurn.silencedByControl)
+        const isBatchCancelled = () =>
+          linkedCancel.signal.aborted ||
+          Boolean(this.getBatchDisabledScope(bot.id, batchItems)) ||
+          batchItems.every((i) => this.isTurnRecalled(bot.id, i))
+
+        if (this.host.runtimeLimiter) {
+          const limiterSignal = linkAbortSignals([this.host.shutdownSignal, linkedCancel.signal])
+          try {
+            runtimeLease = await this.host.runtimeLimiter.acquire({
+              runtimeKey: effectiveDecision.agentPreset,
+              priority: effectiveDecision.trigger === 'listener' ? 'background' : 'interactive',
+              signal: limiterSignal.signal,
+              isAborted: () => isBatchCancelled() || this.host.isDisposed(),
+            })
+          } finally {
+            limiterSignal.dispose()
+          }
+          if (!runtimeLease) {
+            const waitDisabled = this.getBatchDisabledScope(bot.id, batchItems)
+            if (waitDisabled) {
+              throw createDisabledAbortError(waitDisabled)
+            }
+            if (batchItems.every((i) => this.isTurnRecalled(bot.id, i))) {
+              throw createRecalledAbortError()
+            }
+            throw new TurnAbortedError('disposed', '服务正在关闭，已取消排队轮次')
+          }
+        }
+
+        const postLimiterDisabled = this.getBatchDisabledScope(bot.id, batchItems)
+        if (postLimiterDisabled) {
+          throw createDisabledAbortError(postLimiterDisabled)
+        }
+        if (pruneRecalledFromBatch()) {
+          throw createRecalledAbortError()
+        }
+        latestItem = batchItems[batchItems.length - 1] ?? latestItem
+        effectiveDecision = buildEffectiveDecision(batchItems)
+
         this.host.titleGuard.ensureCleanSessionTitle(
           acquired.agent.session,
           latestItem.msg,
@@ -1606,8 +1961,14 @@ export class InboundPipeline {
         const inboundBaseSummary = `${effectiveDecision.listenerName ? `监听「${effectiveDecision.listenerName}」` : effectiveDecision.trigger} → ${effectiveDecision.agentPreset} · ${effectiveDecision.workspaceName}`
         const inboundTags = [
           ...(recovery ? [`重启自动恢复 #${recovery.totalRecoveryAttempts}`] : []),
+          ...(debounced?.debouncedCount && debounced.debouncedCount > 1
+            ? [`防抖合并 ${debounced.debouncedCount} 条消息`]
+            : []),
           ...(triageNote ? [triageNote] : []),
           ...(batchSize > 1 ? [`合并 ${batchSize} 条排队消息`] : []),
+          ...(runtimeLease && runtimeLease.waitMs >= 1_000
+            ? [`并发排队 ${Math.round(runtimeLease.waitMs / 1000)}s`]
+            : []),
         ]
         this.host.store.recordEvent({
           botId: bot.id,
@@ -1646,44 +2007,6 @@ export class InboundPipeline {
           return
         }
 
-        const batchCancelController = new AbortController()
-        const cancelListeners: Array<{ readonly signal: AbortSignal; readonly fn: () => void }> = []
-        const evaluateBatchCancelSignal = (source: AbortSignal) => {
-          if (batchCancelController.signal.aborted) return
-          if (this.isSignalDisabled(source)) {
-            batchCancelController.abort(source.reason)
-            return
-          }
-          // In a coalesced batch, a single member recalling their message must not abort
-          // other members' valid messages; only abort when every item in the batch is recalled.
-          if (batchItems.every((i) => this.isTurnRecalled(bot.id, i))) {
-            batchCancelController.abort(source.reason)
-          }
-        }
-        for (const item of batchItems) {
-          const sig = item.cancelController.signal
-          if (sig.aborted) {
-            evaluateBatchCancelSignal(sig)
-          } else {
-            const fn = () => evaluateBatchCancelSignal(sig)
-            sig.addEventListener('abort', fn, { once: true })
-            cancelListeners.push({ signal: sig, fn })
-          }
-        }
-        const linkedCancel = {
-          signal: batchCancelController.signal,
-          dispose: () => {
-            for (const entry of cancelListeners) {
-              entry.signal.removeEventListener('abort', entry.fn)
-            }
-            cancelListeners.length = 0
-          },
-        }
-        const isSilenced = () => batchItems.some((i) => i.activeTurn.silencedByControl)
-        const isBatchCancelled = () =>
-          linkedCancel.signal.aborted ||
-          Boolean(this.getBatchDisabledScope(bot.id, batchItems)) ||
-          batchItems.every((i) => this.isTurnRecalled(bot.id, i))
         const executingTurnCtx = buildExecutingTurnContext(
           bot,
           latestItem.msg,
@@ -1744,6 +2067,7 @@ export class InboundPipeline {
             this.executingTurnBySession.delete(acquired.sessionId)
           }
           linkedCancel.dispose()
+          disposeBatchCancel = undefined
         }
 
         const settlement = await this.settleBatchReply({
@@ -1775,6 +2099,8 @@ export class InboundPipeline {
         shouldDisposeEphemeral = failure.dispose
         shouldArchiveEphemeral = failure.archive
       } finally {
+        disposeBatchCancel?.()
+        runtimeLease?.release()
         for (const item of batchItems) {
           if (!item.activeTurn.reactionRemoved && item.activeTurn.reactionId) {
             item.activeTurn.reactionRemoved = true
@@ -2303,6 +2629,7 @@ export class InboundPipeline {
     readonly groupConfig?: LarkGroupConfig
     readonly routerConfig: EffectiveRouterConfig
     readonly mediaCache: InboundMediaCache
+    readonly extraImageTargets?: readonly ImageRefTarget[]
     readonly prefetchedQuote?: PrefetchedQuotedMessage
     readonly senderName?: string
     readonly resolvedChatName?: string
@@ -2323,6 +2650,7 @@ export class InboundPipeline {
       groupConfig,
       routerConfig,
       mediaCache,
+      extraImageTargets = [],
       prefetchedQuote,
       senderName,
       resolvedChatName,
@@ -2348,13 +2676,14 @@ export class InboundPipeline {
     }))
     const allTriageImageTargets: ImageRefTarget[] = [
       ...quotedImageTargets,
+      ...extraImageTargets,
       ...currentImageTargets,
     ]
 
     const initialBinding = this.host.store.getBinding(decision.routeKey)
     const fastBypass = shouldFastBypassTriage(msg, decision, routerConfig.bypass, {
       maxTriageImages: routerConfig.maxTriageImages,
-      extraImageCount: quotedImageTargets.length,
+      extraImageCount: quotedImageTargets.length + extraImageTargets.length,
     })
     const bypass = fastBypass.bypass
       ? fastBypass
@@ -2450,12 +2779,18 @@ export class InboundPipeline {
       ? this.host.sessions.getActorState(existingBinding.sessionId) === 'running'
       : false
 
+    const activeChatListeners =
+      decision.trigger === 'listener'
+        ? this.listActiveChatListeners(bot.id, msg.chatId, msg.messageId)
+        : []
+
     const linkedTriageSignal = linkAbortSignals([this.host.shutdownSignal, cancelSignal])
     let result: Awaited<ReturnType<LlmTriageService['evaluate']>>
     try {
       const totalImageCount =
         Math.max(msg.imageKeys.length, msg.msgType === 'image' ? 1 : 0) +
-        quotedImageTargets.length
+        quotedImageTargets.length +
+        extraImageTargets.length
       result = await this.host.triage!.evaluate({
         bot,
         ...(groupConfig ? { group: groupConfig } : {}),
@@ -2487,6 +2822,7 @@ export class InboundPipeline {
           : {}),
         hasActiveWorker,
         workerBusy,
+        ...(activeChatListeners.length > 0 ? { activeChatListeners } : {}),
         traceId,
         signal: linkedTriageSignal.signal,
       })
@@ -3263,6 +3599,9 @@ export class InboundPipeline {
       }
     }
     for (const item of items) {
+      if (item.extraImageTargets && item.extraImageTargets.length > 0) {
+        await collectFromCache(item.mediaCache, item.extraImageTargets, admittedMessageBlocks)
+      }
       if (item.msg.imageKeys.length > 0) {
         await collectFromCache(
           item.mediaCache,

@@ -412,6 +412,7 @@ export const GroupListenerRuleSchema = z.object({
   memberOverrides: z.record(z.string(), z.boolean()).default({}),
   includeKeywords: z.array(z.string()).default([]),
   excludeKeywords: z.array(z.string()).default([]),
+  debounceSeconds: z.number().int().min(0).max(30).default(5),
 })
 
 function migrateLegacyGroupFields(input: unknown): unknown {
@@ -501,6 +502,7 @@ export const LarkGroupConfigSchema = z.preprocess(
       memberOverrides: {},
       includeKeywords: [],
       excludeKeywords: [],
+      debounceSeconds: 5,
     }),
   }),
 )
@@ -785,6 +787,7 @@ export type RoutingDecision =
       readonly userText: string
       readonly promptText: string
       readonly listenerName?: string
+      readonly listenerDebounceMs?: number
     }
 
 export interface RoutingRuntimeContext {

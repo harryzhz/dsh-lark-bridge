@@ -44,6 +44,7 @@ export const Config: z<Partial<LarkBridgeConfig>, LarkBridgeConfig> = z.object({
   maxAuditEvents: z.number().min(20).max(10_000).default(2000),
   autoInstallCliAndSkill: z.boolean().default(true),
   syncGlobalCliAndSkill: z.boolean(),
+  maxConcurrentTurnsPerRuntime: z.number().min(0).max(32).default(3),
 }) as z<Partial<LarkBridgeConfig>, LarkBridgeConfig>
 
 export async function apply(ctx: Context, rawConfig: LarkBridgeConfig): Promise<void> {
@@ -166,6 +167,22 @@ export {
   type ActiveTurnRecord,
   type InboundPipelineHost,
 } from './inbound-pipeline.js'
+export {
+  DEFAULT_MAX_CONCURRENT_TURNS_PER_RUNTIME,
+  RuntimeConcurrencyLimiter,
+  normalizeRuntimeConcurrencyKey,
+  type ConcurrencyAcquireOptions,
+  type ConcurrencyLease,
+  type ConcurrencyPriority,
+  type RuntimeConcurrencyBucketStats,
+  type RuntimeConcurrencyStats,
+} from './runtime-concurrency.js'
+export {
+  DEFAULT_MAX_DEBOUNCE_BATCH,
+  ListenerDebounceBuffer,
+  MAX_DEBOUNCE_WINDOW_CAP_MS,
+  type DebouncedListenerEntry,
+} from './listener-debounce.js'
 export {
   SessionActor,
   SessionCoordinator,
