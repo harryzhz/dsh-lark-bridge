@@ -1279,7 +1279,7 @@ export function MemoryView({
           value={viewMode}
           options={[
             { value: 'graph', label: '关系图谱', count: scopedEntries.length },
-            { value: 'columns', label: '三列阅读' },
+            { value: 'columns', label: '列表阅读' },
           ]}
           onChange={handleSwitchViewMode}
         />
@@ -1357,10 +1357,10 @@ export function MemoryView({
                     <button
                       type="button"
                       className="fb-mem-tool-btn"
-                      title="在三列模式中精读此记忆"
+                      title="在列表阅读模式中精读此记忆"
                       onClick={() => handleSwitchViewMode('columns')}
                     >
-                      三列打开
+                      列表打开
                     </button>
                   }
                   onCloseDrawer={() => setGraphSelectedId(null)}
