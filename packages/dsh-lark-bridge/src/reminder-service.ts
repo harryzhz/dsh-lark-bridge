@@ -1146,6 +1146,12 @@ export class ProactiveReminderService {
       }
     }
 
+    if (sid && !sessionOrigin && !input.botId?.trim()) {
+      throw new Error(
+        `无法解析会话 "${sid}" 对应的飞书来源上下文，已拒绝回退到默认智能体以防止串路；请显式指定 --bot 与 --chat/--user`,
+      )
+    }
+
     const botId =
       input.botId?.trim() ||
       sessionOrigin?.botId ||

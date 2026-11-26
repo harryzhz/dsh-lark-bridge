@@ -8,7 +8,11 @@ import {
   type LarkMemoryStatus,
   type LarkMemoryType,
 } from '@dsh-lark/lark-core'
-import type { LarkBridgeManager } from './bridge-manager.js'
+import {
+  SessionIdentityError,
+  type LarkBridgeManager,
+  type ResolvedCliSessionIdentity,
+} from './bridge-manager.js'
 import type { LarkApiResponse } from './http-api.js'
 
 function bodyRecord(body: unknown): Record<string, unknown> {
@@ -39,25 +43,53 @@ function parseTagsInput(raw: unknown): string[] | undefined {
   return undefined
 }
 
+function resolveMemorySessionIdentity(
+  manager: LarkBridgeManager,
+  rawSessionId?: string,
+  externalSessionId?: string,
+): ResolvedCliSessionIdentity {
+  if (typeof manager.resolveCliSessionIdentity === 'function') {
+    return manager.resolveCliSessionIdentity(rawSessionId, externalSessionId)
+  }
+  const trimmed = rawSessionId?.trim() || undefined
+  const extTrimmed = externalSessionId?.trim() || undefined
+  const provided = Boolean(trimmed || extTrimmed)
+  if (!provided) return { provided: false, unresolved: false }
+  const effectiveRaw = trimmed ?? `ext:${extTrimmed!}`
+  const canonical =
+    typeof manager.resolveCliSessionId === 'function'
+      ? manager.resolveCliSessionId(effectiveRaw)
+      : trimmed && !trimmed.startsWith('ext:')
+        ? trimmed
+        : undefined
+  return {
+    ...(canonical ? { canonicalSessionId: canonical } : {}),
+    provided: true,
+    unresolved: !canonical,
+    rawSessionId: effectiveRaw,
+    ...(extTrimmed ? { externalSessionId: extTrimmed } : {}),
+  }
+}
+
 function resolveSessionContextHints(
   manager: LarkBridgeManager,
   sessionId?: string,
-): { readonly botId?: string; readonly chatId?: string; readonly workingDir?: string } {
+  externalSessionId?: string,
+): { readonly bound: boolean; readonly botId?: string; readonly chatId?: string; readonly workingDir?: string } {
   const cleanSid = sessionId?.trim()
-  if (!cleanSid) return {}
-  try {
-    const resolved = manager.resolveAgentContext(cleanSid) as {
-      botId?: string
-      chatId?: string
-      workingDir?: string
-    }
-    return {
-      ...(resolved.botId ? { botId: resolved.botId } : {}),
-      ...(resolved.chatId ? { chatId: resolved.chatId } : {}),
-      ...(resolved.workingDir ? { workingDir: resolved.workingDir } : {}),
-    }
-  } catch {
-    return {}
+  const cleanExt = externalSessionId?.trim()
+  if (!cleanSid && !cleanExt) return { bound: false }
+  const resolved = manager.resolveAgentContext(cleanSid, cleanExt) as {
+    bound?: boolean
+    botId?: string
+    chatId?: string
+    workingDir?: string
+  }
+  return {
+    bound: resolved.bound === true || (resolved.bound === undefined && Boolean(resolved.botId)),
+    ...(resolved.botId ? { botId: resolved.botId } : {}),
+    ...(resolved.chatId ? { chatId: resolved.chatId } : {}),
+    ...(resolved.workingDir ? { workingDir: resolved.workingDir } : {}),
   }
 }
 
@@ -85,12 +117,21 @@ export async function dispatchMemoryApiRequest(
     readonly segments: readonly string[]
     readonly url: URL
     readonly body: unknown
+    readonly externalSessionId?: string
     readonly isCliAuthenticated: boolean
     readonly isOperatorAuthenticated?: boolean
     readonly principalKind: string
   },
 ): Promise<LarkApiResponse | undefined> {
-  const { method, segments, url, isCliAuthenticated, isOperatorAuthenticated, principalKind } = input
+  const {
+    method,
+    segments,
+    url,
+    externalSessionId,
+    isCliAuthenticated,
+    isOperatorAuthenticated,
+    principalKind,
+  } = input
   if (segments[0] !== 'memory') return undefined
 
   const memory = manager.memory
@@ -98,9 +139,20 @@ export async function dispatchMemoryApiRequest(
   const action = segments[2]
 
   if (method === 'GET' && segments.length === 1) {
-    const sessionId = url.searchParams.get('sessionId') ?? undefined
-    const hints = resolveSessionContextHints(manager, sessionId)
-    const botId = url.searchParams.get('botId')?.trim() || hints.botId
+    const rawSessionId = url.searchParams.get('sessionId')?.trim() || undefined
+    const identity = resolveMemorySessionIdentity(manager, rawSessionId, externalSessionId)
+    const explicitBotId = url.searchParams.get('botId')?.trim() || undefined
+    const hints = identity.provided
+      ? resolveSessionContextHints(manager, rawSessionId, externalSessionId)
+      : { bound: false }
+    if (identity.provided && !hints.bound && !explicitBotId) {
+      throw new SessionIdentityError(
+        'unresolved_session_context',
+        `无法解析当前会话上下文（${identity.rawSessionId}），已拒绝回退到默认智能体读取记忆；请显式指定 --bot`,
+        400,
+      )
+    }
+    const botId = explicitBotId || hints.botId
     const scope = parseOptionalEnum(url.searchParams.get('scope'), (v) =>
       LarkMemoryScopeSchema.parse(v),
     )
@@ -154,14 +206,20 @@ export async function dispatchMemoryApiRequest(
   if (method === 'POST' && segments.length === 1) {
     const body = bodyRecord(input.body)
     const rawSessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : undefined
-    const sessionId = rawSessionId
-      ? typeof manager.resolveCliSessionId === 'function'
-        ? manager.resolveCliSessionId(rawSessionId)
-        : rawSessionId
-      : undefined
-    const hints = resolveSessionContextHints(manager, sessionId ?? rawSessionId)
-    const botId =
-      (typeof body.botId === 'string' && body.botId.trim()) || hints.botId || ''
+    const identity = resolveMemorySessionIdentity(manager, rawSessionId, externalSessionId)
+    const sessionId = identity.canonicalSessionId
+    const explicitBotId = typeof body.botId === 'string' ? body.botId.trim() || undefined : undefined
+    const hints = identity.provided
+      ? resolveSessionContextHints(manager, rawSessionId, externalSessionId)
+      : { bound: false }
+    if (identity.provided && !hints.bound && !explicitBotId) {
+      throw new SessionIdentityError(
+        'unresolved_session_context',
+        `无法解析当前会话上下文（${identity.rawSessionId}），已拒绝回退到默认智能体写入记忆；请显式指定 --bot`,
+        400,
+      )
+    }
+    const botId = explicitBotId || hints.botId || ''
     if (!botId) {
       return { status: 400, payload: { ok: false, error: 'botId is required' } }
     }
@@ -264,11 +322,8 @@ export async function dispatchMemoryApiRequest(
       typeof body.content === 'string' &&
       body.content.trim().length > 0
     const rawSessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : undefined
-    const sessionId = rawSessionId
-      ? typeof manager.resolveCliSessionId === 'function'
-        ? manager.resolveCliSessionId(rawSessionId)
-        : rawSessionId
-      : undefined
+    const identity = resolveMemorySessionIdentity(manager, rawSessionId, externalSessionId)
+    const sessionId = identity.canonicalSessionId
     const tags = parseTagsInput(body.tags)
     const scope = parseOptionalEnum(body.scope, (v) => LarkMemoryScopeSchema.parse(v))
     const confidence = parseOptionalEnum(body.confidence, (v) =>

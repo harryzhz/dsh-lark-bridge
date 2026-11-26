@@ -27,6 +27,7 @@ export interface OperatorAuthToken {
 
 export const OPERATOR_TOKEN_FILENAME = 'operator-token'
 export const OPERATOR_TOKEN_HEADER = 'x-lark-bridge-operator'
+export const EXTERNAL_SESSION_ID_HEADER = 'x-lark-external-session-id'
 
 /**
  * Separate host-operator secret (`0600`) for maintenance operations like graceful

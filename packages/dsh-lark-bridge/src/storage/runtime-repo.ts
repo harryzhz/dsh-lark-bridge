@@ -20,6 +20,8 @@ const MAX_ARCHIVED_REMINDERS = 300
 const MAX_SEEN_MESSAGES = 2000
 const SEEN_MESSAGE_TTL_MS = 24 * 60 * 60_000
 const SEEN_PRUNE_INTERVAL = 50
+const MAX_EXTERNAL_SESSION_LINKS = 5000
+const EXTERNAL_LINK_PRUNE_INTERVAL = 100
 
 interface BindingRow {
   route_key: string
@@ -59,6 +61,7 @@ function normalizeAliases(primaryRouteKey: string, aliases?: readonly string[]):
 
 export class RuntimeRepo {
   private seenInsertCounter = 0
+  private externalLinkInsertCounter = 0
 
   constructor(private readonly db: BridgeDatabase) {}
 
@@ -1307,6 +1310,67 @@ export class RuntimeRepo {
       .prepare(
         `DELETE FROM triage_sessions WHERE session_id IN (
            SELECT session_id FROM triage_sessions ORDER BY last_activity_ms ASC LIMIT ?
+         )`,
+      )
+      .run(excess)
+  }
+
+  // ── External Runtime Session Links (durable ext:<id> -> sessionId) ─────
+
+  upsertExternalSessionLink(
+    externalId: string,
+    sessionId: string,
+    driver = '',
+    updatedAtMs = Date.now(),
+  ): void {
+    const ext = externalId.trim()
+    const sid = sessionId.trim()
+    if (!ext || !sid) return
+    this.db
+      .prepare(
+        `INSERT INTO external_session_links (external_id, session_id, driver, updated_at_ms)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(external_id) DO UPDATE SET
+           session_id = excluded.session_id,
+           driver = CASE WHEN excluded.driver != '' THEN excluded.driver ELSE external_session_links.driver END,
+           updated_at_ms = excluded.updated_at_ms`,
+      )
+      .run(ext, sid, driver.trim(), updatedAtMs)
+    this.externalLinkInsertCounter += 1
+    if (this.externalLinkInsertCounter >= EXTERNAL_LINK_PRUNE_INTERVAL) {
+      this.externalLinkInsertCounter = 0
+      this.pruneExternalSessionLinks()
+    }
+  }
+
+  resolveSessionIdByExternalId(externalId: string): string | undefined {
+    const ext = externalId.trim()
+    if (!ext) return undefined
+    const row = this.db
+      .prepare('SELECT session_id FROM external_session_links WHERE external_id = ?')
+      .get(ext) as { session_id?: string } | undefined
+    return row?.session_id
+  }
+
+  hasExternalSessionLinkForSession(sessionId: string): boolean {
+    const sid = sessionId.trim()
+    if (!sid) return false
+    const row = this.db
+      .prepare('SELECT 1 AS found FROM external_session_links WHERE session_id = ? LIMIT 1')
+      .get(sid) as { found?: number } | undefined
+    return Boolean(row?.found)
+  }
+
+  private pruneExternalSessionLinks(): void {
+    const countRow = this.db
+      .prepare('SELECT COUNT(*) AS cnt FROM external_session_links')
+      .get() as { cnt?: number }
+    const excess = Number(countRow?.cnt ?? 0) - MAX_EXTERNAL_SESSION_LINKS
+    if (excess <= 0) return
+    this.db
+      .prepare(
+        `DELETE FROM external_session_links WHERE external_id IN (
+           SELECT external_id FROM external_session_links ORDER BY updated_at_ms ASC LIMIT ?
          )`,
       )
       .run(excess)

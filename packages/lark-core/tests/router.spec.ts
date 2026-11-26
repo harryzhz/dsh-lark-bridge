@@ -158,6 +158,7 @@ describe('Workspace name, ~ expansion, card images & <system_reminder> compositi
     const ctxReminder = composeLarkContextReminder({
       bot,
       botOpenId: 'ou_bot',
+      sessionId: 'session-demo-42',
       msg: createMessage({
         parentId: 'om_quoted_99',
         mentions: [{ key: '@_user_2', openId: 'ou_peer', name: 'Sam' }],
@@ -166,6 +167,7 @@ describe('Workspace name, ~ expansion, card images & <system_reminder> compositi
       senderName: 'Taylor',
     })
     expect(ctxReminder).toContain('<lark_context ')
+    expect(ctxReminder).toContain('session_id="session-demo-42"')
     expect(ctxReminder).toContain('quoted_message_id="om_quoted_99"')
     expect(ctxReminder).toContain('Sam(open_id="ou_peer")')
     expect(ctxReminder).toContain('lark-bridge')

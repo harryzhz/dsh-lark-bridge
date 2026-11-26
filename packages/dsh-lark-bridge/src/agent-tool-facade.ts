@@ -32,8 +32,33 @@ import type {
   LarkSessionBinding,
 } from './types.js'
 
+export class SessionIdentityError extends Error {
+  readonly code: 'session_identity_mismatch' | 'unresolved_session_context'
+  readonly status: number
+
+  constructor(
+    code: 'session_identity_mismatch' | 'unresolved_session_context',
+    message: string,
+    status: number,
+  ) {
+    super(message)
+    this.name = 'SessionIdentityError'
+    this.code = code
+    this.status = status
+  }
+}
+
+export interface ResolvedCliSessionIdentity {
+  readonly canonicalSessionId?: string
+  readonly provided: boolean
+  readonly unresolved: boolean
+  readonly rawSessionId?: string
+  readonly externalSessionId?: string
+}
+
 export interface AgentCliSendInput {
   readonly sessionId?: string
+  readonly externalSessionId?: string
   readonly botId?: string
   readonly chatId?: string
   readonly userOpenId?: string
@@ -93,7 +118,7 @@ export class AgentToolFacade {
   /**
    * Normalize CLI-supplied session identifiers, translating `ext:<externalId>`
    * tokens (emitted by multiplexed external runtimes) into canonical DSH
-   * `sessionId` values via `externalRuntimes`.
+   * `sessionId` values via `externalRuntimes` / durable SQLite index.
    */
   canonicalizeSessionId(rawSessionId?: string): string | undefined {
     const trimmed = rawSessionId?.trim()
@@ -106,8 +131,74 @@ export class AgentToolFacade {
     return trimmed
   }
 
-  resolveAgentContext(sessionId?: string): {
+  /**
+   * Resolve and cross-validate CLI session identity (`DSH_SESSION_ID` / `ext:<id>`
+   * vs ambient `ANTIGRAVITY_CONVERSATION_ID` header). Fails closed with HTTP 409
+   * when both identities resolve to different canonical DSH sessions so cross-process
+   * environment hijacks can never route messages or writes into another conversation.
+   */
+  resolveCliSessionIdentity(
+    rawSessionId?: string,
+    externalSessionId?: string,
+  ): ResolvedCliSessionIdentity {
+    const trimmedRaw = rawSessionId?.trim() || undefined
+    const trimmedExtHeader = externalSessionId?.trim() || undefined
+    const provided = Boolean(trimmedRaw || trimmedExtHeader)
+    if (!provided) {
+      return { provided: false, unresolved: false }
+    }
+
+    const effectiveRaw = trimmedRaw ?? `ext:${trimmedExtHeader!}`
+    let primaryCanonical: string | undefined
+    let rawExtToken: string | undefined
+    if (trimmedRaw) {
+      if (trimmedRaw.startsWith('ext:')) {
+        rawExtToken = trimmedRaw.slice(4).trim() || undefined
+        primaryCanonical = rawExtToken
+          ? this.host.resolveExternalSessionId?.(rawExtToken)
+          : undefined
+      } else {
+        primaryCanonical = trimmedRaw
+      }
+    }
+
+    const extCanonical = trimmedExtHeader
+      ? trimmedExtHeader === rawExtToken
+        ? primaryCanonical
+        : this.host.resolveExternalSessionId?.(trimmedExtHeader)
+      : undefined
+
+    if (primaryCanonical && extCanonical && primaryCanonical !== extCanonical) {
+      const boundBotId =
+        this.host.store.getBindingBySessionId?.(primaryCanonical)?.botId ??
+        this.host.store.getBindingBySessionId?.(extCanonical)?.botId ??
+        'system'
+      this.host.store.recordEvent?.({
+        botId: boundBotId,
+        sessionId: primaryCanonical,
+        kind: 'error',
+        summary: `拦截到会话身份冲突（防串路）：sessionId=${primaryCanonical} 与外部会话 ${trimmedExtHeader}（归属 ${extCanonical}）不一致`,
+      })
+      throw new SessionIdentityError(
+        'session_identity_mismatch',
+        `会话身份冲突（防串路已拦截）：当前环境 sessionId (${primaryCanonical}) 与外部运行时会话 (${trimmedExtHeader} -> ${extCanonical}) 不一致，已拒绝执行`,
+        409,
+      )
+    }
+
+    const canonicalSessionId = primaryCanonical ?? extCanonical
+    return {
+      ...(canonicalSessionId ? { canonicalSessionId } : {}),
+      provided: true,
+      unresolved: !canonicalSessionId,
+      rawSessionId: effectiveRaw,
+      ...(trimmedExtHeader ? { externalSessionId: trimmedExtHeader } : {}),
+    }
+  }
+
+  resolveAgentContext(sessionId?: string, externalSessionId?: string): {
     readonly sessionId?: string
+    readonly unresolvedSessionId?: string
     readonly bound: boolean
     readonly source?: 'session_binding' | 'schedule_session' | 'reminder_session' | 'default_bot'
     readonly botId?: string
@@ -127,7 +218,8 @@ export class AgentToolFacade {
   } {
     const bots = this.host.connections.listBotStatuses()
     const groups = this.host.store.listGroupViews()
-    const sid = this.canonicalizeSessionId(sessionId)
+    const identity = this.resolveCliSessionIdentity(sessionId, externalSessionId)
+    const sid = identity.canonicalSessionId
 
     if (sid) {
       // Ground truth during an active interactive turn: anchor CLI sends/history/reminders
@@ -231,7 +323,7 @@ export class AgentToolFacade {
         }
       }
 
-      const schedCtx = this.host.getSchedules().getActiveSessionContext(sid)
+      const schedCtx = this.host.getSchedules().getActiveSessionContext?.(sid)
       if (schedCtx && schedCtx.targets.length > 0) {
         const primary = schedCtx.targets[0]!
         const bot = this.host.store.getBot(primary.botId)
@@ -262,12 +354,24 @@ export class AgentToolFacade {
       }
     }
 
+    // Fail-closed when a caller supplied a session identity (DSH_SESSION_ID or ext:<id>)
+    // that did not resolve to any bound session/reminder/schedule: never silently attribute
+    // it to `default_bot` (`bots[0]`), which causes cross-bot sends/memory/reminder leaks.
+    if (identity.provided) {
+      return {
+        ...(sid ? { sessionId: sid } : {}),
+        ...(identity.rawSessionId ? { unresolvedSessionId: identity.rawSessionId } : {}),
+        bound: false,
+        bots,
+        groups,
+      }
+    }
+
     const defaultBot = bots.find((b) => b.enabled && b.connected) ?? bots[0]
     const defaultWorkingDir = defaultBot
       ? this.resolveContextWorkingDir(defaultBot.botId)
       : undefined
     return {
-      ...(sid ? { sessionId: sid } : {}),
       bound: false,
       ...(defaultBot
         ? {
@@ -304,14 +408,19 @@ export class AgentToolFacade {
    * Decouples control decision from assistant prose so silent listener/reminder turns
    * never leak accidental trailing commentary to Feishu.
    */
-  agentSilenceTurn(input: { readonly sessionId?: string; readonly reason?: string }): {
+  agentSilenceTurn(input: {
+    readonly sessionId?: string
+    readonly externalSessionId?: string
+    readonly reason?: string
+  }): {
     readonly silenced: boolean
     readonly source?: 'interactive' | 'reminder'
     readonly turnId?: string
     readonly reason?: string
     readonly message: string
   } {
-    const sid = this.canonicalizeSessionId(input.sessionId)
+    const identity = this.resolveCliSessionIdentity(input.sessionId, input.externalSessionId)
+    const sid = identity.canonicalSessionId
     if (!sid) {
       throw new Error('sessionId is required (--session <id> or run inside an active DSH session)')
     }
@@ -355,9 +464,22 @@ export class AgentToolFacade {
     readonly messageIds: readonly string[]
     readonly botId: string
     readonly targetId: string
+    readonly sessionId?: string
+    readonly routeKey?: string
+    readonly replyToMessageId?: string
+    readonly replyInThread?: boolean
   }> {
-    const ctxInfo = this.resolveAgentContext(input.sessionId)
-    const botId = input.botId?.trim() || ctxInfo.botId
+    const identity = this.resolveCliSessionIdentity(input.sessionId, input.externalSessionId)
+    const ctxInfo = this.resolveAgentContext(input.sessionId, input.externalSessionId)
+    const explicitBotId = input.botId?.trim() || undefined
+    if (identity.provided && !ctxInfo.bound && !explicitBotId) {
+      throw new SessionIdentityError(
+        'unresolved_session_context',
+        `无法解析当前会话上下文（${identity.rawSessionId}），已拒绝回退到默认智能体以防止串路；请显式指定 --bot 与 --chat/--user 或检查会话绑定`,
+        400,
+      )
+    }
+    const botId = explicitBotId || ctxInfo.botId
     if (!botId) throw new Error('No botId specified and no active bot available')
     const bot = this.host.store.getBot(botId)
     if (!bot) throw new Error(`Bot "${botId}" not found`)
@@ -377,6 +499,7 @@ export class AgentToolFacade {
       throw new Error('Target chatId (--chat), userOpenId (--user), or bound session is required')
     }
 
+    const canonicalSessionId = identity.canonicalSessionId
     const receiveIdType: 'open_id' | 'chat_id' = userOpenId ? 'open_id' : 'chat_id'
     const receiveId = userOpenId ?? chatId
     const messageIds: string[] = []
@@ -445,7 +568,6 @@ export class AgentToolFacade {
         if (sent.messageId) messageIds.push(sent.messageId)
       } else {
         const group = chatId ? this.host.store.getGroup(bot.id, chatId) : undefined
-        const canonicalSessionId = this.canonicalizeSessionId(input.sessionId)
         const card = buildReplyCard({
           ...(input.title ? { title: input.title } : {}),
           markdown: markdown || ' ',
@@ -479,15 +601,36 @@ export class AgentToolFacade {
       if (sent.messageId) messageIds.push(sent.messageId)
     }
 
+    if (messageIds.length > 0) {
+      const modeLabel = input.card ? 'card' : input.textOnly ? 'text' : 'reply-card'
+      const targetDesc = userOpenId
+        ? `user=${userOpenId}`
+        : replyToMessageId
+          ? `replyTo=${replyToMessageId}${replyInThread ? '(thread)' : ''}`
+          : `chat=${chatId ?? ''}`
+      this.host.store.recordEvent?.({
+        botId: bot.id,
+        ...(chatId ? { chatId } : {}),
+        ...(ctxInfo.routeKey ? { routeKey: ctxInfo.routeKey } : {}),
+        ...(canonicalSessionId ? { sessionId: canonicalSessionId } : {}),
+        kind: 'reply',
+        summary: `CLI 主动发送（${modeLabel}，${messageIds.length} 条，${targetDesc}，${markdown.length} 字）`,
+      })
+    }
+
     return {
       messageIds,
       botId: bot.id,
       targetId: receiveId ?? replyToMessageId ?? '',
+      ...(canonicalSessionId ? { sessionId: canonicalSessionId } : {}),
+      ...(ctxInfo.routeKey ? { routeKey: ctxInfo.routeKey } : {}),
+      ...(replyToMessageId ? { replyToMessageId, replyInThread } : {}),
     }
   }
 
   async agentHistory(input: {
     readonly sessionId?: string
+    readonly externalSessionId?: string
     readonly botId?: string
     readonly chatId?: string
     readonly threadId?: string
@@ -498,8 +641,17 @@ export class AgentToolFacade {
     readonly threadId?: string
     readonly messages: readonly LarkHistoryMessage[]
   }> {
-    const ctxInfo = this.resolveAgentContext(input.sessionId)
-    const botId = input.botId?.trim() || ctxInfo.botId
+    const identity = this.resolveCliSessionIdentity(input.sessionId, input.externalSessionId)
+    const ctxInfo = this.resolveAgentContext(input.sessionId, input.externalSessionId)
+    const explicitBotId = input.botId?.trim() || undefined
+    if (identity.provided && !ctxInfo.bound && !explicitBotId) {
+      throw new SessionIdentityError(
+        'unresolved_session_context',
+        `无法解析当前会话上下文（${identity.rawSessionId}），已拒绝回退到默认智能体读取历史；请显式指定 --bot 与 --chat`,
+        400,
+      )
+    }
+    const botId = explicitBotId || ctxInfo.botId
     if (!botId) throw new Error('No botId specified and no active bot available')
     const bot = this.host.store.getBot(botId)
     if (!bot) throw new Error(`Bot "${botId}" not found`)
@@ -527,13 +679,23 @@ export class AgentToolFacade {
 
   async agentGetMessage(input: {
     readonly sessionId?: string
+    readonly externalSessionId?: string
     readonly botId?: string
     readonly messageId: string
     readonly downloadResources?: boolean
     readonly includeRaw?: boolean
   }): Promise<LarkMessageDetail | undefined> {
-    const ctxInfo = this.resolveAgentContext(input.sessionId)
-    const botId = input.botId?.trim() || ctxInfo.botId
+    const identity = this.resolveCliSessionIdentity(input.sessionId, input.externalSessionId)
+    const ctxInfo = this.resolveAgentContext(input.sessionId, input.externalSessionId)
+    const explicitBotId = input.botId?.trim() || undefined
+    if (identity.provided && !ctxInfo.bound && !explicitBotId) {
+      throw new SessionIdentityError(
+        'unresolved_session_context',
+        `无法解析当前会话上下文（${identity.rawSessionId}），已拒绝回退到默认智能体读取消息；请显式指定 --bot`,
+        400,
+      )
+    }
+    const botId = explicitBotId || ctxInfo.botId
     if (!botId) throw new Error('No botId specified and no active bot available')
     const bot = this.host.store.getBot(botId)
     if (!bot) throw new Error(`Bot "${botId}" not found`)
@@ -545,6 +707,7 @@ export class AgentToolFacade {
 
   async agentCreateSchedule(input: {
     readonly sessionId?: string
+    readonly externalSessionId?: string
     readonly title: string
     readonly prompt: string
     readonly timing: ScheduleCreateInputLike['timing']
@@ -555,8 +718,16 @@ export class AgentToolFacade {
     readonly deliveryMode?: LarkScheduleDeliveryMode
     readonly notifyOn?: LarkScheduleNotifyOn
   }) {
-    const ctxInfo = this.resolveAgentContext(input.sessionId)
+    const identity = this.resolveCliSessionIdentity(input.sessionId, input.externalSessionId)
+    const ctxInfo = this.resolveAgentContext(input.sessionId, input.externalSessionId)
     const explicitBotId = input.botId?.trim() || undefined
+    if (identity.provided && !ctxInfo.bound && !explicitBotId) {
+      throw new SessionIdentityError(
+        'unresolved_session_context',
+        `无法解析当前会话上下文（${identity.rawSessionId}），已拒绝回退到默认智能体创建定时任务；请显式指定 --bot 与 --chat`,
+        400,
+      )
+    }
     if (explicitBotId && !this.host.store.getBot(explicitBotId)) {
       throw new Error(`未找到智能体 "${explicitBotId}"`)
     }
@@ -564,7 +735,7 @@ export class AgentToolFacade {
     const chatId = input.chatId?.trim() || ctxInfo.chatId
     const bot = botId ? this.host.store.getBot(botId) : undefined
     const group = bot && chatId ? this.host.store.getGroup(bot.id, chatId) : undefined
-    const canonicalSessionId = this.canonicalizeSessionId(input.sessionId)
+    const canonicalSessionId = identity.canonicalSessionId
     const sessionBinding =
       !explicitBotId && !input.chatId?.trim() && canonicalSessionId
         ? this.host.store.listBindings().find((b) => b.sessionId === canonicalSessionId)
