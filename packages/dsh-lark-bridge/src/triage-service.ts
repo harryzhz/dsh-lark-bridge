@@ -853,7 +853,11 @@ export class LlmTriageService {
       imageBlocks = loaded.blocks
     }
 
-    const { system, userText } = this.buildTriagePrompts(input, imageBlocks.length)
+    const peerMentions = extractPeerUserMentions(input.msg)
+      .map((m) => m.name?.trim() || m.openId?.trim() || '')
+      .filter(Boolean)
+
+    const { system, userText } = this.buildTriagePrompts(input, imageBlocks.length, peerMentions)
     const userContent: readonly ContentBlock[] = [
       { type: 'text', text: userText },
       ...imageBlocks,
@@ -950,6 +954,8 @@ export class LlmTriageService {
       text: run.assembledText,
       hasActiveWorker: input.hasActiveWorker,
       ...(input.decision.silentOnly ? { silentOnly: true } : {}),
+      trigger: input.decision.trigger,
+      ...(peerMentions.length > 0 ? { peerMentions } : {}),
     })
     const triageSessionId = await this.recorder?.record({
       bot: input.bot,
@@ -988,6 +994,9 @@ export class LlmTriageService {
   private buildTriagePrompts(
     input: EvaluateTriageInput,
     attachedImageCount = 0,
+    peerMentions: readonly string[] = extractPeerUserMentions(input.msg)
+      .map((m) => m.name?.trim() || m.openId?.trim() || '')
+      .filter(Boolean),
   ): {
     readonly system: string
     readonly userText: string
@@ -1022,9 +1031,6 @@ export class LlmTriageService {
         input.bot.experimental.proactive.delegationFollowupEnabled,
     )
     const silentOnly = Boolean(input.decision.silentOnly)
-    const peerMentions = extractPeerUserMentions(input.msg)
-      .map((m) => m.name?.trim() || m.openId?.trim() || '')
-      .filter(Boolean)
 
     const system = buildTriageSystemPrompt({
       botName: input.bot.name,
@@ -1033,6 +1039,7 @@ export class LlmTriageService {
       ...(input.resolvedChatName ? { chatName: input.resolvedChatName } : {}),
       hasActiveWorker: input.hasActiveWorker,
       trigger: input.decision.trigger,
+      ...(peerMentions.length > 0 ? { peerMentions } : {}),
       ...(input.decision.listenerName ? { listenerName: input.decision.listenerName } : {}),
       ...(input.decision.trigger === 'listener' && !silentOnly && input.group?.listener?.prompt
         ? { listenerPrompt: input.group.listener.prompt }

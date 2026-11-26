@@ -357,7 +357,10 @@ sequenceDiagram
     - `silent`：闲聊或无需回应的纯确认语，零飞书写入（不贴 `OnIt` 表情），运行日志 `静默` 记录关联该分流会话；
     - `quick_reply`：**仅在当前路由尚无活跃主会话时允许**，直接以简洁纯文本回复并在内存记录临时轻回复话题（TTL 30 分钟），运行日志 `回复` 记录关联该分流会话；若群友随后在该话题下免 `@` 追问并升级为正式任务，自动将前序问答拼装为 `<triage_handoff_context>` 注入主运行时首轮并承接话题别名；
     - `handoff` / 回退直通：记录 `分流` 审计事件关联该分流会话并回填转交后的主会话 ID，随后安静贴上 `OnIt` 表情由主运行时接管处理。
-- **已接管话题防误杀不变量**：当 `routeKey` 已存在活跃主会话绑定时，裁决空间强制收敛为 `silent | handoff`（禁止 `quick_reply`），并在启用 `includeLastReply` 时喂入上一轮主回复全文，避免把对反问的“好的 / 选 B”误判为普通确认吞掉。
+- **三项分流安全不变量**：
+  - **已接管话题防误杀不变量**：当 `routeKey` 已存在活跃主会话绑定时，裁决空间强制收敛为 `silent | handoff`（禁止 `quick_reply`），并在启用 `includeLastReply` 时喂入上一轮主回复全文，避免把对反问的“好的 / 选 B”误判为普通确认吞掉；
+  - **显式 `@Bot` 禁静默不变量**：即使在 `all_group` 模式下，显式 `@Bot`（`trigger = mention`）与主运行时保持同一契约——严禁被分流静默（无活跃会话时仅允许 `quick_reply` 或 `handoff`，模型若返回 `silent` 自动纠偏为 `handoff`；已有活跃主会话时则零开销确定性直通主运行时）；
+  - **非 `@Bot` 提及他人禁抢答不变量**：群主动监听或活跃话题免 `@` 续聊消息含 `peer_mentions`（仅 `@` 其他成员或其他智能体、未 `@` 本智能体）时，严禁分流 `quick_reply` 抢答，模型若误判 `quick_reply` 自动拦截降级为 `silent`。
 - **三种生效范围、声明式直通规则与 Fail-Open 安全网**：
   - `passive_only`（推荐默认）：仅拦截 `listener` 与 `active-thread`，显式 `@Bot` 直达主运行时；
   - `active_thread_only`：主动监听首消息（`listener`）与显式 `@Bot` 均直达主运行时，仅对活跃话题续聊（`active-thread`）做分流滤噪；

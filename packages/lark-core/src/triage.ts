@@ -134,8 +134,8 @@ export const DEFAULT_TRIAGE_SYSTEM_PROMPT = [
   '   - 若消息或引用消息附带图片：报错截图、监控图表、界面 Bug、架构/设计图或含实质业务信息的内容，一律选 `handoff`；',
   '   - 任何你无法 100% 确定不需要工具或上下文核实的问题（**拿不准一律选 `handoff`，宁可多移交、绝不漏任务或编造事实**）；',
   '   - 当已有活跃主会话且消息是追问、补充信息、或对上一轮提问的答复/批准（如上一轮问“是否执行/选 A 还是 B”，用户回“好的”“执行吧”“B”）时，必须选 `handoff`。',
-  '2. `silent`（静默跳过，不发消息也不唤醒主运行时）：',
-  '   - 群友之间的闲聊、寒暄、表情包/梗图/生活晒图、无关插话、明确指派给他人的事项；',
+  '2. `silent`（静默跳过，不发消息也不唤醒主运行时；显式 `@` 本智能体时严禁使用）：',
+  '   - 群友之间的闲聊、寒暄、表情包/梗图/生活晒图、无关插话、明确指派或 @ 他人/其他智能体的事项；',
   '   - 无需回应的纯陈述确认语（如“收到”“好的”“了解”“+1”“辛苦了”“谢谢”），前提是它**不是**对上一轮提问的确认答复。',
   '{{active_session_rule}}',
   '',
@@ -274,10 +274,37 @@ function triggerLabelOf(trigger: TriagePromptInput['trigger']): string {
   return '私聊'
 }
 
+function isUnmentionedPeerDirected(
+  trigger: TriagePromptInput['trigger'] | undefined,
+  peerMentions: readonly string[] | undefined,
+): boolean {
+  return Boolean(
+    (trigger === 'listener' || trigger === 'active-thread') &&
+      peerMentions &&
+      peerMentions.length > 0,
+  )
+}
+
+function formatPeerMentionsLabel(peerMentions: readonly string[]): string {
+  const cleaned = peerMentions.map((item) => item.trim()).filter(Boolean)
+  if (cleaned.length <= 2) return cleaned.join('、')
+  return `${cleaned.slice(0, 2).join('、')}等`
+}
+
 function triggerGuideOf(
   trigger: TriagePromptInput['trigger'],
-  options?: { readonly delegationFollowupEnabled?: boolean; readonly silentOnly?: boolean },
+  options?: {
+    readonly botName?: string
+    readonly peerMentions?: readonly string[]
+    readonly delegationFollowupEnabled?: boolean
+    readonly silentOnly?: boolean
+  },
 ): string {
+  const botLabel = options?.botName?.trim() ? `「${options.botName.trim()}」` : ''
+  const peerLabel =
+    options?.peerMentions && options.peerMentions.length > 0
+      ? `（当前消息仅 @ 了 ${formatPeerMentionsLabel(options.peerMentions)}，并非本智能体${botLabel}）`
+      : ''
   const delegationNote =
     '- **已开启「委派事项跟进」**：若成员 A 明确 @ 成员 B 指派具体可跟进事项（如故障排查、修复 Bug、发布、审批、CR、待办交付等），**不要按“指派他人”静默**，应选 `handoff` 交由主运行时后台登记提醒；纯寒暄、玩笑、纯信息同步或无明确行动项的 @ 他人仍选 `silent`。'
 
@@ -291,20 +318,22 @@ function triggerGuideOf(
   if (trigger === 'mention') {
     return [
       '## 触发信号：显式 @ 本智能体',
-      '- 用户主动 @ 了本智能体，表达了明确对话意图：极度克制 `silent`（仅明显纯礼貌致谢且无需回应时可 `silent` 或简短 `quick_reply`）；凡有实质诉求一律 `handoff`。',
+      `- 用户主动 @ 了本智能体${botLabel}，表达了明确对话意图：**本轮严禁选择 \`silent\`**（系统强制响应显式 @）；`,
+      '- 仅在 `has_active_session=false` 且属于简单打招呼、礼貌致谢或轻松闲聊吐槽时可选 `quick_reply` 简短回应；凡有实质诉求、需核实上下文或 `has_active_session=true` 一律 `handoff`。',
     ].join('\n')
   }
   if (trigger === 'listener') {
     return [
       '## 触发信号：群主动监听（旁听）',
-      '- 用户并未 @ 本智能体，请严格参照下方监听规则过滤噪音；无关讨论与常规状态同步直接 `silent`，符合规则需要核实或执行的 `handoff`。',
+      `- 用户并未 @ 本智能体${botLabel}，请严格参照下方监听规则过滤噪音；无关讨论与常规状态同步直接 \`silent\`，符合规则需要核实或执行的 \`handoff\`。`,
+      `- **严防错认 @ 对象**：若消息或 \`peer_mentions\` 提及了其他成员或其他智能体${peerLabel}，严禁误认为在呼叫本智能体，也**禁止使用 \`quick_reply\` 抢答**；除命中业务监听规则或委派跟进需 \`handoff\` 外，一律 \`silent\`。`,
       ...(options?.delegationFollowupEnabled ? [delegationNote] : []),
     ].join('\n')
   }
   if (trigger === 'active-thread') {
     return [
       '## 触发信号：活跃话题内免 @ 续聊',
-      '- 消息位于已有对话话题中：请结合最近对话与上一轮主回复判断是否面向本智能体继续推进；若只是同事间旁白或纯确认收尾则 `silent`，否则 `handoff`。',
+      `- 消息位于已有对话话题中：请结合最近对话与上一轮主回复判断是否面向本智能体${botLabel}继续推进；若只是同事间旁白、仅 @ 其他成员/智能体的对话${peerLabel}或纯确认收尾则 \`silent\`，否则 \`handoff\`。`,
       ...(options?.delegationFollowupEnabled ? [delegationNote] : []),
     ].join('\n')
   }
@@ -317,12 +346,25 @@ function triggerGuideOf(
   return ''
 }
 
-function activeSessionRuleOf(hasActiveSession: boolean, silentOnly = false): string {
+function activeSessionRuleOf(
+  hasActiveSession: boolean,
+  silentOnly = false,
+  options?: {
+    readonly trigger?: TriagePromptInput['trigger']
+    readonly peerMentions?: readonly string[]
+  },
+): string {
   if (silentOnly) {
     return '3. **当前为后台静默观察模式（`silent_only=true`）**：禁止使用 `quick_reply`，只能在 `silent` 与 `handoff` 之间二选一。'
   }
   if (hasActiveSession) {
+    if (options?.trigger === 'mention') {
+      return '3. **当前话题已由主运行时接管且用户显式 @ 本智能体（`has_active_session=true`）**：禁止使用 `silent` 与 `quick_reply`，必须选择 `handoff`。'
+    }
     return '3. **当前话题已由主运行时接管（`has_active_session=true`）**：禁止使用 `quick_reply`，只能在 `silent` 与 `handoff` 之间二选一，避免双人格分裂或越权回答。'
+  }
+  if (isUnmentionedPeerDirected(options?.trigger, options?.peerMentions)) {
+    return `3. **当前消息仅 @ 了其他成员/智能体（${formatPeerMentionsLabel(options!.peerMentions!)}），未 @ 本智能体**：禁止使用 \`quick_reply\` 抢答，只能在 \`silent\` 与 \`handoff\` 之间二选一。`
   }
   return [
     '3. `quick_reply`（仅在 `has_active_session=false` 时允许）：',
@@ -338,6 +380,7 @@ export function buildTriageSystemPromptVars(input: {
   readonly chatName?: string
   readonly hasActiveWorker: boolean
   readonly trigger: TriagePromptInput['trigger']
+  readonly peerMentions?: readonly string[]
   readonly listenerName?: string
   readonly listenerPrompt?: string
   readonly delegationFollowupEnabled?: boolean
@@ -354,12 +397,21 @@ export function buildTriageSystemPromptVars(input: {
     chat_name: input.chatName?.trim() ?? '',
     trigger: input.silentOnly && input.delegationFollowupEnabled ? '委派事项静默观察' : triggerLabelOf(input.trigger),
     trigger_guide: triggerGuideOf(input.trigger, {
+      botName: input.botName,
+      ...(input.peerMentions && input.peerMentions.length > 0
+        ? { peerMentions: input.peerMentions }
+        : {}),
       ...(input.delegationFollowupEnabled !== undefined
         ? { delegationFollowupEnabled: input.delegationFollowupEnabled }
         : {}),
       ...(input.silentOnly !== undefined ? { silentOnly: input.silentOnly } : {}),
     }),
-    active_session_rule: activeSessionRuleOf(input.hasActiveWorker, Boolean(input.silentOnly)),
+    active_session_rule: activeSessionRuleOf(input.hasActiveWorker, Boolean(input.silentOnly), {
+      trigger: input.trigger,
+      ...(input.peerMentions && input.peerMentions.length > 0
+        ? { peerMentions: input.peerMentions }
+        : {}),
+    }),
     listener_name: input.trigger === 'listener' ? (input.listenerName?.trim() ?? '') : '',
     listener_prompt: listenerPrompt,
   }
@@ -394,6 +446,7 @@ export function buildTriageSystemPrompt(input: {
   readonly chatName?: string
   readonly hasActiveWorker: boolean
   readonly trigger: TriagePromptInput['trigger']
+  readonly peerMentions?: readonly string[]
   readonly listenerName?: string
   readonly listenerPrompt?: string
   readonly systemPromptTemplate?: string
@@ -406,8 +459,10 @@ export function buildTriageSystemPrompt(input: {
 
 export function buildTriageUserMessage(input: TriagePromptInput): string {
   const sections: string[] = []
+  const cleanBotName = input.botName.trim()
   const metaParts = [
     `trigger=${input.trigger}`,
+    ...(cleanBotName ? [`bot_name="${cleanBotName}"`] : []),
     `has_active_session=${input.hasActiveWorker ? 'true' : 'false'}`,
     ...(input.silentOnly ? ['silent_only=true'] : []),
     ...(input.hasActiveWorker ? [`session_busy=${input.workerBusy ? 'true' : 'false'}`] : []),
@@ -498,6 +553,10 @@ function normalizeVerdictObject(
   obj: Record<string, unknown> | undefined,
   hasActiveWorker: boolean,
   silentOnly = false,
+  options?: {
+    readonly trigger?: TriagePromptInput['trigger']
+    readonly peerMentions?: readonly string[]
+  },
 ): TriageVerdict | undefined {
   if (!obj) return undefined
   const rawAction = typeof obj.action === 'string' ? obj.action.trim().toLowerCase() : ''
@@ -513,6 +572,10 @@ function normalizeVerdictObject(
         : ''
 
   if (rawAction === 'silent') {
+    // Invariant: explicit @Bot mentions must never be silently swallowed by triage.
+    if (options?.trigger === 'mention' && !silentOnly) {
+      return { action: 'handoff', reason: `${reason}（显式 @ 智能体禁止静默，转交主运行时）` }
+    }
     return { action: 'silent', reason }
   }
   if (rawAction === 'handoff') {
@@ -525,6 +588,15 @@ function normalizeVerdictObject(
     // Invariant: once the main runtime owns the route, never allow quick_reply to split persona/context.
     if (hasActiveWorker) {
       return { action: 'handoff', reason: `${reason}（已有活跃会话，转交主运行时）` }
+    }
+    // Invariant: passive listener / active-thread messages mentioning other peers (without @Bot)
+    // must never trigger a quick_reply hijack pretending to answer for the mentioned peer.
+    if (isUnmentionedPeerDirected(options?.trigger, options?.peerMentions)) {
+      const peerLabel = formatPeerMentionsLabel(options!.peerMentions!)
+      return {
+        action: 'silent',
+        reason: `${reason}（仅 @ ${peerLabel}，未 @ 本智能体，已拦截抢答快回）`,
+      }
     }
     if (!rawReply) {
       return { action: 'handoff', reason: '轻回复内容为空，回退直通主运行时', fallback: true }
@@ -543,14 +615,23 @@ export function parseTriageVerdict(input: {
   readonly text?: string
   readonly hasActiveWorker: boolean
   readonly silentOnly?: boolean
+  readonly trigger?: TriagePromptInput['trigger']
+  readonly peerMentions?: readonly string[]
 }): TriageVerdict {
   const silentOnly = Boolean(input.silentOnly)
+  const guardOpts = {
+    ...(input.trigger ? { trigger: input.trigger } : {}),
+    ...(input.peerMentions && input.peerMentions.length > 0
+      ? { peerMentions: input.peerMentions }
+      : {}),
+  }
   const matchingTool = input.toolCalls?.find((c) => c.name === TRIAGE_TOOL_NAME)
   if (matchingTool) {
     const parsed = normalizeVerdictObject(
       tryParseJsonObject(matchingTool.arguments),
       input.hasActiveWorker,
       silentOnly,
+      guardOpts,
     )
     if (parsed) return parsed
   }
@@ -560,6 +641,7 @@ export function parseTriageVerdict(input: {
       tryParseJsonObject(input.text),
       input.hasActiveWorker,
       silentOnly,
+      guardOpts,
     )
     if (parsed) return parsed
   }

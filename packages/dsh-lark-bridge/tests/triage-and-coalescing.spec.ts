@@ -757,7 +757,12 @@ describe('Smart Triage Gate, Per-Group Overrides & Busy-Queue Coalescing', () =>
 
   it('supports per-group independent smart triage model, scope, and custom prompt overrides even when Bot default is off', async () => {
     const h = createHarness({
-      triageStream: () => makeToolCallStream({ action: 'silent', reason: '群独立规则静默' }),
+      triageStream: () =>
+        makeToolCallStream({
+          action: 'quick_reply',
+          reason: '群独立规则快回',
+          reply_text: '不客气，随时喊我。',
+        }),
       workerReply: () => '主运行时直达回复',
     })
     const fx = makeFakeTransport()
@@ -786,7 +791,7 @@ describe('Smart Triage Gate, Per-Group Overrides & Busy-Queue Coalescing', () =>
         model: 'plan-fast',
         scope: 'all_group',
         timeoutMs: 3000,
-        systemPrompt: '你是 {{bot_name}}，当前群 {{chat_name}}。群 A 专属分流规则：纯致谢静默。{{active_session_rule}}',
+        systemPrompt: '你是 {{bot_name}}，当前群 {{chat_name}}。群 A 专属分流规则：纯致谢快回。{{active_session_rule}}',
         coalesceQueuedMessages: true,
       },
     })
@@ -816,6 +821,8 @@ describe('Smart Triage Gate, Per-Group Overrides & Busy-Queue Coalescing', () =>
     expect(h.triageCalls[0]?.system).toContain('你是 DevBot，当前群 独立分流群 A')
     expect(h.triageCalls[0]?.system).toContain('群 A 专属分流规则')
     expect(h.createdSessions).toHaveLength(0)
+    expect(fx.sentReplies).toHaveLength(1)
+    expect(fx.sentReplies[0]?.text).toBe('不客气，随时喊我。')
 
     await h.manager.inbound.handleInbound(
       'bot-1',
@@ -830,7 +837,7 @@ describe('Smart Triage Gate, Per-Group Overrides & Busy-Queue Coalescing', () =>
     // Group B did NOT call triage and went straight to main runtime
     expect(h.triageCalls).toHaveLength(1)
     expect(h.createdSessions).toHaveLength(1)
-    expect(fx.sentReplies).toHaveLength(1)
+    expect(fx.sentReplies).toHaveLength(2)
 
     await h.manager.stop()
     h.store.close()
@@ -897,16 +904,27 @@ describe('Smart Triage Gate, Per-Group Overrides & Busy-Queue Coalescing', () =>
       chatId: 'oc_team',
       chatName: '稳定性群',
       enabled: true,
+      listener: {
+        enabled: true,
+        name: '工作日常',
+        prompt: '仅回应有实质问题或告警的讨论，纯确认语静默',
+        scope: 'all',
+        replyMode: 'reply',
+        sessionMode: 'thread',
+        allowSilentEmptyReply: true,
+        autoCloseAfterCompletion: false,
+        msgTypes: ['text'],
+        senderTypes: ['user'],
+      },
     })
 
-    // Call 1: silent verdict -> persisted as archived DSH v4 triage session & linked to audit event
+    // Call 1: passive listener silent verdict -> persisted as archived DSH v4 triage session & linked to audit event
     await h.manager.inbound.handleInbound(
       'bot-1',
       fx.transport,
       makeGroupMsg({
         messageId: 'om_tr_1',
-        text: '@DevBot 收到',
-        mentions: [{ key: '@_user_1', openId: 'ou_bot', name: 'DevBot' }],
+        text: '收到',
       }),
     )
 
@@ -1533,6 +1551,159 @@ describe('Smart Triage Gate, Per-Group Overrides & Busy-Queue Coalescing', () =>
     })
     expect(abortedResult.verdict.action).toBe('silent')
     expect(abortedResult.verdict.fallback).toBeUndefined()
+
+    await h.manager.stop()
+    h.store.close()
+  })
+
+  it('never silently drops explicit @mentions under all_group and intercepts listener quick_reply hijacks on peer mentions', async () => {
+    let callIdx = 0
+    const h = createHarness({
+      triageStream: (opts) => {
+        callIdx += 1
+        const userText = (opts.messages[0]?.content ?? [])
+          .map((b) => ('text' in b && typeof b.text === 'string' ? b.text : ''))
+          .join('\n')
+        const incomingIdx = userText.indexOf('<incoming_message>')
+        const incomingSection = incomingIdx >= 0 ? userText.slice(incomingIdx) : userText
+        // 1. Model mistakenly attempts `quick_reply` when listener sees `@OtherBot 重生了吗？`
+        if (incomingSection.includes('重生了吗')) {
+          return makeToolCallStream({
+            action: 'quick_reply',
+            reason: '@本智能体的轻松寒暄',
+            reply_text: '重生了，记忆都在！',
+          })
+        }
+        // 2. Model mistakenly attempts `silent` on explicit @DevBot snark under all_group
+        if (incomingSection.includes('谁问你了')) {
+          return makeToolCallStream({
+            action: 'silent',
+            reason: '群内吐槽式插话，无实质诉求',
+          })
+        }
+        return makeToolCallStream({
+          action: 'handoff',
+          reason: '需主运行时处理',
+        })
+      },
+      workerReply: (_prompt, turn) => `主运行时第 ${turn} 轮已响应`,
+    })
+    const fx = makeFakeTransport()
+
+    h.store.upsertBot({
+      id: 'bot-guard',
+      name: 'DevBot',
+      larkAppId: 'cli_demo',
+      larkAppSecret: 'sec_demo',
+      defaultWorkingDir: h.dir,
+      agentPreset: 'standard',
+      useInteractiveCard: false,
+      receivedReactionEmoji: 'OnIt',
+      router: {
+        enabled: true,
+        provider: 'deepseek',
+        model: 'deepseek-chat',
+        scope: 'all_group',
+      },
+    })
+    h.store.upsertGroup({
+      key: 'bot-guard:oc_team',
+      botId: 'bot-guard',
+      chatId: 'oc_team',
+      chatName: '协作群',
+      enabled: true,
+      replyMode: 'reply',
+      listener: {
+        enabled: true,
+        name: '工作日常',
+        prompt: '参与团队讨论，无关闲聊静默',
+        scope: 'all',
+        replyMode: 'reply',
+        sessionMode: 'thread',
+        allowSilentEmptyReply: true,
+        autoCloseAfterCompletion: false,
+        msgTypes: ['text'],
+        senderTypes: ['user'],
+      },
+    })
+
+    // Scenario 1: Listener sees `@OtherBot 重生了吗？` (not @DevBot) -> model tries quick_reply -> intercepted to silent!
+    await h.manager.inbound.handleInbound(
+      'bot-guard',
+      fx.transport,
+      makeGroupMsg({
+        botId: 'bot-guard',
+        messageId: 'om_peer_bot_1',
+        text: '@_user_1 重生了吗？',
+        mentions: [{ key: '@_user_1', openId: 'ou_other_bot', name: 'OtherBot' }],
+      }),
+    )
+    expect(callIdx).toBe(1)
+    expect(h.triageCalls[0]?.system).toContain('禁止使用 `quick_reply` 抢答')
+    expect(fx.sentReplies).toHaveLength(0)
+    expect(h.createdSessions).toHaveLength(0)
+    expect(h.manager.triage.context.hasEphemeralThread('cli_demo:oc_team:om_peer_bot_1')).toBe(false)
+    const peerTriageRow = h.store.listTriageSessions('bot-guard')[0]
+    expect(peerTriageRow?.action).toBe('silent')
+    expect(peerTriageRow?.reason).toContain('仅 @ OtherBot')
+
+    // Scenario 2: Explicit @DevBot without active session -> model tries silent -> upgraded to handoff!
+    await h.manager.inbound.handleInbound(
+      'bot-guard',
+      fx.transport,
+      makeGroupMsg({
+        botId: 'bot-guard',
+        messageId: 'om_mention_root_1',
+        text: '@_user_1 谁问你了',
+        mentions: [{ key: '@_user_1', openId: 'ou_bot', name: 'DevBot' }],
+      }),
+    )
+    expect(callIdx).toBe(2)
+    expect(h.createdSessions).toHaveLength(1)
+    expect(h.submittedWorkerPrompts).toHaveLength(1)
+    expect(fx.sentReplies).toHaveLength(1)
+    expect(fx.sentReplies[0]?.text).toBe('主运行时第 1 轮已响应')
+    const mentionTriageRow = h.store.listTriageSessions('bot-guard')[0]
+    expect(mentionTriageRow?.action).toBe('handoff')
+    expect(mentionTriageRow?.reason).toContain('显式 @ 智能体禁止静默')
+
+    // Scenario 3: Explicit @DevBot in a thread that ALREADY has an active Worker session ->
+    //             bypasses triage LLM directly (zero extra triage call, audited as fast bypass)
+    await h.manager.inbound.handleInbound(
+      'bot-guard',
+      fx.transport,
+      makeGroupMsg({
+        botId: 'bot-guard',
+        messageId: 'om_mention_follow_2',
+        rootId: 'om_mention_root_1',
+        parentId: 'om_mention_root_1',
+        text: '@_user_1 再确认下刚才的结论',
+        mentions: [{ key: '@_user_1', openId: 'ou_bot', name: 'DevBot' }],
+      }),
+    )
+    expect(callIdx).toBe(2)
+    expect(h.submittedWorkerPrompts).toHaveLength(2)
+    expect(fx.sentReplies).toHaveLength(2)
+    expect(fx.sentReplies[1]?.text).toBe('主运行时第 2 轮已响应')
+    const bypassAudit = h.store
+      .listEvents({ botId: 'bot-guard', limit: 20 })
+      .find((e) => e.kind === 'triage' && e.summary.includes('话题已有活跃会话'))
+    expect(bypassAudit).toBeDefined()
+
+    // Scenario 4: Listener sees `@Alex 帮我排查一下超时问题` -> model returns handoff -> still allowed!
+    await h.manager.inbound.handleInbound(
+      'bot-guard',
+      fx.transport,
+      makeGroupMsg({
+        botId: 'bot-guard',
+        messageId: 'om_peer_handoff_3',
+        text: '@_user_1 帮我排查一下超时问题',
+        mentions: [{ key: '@_user_1', openId: 'ou_alex', name: 'Alex' }],
+      }),
+    )
+    expect(callIdx).toBe(3)
+    expect(h.createdSessions).toHaveLength(2)
+    expect(h.submittedWorkerPrompts).toHaveLength(3)
 
     await h.manager.stop()
     h.store.close()
