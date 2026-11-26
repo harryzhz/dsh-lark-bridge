@@ -3,6 +3,15 @@ import type { LarkReminderItem } from './proactive.js'
 import { trimInvisibleText } from './reply-text.js'
 import type { LarkBotConfig } from './types.js'
 
+export type LarkCardWidthMode = 'default' | 'compact' | 'fill'
+
+function buildCardConfig(widthMode: LarkCardWidthMode): Record<string, unknown> {
+  return {
+    update_multi: true,
+    width_mode: widthMode,
+  }
+}
+
 export interface ReplyCardImage {
   readonly imgKey: string
   readonly alt?: string
@@ -105,7 +114,7 @@ export function buildReplyCard(options: ReplyCardOptions): Record<string, unknow
 
   return {
     schema: '2.0',
-    config: { wide_screen_mode: true },
+    config: buildCardConfig('fill'),
     ...(options.title
       ? {
           header: {
@@ -172,7 +181,7 @@ export function buildApprovalCard(options: ApprovalCardOptions): Record<string, 
 
   return {
     schema: '2.0',
-    config: { wide_screen_mode: true },
+    config: buildCardConfig('default'),
     header: {
       title: { tag: 'plain_text', content: '需要工具执行审批' },
       template: 'orange',
@@ -205,7 +214,7 @@ export function buildReminderConfirmCard(
   const detail = item.reason?.trim() || item.prompt.trim().slice(0, 160)
   return {
     schema: '2.0',
-    config: { wide_screen_mode: true },
+    config: buildCardConfig('default'),
     header: {
       title: { tag: 'plain_text', content: `待确认跟进提醒 · ${item.title}` },
       template: 'blue',
@@ -272,7 +281,7 @@ export function buildReminderNoticeCard(
   const stakeholderLines = formatReminderStakeholderLines(item)
   return {
     schema: '2.0',
-    config: { wide_screen_mode: true },
+    config: buildCardConfig('default'),
     header: {
       title: { tag: 'plain_text', content: `已创建跟进提醒 · ${item.title}` },
       template: 'grey',
@@ -319,7 +328,7 @@ export function buildReminderStatusCard(
 ): Record<string, unknown> {
   return {
     schema: '2.0',
-    config: { wide_screen_mode: true },
+    config: buildCardConfig('default'),
     header: {
       title: { tag: 'plain_text', content: title },
       template,
