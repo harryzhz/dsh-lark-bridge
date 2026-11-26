@@ -512,4 +512,326 @@ describe('Multimodal triage, DSH ImageAttachmentRef admission & quoted message a
     await manager.stop()
     store.close()
   })
+
+  it('deduplicates quoted text, quoted images, and bot replies across follow-up turns in the same thread session', async () => {
+    const dir = makeTempDir()
+    const store = new LarkBridgeStore(dir)
+    const listeners = new Set<(session: Session, event: SessionEvent) => void>()
+    const liveAgents = new Map<string, { session: Session; cancel: ReturnType<typeof vi.fn>; followup: (msg: { id?: string; content: readonly ContentBlock[] }) => void }>()
+    const workerContentBlocks: Array<readonly ContentBlock[]> = []
+    let turnSeq = 0
+    let attSeq = 0
+
+    const emit = (session: Session, event: SessionEvent) => {
+      for (const fn of [...listeners]) fn(session, event)
+    }
+
+    const ctx = {
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+      get: (key: string) => {
+        if (key === 'workspaceRegistry') {
+          return {
+            list: () => [],
+            create: async (_cwd: string, title?: string) => ({
+              id: 'ws-dedup',
+              title: title ?? 'demo',
+              cwd: '/tmp',
+              sessionIds: [],
+              attachSession: vi.fn().mockResolvedValue(undefined),
+              setTitle: vi.fn().mockResolvedValue(undefined),
+            }),
+            archivedSessionIds: [],
+            archiveSession: async () => true,
+          }
+        }
+        if (key === 'attachments') {
+          return {
+            saveImage: vi.fn(async (input: { data: Uint8Array; mediaType: string; name?: string }) => ({
+              attachmentId: `sha256:dedup_${++attSeq}`,
+              mediaType: input.mediaType,
+              bytes: input.data.byteLength,
+              width: 640,
+              height: 480,
+              ...(input.name ? { name: input.name } : {}),
+            })),
+          }
+        }
+        return undefined
+      },
+      inject: vi.fn(),
+      effect: () => () => {},
+      on: (name: string, fn: (session: Session, event: SessionEvent) => void) => {
+        if (name === 'session/event') listeners.add(fn)
+        return () => {
+          listeners.delete(fn)
+        }
+      },
+      llm: {
+        listProviders: () => [{ id: 'mock-native', name: 'Mock Native' }],
+        listModels: async () => [{ id: 'mock-vision', name: 'Mock Vision' }],
+      },
+      sessions: { get: () => undefined },
+      agents: {
+        listPresets: () => [{ id: 'standard', name: 'Standard', defaultModel: 'mock-vision' }],
+        get: (sessionId: string) => liveAgents.get(sessionId),
+        create: async (opts: { sessionId: string; meta: { cwd: string; agentPreset: string } }) => {
+          const recorded: SessionEvent[] = []
+          const session = {
+            id: opts.sessionId,
+            header: { cwd: opts.meta.cwd, agentPreset: opts.meta.agentPreset },
+            snapshotEvents: () => [...recorded],
+            append: (type: string, data: unknown) => {
+              const ev = { seq: recorded.length, type, data } as unknown as SessionEvent
+              recorded.push(ev)
+              return ev
+            },
+          } as unknown as Session
+          const agent = {
+            session,
+            cancel: vi.fn(),
+            followup: (userMsg: { id?: string; content: readonly ContentBlock[] }) => {
+              const turn = ++turnSeq
+              workerContentBlocks.push(userMsg.content)
+              const userEv = {
+                seq: recorded.length,
+                type: 'user/message',
+                data: { id: userMsg.id, turn, content: userMsg.content },
+              } as unknown as SessionEvent
+              recorded.push(userEv)
+              queueMicrotask(() => {
+                emit(session, { type: 'turn/start', data: { turn } } as unknown as SessionEvent)
+                emit(session, userEv)
+                emit(session, {
+                  type: 'assistant/message',
+                  data: {
+                    turn,
+                    message: { role: 'assistant', content: [{ type: 'text', text: `回复 #${turn}` }] },
+                  },
+                } as unknown as SessionEvent)
+                emit(session, {
+                  type: 'turn/end',
+                  data: { turn, reason: { kind: 'completed' } },
+                } as unknown as SessionEvent)
+              })
+            },
+          }
+          liveAgents.set(opts.sessionId, agent)
+          return {
+            agent,
+            dispose: async () => {
+              liveAgents.delete(opts.sessionId)
+            },
+          }
+        },
+      },
+    } as unknown as Context
+
+    const manager = new LarkBridgeManager(
+      ctx,
+      {
+        dataDir: dir,
+        publicBaseUrl: 'http://127.0.0.1:3880',
+        idleSweepIntervalMs: 0,
+        maxAuditEvents: 200,
+        autoInstallCliAndSkill: false,
+      },
+      store,
+    )
+
+    store.upsertBot({
+      id: 'bot-dedup',
+      name: 'DedupBot',
+      larkAppId: 'cli_dedup_1',
+      larkAppSecret: 'mock-secret',
+      defaultWorkingDir: dir,
+      agentPreset: 'standard',
+      receivedReactionEmoji: 'NONE',
+    })
+    store.upsertGroup({
+      botId: 'bot-dedup',
+      chatId: 'oc_dedup_chat',
+      enabled: true,
+    })
+
+    const getMessageDetail = vi.fn(async (id: string) => {
+      if (id === 'om_root_with_img') {
+        return {
+          messageId: 'om_root_with_img',
+          msgType: 'post',
+          senderName: 'Alex',
+          senderType: 'user' as const,
+          text: '原始反馈正文，很长的一段诊断说明',
+          createTimeMs: Date.now() - 10_000,
+          resources: [{ type: 'image' as const, key: 'img_root_1' }],
+        }
+      }
+      if (id === 'om_ext_root') {
+        return {
+          messageId: 'om_ext_root',
+          msgType: 'post',
+          senderName: 'Sam',
+          senderType: 'user' as const,
+          text: '外部根消息正文内容',
+          createTimeMs: Date.now() - 10_000,
+          resources: [{ type: 'image' as const, key: 'img_ext_1' }],
+        }
+      }
+      if (id === 'om_bot_reply_1') {
+        return {
+          messageId: 'om_bot_reply_1',
+          msgType: 'interactive',
+          senderName: 'DedupBot',
+          senderType: 'bot' as const,
+          text: '回复 #1',
+          createTimeMs: Date.now() - 5_000,
+          resources: [],
+        }
+      }
+      return undefined
+    })
+    const downloadResourceBuffer = vi.fn().mockResolvedValue(PNG_BYTES)
+    let replySeq = 0
+    const sendReply = vi.fn(async (params: { replyToMessageId?: string }) => ({
+      messageId: `om_bot_reply_${++replySeq}`,
+      rootId:
+        params.replyToMessageId === 'om_root_with_img'
+          ? 'om_root_with_img'
+          : params.replyToMessageId === 'om_ext_reply_1'
+            ? 'om_ext_root'
+            : undefined,
+      threadId:
+        params.replyToMessageId === 'om_ext_reply_1' ? 'omt_ext_1' : undefined,
+    }))
+    const transport = {
+      state: { botOpenId: 'ou_bot_dedup', connected: true },
+      addReaction: vi.fn().mockResolvedValue(undefined),
+      removeReaction: vi.fn().mockResolvedValue(undefined),
+      sendReply,
+      getMessageDetail,
+      downloadResourceBuffer,
+    } as unknown as LarkBotTransport
+
+    // 1. Thread root turn with text + image
+    await manager.inbound.handleInbound(
+      'bot-dedup',
+      transport,
+      makeMsg({
+        botId: 'bot-dedup',
+        larkAppId: 'cli_dedup_1',
+        botOpenId: 'ou_bot_dedup',
+        chatId: 'oc_dedup_chat',
+        messageId: 'om_root_with_img',
+        msgType: 'post',
+        text: '@_user_1 原始反馈正文，很长的一段诊断说明',
+        mentions: [{ key: '@_user_1', openId: 'ou_bot_dedup', name: 'DedupBot' }],
+        imageKeys: ['img_root_1'],
+      }),
+    )
+    expect(downloadResourceBuffer).toHaveBeenCalledTimes(1)
+    expect(workerContentBlocks[0]!.filter((b) => b.type === 'image')).toHaveLength(1)
+
+    // 2. Follow-up reply in the same thread (`parentId === rootId === om_root_with_img`):
+    //    must skip getMessageDetail, skip image re-download, and omit <quoted_message>
+    await manager.inbound.handleInbound(
+      'bot-dedup',
+      transport,
+      makeMsg({
+        botId: 'bot-dedup',
+        larkAppId: 'cli_dedup_1',
+        botOpenId: 'ou_bot_dedup',
+        chatId: 'oc_dedup_chat',
+        messageId: 'om_thread_followup_2',
+        rootId: 'om_root_with_img',
+        parentId: 'om_root_with_img',
+        msgType: 'text',
+        text: '三个依次交付',
+        mentions: [],
+        imageKeys: [],
+      }),
+    )
+    expect(getMessageDetail).not.toHaveBeenCalled()
+    expect(downloadResourceBuffer).toHaveBeenCalledTimes(1)
+    expect(workerContentBlocks[1]!.filter((b) => b.type === 'image')).toHaveLength(0)
+    const turn2Text = (workerContentBlocks[1]![0] as { text: string }).text
+    expect(turn2Text).toContain('thread_id="om_root_with_img"')
+    expect(turn2Text).toContain('quoted_message_id="om_root_with_img"')
+    expect(turn2Text).not.toContain('<quoted_message')
+    expect(turn2Text).not.toContain('原始反馈正文')
+
+    // 3. Explicit quote of the bot's own reply (`om_bot_reply_1`) in the same thread:
+    //    must skip getMessageDetail & <quoted_message> body, leaving only a concise pointer
+    await manager.inbound.handleInbound(
+      'bot-dedup',
+      transport,
+      makeMsg({
+        botId: 'bot-dedup',
+        larkAppId: 'cli_dedup_1',
+        botOpenId: 'ou_bot_dedup',
+        chatId: 'oc_dedup_chat',
+        messageId: 'om_thread_followup_3',
+        rootId: 'om_root_with_img',
+        parentId: 'om_bot_reply_1',
+        msgType: 'text',
+        text: '按你上面说的直接做',
+        mentions: [],
+        imageKeys: [],
+      }),
+    )
+    expect(getMessageDetail).not.toHaveBeenCalled()
+    const turn3Text = (workerContentBlocks[2]![0] as { text: string }).text
+    expect(turn3Text).not.toContain('<quoted_message')
+    expect(turn3Text).toContain('引用消息：om_bot_reply_1（内容已在本会话前文中')
+
+    // 4. New thread starting from an unseen external root (`om_ext_root` with image):
+    //    first turn expands text + image; second turn in same thread must NOT repeat either
+    await manager.inbound.handleInbound(
+      'bot-dedup',
+      transport,
+      makeMsg({
+        botId: 'bot-dedup',
+        larkAppId: 'cli_dedup_1',
+        botOpenId: 'ou_bot_dedup',
+        chatId: 'oc_dedup_chat',
+        messageId: 'om_ext_reply_1',
+        rootId: 'om_ext_root',
+        parentId: 'om_ext_root',
+        msgType: 'text',
+        text: '@_user_1 帮我分析下',
+        mentions: [{ key: '@_user_1', openId: 'ou_bot_dedup', name: 'DedupBot' }],
+        imageKeys: [],
+      }),
+    )
+    expect(getMessageDetail).toHaveBeenCalledTimes(1)
+    expect(downloadResourceBuffer).toHaveBeenCalledTimes(2)
+    expect(workerContentBlocks[3]!.filter((b) => b.type === 'image')).toHaveLength(1)
+    expect((workerContentBlocks[3]![0] as { text: string }).text).toContain('<quoted_message message_id="om_ext_root"')
+
+    await manager.inbound.handleInbound(
+      'bot-dedup',
+      transport,
+      makeMsg({
+        botId: 'bot-dedup',
+        larkAppId: 'cli_dedup_1',
+        botOpenId: 'ou_bot_dedup',
+        chatId: 'oc_dedup_chat',
+        messageId: 'om_ext_reply_2',
+        threadId: 'omt_ext_1',
+        rootId: 'om_ext_root',
+        parentId: 'om_ext_root',
+        msgType: 'text',
+        text: '继续改代码',
+        mentions: [],
+        imageKeys: [],
+      }),
+    )
+    expect(getMessageDetail).toHaveBeenCalledTimes(1)
+    expect(downloadResourceBuffer).toHaveBeenCalledTimes(2)
+    expect(workerContentBlocks[4]!.filter((b) => b.type === 'image')).toHaveLength(0)
+    const extTurn2Text = (workerContentBlocks[4]![0] as { text: string }).text
+    expect(extTurn2Text).not.toContain('<quoted_message')
+    expect(extTurn2Text).not.toContain('外部根消息正文内容')
+
+    await manager.stop()
+    store.close()
+  })
 })

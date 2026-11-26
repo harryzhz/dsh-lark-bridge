@@ -12,6 +12,11 @@ import type {
 } from '@dsh-lark/lark-core'
 
 export const LARK_ORIGIN_RECORD_TYPE = 'plugin:lark-bridge/origin'
+export const LARK_SENT_MESSAGE_RECORD_TYPE = 'plugin:lark-bridge/sent-message'
+
+export interface LarkSentMessageRecord {
+  readonly messageId: string
+}
 
 export interface LarkOriginRecord {
   readonly botId: string
@@ -47,6 +52,9 @@ declare module '@deepseek-ai/dsh-session/types' {
       trigger: string
       listenerName?: string
       scheduleId?: string
+    }
+    'plugin:lark-bridge/sent-message': {
+      messageId: string
     }
   }
 }
