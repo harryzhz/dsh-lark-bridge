@@ -13,7 +13,7 @@ import {
   resolveEffectiveBotId,
   SelectMenu,
 } from '../components/fields.js'
-import { resolveModelDisplayName, resolveRuntimeDisplayName } from '../components/options.js'
+import { resolveModelDisplayName } from '../components/options.js'
 import { formatTime } from '../state.js'
 import type {
   BotRecord,
@@ -37,6 +37,7 @@ import {
   type TechChartMode,
 } from './ObservabilityCharts.js'
 import {
+  formatAgentModelsSummary,
   formatBytes,
   formatCompactNumber,
   formatDeltaBadge,
@@ -47,12 +48,15 @@ import {
   OBSERVABILITY_WINDOWS,
   P2P_CHAT_FILTER,
   resolveErrorCodeLabel,
+  resolveObservabilityAgentLabel,
+  resolveObservabilityModelLabel,
   resolveTableLabel,
   resolveTriggerLabel,
 } from './observability-model.js'
 import { OverviewView } from './OverviewView.js'
 
 export type CockpitPane = 'overview' | 'insights' | 'monitor'
+type ConsumptionTab = 'models' | 'agents'
 type RankingTab = 'bots' | 'chats'
 
 const POLL_IDLE_MS = 15_000
@@ -63,23 +67,18 @@ function InsightsPane({
   payload,
   runtimes,
   models,
-  selectedBotId,
-  selectedChatId,
-  onSelectBot,
-  onSelectChat,
 }: {
   readonly payload: ObservabilityPayload
   readonly runtimes: readonly RuntimeOption[]
   readonly models: readonly ModelGroup[]
-  readonly selectedBotId: string
-  readonly selectedChatId: string
-  readonly onSelectBot: (botId: string) => void
-  readonly onSelectChat: (chatId: string) => void
 }) {
   const [chartMode, setChartMode] = useState<ProductChartMode>('tokens')
+  const [consumptionTab, setConsumptionTab] = useState<ConsumptionTab>('models')
   const [rankTab, setRankTab] = useState<RankingTab>('chats')
+  const [expandedRankKey, setExpandedRankKey] = useState<string>('')
   const { product, series } = payload
   const { tokens, sessions, traffic, triage, proactive } = product
+  const agentBreakdowns = product.agents ?? []
 
   const tokenSpark = useMemo(() => series.map((p) => p.totalTokens), [series])
   const sessionSpark = useMemo(() => series.map((p) => p.sessions), [series])
@@ -124,6 +123,18 @@ function InsightsPane({
   const proactiveTotal = proactive.scheduleRuns + proactive.reminderRuns + proactive.dreamRuns
   const maxTriggerTokens = Math.max(0, ...product.triggers.map((t) => t.totalTokens))
   const maxTriggerCount = Math.max(1, ...product.triggers.map((t) => t.count))
+  const visibleChatRanking = product.chatRanking.slice(0, 7)
+  const maxChatRankTokens = Math.max(0, ...visibleChatRanking.map((c) => c.totalTokens))
+  const maxBotRankTokens = Math.max(0, ...product.botRanking.map((b) => b.totalTokens))
+
+  const handleRankTabChange = (next: RankingTab) => {
+    setRankTab(next)
+    setExpandedRankKey('')
+  }
+
+  const toggleRankExpand = (key: string) => {
+    setExpandedRankKey((prev) => (prev === key ? '' : key))
+  }
 
   return (
     <div className="fb-obs-stack">
@@ -196,30 +207,124 @@ function InsightsPane({
       <section className="fb-card fb-obs-panel">
         <div className="fb-obs-panel-head">
           <div className="fb-obs-panel-title-wrap">
-            <h2 className="fb-obs-panel-title">Token 结构与模型消耗</h2>
-            <span className="fb-obs-panel-sub fb-mono">CACHE HIT {tokens.cacheHitRate}%</span>
-          </div>
-          {product.models.length > 0 && (
+            <h2 className="fb-obs-panel-title">Token 结构与消耗</h2>
             <span className="fb-obs-panel-sub fb-mono">
-              {product.models.length} MODELS · {formatCompactNumber(traffic.llmSteps)} STEPS
+              CACHE HIT {tokens.cacheHitRate}% · {formatCompactNumber(traffic.llmSteps)} STEPS
             </span>
-          )}
+          </div>
+          <FilterTabs
+            label="Token 消耗维度切换"
+            value={consumptionTab}
+            options={[
+              { value: 'models' as const, label: '按模型', count: product.models.length },
+              { value: 'agents' as const, label: '按 Agent', count: agentBreakdowns.length },
+            ]}
+            onChange={setConsumptionTab}
+          />
         </div>
 
         <SegmentedBar items={tokenAnatomy} layout="grid" />
 
         <div className="fb-obs-divider" />
 
-        {product.models.length === 0 ? (
+        {consumptionTab === 'models' ? (
+          product.models.length === 0 ? (
+            <div className="fb-obs-empty-inline">
+              当前周期暂无模型 Token 采样，完成一次对话或等待历史会话索引完成后呈现
+            </div>
+          ) : (
+            <div className="fb-obs-table-wrap">
+              <table className="fb-obs-table fb-num">
+                <thead>
+                  <tr>
+                    <th>模型</th>
+                    <th className="fb-obs-tr">步数</th>
+                    <th className="fb-obs-tr">非缓存输入</th>
+                    <th className="fb-obs-tr">缓存命中</th>
+                    <th className="fb-obs-tr">输出</th>
+                    <th className="fb-obs-tr">占比</th>
+                    <th className="fb-obs-tr">总量</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {product.models.slice(0, 8).map((m) => {
+                    const modelDisplay = resolveObservabilityModelLabel(
+                      m.model,
+                      m.agentPreset,
+                      runtimes,
+                      models,
+                      resolveModelDisplayName,
+                    )
+                    const agentKeys =
+                      m.agents && m.agents.length > 0
+                        ? m.agents
+                        : m.agentPreset
+                          ? [m.agentPreset]
+                          : []
+                    const agentSummary =
+                      agentKeys
+                        .map((k) => resolveObservabilityAgentLabel(k, runtimes))
+                        .filter((v, idx, arr) => Boolean(v) && arr.indexOf(v) === idx)
+                        .join(' · ') ||
+                      m.provider ||
+                      '—'
+                    return (
+                      <tr key={m.model || '__unattributed__'}>
+                        <td>
+                          <div className="fb-obs-cell-stack" data-wide="">
+                            <span
+                              className={`fb-obs-cell-main${modelDisplay.unattributed ? ' fb-obs-muted' : ''}`}
+                              title={m.model || modelDisplay.label}
+                            >
+                              {modelDisplay.label}
+                            </span>
+                            <span className="fb-obs-cell-sub" title={agentSummary}>
+                              {agentSummary}
+                            </span>
+                          </div>
+                        </td>
+                        <td className="fb-obs-tr fb-mono">{formatCompactNumber(m.steps)}</td>
+                        <td className="fb-obs-tr fb-mono">
+                          {formatTokens(m.inputTokens + m.cacheWriteTokens)}
+                        </td>
+                        <td className="fb-obs-tr">
+                          <span
+                            className="fb-obs-pill fb-mono"
+                            data-tone={m.cacheHitRate >= 50 ? 'good' : 'neutral'}
+                          >
+                            {m.cacheHitRate}%
+                          </span>
+                        </td>
+                        <td className="fb-obs-tr fb-mono">{formatTokens(m.outputTokens)}</td>
+                        <td className="fb-obs-tr fb-mono fb-obs-muted">{m.sharePct.toFixed(1)}%</td>
+                        <td className="fb-obs-tr">
+                          <div className="fb-obs-bar-num">
+                            <strong className="fb-mono">{formatTokens(m.totalTokens)}</strong>
+                            <div className="fb-obs-mini-track">
+                              <div
+                                className="fb-obs-mini-fill"
+                                style={{ width: `${Math.max(4, m.sharePct)}%` }}
+                              />
+                            </div>
+                          </div>
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )
+        ) : agentBreakdowns.length === 0 ? (
           <div className="fb-obs-empty-inline">
-            当前周期暂无模型 Token 采样，完成一次对话或等待历史会话索引完成后呈现
+            当前周期暂无 Agent 运行时 Token 采样
           </div>
         ) : (
           <div className="fb-obs-table-wrap">
             <table className="fb-obs-table fb-num">
               <thead>
                 <tr>
-                  <th>模型 / 运行时</th>
+                  <th>Agent</th>
                   <th className="fb-obs-tr">步数</th>
                   <th className="fb-obs-tr">非缓存输入</th>
                   <th className="fb-obs-tr">缓存命中</th>
@@ -229,50 +334,64 @@ function InsightsPane({
                 </tr>
               </thead>
               <tbody>
-                {product.models.slice(0, 8).map((m) => (
-                  <tr key={`${m.provider}::${m.model}`}>
-                    <td>
-                      <div className="fb-obs-cell-stack" data-wide="">
-                        <span className="fb-obs-cell-main" title={m.model}>
-                          {resolveModelDisplayName(m.agentPreset, m.model, runtimes, models) || m.model}
-                        </span>
-                        <span className="fb-obs-cell-sub fb-mono">
-                          {[
-                            m.agentPreset ? resolveRuntimeDisplayName(m.agentPreset, runtimes) : '',
-                            m.provider,
-                          ]
-                            .filter(Boolean)
-                            .join(' · ') || '—'}
-                        </span>
-                      </div>
-                    </td>
-                    <td className="fb-obs-tr fb-mono">{formatCompactNumber(m.steps)}</td>
-                    <td className="fb-obs-tr fb-mono">
-                      {formatTokens(m.inputTokens + m.cacheWriteTokens)}
-                    </td>
-                    <td className="fb-obs-tr">
-                      <span
-                        className="fb-obs-pill fb-mono"
-                        data-tone={m.cacheHitRate >= 50 ? 'good' : 'neutral'}
-                      >
-                        {m.cacheHitRate}%
-                      </span>
-                    </td>
-                    <td className="fb-obs-tr fb-mono">{formatTokens(m.outputTokens)}</td>
-                    <td className="fb-obs-tr fb-mono fb-obs-muted">{m.sharePct.toFixed(1)}%</td>
-                    <td className="fb-obs-tr">
-                      <div className="fb-obs-bar-num">
-                        <strong className="fb-mono">{formatTokens(m.totalTokens)}</strong>
-                        <div className="fb-obs-mini-track">
-                          <div
-                            className="fb-obs-mini-fill"
-                            style={{ width: `${Math.max(4, m.sharePct)}%` }}
-                          />
+                {agentBreakdowns.slice(0, 8).map((a) => {
+                  const agentName = resolveObservabilityAgentLabel(a.agentKey, runtimes)
+                  const modelSummary = formatAgentModelsSummary(
+                    a.models,
+                    a.agentPreset,
+                    runtimes,
+                    models,
+                    resolveModelDisplayName,
+                  )
+                  const subText = [
+                    a.sessions > 0 ? `${a.sessions} 会话` : '',
+                    modelSummary.text,
+                  ]
+                    .filter(Boolean)
+                    .join(' · ')
+                  return (
+                    <tr key={a.agentKey}>
+                      <td>
+                        <div className="fb-obs-cell-stack" data-wide="">
+                          <span className="fb-obs-cell-main" title={agentName}>
+                            {agentName}
+                          </span>
+                          <span
+                            className="fb-obs-cell-sub"
+                            title={modelSummary.title || subText}
+                          >
+                            {subText}
+                          </span>
                         </div>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
+                      </td>
+                      <td className="fb-obs-tr fb-mono">{formatCompactNumber(a.steps)}</td>
+                      <td className="fb-obs-tr fb-mono">
+                        {formatTokens(a.inputTokens + a.cacheWriteTokens)}
+                      </td>
+                      <td className="fb-obs-tr">
+                        <span
+                          className="fb-obs-pill fb-mono"
+                          data-tone={a.cacheHitRate >= 50 ? 'good' : 'neutral'}
+                        >
+                          {a.cacheHitRate}%
+                        </span>
+                      </td>
+                      <td className="fb-obs-tr fb-mono">{formatTokens(a.outputTokens)}</td>
+                      <td className="fb-obs-tr fb-mono fb-obs-muted">{a.sharePct.toFixed(1)}%</td>
+                      <td className="fb-obs-tr">
+                        <div className="fb-obs-bar-num">
+                          <strong className="fb-mono">{formatTokens(a.totalTokens)}</strong>
+                          <div className="fb-obs-mini-track">
+                            <div
+                              className="fb-obs-mini-fill"
+                              style={{ width: `${Math.max(4, a.sharePct)}%` }}
+                            />
+                          </div>
+                        </div>
+                      </td>
+                    </tr>
+                  )
+                })}
               </tbody>
             </table>
           </div>
@@ -394,7 +513,11 @@ function InsightsPane({
           <div className="fb-obs-panel-head">
             <div className="fb-obs-panel-title-wrap">
               <h2 className="fb-obs-panel-title">维度消耗排行</h2>
-              <span className="fb-obs-panel-sub">点击下钻</span>
+              <span className="fb-obs-panel-sub fb-mono">
+                {rankTab === 'chats'
+                  ? `TOP ${visibleChatRanking.length} · TOKEN`
+                  : `${product.botRanking.length} BOTS · TOKEN`}
+              </span>
             </div>
             <FilterTabs
               label="排行维度切换"
@@ -403,7 +526,7 @@ function InsightsPane({
                 { value: 'chats' as const, label: '群聊 / 私聊', count: product.chatRanking.length },
                 { value: 'bots' as const, label: '智能体', count: product.botRanking.length },
               ]}
-              onChange={setRankTab}
+              onChange={handleRankTabChange}
             />
           </div>
 
@@ -413,66 +536,201 @@ function InsightsPane({
             ) : (
               <div className="fb-obs-rank-list fb-num">
                 {product.botRanking.map((b) => {
-                  const active = selectedBotId === b.botId
+                  const rowKey = `bot:${b.botId}`
+                  const expanded = expandedRankKey === rowKey
+                  const barPct =
+                    maxBotRankTokens > 0 ? Math.max(3, (b.totalTokens / maxBotRankTokens) * 100) : 0
+                  const nonCacheInput = (b.inputTokens ?? 0) + (b.cacheWriteTokens ?? 0)
+                  const topModels = b.topModels ?? []
                   return (
-                    <button
+                    <div
                       key={b.botId}
-                      type="button"
-                      className="fb-obs-rank-row"
-                      data-active={active ? '' : undefined}
-                      onClick={() => onSelectBot(active ? '' : b.botId)}
+                      className="fb-obs-rank-item"
+                      data-expanded={expanded ? '' : undefined}
                     >
-                      <Avatar src={b.avatarUrl} name={b.name} kind="bot" size="sm" />
-                      <div className="fb-obs-rank-main">
-                        <div className="fb-obs-rank-title">
-                          <span>{b.name}</span>
-                          <StateDot state={b.connected ? 'done' : b.enabled ? 'error' : 'idle'} />
+                      <button
+                        type="button"
+                        className="fb-obs-rank-row"
+                        aria-expanded={expanded}
+                        onClick={() => toggleRankExpand(rowKey)}
+                      >
+                        <Avatar src={b.avatarUrl} name={b.name} kind="bot" size="sm" />
+                        <div className="fb-obs-rank-main">
+                          <div className="fb-obs-rank-title">
+                            <span>{b.name}</span>
+                            <StateDot state={b.connected ? 'done' : b.enabled ? 'error' : 'idle'} />
+                          </div>
+                          <div className="fb-obs-rank-meta">
+                            会话 {b.sessions} · 回复 {b.replied} · 缓存 {b.cacheHitRate}% · 均耗{' '}
+                            {formatLatencyMs(b.avgLatencyMs)}
+                          </div>
                         </div>
-                        <div className="fb-obs-rank-meta">
-                          会话 {b.sessions} · 回复 {b.replied} · 缓存 {b.cacheHitRate}% · 均耗{' '}
-                          {formatLatencyMs(b.avgLatencyMs)}
+                        <div className="fb-obs-rank-side fb-mono">
+                          <strong>{formatTokens(b.totalTokens)}</strong>
+                          {barPct > 0 ? (
+                            <div className="fb-obs-mini-track fb-obs-rank-track">
+                              <div className="fb-obs-mini-fill" style={{ width: `${barPct}%` }} />
+                            </div>
+                          ) : (
+                            <span className="fb-obs-muted">tok</span>
+                          )}
                         </div>
-                      </div>
-                      <div className="fb-obs-rank-side fb-mono">
-                        <strong>{formatTokens(b.totalTokens)}</strong>
-                        <span className="fb-obs-muted">tok</span>
-                      </div>
-                    </button>
+                        <span className="fb-obs-rank-chevron" aria-hidden="true">
+                          ›
+                        </span>
+                      </button>
+
+                      {expanded && (
+                        <div className="fb-obs-rank-detail">
+                          <div className="fb-obs-rank-detail-grid fb-mono">
+                            <span>
+                              <em className="fb-obs-muted">缓存读取</em>{' '}
+                              {formatTokens(b.cacheReadTokens ?? 0)}
+                            </span>
+                            <span>
+                              <em className="fb-obs-muted">非缓存输入</em>{' '}
+                              {formatTokens(nonCacheInput)}
+                            </span>
+                            <span>
+                              <em className="fb-obs-muted">输出</em>{' '}
+                              {formatTokens(b.outputTokens ?? 0)}
+                            </span>
+                            <span>
+                              <em className="fb-obs-muted">P95</em>{' '}
+                              {formatLatencyMs(b.p95LatencyMs)}
+                            </span>
+                          </div>
+                          {topModels.length > 0 && (
+                            <div className="fb-obs-rank-models">
+                              {topModels.map((tm) => {
+                                const ml = resolveObservabilityModelLabel(
+                                  tm.model,
+                                  tm.agentPreset,
+                                  runtimes,
+                                  models,
+                                  resolveModelDisplayName,
+                                )
+                                return (
+                                  <span
+                                    key={tm.model}
+                                    className="fb-obs-rank-model-chip fb-mono"
+                                    title={tm.model}
+                                  >
+                                    <span>{ml.label}</span>
+                                    <em className="fb-obs-muted">{formatTokens(tm.totalTokens)}</em>
+                                  </span>
+                                )
+                              })}
+                            </div>
+                          )}
+                          <div className="fb-obs-rank-meta">
+                            收到 {b.inbound} · 回复 {b.replied}
+                            {b.silentSkipped > 0 ? ` · 静默 ${b.silentSkipped}` : ''}
+                            {b.errors > 0 ? ` · 异常 ${b.errors}` : ''}
+                            {b.activeBindings > 0 ? ` · 活跃绑定 ${b.activeBindings}` : ''}
+                          </div>
+                        </div>
+                      )}
+                    </div>
                   )
                 })}
               </div>
             )
-          ) : product.chatRanking.length === 0 ? (
+          ) : visibleChatRanking.length === 0 ? (
             <div className="fb-obs-empty-inline">当前周期暂无群聊或私聊数据</div>
           ) : (
             <div className="fb-obs-rank-list fb-num">
-              {product.chatRanking.slice(0, 7).map((c) => {
-                const targetFilter = c.chatType === 'p2p' ? P2P_CHAT_FILTER : c.chatId
-                const active = selectedChatId === targetFilter
+              {visibleChatRanking.map((c) => {
+                const rowKey = `chat:${c.key}`
+                const expanded = expandedRankKey === rowKey
+                const barPct =
+                  maxChatRankTokens > 0 ? Math.max(3, (c.totalTokens / maxChatRankTokens) * 100) : 0
+                const nonCacheInput = (c.inputTokens ?? 0) + (c.cacheWriteTokens ?? 0)
+                const topModels = c.topModels ?? []
                 return (
-                  <button
+                  <div
                     key={c.key}
-                    type="button"
-                    className="fb-obs-rank-row"
-                    data-active={active ? '' : undefined}
-                    onClick={() => onSelectChat(active ? '' : targetFilter)}
+                    className="fb-obs-rank-item"
+                    data-expanded={expanded ? '' : undefined}
                   >
-                    <div className="fb-obs-rank-main">
-                      <div className="fb-obs-rank-title">
-                        <span title={c.chatName}>{c.chatName}</span>
-                        {c.chatType === 'p2p' && <Tag tone="neutral">私聊</Tag>}
-                        {c.activeBindings > 0 && <Tag tone="info">{c.activeBindings} 活跃</Tag>}
+                    <button
+                      type="button"
+                      className="fb-obs-rank-row"
+                      aria-expanded={expanded}
+                      onClick={() => toggleRankExpand(rowKey)}
+                    >
+                      <div className="fb-obs-rank-main">
+                        <div className="fb-obs-rank-title">
+                          <span title={c.chatName}>{c.chatName}</span>
+                          {c.chatType === 'p2p' && <Tag tone="neutral">私聊</Tag>}
+                          {c.activeBindings > 0 && <Tag tone="info">{c.activeBindings} 活跃</Tag>}
+                        </div>
+                        <div className="fb-obs-rank-meta">
+                          {c.botName} · 会话 {c.sessions} · 收到 {c.inbound} · 回复 {c.replied}
+                          {c.errors > 0 ? ` · 异常 ${c.errors}` : ''}
+                        </div>
                       </div>
-                      <div className="fb-obs-rank-meta">
-                        {c.botName} · 会话 {c.sessions} · 收到 {c.inbound} · 回复 {c.replied}
-                        {c.errors > 0 ? ` · 异常 ${c.errors}` : ''}
+                      <div className="fb-obs-rank-side fb-mono">
+                        <strong>{formatTokens(c.totalTokens)}</strong>
+                        {barPct > 0 ? (
+                          <div className="fb-obs-mini-track fb-obs-rank-track">
+                            <div className="fb-obs-mini-fill" style={{ width: `${barPct}%` }} />
+                          </div>
+                        ) : (
+                          <span className="fb-obs-muted">{formatLatencyMs(c.avgLatencyMs)}</span>
+                        )}
                       </div>
-                    </div>
-                    <div className="fb-obs-rank-side fb-mono">
-                      <strong>{formatTokens(c.totalTokens)}</strong>
-                      <span className="fb-obs-muted">{formatLatencyMs(c.avgLatencyMs)}</span>
-                    </div>
-                  </button>
+                      <span className="fb-obs-rank-chevron" aria-hidden="true">
+                        ›
+                      </span>
+                    </button>
+
+                    {expanded && (
+                      <div className="fb-obs-rank-detail">
+                        <div className="fb-obs-rank-detail-grid fb-mono">
+                          <span>
+                            <em className="fb-obs-muted">缓存读取</em>{' '}
+                            {formatTokens(c.cacheReadTokens ?? 0)}
+                          </span>
+                          <span>
+                            <em className="fb-obs-muted">非缓存输入</em>{' '}
+                            {formatTokens(nonCacheInput)}
+                          </span>
+                          <span>
+                            <em className="fb-obs-muted">输出</em>{' '}
+                            {formatTokens(c.outputTokens ?? 0)}
+                          </span>
+                          <span>
+                            <em className="fb-obs-muted">缓存命中</em> {c.cacheHitRate}% · 均耗{' '}
+                            {formatLatencyMs(c.avgLatencyMs)}
+                          </span>
+                        </div>
+                        {topModels.length > 0 && (
+                          <div className="fb-obs-rank-models">
+                            {topModels.map((tm) => {
+                              const ml = resolveObservabilityModelLabel(
+                                tm.model,
+                                tm.agentPreset,
+                                runtimes,
+                                models,
+                                resolveModelDisplayName,
+                              )
+                              return (
+                                <span
+                                  key={tm.model}
+                                  className="fb-obs-rank-model-chip fb-mono"
+                                  title={tm.model}
+                                >
+                                  <span>{ml.label}</span>
+                                  <em className="fb-obs-muted">{formatTokens(tm.totalTokens)}</em>
+                                </span>
+                              )
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
                 )
               })}
             </div>
@@ -1082,6 +1340,19 @@ export function ObservabilityView({
                 options={chatOptions}
                 onChange={setChatId}
               />
+
+              {(effectiveBotId || effectiveChatId) && (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => {
+                    setBotId('')
+                    setChatId('')
+                  }}
+                >
+                  重置筛选
+                </Button>
+              )}
             </>
           )}
 
@@ -1121,10 +1392,6 @@ export function ObservabilityView({
           payload={payload}
           runtimes={runtimes}
           models={models}
-          selectedBotId={effectiveBotId}
-          selectedChatId={effectiveChatId}
-          onSelectBot={handleBotChange}
-          onSelectChat={setChatId}
         />
       )}
 

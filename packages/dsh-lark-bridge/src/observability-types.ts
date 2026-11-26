@@ -63,6 +63,7 @@ export interface ObservabilityModelBreakdown {
   readonly model: string
   readonly provider: string
   readonly agentPreset: string
+  readonly agents: readonly string[]
   readonly steps: number
   readonly inputTokens: number
   readonly cacheReadTokens: number
@@ -72,6 +73,35 @@ export interface ObservabilityModelBreakdown {
   readonly totalTokens: number
   readonly cacheHitRate: number
   readonly sharePct: number
+}
+
+export interface ObservabilityAgentModelSummary {
+  readonly model: string
+  readonly totalTokens: number
+  readonly sharePct: number
+}
+
+export interface ObservabilityAgentBreakdown {
+  readonly agentKey: string
+  readonly agentPreset: string
+  readonly kind: 'runtime' | 'triage' | 'unknown'
+  readonly sessions: number
+  readonly steps: number
+  readonly inputTokens: number
+  readonly cacheReadTokens: number
+  readonly cacheWriteTokens: number
+  readonly outputTokens: number
+  readonly reasoningTokens: number
+  readonly totalTokens: number
+  readonly cacheHitRate: number
+  readonly sharePct: number
+  readonly models: readonly ObservabilityAgentModelSummary[]
+}
+
+export interface ObservabilityRankModelSummary {
+  readonly model: string
+  readonly agentPreset: string
+  readonly totalTokens: number
 }
 
 export interface ObservabilityTriggerBreakdown {
@@ -108,6 +138,11 @@ export interface ObservabilityBotRow {
   readonly errors: number
   readonly successRate: number
   readonly totalTokens: number
+  readonly inputTokens?: number
+  readonly cacheReadTokens?: number
+  readonly cacheWriteTokens?: number
+  readonly outputTokens?: number
+  readonly topModels?: readonly ObservabilityRankModelSummary[]
   readonly cacheHitRate: number
   readonly avgLatencyMs: number
   readonly p95LatencyMs: number
@@ -132,6 +167,11 @@ export interface ObservabilityChatRow {
   readonly replied: number
   readonly errors: number
   readonly totalTokens: number
+  readonly inputTokens?: number
+  readonly cacheReadTokens?: number
+  readonly cacheWriteTokens?: number
+  readonly outputTokens?: number
+  readonly topModels?: readonly ObservabilityRankModelSummary[]
   readonly cacheHitRate: number
   readonly avgLatencyMs: number
   readonly lastActiveMs: number
@@ -286,6 +326,7 @@ export interface ObservabilityPayload {
       readonly totalMemoryRecalls: number
     }
     readonly models: readonly ObservabilityModelBreakdown[]
+    readonly agents: readonly ObservabilityAgentBreakdown[]
     readonly triggers: readonly ObservabilityTriggerBreakdown[]
     readonly heatmap: {
       readonly maxCount: number

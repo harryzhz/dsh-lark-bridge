@@ -932,6 +932,7 @@ export interface ObservabilityModelBreakdown {
   model: string
   provider: string
   agentPreset: string
+  agents?: string[]
   steps: number
   inputTokens: number
   cacheReadTokens: number
@@ -941,6 +942,35 @@ export interface ObservabilityModelBreakdown {
   totalTokens: number
   cacheHitRate: number
   sharePct: number
+}
+
+export interface ObservabilityAgentModelSummary {
+  model: string
+  totalTokens: number
+  sharePct: number
+}
+
+export interface ObservabilityAgentBreakdown {
+  agentKey: string
+  agentPreset: string
+  kind: 'runtime' | 'triage' | 'unknown'
+  sessions: number
+  steps: number
+  inputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  outputTokens: number
+  reasoningTokens: number
+  totalTokens: number
+  cacheHitRate: number
+  sharePct: number
+  models: ObservabilityAgentModelSummary[]
+}
+
+export interface ObservabilityRankModelSummary {
+  model: string
+  agentPreset: string
+  totalTokens: number
 }
 
 export interface ObservabilityTriggerBreakdown {
@@ -977,6 +1007,11 @@ export interface ObservabilityBotRow {
   errors: number
   successRate: number
   totalTokens: number
+  inputTokens?: number
+  cacheReadTokens?: number
+  cacheWriteTokens?: number
+  outputTokens?: number
+  topModels?: ObservabilityRankModelSummary[]
   cacheHitRate: number
   avgLatencyMs: number
   p95LatencyMs: number
@@ -1001,6 +1036,11 @@ export interface ObservabilityChatRow {
   replied: number
   errors: number
   totalTokens: number
+  inputTokens?: number
+  cacheReadTokens?: number
+  cacheWriteTokens?: number
+  outputTokens?: number
+  topModels?: ObservabilityRankModelSummary[]
   cacheHitRate: number
   avgLatencyMs: number
   lastActiveMs: number
@@ -1155,6 +1195,7 @@ export interface ObservabilityPayload {
       totalMemoryRecalls: number
     }
     models: ObservabilityModelBreakdown[]
+    agents?: ObservabilityAgentBreakdown[]
     triggers: ObservabilityTriggerBreakdown[]
     heatmap: {
       maxCount: number

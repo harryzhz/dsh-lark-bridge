@@ -1,4 +1,9 @@
-import type { ObservabilityWindow } from '../types.js'
+import type {
+  ModelGroup,
+  ObservabilityAgentModelSummary,
+  ObservabilityWindow,
+  RuntimeOption,
+} from '../types.js'
 
 export const OBSERVABILITY_WINDOWS: ReadonlyArray<{
   readonly value: ObservabilityWindow
@@ -12,6 +17,8 @@ export const OBSERVABILITY_WINDOWS: ReadonlyArray<{
 ]
 
 export const P2P_CHAT_FILTER = '__p2p__'
+export const TRIAGE_AGENT_KEY = '__triage__'
+export const UNATTRIBUTED_AGENT_KEY = '__unknown__'
 
 export const WEEKDAY_LABELS = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'] as const
 
@@ -76,6 +83,80 @@ export function resolveErrorCodeLabel(code: string): string {
 
 export function resolveTableLabel(table: string): string {
   return TABLE_LABELS[table] ?? table
+}
+
+const BUILTIN_AGENT_LABELS: Readonly<Record<string, string>> = {
+  [TRIAGE_AGENT_KEY]: '智能分流',
+  [UNATTRIBUTED_AGENT_KEY]: '其他运行时',
+  standard: '标准模式',
+  ptc: 'PTC 模式',
+  minimal: '极简模式',
+  cordis: '创造模式',
+}
+
+export function resolveObservabilityAgentLabel(
+  agentKey: string,
+  runtimes: readonly RuntimeOption[],
+): string {
+  const clean = agentKey.trim()
+  if (!clean) return BUILTIN_AGENT_LABELS[UNATTRIBUTED_AGENT_KEY]!
+  if (BUILTIN_AGENT_LABELS[clean]) return BUILTIN_AGENT_LABELS[clean]!
+  const match = runtimes.find((r) => r.id === clean || r.providerId === clean)
+  if (match?.name) return match.name
+  return clean
+}
+
+export function resolveObservabilityModelLabel(
+  rawModel: string,
+  agentPreset: string,
+  runtimes: readonly RuntimeOption[],
+  models: readonly ModelGroup[],
+  resolveModelName: (
+    agentPreset: string,
+    explicitModel: string | undefined,
+    runtimes: readonly RuntimeOption[],
+    models: readonly ModelGroup[],
+  ) => string,
+): { readonly label: string; readonly unattributed: boolean } {
+  const clean = rawModel.trim()
+  if (!clean) {
+    return { label: '未记录模型', unattributed: true }
+  }
+  const preset =
+    agentPreset && agentPreset !== TRIAGE_AGENT_KEY && agentPreset !== UNATTRIBUTED_AGENT_KEY
+      ? agentPreset
+      : ''
+  const resolved = resolveModelName(preset, clean, runtimes, models)
+  return { label: resolved || clean, unattributed: false }
+}
+
+export function formatAgentModelsSummary(
+  agentModels: readonly ObservabilityAgentModelSummary[],
+  agentPreset: string,
+  runtimes: readonly RuntimeOption[],
+  models: readonly ModelGroup[],
+  resolveModelName: (
+    agentPreset: string,
+    explicitModel: string | undefined,
+    runtimes: readonly RuntimeOption[],
+    models: readonly ModelGroup[],
+  ) => string,
+  maxVisible = 3,
+): { readonly text: string; readonly title: string } {
+  const names = agentModels
+    .filter((m) => m.model.trim().length > 0)
+    .map(
+      (m) =>
+        resolveObservabilityModelLabel(m.model, agentPreset, runtimes, models, resolveModelName)
+          .label,
+    )
+  if (names.length === 0) return { text: '未记录具体模型', title: '' }
+  const title = names.join(' · ')
+  if (names.length <= maxVisible) return { text: title, title }
+  return {
+    text: `${names.slice(0, maxVisible).join(' · ')} 等 ${names.length} 个模型`,
+    title,
+  }
 }
 
 export function formatTokens(n: number): string {
