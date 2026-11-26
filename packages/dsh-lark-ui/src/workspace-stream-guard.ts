@@ -108,31 +108,27 @@ function readErrorCode(err: unknown): string | undefined {
   return typeof code === 'string' ? code : undefined
 }
 
-function applyWorkspaceFrame(sink: WorkspaceFollowSinkLike, frame: WorkspaceFollowFrameLike): boolean {
+function applyWorkspaceFrame(sink: WorkspaceFollowSinkLike, frame: WorkspaceFollowFrameLike): void {
   switch (frame.type) {
     case 'baseline':
-      sink.replaceBaseline(frame.value)
-      return true
     case 'replace':
       sink.replaceBaseline(frame.value)
-      return false
+      return
     case 'upsert':
       sink.upsertView(frame.workspace)
-      return false
+      return
     case 'remove':
       sink.removeView(frame.workspaceId)
-      return false
+      return
     case 'order':
       sink.replaceOrder(frame.workspaceIds ?? [])
-      return false
+      return
     case 'archived':
       sink.replaceArchived(frame.archivedSessionIds ?? [])
-      return false
+      return
     case 'pinned':
       sink.replacePinned(frame.pinnedSessionIds ?? [])
-      return false
-    default:
-      return false
+      return
   }
 }
 
@@ -151,41 +147,67 @@ function abortableSleep(ms: number, signal: AbortSignal): Promise<boolean> {
   })
 }
 
-export function installWorkspaceStreamGuard(
-  scope: WorkspaceStreamGuardScope,
-  options: WorkspaceStreamGuardOptions = {},
-): () => void {
-  const generationSource = scope.connection?.generation
-  const remoteWorkspace = scope.remote?.workspace
-  const rawList = scope.workspaces?.list
-  const logger = options.logger ?? console
-  const retryBaseMs = Math.max(10, options.retryBaseMs ?? DEFAULT_RETRY_BASE_MS)
-  const retryMaxMs = Math.max(retryBaseMs, options.retryMaxMs ?? DEFAULT_RETRY_MAX_MS)
-  const maxRetriesPerGeneration = Math.max(
-    1,
-    options.maxRetriesPerGeneration ?? DEFAULT_MAX_RETRIES_PER_GEN,
-  )
+class WorkspaceStreamGuard {
+  private readonly retryBaseMs: number
+  private readonly retryMaxMs: number
+  private readonly maxRetriesPerGeneration: number
+  private readonly logger: Pick<Console, 'warn' | 'info'>
+  private readonly markedModel: { [WORKSPACE_STREAM_TAKEN_OVER]?: boolean }
+  private takenOver: boolean
+  private disposed = false
+  private warnedIncompatible = false
+  private activeGenerationId: number | undefined
+  private activeAbort: AbortController | undefined
+  private activeStreamHandle: { dispose?: () => void } | undefined
+  private offWs: (() => void) | undefined
+  private offGen: (() => void) | undefined
 
-  if (!generationSource || !remoteWorkspace || typeof remoteWorkspace.follow !== 'function' || !rawList) {
-    return () => {}
+  constructor(
+    private readonly generationSource: SnapshotSourceLike<ConnectionGenerationLike | undefined>,
+    private readonly remoteWorkspace: WorkspaceRemoteLike,
+    private readonly rawList: SnapshotSourceLike<WorkspaceSnapshotLike>,
+    options: WorkspaceStreamGuardOptions,
+  ) {
+    this.logger = options.logger ?? console
+    this.retryBaseMs = Math.max(10, options.retryBaseMs ?? DEFAULT_RETRY_BASE_MS)
+    this.retryMaxMs = Math.max(this.retryBaseMs, options.retryMaxMs ?? DEFAULT_RETRY_MAX_MS)
+    this.maxRetriesPerGeneration = Math.max(
+      1,
+      options.maxRetriesPerGeneration ?? DEFAULT_MAX_RETRIES_PER_GEN,
+    )
+    this.markedModel = rawList as unknown as { [WORKSPACE_STREAM_TAKEN_OVER]?: boolean }
+    this.takenOver = Boolean(this.markedModel[WORKSPACE_STREAM_TAKEN_OVER])
   }
 
-  let disposed = false
-  let warnedIncompatible = false
-  let activeGenerationId: number | undefined
-  let activeAbort: AbortController | undefined
-  let activeStreamHandle: { dispose?: () => void } | undefined
+  start(): () => void {
+    const onUpdate = () => {
+      this.reconcile()
+    }
+    this.offWs = this.rawList.subscribe(onUpdate)
+    this.offGen = this.generationSource.subscribe(onUpdate)
+    this.reconcile()
+    return () => {
+      this.dispose()
+    }
+  }
 
-  const markedModel = rawList as unknown as { [WORKSPACE_STREAM_TAKEN_OVER]?: boolean }
-  let takenOver = Boolean(markedModel[WORKSPACE_STREAM_TAKEN_OVER])
+  dispose(): void {
+    if (this.disposed) return
+    this.disposed = true
+    this.offWs?.()
+    this.offGen?.()
+    this.offWs = undefined
+    this.offGen = undefined
+    this.stopActiveAttempt()
+  }
 
-  const stopActiveAttempt = () => {
-    activeGenerationId = undefined
-    const abort = activeAbort
-    activeAbort = undefined
+  private stopActiveAttempt(): void {
+    this.activeGenerationId = undefined
+    const abort = this.activeAbort
+    this.activeAbort = undefined
     abort?.abort(new Error('workspace stream recovery superseded'))
-    const handle = activeStreamHandle
-    activeStreamHandle = undefined
+    const handle = this.activeStreamHandle
+    this.activeStreamHandle = undefined
     try {
       handle?.dispose?.()
     } catch {
@@ -193,133 +215,157 @@ export function installWorkspaceStreamGuard(
     }
   }
 
-  const runRecoveryForGeneration = async (
+  private reconcile(): void {
+    if (this.disposed) return
+    if (!this.ensureTakenOver()) return
+    if (!isWorkspaceFollowSink(this.rawList)) return
+
+    const currentGen = this.generationSource.getSnapshot()
+    if (!currentGen) {
+      this.stopActiveAttempt()
+      return
+    }
+    if (
+      this.activeGenerationId === currentGen.id &&
+      this.activeAbort &&
+      !this.activeAbort.signal.aborted
+    ) {
+      return
+    }
+
+    this.stopActiveAttempt()
+    const abort = new AbortController()
+    this.activeAbort = abort
+    this.activeGenerationId = currentGen.id
+    void this.runRecoveryForGeneration(this.rawList, currentGen.id, abort)
+  }
+
+  private ensureTakenOver(): boolean {
+    if (this.takenOver) return true
+    const wsSnap = this.rawList.getSnapshot()
+    if (wsSnap?.state !== 'error' && !this.markedModel[WORKSPACE_STREAM_TAKEN_OVER]) {
+      return false
+    }
+    if (!isWorkspaceFollowSink(this.rawList)) {
+      if (!this.warnedIncompatible) {
+        this.warnedIncompatible = true
+        this.logger.warn(
+          '[dsh-lark-ui] workspace stream entered error state, but host model lacks WorkspaceFollowSink methods; automatic recovery skipped',
+        )
+      }
+      return false
+    }
+    this.takenOver = true
+    this.markedModel[WORKSPACE_STREAM_TAKEN_OVER] = true
+    this.logger.warn(
+      `[dsh-lark-ui] detected terminated DSH workspace stream (${wsSnap?.error?.code ?? 'error'}); activating generation-aware recovery`,
+    )
+    return true
+  }
+
+  private async runRecoveryForGeneration(
     sink: WorkspaceFollowSinkLike,
     generationId: number,
     abort: AbortController,
-  ): Promise<void> => {
+  ): Promise<void> {
     const signal = abort.signal
     let attempt = 0
-    while (!disposed && !signal.aborted) {
-      let baselineAccepted = false
-      let streamHandle: (AsyncIterable<WorkspaceFollowFrameLike> & { dispose?: () => void }) | undefined
-      try {
-        streamHandle = remoteWorkspace.follow(signal)
-        activeStreamHandle = streamHandle
-        for await (const frame of streamHandle) {
-          if (disposed || signal.aborted) return
-          if (!baselineAccepted) {
-            if (frame.type !== 'baseline') {
-              throw new Error(`workspace recovery expected baseline frame, got "${String(frame.type)}"`)
-            }
-            applyWorkspaceFrame(sink, frame)
-            baselineAccepted = true
-            attempt = 0
-            continue
-          }
-          if (frame.type === 'baseline') {
-            throw new Error('workspace recovery received duplicate opening baseline')
-          }
-          applyWorkspaceFrame(sink, frame)
-        }
-        if (disposed || signal.aborted) return
-      } catch (err) {
-        if (disposed || signal.aborted) return
-        const code = readErrorCode(err)
-        if (code && NON_RETRYABLE_REMOTE_CODES.has(code)) {
-          logger.warn(
-            `[dsh-lark-ui] workspace stream recovery paused on non-retryable error (${code}) until next connection generation`,
-          )
-          return
-        }
-      } finally {
-        if (activeStreamHandle === streamHandle) {
-          activeStreamHandle = undefined
-        }
-        try {
-          streamHandle?.dispose?.()
-        } catch {
-          // Ignore handle dispose errors.
-        }
+    while (!this.disposed && !signal.aborted) {
+      const outcome = await this.consumeSingleStream(sink, signal)
+      if (this.disposed || signal.aborted) return
+      if (outcome.nonRetryableCode) {
+        this.logger.warn(
+          `[dsh-lark-ui] workspace stream recovery paused on non-retryable error (${outcome.nonRetryableCode}) until next connection generation`,
+        )
+        return
       }
-
-      if (disposed || signal.aborted) return
-      if (generationSource.getSnapshot()?.id !== generationId) return
+      if (outcome.baselineAccepted) {
+        attempt = 0
+      }
+      if (this.generationSource.getSnapshot()?.id !== generationId) return
 
       attempt += 1
-      if (attempt > maxRetriesPerGeneration) {
-        logger.warn(
-          `[dsh-lark-ui] workspace stream recovery exhausted ${maxRetriesPerGeneration} retries in generation #${generationId}; waiting for next connection generation`,
+      if (attempt > this.maxRetriesPerGeneration) {
+        this.logger.warn(
+          `[dsh-lark-ui] workspace stream recovery exhausted ${this.maxRetriesPerGeneration} retries in generation #${generationId}; waiting for next connection generation`,
         )
         return
       }
 
-      try {
-        sink.handleCarrierFailure?.()
-      } catch {
-        // Ignore transient UI state update errors.
-      }
-
-      const delayMs = Math.min(retryMaxMs, retryBaseMs * 2 ** (attempt - 1))
+      this.notifyCarrierRetry(sink)
+      const delayMs = Math.min(this.retryMaxMs, this.retryBaseMs * 2 ** (attempt - 1))
       const slept = await abortableSleep(delayMs, signal)
-      if (!slept || disposed || signal.aborted) return
-      if (generationSource.getSnapshot()?.id !== generationId) return
+      if (!slept || this.disposed || signal.aborted) return
+      if (this.generationSource.getSnapshot()?.id !== generationId) return
     }
   }
 
-  const reconcile = () => {
-    if (disposed) return
-    const wsSnap = rawList.getSnapshot()
-    if (!takenOver) {
-      if (wsSnap?.state !== 'error' && !markedModel[WORKSPACE_STREAM_TAKEN_OVER]) {
-        return
-      }
-      if (!isWorkspaceFollowSink(rawList)) {
-        if (!warnedIncompatible) {
-          warnedIncompatible = true
-          logger.warn(
-            '[dsh-lark-ui] workspace stream entered error state, but host model lacks WorkspaceFollowSink methods; automatic recovery skipped',
-          )
+  private async consumeSingleStream(
+    sink: WorkspaceFollowSinkLike,
+    signal: AbortSignal,
+  ): Promise<{ readonly baselineAccepted: boolean; readonly nonRetryableCode?: string }> {
+    let baselineAccepted = false
+    let streamHandle: (AsyncIterable<WorkspaceFollowFrameLike> & { dispose?: () => void }) | undefined
+    try {
+      streamHandle = this.remoteWorkspace.follow(signal)
+      this.activeStreamHandle = streamHandle
+      for await (const frame of streamHandle) {
+        if (this.disposed || signal.aborted) return { baselineAccepted }
+        if (!baselineAccepted) {
+          if (frame.type !== 'baseline') {
+            throw new Error(`workspace recovery expected baseline frame, got "${String(frame.type)}"`)
+          }
+          applyWorkspaceFrame(sink, frame)
+          baselineAccepted = true
+          continue
         }
-        return
+        if (frame.type === 'baseline') {
+          throw new Error('workspace recovery received duplicate opening baseline')
+        }
+        applyWorkspaceFrame(sink, frame)
       }
-      takenOver = true
-      markedModel[WORKSPACE_STREAM_TAKEN_OVER] = true
-      logger.warn(
-        `[dsh-lark-ui] detected terminated DSH workspace stream (${wsSnap?.error?.code ?? 'error'}); activating generation-aware recovery`,
-      )
+      return { baselineAccepted }
+    } catch (err) {
+      if (this.disposed || signal.aborted) return { baselineAccepted }
+      const code = readErrorCode(err)
+      if (code && NON_RETRYABLE_REMOTE_CODES.has(code)) {
+        return { baselineAccepted, nonRetryableCode: code }
+      }
+      return { baselineAccepted }
+    } finally {
+      if (this.activeStreamHandle === streamHandle) {
+        this.activeStreamHandle = undefined
+      }
+      try {
+        streamHandle?.dispose?.()
+      } catch {
+        // Ignore handle dispose errors.
+      }
     }
-
-    if (!isWorkspaceFollowSink(rawList)) return
-
-    const currentGen = generationSource.getSnapshot()
-    if (!currentGen) {
-      stopActiveAttempt()
-      return
-    }
-    if (activeGenerationId === currentGen.id && activeAbort && !activeAbort.signal.aborted) {
-      return
-    }
-
-    stopActiveAttempt()
-    const abort = new AbortController()
-    activeAbort = abort
-    activeGenerationId = currentGen.id
-    void runRecoveryForGeneration(rawList, currentGen.id, abort)
   }
 
-  const offWs = rawList.subscribe(reconcile)
-  const offGen = generationSource.subscribe(reconcile)
-  reconcile()
+  private notifyCarrierRetry(sink: WorkspaceFollowSinkLike): void {
+    try {
+      sink.handleCarrierFailure?.()
+    } catch {
+      // Ignore transient UI state update errors.
+    }
+  }
+}
 
-  const dispose = () => {
-    if (disposed) return
-    disposed = true
-    offWs()
-    offGen()
-    stopActiveAttempt()
+export function installWorkspaceStreamGuard(
+  scope: WorkspaceStreamGuardScope,
+  options: WorkspaceStreamGuardOptions = {},
+): () => void {
+  const generationSource = scope.connection?.generation
+  const remoteWorkspace = scope.remote?.workspace
+  const rawList = scope.workspaces?.list
+  if (!generationSource || !remoteWorkspace || typeof remoteWorkspace.follow !== 'function' || !rawList) {
+    return () => {}
   }
 
+  const guard = new WorkspaceStreamGuard(generationSource, remoteWorkspace, rawList, options)
+  const dispose = guard.start()
   scope.effect?.(() => dispose, 'dsh-lark-ui.workspace-stream-guard')
   return dispose
 }
