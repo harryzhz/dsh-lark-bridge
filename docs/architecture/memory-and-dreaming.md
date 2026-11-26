@@ -222,8 +222,11 @@ sequenceDiagram
 
 ### 5.1 Layer 1（首轮有界索引）规则
 
-- **触发时机**：仅在 `InboundPipeline.buildBatchPrompt` 且 `isNewSession === true` 时注入（续轮共享会话历史，不重复注入）。
-- **注入条件**：当前上下文匹配到 ≥ 1 条 `active` 记忆，或该 Bot 已启用 Dreaming（空库时注入极简 3 行能力引导；未开 Dreaming 且无记忆的普通 Bot 零额外 Token 开销）。
+- **触发时机**：在三类新会话的首轮注入（续轮或复用已有会话不重复注入）：
+  1. 入站对话新会话（`InboundPipeline.buildBatchPrompt`，`isNewSession === true`）；
+  2. 一次性跟进提醒独立会话（`ProactiveReminderService.startReminderExecution`，与 `<role>` 一并合入 `<system_reminder>`）；
+  3. 新建独立会话且归属单一智能体的周期性定时任务首轮（`ScheduleNotifier.enrichScheduleUserMessage`，多群群发仅注 `bot`/`workspace` 记忆防跨群串味；复用旧会话 `target.kind === 'session'` 跳过）。
+- **注入条件**：入站会话匹配到 ≥ 1 条 `active` 记忆或该 Bot 已启用 Dreaming（空库时注入极简 3 行能力引导）；提醒与定时任务自动化会话仅在匹配到 ≥ 1 条 `active` 记忆时注入（`includeWhenEmpty: false`，空库零额外 Token 开销）。
 - **排序优先级**（`rankMemoryEntriesForContext`）：
   1. `pinned DESC`（置顶优先）
   2. 类型权重：`feedback (0) < user (1) < project (2) < reference (3)`

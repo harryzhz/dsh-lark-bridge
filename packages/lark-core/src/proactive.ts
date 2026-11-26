@@ -275,6 +275,8 @@ export interface ReminderTriggerPromptInput {
   readonly item: LarkReminderItem
   readonly currentLocalTimeStr: string
   readonly siblingActiveReminders?: readonly Pick<LarkReminderItem, 'id' | 'title' | 'scheduledAt'>[]
+  readonly roleReminder?: string
+  readonly memoryReminder?: string
 }
 
 /**
@@ -352,8 +354,8 @@ export function composeReminderTriggerPrompt(input: ReminderTriggerPromptInput):
   const outputStepNum = delegationDeferLine ? 4 : 3
   const outputGuideline =
     item.origin.chatType === 'group'
-      ? `  ${outputStepNum}. 若需发出提醒或提审：**群聊提醒严禁无 @ 群发**，必须以 \`<at id="ou_xxx">姓名</at>\` 明确 @ 主负责人，有抄送或关注人员时通过 \`cc <at id="ou_xxx">姓名</at>\` 一并周知${isDelegation ? '（措辞保持温和中性确认口吻，不武断断言“未处理”）' : ''}；未给出 \`open_id\` 时先运行 \`lark-bridge members --query <姓名>\` 按需查询本群真实 ID，禁止编造或跨应用混用；勿用 \`lark-bridge send\` 重复发送正文。`
-      : `  ${outputStepNum}. 若需提醒或提审，直接输出简洁的简体中文 Markdown 正文（勿用 \`lark-bridge send\` 重复发送正文）。`
+      ? `  ${outputStepNum}. 若需发出消息：**群聊提醒严禁无 @ 群发**，必须以 \`<at id="ou_xxx">姓名</at>\` 明确 @ 主负责人，有抄送或关注人员时通过 \`cc <at id="ou_xxx">姓名</at>\` 一并周知；正文直接说明具体事项或询问当前进展（像群内同事自然沟通，勿将系统或提醒指令中的语气要求字面写进正文${isDelegation ? '，且不武断断言“未处理”' : ''}）；未给出 \`open_id\` 时先运行 \`lark-bridge members --query <姓名>\` 按需查询本群真实 ID，禁止编造或跨应用混用；勿用 \`lark-bridge send\` 重复发送正文。`
+      : `  ${outputStepNum}. 若需发出消息，直接输出简洁的简体中文 Markdown 正文说明事项或待确认点（勿将系统或提醒指令中的语气要求字面写进正文，勿用 \`lark-bridge send\` 重复发送正文）。`
 
   innerLines.push(
     '- 执行准则：',
@@ -364,7 +366,11 @@ export function composeReminderTriggerPrompt(input: ReminderTriggerPromptInput):
     '</reminder_trigger>',
   )
 
-  const systemBlock = composeSystemReminder([innerLines.join('\n')])!
+  const systemBlock = composeSystemReminder([
+    input.roleReminder,
+    input.memoryReminder,
+    innerLines.join('\n'),
+  ])!
   return `${systemBlock}\n\n<user_message>\n${item.prompt.trim()}\n</user_message>`
 }
 

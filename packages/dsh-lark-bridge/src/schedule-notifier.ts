@@ -11,6 +11,7 @@ import {
 } from '@deepseek-ai/dsh-session'
 import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
 import {
+  composeRoleReminder,
   composeScheduleContextReminder,
   composeSystemReminder,
   expandWorkingDir,
@@ -20,6 +21,7 @@ import {
   type ScheduleTargetContextItem,
 } from '@dsh-lark/lark-core'
 import { assertExistingWorkingDirectory } from './fs-browser.js'
+import type { MemoryService } from './memory-service.js'
 import { EXTERNAL_LAUNCH_RECORD_TYPE } from './runtime-catalog.js'
 import type { LarkBridgeStore } from './store.js'
 import { TurnFinalReplyTracker } from './turn-runner.js'
@@ -123,6 +125,7 @@ export interface ScheduleDeliveryHost {
   readonly ctx: Context
   readonly store: LarkBridgeStore
   readonly workspaces: WorkspaceGrouping
+  readonly memory?: MemoryService
   getBotOpenId?(botId: string): string | undefined
   sendScheduleMessage(input: {
     readonly botId: string
@@ -238,10 +241,43 @@ function extractScheduleIdsFromFraming(text: string): string[] {
   return ids
 }
 
+function extractSchedulePromptTextsFromFraming(text: string): string[] {
+  if (!text || text.startsWith('[SCHEDULE CHANGE]')) return []
+  const prompts: string[] = []
+  const singleMatch = /reminder_prompt_json:\s*("(?:\\.|[^"\\])*")/.exec(text)
+  if (singleMatch?.[1]) {
+    try {
+      const parsed = JSON.parse(singleMatch[1])
+      if (typeof parsed === 'string' && parsed.trim()) prompts.push(parsed.trim())
+    } catch {
+      // Ignore malformed prompt.
+    }
+  }
+  const batchMatch = /reminders_json:\s*(\[[\s\S]*\])\s*$/.exec(text)
+  if (batchMatch?.[1]) {
+    try {
+      const arr = JSON.parse(batchMatch[1]) as Array<{ reminder_prompt?: unknown }>
+      if (Array.isArray(arr)) {
+        for (const item of arr) {
+          if (typeof item?.reminder_prompt === 'string' && item.reminder_prompt.trim()) {
+            prompts.push(item.reminder_prompt.trim())
+          }
+        }
+      }
+    } catch {
+      // Ignore malformed batch payload.
+    }
+  }
+  return prompts
+}
+
+const MAX_IDENTITY_INJECTED_SESSIONS = 2000
+
 /**
  * Bridges DSH's `schedule` service to Lark notification groups:
- * 1. Injects two-level `<system_reminder><schedule ...>...</schedule></system_reminder>`
- *    (target bot, chat, and delivery rules) into every scheduled turn.
+ * 1. Injects two-level `<system_reminder>` (`<role>`, `<memory>` on fresh single-bot sessions,
+ *    plus `<schedule ...>...</schedule>` with target bot, chat, and delivery rules) into every
+ *    scheduled turn.
  * 2. Automatically pushes scheduled turn output as a Lark card to bound groups.
  */
 export class ScheduleNotifier {
@@ -251,6 +287,7 @@ export class ScheduleNotifier {
   private readonly catalogById = new Map<string, ScheduleEntryLike>()
   private readonly inferredOriginById = new Map<string, LarkScheduleOriginHint>()
   private readonly originCache = new Map<string, LarkOriginRecord | null>()
+  private readonly identityInjectedSessions = new Set<string>()
   private readonly instrumentedAgents = new WeakSet<object>()
   private readonly disposers: Array<() => void> = []
 
@@ -295,6 +332,7 @@ export class ScheduleNotifier {
     this.activeTurns.clear()
     this.currentTurnBySession.clear()
     this.activeSessionContexts.clear()
+    this.identityInjectedSessions.clear()
   }
 
   service(): HostScheduleService | undefined {
@@ -347,13 +385,19 @@ export class ScheduleNotifier {
     if (session && scheduleIds.length > 0) {
       this.maybeAttachLaunchProfileRecord(session, scheduleIds)
     }
+    const identityBlocks = this.buildFirstTurnIdentityRemindersSync(
+      sessionId,
+      scheduleIds,
+      rawText,
+      session,
+    )
     const reminderBlocks: string[] = []
     for (const scheduleId of scheduleIds) {
       const built = this.buildScheduleReminderSync(sessionId, scheduleId)
       if (built) reminderBlocks.push(built)
     }
 
-    const systemBlock = composeSystemReminder(reminderBlocks)
+    const systemBlock = composeSystemReminder([...identityBlocks, ...reminderBlocks])
     if (!systemBlock) return message
     const prefix = `${systemBlock}\n\n`
     let injected = false
@@ -365,6 +409,83 @@ export class ScheduleNotifier {
       return block
     })
     return { ...message, content: nextContent }
+  }
+
+  private buildFirstTurnIdentityRemindersSync(
+    sessionId: string,
+    scheduleIds: readonly string[],
+    rawText: string,
+    session?: Session,
+  ): string[] {
+    if (scheduleIds.length === 0 || this.identityInjectedSessions.has(sessionId)) return []
+    if (session && typeof session.snapshotEvents === 'function') {
+      if (session.snapshotEvents().some((ev) => ev.type === 'user/message')) return []
+    }
+
+    const allTargets: LarkScheduleTarget[] = []
+    const queryParts: string[] = []
+    let entryCwd: string | undefined
+
+    for (const scheduleId of scheduleIds) {
+      const entry = this.catalogById.get(scheduleId)
+      if (entry?.target.kind === 'session') return []
+      if (!entryCwd && entry?.target.create?.cwd) {
+        entryCwd = entry.target.create.cwd
+      }
+      const explicit = this.host.store.getScheduleBinding(scheduleId)
+      const inferred = this.inferredOriginById.get(scheduleId)
+      const enabled = explicit ? explicit.enabled : Boolean(inferred)
+      if (!enabled) continue
+
+      const targets: readonly LarkScheduleTarget[] =
+        explicit && explicit.targets.length > 0
+          ? explicit.targets
+          : inferred
+            ? [{ botId: inferred.botId, chatId: inferred.chatId }]
+            : []
+      allTargets.push(...targets)
+      if (entry?.title?.trim()) queryParts.push(entry.title.trim())
+      if (entry?.prompt?.trim()) queryParts.push(entry.prompt.trim())
+    }
+
+    const distinctBotIds = new Set(allTargets.map((t) => t.botId))
+    if (distinctBotIds.size !== 1) return []
+    const botId = [...distinctBotIds][0]!
+    const bot = this.host.store.getBot(botId)
+    if (!bot) return []
+
+    const distinctChatIds = new Set(allTargets.map((t) => t.chatId).filter(Boolean))
+    const singleChatId = distinctChatIds.size === 1 ? [...distinctChatIds][0] : undefined
+    const singleGroup = singleChatId ? this.host.store.getGroup(bot.id, singleChatId) : undefined
+
+    const rawWorkingDir =
+      session?.header?.cwd || entryCwd || resolveEffectiveWorkingDir(bot, singleGroup)
+    const workingDir = rawWorkingDir ? expandWorkingDir(rawWorkingDir) || rawWorkingDir : undefined
+
+    const roleReminder = composeRoleReminder(bot, singleGroup)
+    if (queryParts.length === 0) {
+      queryParts.push(...extractSchedulePromptTextsFromFraming(rawText))
+    }
+    const queryText = queryParts.join('\n').trim() || undefined
+    const memoryReminder = this.host.memory?.composeFirstTurnReminder(
+      {
+        botId: bot.id,
+        ...(singleChatId ? { chatId: singleChatId } : {}),
+        ...(workingDir ? { workingDir } : {}),
+      },
+      {
+        includeWhenEmpty: false,
+        ...(queryText ? { queryText } : {}),
+      },
+    )
+
+    this.identityInjectedSessions.add(sessionId)
+    if (this.identityInjectedSessions.size > MAX_IDENTITY_INJECTED_SESSIONS) {
+      const oldest = this.identityInjectedSessions.values().next().value
+      if (oldest) this.identityInjectedSessions.delete(oldest)
+    }
+
+    return [roleReminder, memoryReminder].filter((s): s is string => Boolean(s))
   }
 
   private maybeAttachLaunchProfileRecord(session: Session, scheduleIds: readonly string[]): void {

@@ -247,6 +247,7 @@ export class LarkBridgeManager {
       ctx,
       store,
       workspaces: this.workspaces,
+      memory: this.memory,
       getBotOpenId: (botId) => this.connections.getTransport(botId)?.state.botOpenId,
       sendScheduleMessage: (input) => this.facade.sendScheduleMessage(input),
     })
@@ -270,6 +271,7 @@ export class LarkBridgeManager {
       store,
       runtimes: this.runtimes,
       workspaces: this.workspaces,
+      memory: this.memory,
       onActivityChange: notifyActivityChange,
       getExecutingTurnContext: (sessionId) => this.inbound.getExecutingTurnContext(sessionId),
       resolveMemberName: (botId, chatId, openId) =>
