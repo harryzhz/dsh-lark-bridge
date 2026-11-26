@@ -427,9 +427,17 @@ export class LarkBridgeManager {
       this.idleTimer = setInterval(
         () => {
           if (this.phase === 'draining' || this.disposed) return
-          void this.sweepIdleBindings().finally(() => {
-            this.maybeCheckpointWal()
-          })
+          void this.sweepIdleBindings()
+            .then(() =>
+              this.workspaces.reconcileBindings().catch((err) => {
+                this.ctx.logger.warn(
+                  `[lark-bridge] periodic workspace reconciliation warning: ${err instanceof Error ? err.message : String(err)}`,
+                )
+              }),
+            )
+            .finally(() => {
+              this.maybeCheckpointWal()
+            })
         },
         this.config.idleSweepIntervalMs,
       )

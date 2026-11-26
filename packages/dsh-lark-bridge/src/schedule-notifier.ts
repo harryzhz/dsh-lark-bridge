@@ -863,6 +863,7 @@ export class ScheduleNotifier {
           }),
           startedMs: Date.now(),
         })
+        void this.attachScheduledSessionEarly(session, messageId).catch(() => {})
       }
       return
     }
@@ -976,31 +977,7 @@ export class ScheduleNotifier {
     const notifyOn = explicit?.notifyOn ?? 'non_empty'
 
     const primaryTarget = targets[0]!
-    const primaryBot = this.host.store.getBot(primaryTarget.botId)
-    const primaryGroup = this.host.store.getGroup(primaryTarget.botId, primaryTarget.chatId)
-    if (primaryBot && session.header.cwd) {
-      const chatName =
-        this.host.store.resolveChatName(primaryTarget.botId, primaryTarget.chatId) ||
-        (inferredOrigin?.chatId === primaryTarget.chatId ? inferredOrigin.chatName : undefined)
-      const sessionDir = expandWorkingDir(session.header.cwd) || session.header.cwd
-      const syntheticGroup =
-        primaryGroup ??
-        ({
-          key: `${primaryBot.id}:${primaryTarget.chatId}`,
-          botId: primaryBot.id,
-          chatId: primaryTarget.chatId,
-          chatName: chatName ?? '',
-          enabled: true,
-          workingDir: sessionDir,
-          workspaceName: '',
-        } as never)
-      const workspaceName = this.host.store.resolveGroupWorkspaceName(
-        primaryBot,
-        syntheticGroup,
-        chatName,
-      )
-      await this.host.workspaces.attachSession(session.header.cwd, workspaceName, session.id)
-    }
+    await this.attachScheduledSessionWorkspace(session, primaryTarget, inferredOrigin)
     this.maybeTitleScheduleSession(session, entry.title)
 
     const replyText = normalizeReplyText(turn.replyTracker.result(), {
@@ -1219,6 +1196,64 @@ export class ScheduleNotifier {
       }
     }
     return undefined
+  }
+
+  private async attachScheduledSessionEarly(session: Session, messageId: string): Promise<void> {
+    if (!session.header.cwd) return
+    const entry = await this.findMatchingSchedule(messageId, session.id)
+    if (!entry) {
+      await this.host.workspaces.attachSession(session.header.cwd, '', session.id)
+      return
+    }
+    const inferredOrigin = await this.resolveInferredOrigin(entry)
+    const explicit = this.host.store.getScheduleBinding(entry.id)
+    const targets: readonly LarkScheduleTarget[] =
+      explicit && explicit.targets.length > 0
+        ? explicit.targets
+        : inferredOrigin
+          ? [{ botId: inferredOrigin.botId, chatId: inferredOrigin.chatId }]
+          : []
+    await this.attachScheduledSessionWorkspace(session, targets[0], inferredOrigin)
+    this.maybeTitleScheduleSession(session, entry.title)
+  }
+
+  private async attachScheduledSessionWorkspace(
+    session: Session,
+    primaryTarget: LarkScheduleTarget | undefined,
+    inferredOrigin: LarkScheduleOriginHint | undefined,
+  ): Promise<void> {
+    if (!session.header.cwd) return
+    if (!primaryTarget) {
+      await this.host.workspaces.attachSession(session.header.cwd, '', session.id)
+      return
+    }
+    const primaryBot = this.host.store.getBot(primaryTarget.botId)
+    if (!primaryBot) {
+      await this.host.workspaces.attachSession(session.header.cwd, '', session.id)
+      return
+    }
+    const primaryGroup = this.host.store.getGroup(primaryTarget.botId, primaryTarget.chatId)
+    const chatName =
+      this.host.store.resolveChatName(primaryTarget.botId, primaryTarget.chatId) ||
+      (inferredOrigin?.chatId === primaryTarget.chatId ? inferredOrigin.chatName : undefined)
+    const sessionDir = expandWorkingDir(session.header.cwd) || session.header.cwd
+    const syntheticGroup =
+      primaryGroup ??
+      ({
+        key: `${primaryBot.id}:${primaryTarget.chatId}`,
+        botId: primaryBot.id,
+        chatId: primaryTarget.chatId,
+        chatName: chatName ?? '',
+        enabled: true,
+        workingDir: sessionDir,
+        workspaceName: '',
+      } as never)
+    const workspaceName = this.host.store.resolveGroupWorkspaceName(
+      primaryBot,
+      syntheticGroup,
+      chatName,
+    )
+    await this.host.workspaces.attachSession(session.header.cwd, workspaceName, session.id)
   }
 
   private maybeTitleScheduleSession(session: Session, scheduleTitle: string): void {

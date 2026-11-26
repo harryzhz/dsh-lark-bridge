@@ -33,6 +33,7 @@ import {
 import { ReminderEditDialog } from './components/ReminderEditDialog.js'
 import { ScheduleConfigDialog } from './components/ScheduleConfigDialog.js'
 import { installSessionModelFilter } from './session-model-filter.js'
+import { installWorkspaceStreamGuard, type WorkspaceStreamGuardScope } from './workspace-stream-guard.js'
 import {
   activateDshSession,
   activateDshSessionDetailed,
@@ -653,6 +654,13 @@ function applyReadOnlyViewerMode(ctx: ClientContext): void {
     }, 'dsh-lark-ui.viewer-layout-ref')
   })
 
+  ctx.inject?.(
+    ['connection', 'remote', 'remote.workspace', 'workspaces'],
+    (scope: WorkspaceStreamGuardScope) => {
+      installWorkspaceStreamGuard(scope)
+    },
+  )
+
   if (!targetSessionId) return
 
   ctx.inject?.(
@@ -795,6 +803,13 @@ export function apply(ctx: ClientContext): void {
   ctx.inject?.(['modelDirectories', 'sessions'], (scope) => {
     installSessionModelFilter(scope)
   })
+
+  ctx.inject?.(
+    ['connection', 'remote', 'remote.workspace', 'workspaces'],
+    (scope: WorkspaceStreamGuardScope) => {
+      installWorkspaceStreamGuard(scope)
+    },
+  )
 
   const navigateSchedules = () => {
     const layout = layoutRef ?? readOptionalService<LayoutNavigationLike>(ctx, 'layout')
