@@ -21,11 +21,64 @@ https://github.com/user-attachments/assets/3f02edff-d477-49dc-a515-fc3820231f71
 
 ## 2. 安装与使用
 
-前置环境：支持 macOS / Windows / Linux，需 `Node.js >= 22.0.0`、`DeepSeek Harness >= 0.2.2-rc.5`。
+前置环境：支持 macOS / Windows / Linux，`DeepSeek Harness >= 0.2.2-rc.5`（Web 版需 `Node.js >= 22.13.0`；Desktop App 版自带内置 Node/pnpm 运行时，无需单独预装）。
 
-### 2.1 安装插件
+### 2.1 一键安装（推荐，自动检测并安装 DSH + 双插件）
 
-#### 方式一：DSH 界面安装（Desktop / Web，推荐）
+提供跨平台一键安装脚本（[scripts/install.sh](./scripts/install.sh) 与 [scripts/install.ps1](./scripts/install.ps1)），同时覆盖 **Desktop App 版** 与 **Web 版**：
+
+- **自动检测现状**：自动识别系统架构、Node.js / pnpm、DSH 本体（Desktop App 与 Web CLI）及现有插件版本；已安装兼容版本直接复用，已为最新插件自动跳过，不修改用户已有配置与凭据。
+- **自动安装 DSH 与双插件**：缺失或版本过低时自动安装 DeepSeek Harness（Desktop 官方安装包或 Web 版 `@deepseek-ai/dsh`），并一次性安装激活 `@harryzhz/dsh-external-agents` 与 `@harryzhz/dsh-lark-bridge` 最新 GitHub Release。
+
+| 版本 | 适用场景 | 支持平台 | 安装内容 |
+| --- | --- | --- | --- |
+| **Desktop App 版**（`--mode app`） | 桌面日常交互使用，开箱即用 | macOS / Windows | 自动安装官方 Desktop 客户端、完成首次 profile 初始化，通过内置 CLI 安装双插件 |
+| **Web 版**（`--mode web`） | 局域网 / 服务器后台常驻、免重启热更新 | macOS / Linux / Windows | 自动准备 Node 22 + pnpm + 独立 `@deepseek-ai/dsh`（免 sudo），向 `web` profile 安装双插件 |
+| **两版都装**（`--mode both`） | 同时使用桌面客户端与独立 Web 服务 | macOS / Windows | 依次完成 Desktop App 与 Web 两套环境的安装与插件激活 |
+
+#### macOS / Linux
+
+```bash
+# 交互模式：自动检测本机环境，提示选择 Desktop App / Web / 两版都装（Linux 自动选 Web）
+curl -fsSL https://raw.githubusercontent.com/harryzhz/dsh-lark-bridge/main/scripts/install.sh | bash
+
+# 直接指定版本（非交互可追加 -y）
+curl -fsSL https://raw.githubusercontent.com/harryzhz/dsh-lark-bridge/main/scripts/install.sh | bash -s -- --mode app
+curl -fsSL https://raw.githubusercontent.com/harryzhz/dsh-lark-bridge/main/scripts/install.sh | bash -s -- --mode web
+curl -fsSL https://raw.githubusercontent.com/harryzhz/dsh-lark-bridge/main/scripts/install.sh | bash -s -- --mode both
+```
+
+#### Windows (PowerShell)
+
+```powershell
+# 交互模式：自动检测本机环境，提示选择 Desktop App / Web / 两版都装
+irm https://raw.githubusercontent.com/harryzhz/dsh-lark-bridge/main/scripts/install.ps1 | iex
+
+# 直接指定版本（支持 app / web / both）
+$env:DSH_INSTALL_MODE = 'app';  irm https://raw.githubusercontent.com/harryzhz/dsh-lark-bridge/main/scripts/install.ps1 | iex
+$env:DSH_INSTALL_MODE = 'web';  irm https://raw.githubusercontent.com/harryzhz/dsh-lark-bridge/main/scripts/install.ps1 | iex
+$env:DSH_INSTALL_MODE = 'both'; irm https://raw.githubusercontent.com/harryzhz/dsh-lark-bridge/main/scripts/install.ps1 | iex
+```
+
+#### 常用可选参数
+
+| 参数（`install.sh` / `install.ps1`） | 环境变量 | 说明 |
+| --- | --- | --- |
+| `--mode <auto\|web\|app\|both>` / `-Mode` | `DSH_INSTALL_MODE` | 指定安装模式（`install.sh` 亦支持 `--web` / `--app` / `--both`） |
+| `--without-external-agents` / `-WithoutExternalAgents` | `DSH_WITHOUT_EXTERNAL_AGENTS=1` | 仅安装 `dsh-lark-bridge`，不安装 `dsh-external-agents` |
+| `--upgrade-dsh` / `-UpgradeDsh` | `DSH_UPGRADE=1` | 即使已存在兼容版 DSH，也重新下载/升级到最新版本 |
+| `--force` / `-Force` | `DSH_FORCE=1` | 即使插件已是目标版本也强制重新安装 |
+| `--github-proxy <url>` / `-GithubProxy` | `GITHUB_PROXY` | 为 GitHub Release 下载添加镜像前缀 |
+| `--dry-run` / `-DryRun` | `DSH_DRY_RUN=1` | 仅检测环境并打印将执行的安装计划，不做实际修改 |
+| `-y, --yes` / `-Yes` | `DSH_YES=1` | 非交互模式，自动确认所有提示 |
+
+> **说明**：Desktop App 版在安装插件前会自动优雅退出正在运行的应用（避免写锁冲突）；安装完成后重新打开 DeepSeek Harness，左侧边栏即出现 **飞书桥接**，外部 CLI 运行时同时就绪。
+
+### 2.2 手动安装插件
+
+如已自行安装 DSH，也可直接在界面或通过 `dsh plugin` CLI 手动安装插件：
+
+#### 方式一：DSH 界面安装（Desktop / Web）
 
 1. 打开侧边栏 **插件 → 添加插件**。
 2. 填入任一安装源并点击 **安装**：
@@ -39,7 +92,7 @@ https://github.com/user-attachments/assets/3f02edff-d477-49dc-a515-fc3820231f71
 
 #### 方式二：`dsh plugin` CLI 安装（独立 Web 服务 / 服务器常驻）
 
-> `--profile <name>` 须写在 `add` / `remove` 之前。`desktop` profile 由桌面端托管，请使用上方界面安装。
+> `--profile <name>` 须写在 `add` / `remove` 之前。`desktop` profile 仅能由桌面端界面或其内置 CLI 管理（一键脚本已自动调用内置 CLI）。
 
 ```bash
 # 从 GitHub Release latest .tgz 安装（推荐，免构建脚本）
@@ -72,7 +125,7 @@ allowBuilds:
 
 如额外安装了 `dsh-external-agents`，重启一次 DSH 即可自动发现全部外部运行时。
 
-### 2.2 启动与自动装配
+### 2.3 启动与自动装配
 
 - **DSH Desktop**：在「插件」页启用后，直接点击左侧 **飞书桥接** 进入控制台。
 - **独立 DSH Web 服务**：安装插件后直接用标准 `dsh` 命令启动，需要后台保活时用 macOS LaunchAgent 或 systemd 托管即可（确保 `PATH` 包含 `~/.local/bin` 及所用外部 CLI 路径）。
@@ -127,7 +180,7 @@ lark-bridge lifecycle resume-intake
 - **权限边界**：`drain` 与 `resume-intake` 需宿主机本机运维凭证（`$DSH_HOME/lark-bridge/operator-token`，权限 `0600`）或控制台 Owner 会话，在 Agent 会话内默认拒绝执行。
 - **退出码与兜底恢复**：`0` 表示全部在途任务已排空；`2` 表示超过等待超时（默认 `120` 秒）仍有在途任务；`1` 表示命令或鉴权错误。即便在退出码 `2` 时继续重启或发生非计划重启，在途回合也会持久化断点至 SQLite `pending_turns`（保留原 `OnIt` 表情），新进程启动后自动补发已完成回复或续跑未完成回合（15 分钟窗口内最多自动恢复 1 次）；新实例启动还会自动等待旧进程最多 `6` 秒平滑交接 `bridge.lock`。
 
-### 2.3 扫码创建飞书智能体
+### 2.4 扫码创建飞书智能体
 
 控制台支持 **自动创建飞书智能体**（开放平台全自动创建 / 扫码快速注册 SDK）与 **接入已有应用** 两种方式：
 
