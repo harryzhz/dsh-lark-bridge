@@ -134,6 +134,7 @@ export class LarkBridgeManager {
   private readonly startedAtMs = Date.now()
   private liveWebOrigin = ''
   private liveConnection?: { authenticatedUrl?: (baseUrl: string) => string }
+  private liveWebServer?: unknown
   private idleTimer: ReturnType<typeof setInterval> | null = null
   private lastWalCheckpointAtMs = 0
   private phase: BridgeLifecyclePhase = 'starting'
@@ -152,7 +153,7 @@ export class LarkBridgeManager {
     this.platform = new LarkPlatformManager(config.dataDir)
     this.sessionViewer = new LarkSessionViewerService(ctx, store)
     this.directoryEnricher = new LarkDirectoryEnricher(this.platform, () => this.store.listBots())
-    this.cliAuth = ensureCliAuthEndpoint(config.dataDir, config.publicBaseUrl)
+    this.cliAuth = ensureCliAuthEndpoint(config.dataDir, config.publicBaseUrl, { deferWrite: true })
     this.operatorAuth = ensureOperatorAuth(config.dataDir)
     const notifyActivityChange = () => this.notifyDrainWaitersIfQuiescent()
 
@@ -383,20 +384,31 @@ export class LarkBridgeManager {
     return this.inbound.handleInbound(botId, transport, msg)
   }
 
+  /**
+   * Acquires the per-dataDir instance lock (idempotent). Called before binding
+   * HTTP routes or mutating `cli-endpoint.json` so a conflicting secondary
+   * process never overwrites the live instance's CLI endpoint file.
+   */
+  async acquireInstanceLock(): Promise<void> {
+    if (this.config.enableInstanceLock === false || this.instanceLock.status().held) {
+      return
+    }
+    const lockStatus = await this.instanceLock.acquireAsync({
+      ...(this.config.instanceLockWaitMs !== undefined
+        ? { waitMs: this.config.instanceLockWaitMs }
+        : {}),
+    })
+    if (lockStatus.recoveredStaleLock) {
+      this.ctx.logger.warn(
+        `[lark-bridge] recovered stale instance lock from PID=${lockStatus.recoveredStaleLock.pid} (${lockStatus.recoveredStaleLock.host})`,
+      )
+    }
+  }
+
   async start(): Promise<void> {
     this.phase = 'starting'
-    if (this.config.enableInstanceLock !== false) {
-      const lockStatus = await this.instanceLock.acquireAsync({
-        ...(this.config.instanceLockWaitMs !== undefined
-          ? { waitMs: this.config.instanceLockWaitMs }
-          : {}),
-      })
-      if (lockStatus.recoveredStaleLock) {
-        this.ctx.logger.warn(
-          `[lark-bridge] recovered stale instance lock from PID=${lockStatus.recoveredStaleLock.pid} (${lockStatus.recoveredStaleLock.host})`,
-        )
-      }
-    }
+    await this.acquireInstanceLock()
+    this.persistCliEndpointIfReady()
 
     this.sessionViewer.attachToHost()
     if (this.config.autoInstallCliAndSkill !== false) {
@@ -775,6 +787,7 @@ export class LarkBridgeManager {
   bindLiveWebOrigin(
     origin: string,
     connection?: { authenticatedUrl?: (baseUrl: string) => string },
+    webServer?: unknown,
   ): void {
     const clean = origin.trim().replace(/\/+$/, '')
     if (!clean) return
@@ -782,9 +795,104 @@ export class LarkBridgeManager {
     if (connection) {
       this.liveConnection = connection
     }
-    if (!this.config.publicBaseUrl.trim()) {
-      this.cliAuth.updateBaseUrl(clean)
+    if (webServer !== undefined) {
+      this.liveWebServer = webServer
     }
+    this.persistCliEndpointIfReady()
+  }
+
+  private persistCliEndpointIfReady(): void {
+    if (this.config.enableInstanceLock !== false && !this.instanceLock.status().held) {
+      return
+    }
+    // Prefer the live local listener origin so local `lark-bridge` CLI calls talk
+    // directly to this process without detouring through an external reverse proxy.
+    const targetBase = this.liveWebOrigin || this.config.publicBaseUrl.trim()
+    if (targetBase) {
+      this.cliAuth.updateBaseUrl(targetBase)
+    }
+  }
+
+  private isAuthenticatedEntryUrl(candidateUrl: string, baseUrl: string): boolean {
+    try {
+      const candidate = new URL(candidateUrl)
+      if (candidate.protocol !== 'http:' && candidate.protocol !== 'https:') return false
+      if (candidate.searchParams.has('token') && candidate.searchParams.get('token')?.trim()) {
+        return true
+      }
+      const base = new URL(baseUrl)
+      return candidate.href !== base.href && Boolean(candidate.search)
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * Checks whether this host can mint an authenticated entry URL without invoking
+   * `connection.authenticatedUrl` prematurely on DSH 0.2.2-rc.5.
+   */
+  canResolveAuthenticatedEntryUrl(baseUrl: string): boolean {
+    const conn =
+      this.liveConnection ??
+      (this.ctx.get('connection' as never) as { authenticatedUrl?: (url: string) => string } | undefined)
+    if (typeof conn?.authenticatedUrl === 'function') return true
+    return Boolean(this.resolveAuthenticatedEntryUrl(baseUrl))
+  }
+
+  /**
+   * Resolves a DSH authenticated entry URL across both:
+   * - DSH 0.2.2-rc.5 (`connection.authenticatedUrl(baseUrl)`)
+   * - DSH 0.2.3-alpha.2+ (`ctx.emit(webServer, 'webserver/entry-url', baseUrl, entries)`)
+   */
+  resolveAuthenticatedEntryUrl(baseUrl: string): string | undefined {
+    const cleanBase = baseUrl.trim()
+    if (!cleanBase) return undefined
+
+    const conn =
+      this.liveConnection ??
+      (this.ctx.get('connection' as never) as { authenticatedUrl?: (url: string) => string } | undefined)
+    if (typeof conn?.authenticatedUrl === 'function') {
+      try {
+        const direct = conn.authenticatedUrl(cleanBase)
+        if (typeof direct === 'string' && direct.trim()) {
+          return direct.trim()
+        }
+      } catch {
+        // Fall through to event-based lookup.
+      }
+    }
+
+    const webServer = this.liveWebServer ?? this.ctx.get('webServer' as never)
+    const emitFn = (this.ctx as unknown as { emit?: (...args: unknown[]) => void }).emit
+    if (typeof emitFn === 'function') {
+      const entries: Array<{ readonly label?: string; readonly url?: string; readonly open?: boolean }> = []
+      try {
+        if (webServer !== undefined) {
+          emitFn.call(this.ctx, webServer, 'webserver/entry-url', cleanBase, entries)
+        } else {
+          emitFn.call(this.ctx, 'webserver/entry-url', cleanBase, entries)
+        }
+      } catch {
+        // Ignore emitter errors and fail closed below.
+      }
+      const preferred =
+        entries.find(
+          (entry) =>
+            entry?.open !== false &&
+            typeof entry?.url === 'string' &&
+            this.isAuthenticatedEntryUrl(entry.url.trim(), cleanBase),
+        ) ??
+        entries.find(
+          (entry) =>
+            typeof entry?.url === 'string' &&
+            this.isAuthenticatedEntryUrl(entry.url.trim(), cleanBase),
+        )
+      if (preferred?.url) {
+        return preferred.url.trim()
+      }
+    }
+
+    return undefined
   }
 
   getLiveWebOrigin(): string {
@@ -820,10 +928,7 @@ export class LarkBridgeManager {
   }): IssuedConsoleLoginLink | undefined {
     const base = this.resolveWebBaseUrl()
     if (!base) return undefined
-    const conn =
-      this.liveConnection ??
-      (this.ctx.get('connection' as never) as { authenticatedUrl?: (url: string) => string } | undefined)
-    if (typeof conn?.authenticatedUrl !== 'function') return undefined
+    if (!this.canResolveAuthenticatedEntryUrl(`${base}/`)) return undefined
     const ticket = this.consoleLogin.issue({
       ...input,
       ttlMs: DEFAULT_CONSOLE_LOGIN_TTL_MS,
@@ -1037,10 +1142,7 @@ export class LarkBridgeManager {
     } catch {
       return false
     }
-    const conn =
-      this.liveConnection ??
-      (this.ctx.get('connection' as never) as { authenticatedUrl?: (url: string) => string } | undefined)
-    return typeof conn?.authenticatedUrl === 'function'
+    return this.canResolveAuthenticatedEntryUrl(this.liveWebOrigin)
   }
 
   private resolveWebBaseUrl(): string {

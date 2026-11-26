@@ -336,6 +336,7 @@ export async function handleConsoleLogin(
     readonly liveOrigin: string
     readonly advertisedOrigin?: string
     readonly connection: LoopbackConnectionAuth
+    readonly resolveAuthenticatedUrl?: (baseUrl: string) => string | undefined
     readonly handoff: ConsoleLoginHandoff
     readonly onAudit?: (ev: { readonly botId: string; readonly summary: string }) => void
     readonly nowMs?: () => number
@@ -347,7 +348,14 @@ export async function handleConsoleLogin(
     return
   }
 
-  const { liveOrigin, advertisedOrigin = '', connection, handoff, onAudit } = options
+  const {
+    liveOrigin,
+    advertisedOrigin = '',
+    connection,
+    resolveAuthenticatedUrl,
+    handoff,
+    onAudit,
+  } = options
   const nowMs = options.nowMs?.() ?? Date.now()
   const authorityBase = (advertisedOrigin || liveOrigin).trim().replace(/\/+$/, '')
   if (!authorityBase || !matchesAnyAllowedAuthority(singleHeader(req.headers.host), [liveOrigin, advertisedOrigin])) {
@@ -439,7 +447,14 @@ export async function handleConsoleLogin(
     return
   }
 
-  if (typeof connection.authenticatedUrl !== 'function') {
+  // Always pass a trailing-slash root URL so DSH's `authorizeIndex` (`pathname === '/'`) matches.
+  const rootUrl = `${authorityBase}/`
+  const resolvedAuthUrl =
+    resolveAuthenticatedUrl?.(rootUrl) ??
+    (typeof connection.authenticatedUrl === 'function'
+      ? connection.authenticatedUrl(rootUrl)
+      : undefined)
+  if (!resolvedAuthUrl) {
     sendHtml(
       res,
       'POST',
@@ -449,8 +464,7 @@ export async function handleConsoleLogin(
     return
   }
 
-  // Always pass a trailing-slash root URL so DSH's `authorizeIndex` (`pathname === '/'`) matches.
-  const authed = new URL(connection.authenticatedUrl(`${authorityBase}/`))
+  const authed = new URL(resolvedAuthUrl)
   const targetPath = `${authed.pathname}${authed.search}`
   onAudit?.({
     botId: ticket.botId,

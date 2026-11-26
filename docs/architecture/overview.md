@@ -47,7 +47,7 @@ flowchart LR
 ## 4. HTTP / RPC 鉴权与 Desktop 会话接管约束
 
 - **统一鉴权与载体无关通道**：
-  - 面向 `@deepseek-ai/dsh@0.2.2-rc.5` 的自定义 HTTP 路由（`/api/lark-bridge/*`）必须显式通过 `ctx.connection.admit(req)` 或受限 CLI Bearer Token 执行 fail-closed 鉴权。
+  - 面向 `@deepseek-ai/dsh@0.2.2-rc.5` 与 `0.2.3-alpha.2+` 的自定义 HTTP 路由（`/api/lark-bridge/*`）在注册时显式声明 `auth: 'anonymous'`（保留外层 Host/Origin 防重绑定校验，避免 `0.2.3-alpha.2+` 默认 `required` 策略拦截 CLI Bearer / Operator Token），并在插件内显式执行受限 CLI / Operator Bearer Token 或 `ctx.connection.admit(req)` 的 fail-closed 鉴权；跨站顶层导航（`/open`、`/console-login` 的 `GET/HEAD`）同步挂载于 `webserver/request`，认证入口 URL 兼容 `connection.authenticatedUrl` 与 `webserver/entry-url` 事件。
   - Web 与 Electron Desktop 客户端统一走 `ctx.connection.fetch.register('/api/lark-bridge-rpc')` + `ctx.connection.rpc.call('/api', 'lark-bridge-rpc', ...)` 载体无关通道（兼容 Desktop `file://` 渲染进程与 `__DSH_TRANSPORT__`）。
   - 宿主机本地目录浏览接口（`/api/lark-bridge/fs/dirs`）、只读链接密钥重置接口与桌面端会话打开通道严格限定 Owner 会话访问；优雅排空与恢复入站接口（`/api/lark-bridge/lifecycle/drain|resume-intake`）限定 Owner 会话或独立 `0o600` `operator-token`，普通 Agent CLI Token 禁止访问。
 - **Electron Desktop 适配**：

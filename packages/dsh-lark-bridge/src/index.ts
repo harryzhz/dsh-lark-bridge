@@ -1,8 +1,9 @@
 import { homedir, networkInterfaces } from 'node:os'
+import type { IncomingMessage, ServerResponse } from 'node:http'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-client-connection'
-import type {} from '@deepseek-ai/dsh-host-webserver'
+import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
 import type {} from '@deepseek-ai/dsh-workspace'
 import z from '@deepseek-ai/schemastery'
 import { LarkBridgeManager } from './bridge-manager.js'
@@ -10,6 +11,7 @@ import {
   LARK_BRIDGE_RPC_PATH,
   createLarkConnectionRpcHandler,
   createLarkHttpHandler,
+  createLarkNavigationRequestHandler,
 } from './http-api.js'
 import { LarkBridgeStore } from './store.js'
 import type { LarkBridgeConfig } from './types.js'
@@ -65,6 +67,11 @@ export async function apply(ctx: Context, rawConfig: LarkBridgeConfig): Promise<
     'dsh-lark-bridge.lifecycle',
   )
 
+  // Acquire the per-dataDir instance lock BEFORE mounting HTTP/RPC routes or writing
+  // `cli-endpoint.json` so a conflicting secondary process (e.g. Desktop + Web sharing
+  // the same `DSH_HOME`) never overwrites the live instance's CLI endpoint metadata.
+  await manager.acquireInstanceLock()
+
   // 1. Register carrier-independent `/api/lark-bridge-rpc` exact Fetch route on DSH Connection
   //    so both DSH Web and DSH Electron Desktop UI (`file://` + `__DSH_TRANSPORT__`) communicate
   //    through the authenticated owner channel without CORS or origin issues.
@@ -90,18 +97,40 @@ export async function apply(ctx: Context, rawConfig: LarkBridgeConfig): Promise<
   ctx.inject(['webServer', 'connection'], (webCtx) => {
     try {
       const origin = webCtx.webServer.getOrigin()
-      if (origin) manager.bindLiveWebOrigin(origin, webCtx.connection)
+      if (origin) manager.bindLiveWebOrigin(origin, webCtx.connection, webCtx.webServer)
     } catch {
       // Listener may not expose an origin on unusual bind addresses.
     }
+
+    // DSH 0.2.3-alpha.2+: handle GET/HEAD top-level navigations (`/open`, `/console-login`)
+    // in `webserver/request` before outer `webserver/authorize` rejects cross-site clicks from
+    // Feishu Web (`Sec-Fetch-Site: cross-site`). No-op on 0.2.2-rc.5 where the event does not fire.
+    const navigationInterceptor = createLarkNavigationRequestHandler(webCtx.connection, manager)
+    const webCtxEvents = webCtx as unknown as {
+      on?: (
+        event: string,
+        listener: (
+          req: IncomingMessage,
+          res: ServerResponse,
+          next: () => Promise<void>,
+        ) => Promise<void>,
+      ) => void
+    }
+    webCtxEvents.on?.('webserver/request', navigationInterceptor)
+
     const handler = createLarkHttpHandler(webCtx, webCtx.connection, manager)
+    // DSH 0.2.3-alpha.2+ defaults route auth to `'required'`, which enforces DSH browser cookie
+    // auth before entering plugin handlers and blocks CLI Bearer / Operator tokens with HTTP 401.
+    // Declaring `auth: 'anonymous'` preserves outer Host/Origin trust checks while delegating
+    // fail-closed credential verification (`cliAuth` / `operatorAuth` / `connection.admit`) to the plugin.
+    const route = {
+      kind: 'prefix',
+      path: '/api/lark-bridge',
+      auth: 'anonymous',
+      handler,
+    } as WebRoute
     webCtx.effect(
-      () =>
-        webCtx.webServer.register({
-          kind: 'prefix',
-          path: '/api/lark-bridge',
-          handler,
-        }),
+      () => webCtx.webServer.register(route),
       'dsh-lark-bridge.http-api',
     )
   })
@@ -141,6 +170,7 @@ export {
   resolveBundledAssetPaths,
   type BundledAssetPaths,
   type CliAuthEndpoint,
+  type EnsureCliAuthOptions,
   type InstallLocalCliOptions,
   type OperatorAuthToken,
 } from './cli-support.js'
@@ -199,6 +229,7 @@ export {
   LARK_BRIDGE_RPC_PATH,
   createLarkConnectionRpcHandler,
   createLarkHttpHandler,
+  createLarkNavigationRequestHandler,
   dispatchLarkApiRequest,
   type ConnectionAdmitter,
   type LarkApiRequest,
