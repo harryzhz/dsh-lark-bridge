@@ -1,5 +1,8 @@
 import { networkInterfaces } from 'node:os'
 import type { Context } from '@deepseek-ai/cordis'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import { pluginRecordOf, type Session, type SessionId } from '@deepseek-ai/dsh-session'
+import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
 import {
   LarkPlatformManager,
   type DiscoveredLarkChat,
@@ -16,7 +19,12 @@ import {
   type LarkUserSearchHit,
   type SubstituteTarget,
 } from '@dsh-lark/lark-core'
-import { AgentToolFacade, type AgentCliSendInput } from './agent-tool-facade.js'
+import {
+  AgentToolFacade,
+  SessionIdentityError,
+  type AgentCliSendInput,
+  type ResolvedCliSessionIdentity,
+} from './agent-tool-facade.js'
 import { BotConnectionPool } from './bot-connection-pool.js'
 import {
   ensureCliAuthEndpoint,
@@ -61,11 +69,16 @@ import type {
 import { WorkspaceGrouping } from './workspace-grouping.js'
 
 const SHUTDOWN_DISPOSE_BUDGET_MS = 2_500
+const EXTERNAL_BINDING_RECORD_TYPE = 'plugin:external-agent/binding'
 const WAL_PASSIVE_CHECKPOINT_THRESHOLD_BYTES = 2 * 1024 * 1024
 const WAL_IDLE_TRUNCATE_THRESHOLD_BYTES = 4 * 1024 * 1024
 const WAL_PERIODIC_CHECKPOINT_INTERVAL_MS = 15 * 60_000
 
-export type { AgentCliSendInput } from './agent-tool-facade.js'
+export {
+  SessionIdentityError,
+  type AgentCliSendInput,
+  type ResolvedCliSessionIdentity,
+} from './agent-tool-facade.js'
 
 async function withShutdownBudget(work: Promise<unknown>, budgetMs: number): Promise<void> {
   let timer: ReturnType<typeof setTimeout> | undefined
@@ -241,7 +254,7 @@ export class LarkBridgeManager {
       getSchedules: () => this.schedules,
       getReminders: () => this.reminders,
       sessionWebUrl: (sid) => this.sessionWebUrl(sid),
-      resolveExternalSessionId: (extId) => this.runtimes.resolveSessionIdByExternalId(extId),
+      resolveExternalSessionId: (extId) => this.resolveExternalSessionId(extId),
     })
 
     this.schedules = new ScheduleNotifier({
@@ -395,6 +408,7 @@ export class LarkBridgeManager {
 
     this.disposers.push(this.workspaces.install())
     this.disposers.push(this.observability.install())
+    this.disposers.push(this.installExternalBindingPersistence())
     this.schedules.start()
     this.dreaming.start(this.config.idleSweepIntervalMs > 0 ? 60_000 : 0)
     await this.reminders.recoverStaleRunningReminders().catch((err) => {
@@ -418,6 +432,11 @@ export class LarkBridgeManager {
     })
 
     void this.schedules.refreshScheduleContextCache()
+    void this.backfillExternalSessionLinks().catch((err) => {
+      this.ctx.logger.warn(
+        `[lark-bridge] external session link backfill warning: ${err instanceof Error ? err.message : String(err)}`,
+      )
+    })
     void this.titleGuard.reconcileHistoricalSessions().catch((err) => {
       this.ctx.logger.warn(
         `[lark-bridge] historical session reconciliation warning: ${err instanceof Error ? err.message : String(err)}`,
@@ -814,17 +833,130 @@ export class LarkBridgeManager {
     }
   }
 
+  // ── External Session Binding Persistence (durable ext:<id> -> sessionId) ─
+
+  private resolveExternalSessionId(externalId: string): string | undefined {
+    const clean = externalId.trim()
+    if (!clean) return undefined
+    const live = this.runtimes.resolveSessionIdByExternalId(clean)
+    if (live) {
+      if (typeof this.store.upsertExternalSessionLink === 'function') {
+        try {
+          this.store.upsertExternalSessionLink(clean, live)
+        } catch {
+          // Best-effort read-through cache into SQLite.
+        }
+      }
+      return live
+    }
+    if (typeof this.store.resolveSessionIdByExternalId === 'function') {
+      return this.store.resolveSessionIdByExternalId(clean)
+    }
+    return undefined
+  }
+
+  private recordExternalBindingEvent(sessionId: string, event: unknown): void {
+    const rec = pluginRecordOf(event as never) as
+      | { type?: string; data?: unknown; payload?: unknown }
+      | undefined
+    if (rec?.type !== EXTERNAL_BINDING_RECORD_TYPE) return
+    const data = (rec.data ?? rec.payload) as { driver?: unknown; externalId?: unknown } | undefined
+    const externalId = typeof data?.externalId === 'string' ? data.externalId.trim() : ''
+    if (!externalId) return
+    const driver = typeof data?.driver === 'string' ? data.driver.trim() : ''
+    if (typeof this.store.upsertExternalSessionLink === 'function') {
+      try {
+        this.store.upsertExternalSessionLink(externalId, sessionId, driver)
+      } catch {
+        // Ignore persistence failures during shutdown/teardown.
+      }
+    }
+  }
+
+  private installExternalBindingPersistence(): () => void {
+    if (typeof this.ctx.on !== 'function') return () => {}
+    return this.ctx.on(
+      'session/event' as never,
+      ((session: Session, event: unknown) => {
+        if (!session?.id) return
+        this.recordExternalBindingEvent(String(session.id), event)
+      }) as never,
+    )
+  }
+
+  private async backfillExternalSessionLinks(): Promise<void> {
+    if (
+      typeof this.store.upsertExternalSessionLink !== 'function' ||
+      typeof this.store.hasExternalSessionLinkForSession !== 'function'
+    ) {
+      return
+    }
+    const candidateIds = new Set<string>()
+    for (const binding of this.store.listBindings()) {
+      if (binding.sessionId) candidateIds.add(binding.sessionId)
+    }
+    for (const rem of this.store.listReminders('active')) {
+      if (rem.lastSessionId) candidateIds.add(rem.lastSessionId)
+    }
+    if (candidateIds.size === 0) return
+
+    const liveSessions = this.ctx.sessions as unknown as {
+      get?: (id: SessionId) => Session | undefined
+    }
+    const persistence =
+      typeof this.ctx.get === 'function'
+        ? (this.ctx.get('sessionPersistence' as never) as SessionPersistence | undefined)
+        : undefined
+
+    for (const sid of candidateIds) {
+      if (this.disposed) return
+      if (this.store.hasExternalSessionLinkForSession(sid)) continue
+      const live = liveSessions?.get?.(brandString<SessionId>(sid))
+      if (live && typeof live.snapshotEvents === 'function') {
+        for (const ev of live.snapshotEvents()) {
+          this.recordExternalBindingEvent(sid, ev)
+        }
+        if (this.store.hasExternalSessionLinkForSession(sid)) continue
+      }
+      if (!persistence || typeof persistence.open !== 'function') continue
+      try {
+        const handle = await persistence.open(brandString<SessionId>(sid), 'read')
+        try {
+          const res = await handle.read(0, 60)
+          for (const ev of res.events) {
+            this.recordExternalBindingEvent(sid, ev)
+          }
+        } finally {
+          await handle.close().catch(() => {})
+        }
+      } catch {
+        // Ignore unreadable/archived sessions.
+      }
+    }
+  }
+
   // ── Agent CLI Tool Facade ────────────────────────────────────────────────
 
   resolveCliSessionId(sessionId?: string): string | undefined {
     return this.facade.canonicalizeSessionId(sessionId)
   }
 
-  resolveAgentContext(sessionId?: string) {
-    return this.facade.resolveAgentContext(sessionId)
+  resolveCliSessionIdentity(
+    sessionId?: string,
+    externalSessionId?: string,
+  ): ResolvedCliSessionIdentity {
+    return this.facade.resolveCliSessionIdentity(sessionId, externalSessionId)
   }
 
-  agentSilenceTurn(input: { readonly sessionId?: string; readonly reason?: string }) {
+  resolveAgentContext(sessionId?: string, externalSessionId?: string) {
+    return this.facade.resolveAgentContext(sessionId, externalSessionId)
+  }
+
+  agentSilenceTurn(input: {
+    readonly sessionId?: string
+    readonly externalSessionId?: string
+    readonly reason?: string
+  }) {
     return this.facade.agentSilenceTurn(input)
   }
 
@@ -834,6 +966,7 @@ export class LarkBridgeManager {
 
   agentHistory(input: {
     readonly sessionId?: string
+    readonly externalSessionId?: string
     readonly botId?: string
     readonly chatId?: string
     readonly threadId?: string
@@ -849,6 +982,7 @@ export class LarkBridgeManager {
 
   agentGetMessage(input: {
     readonly sessionId?: string
+    readonly externalSessionId?: string
     readonly botId?: string
     readonly messageId: string
     readonly downloadResources?: boolean
@@ -859,6 +993,7 @@ export class LarkBridgeManager {
 
   agentCreateSchedule(input: {
     readonly sessionId?: string
+    readonly externalSessionId?: string
     readonly title: string
     readonly prompt: string
     readonly timing: ScheduleCreateInputLike['timing']

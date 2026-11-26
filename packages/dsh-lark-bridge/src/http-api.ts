@@ -2,8 +2,13 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Context } from '@deepseek-ai/cordis'
 import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
 import { resolveEffectiveWorkspaceName, toPublicBotView } from '@dsh-lark/lark-core'
-import type { AgentCliSendInput, LarkBridgeManager } from './bridge-manager.js'
-import { OPERATOR_TOKEN_HEADER } from './cli-support.js'
+import {
+  SessionIdentityError,
+  type AgentCliSendInput,
+  type LarkBridgeManager,
+  type ResolvedCliSessionIdentity,
+} from './bridge-manager.js'
+import { EXTERNAL_SESSION_ID_HEADER, OPERATOR_TOKEN_HEADER } from './cli-support.js'
 import { LARK_CONSOLE_LOGIN_PATH, handleConsoleLogin } from './console-login.js'
 import {
   assertExistingWorkingDirectory,
@@ -35,6 +40,7 @@ export interface LarkApiRequest {
   /** Route relative to `/api/lark-bridge`, e.g. `/bots` or `/events?limit=120`. */
   readonly path: string
   readonly body?: unknown
+  readonly externalSessionId?: string
   readonly isCliAuthenticated: boolean
   readonly isOperatorAuthenticated?: boolean
   readonly principalKind: string
@@ -370,19 +376,25 @@ export async function dispatchLarkApiRequest(
 
     // ── Agent CLI endpoints (never expose app secrets or OAuth tokens) ───
     if (segments[0] === 'agent') {
+      const extSessionId = request.externalSessionId?.trim() || undefined
       if (method === 'GET' && segments[1] === 'context') {
         const sessionId = url.searchParams.get('sessionId') ?? undefined
-        return ok({ ok: true, ...manager.resolveAgentContext(sessionId) })
+        const resolved = extSessionId
+          ? manager.resolveAgentContext(sessionId, extSessionId)
+          : manager.resolveAgentContext(sessionId)
+        return ok({ ok: true, ...resolved })
       }
       if (method === 'POST' && segments[1] === 'send') {
         const body = bodyRecord(request.body) as unknown as AgentCliSendInput
-        const result = await manager.agentSend(body)
+        const sendInput = extSessionId ? { ...body, externalSessionId: extSessionId } : body
+        const result = await manager.agentSend(sendInput)
         return ok({ ok: true, ...result })
       }
       if (method === 'POST' && segments[1] === 'silence') {
         const body = bodyRecord(request.body) as { sessionId?: string; reason?: string }
         const result = manager.agentSilenceTurn({
           ...(body.sessionId ? { sessionId: body.sessionId } : {}),
+          ...(extSessionId ? { externalSessionId: extSessionId } : {}),
           ...(body.reason ? { reason: body.reason } : {}),
         })
         return ok({ ok: true, ...result })
@@ -397,6 +409,7 @@ export async function dispatchLarkApiRequest(
           : undefined
         const result = await manager.agentHistory({
           ...(sessionId ? { sessionId } : {}),
+          ...(extSessionId ? { externalSessionId: extSessionId } : {}),
           ...(botId ? { botId } : {}),
           ...(chatId ? { chatId } : {}),
           ...(threadId ? { threadId } : {}),
@@ -411,6 +424,7 @@ export async function dispatchLarkApiRequest(
         const includeRaw = url.searchParams.get('raw') === '1'
         const detail = await manager.agentGetMessage({
           ...(sessionId ? { sessionId } : {}),
+          ...(extSessionId ? { externalSessionId: extSessionId } : {}),
           ...(botId ? { botId } : {}),
           messageId: segments[2],
           downloadResources,
@@ -439,6 +453,7 @@ export async function dispatchLarkApiRequest(
         }
         const created = await manager.agentCreateSchedule({
           ...(body.sessionId ? { sessionId: body.sessionId } : {}),
+          ...(extSessionId ? { externalSessionId: extSessionId } : {}),
           title: body.title.trim(),
           prompt: body.prompt.trim(),
           timing: body.timing,
@@ -574,6 +589,7 @@ export async function dispatchLarkApiRequest(
         segments,
         url,
         body: request.body,
+        ...(request.externalSessionId ? { externalSessionId: request.externalSessionId } : {}),
         isCliAuthenticated,
         ...(isOperatorAuthenticated !== undefined ? { isOperatorAuthenticated } : {}),
         principalKind,
@@ -965,15 +981,48 @@ export async function dispatchLarkApiRequest(
           sessionId?: string
         }
         const { sessionId: rawSessionId, ...restBody } = rawBody
-        const canonicalSessionId =
-          typeof rawSessionId === 'string'
-            ? typeof manager.resolveCliSessionId === 'function'
-              ? manager.resolveCliSessionId(rawSessionId)
-              : rawSessionId
-            : undefined
+        const identity: ResolvedCliSessionIdentity =
+          typeof manager.resolveCliSessionIdentity === 'function'
+            ? manager.resolveCliSessionIdentity(
+                typeof rawSessionId === 'string' ? rawSessionId : undefined,
+                request.externalSessionId,
+              )
+            : ((): ResolvedCliSessionIdentity => {
+                const rawStr = typeof rawSessionId === 'string' ? rawSessionId.trim() : ''
+                const extStr = request.externalSessionId?.trim() ?? ''
+                if (!rawStr && !extStr) {
+                  return { provided: false, unresolved: false }
+                }
+                const effectiveRaw = rawStr || `ext:${extStr}`
+                const canonical =
+                  typeof manager.resolveCliSessionId === 'function'
+                    ? manager.resolveCliSessionId(effectiveRaw)
+                    : rawStr && !rawStr.startsWith('ext:')
+                      ? rawStr
+                      : undefined
+                return {
+                  ...(canonical ? { canonicalSessionId: canonical } : {}),
+                  provided: true,
+                  unresolved: !canonical,
+                  rawSessionId: effectiveRaw,
+                }
+              })()
+        const hasExplicitTarget = Boolean(
+          typeof restBody.botId === 'string' &&
+            restBody.botId.trim() &&
+            ((typeof restBody.chatId === 'string' && restBody.chatId.trim()) ||
+              (typeof restBody.userOpenId === 'string' && restBody.userOpenId.trim())),
+        )
+        if (identity.unresolved && !hasExplicitTarget) {
+          throw new SessionIdentityError(
+            'unresolved_session_context',
+            `无法解析当前会话上下文（${identity.rawSessionId}），已拒绝创建提醒以防止归属到默认智能体；请显式指定 --bot 与 --chat/--user`,
+            400,
+          )
+        }
         const body: CreateReminderInput = {
           ...restBody,
-          ...(canonicalSessionId ? { sessionId: canonicalSessionId } : {}),
+          ...(identity.canonicalSessionId ? { sessionId: identity.canonicalSessionId } : {}),
         }
         const item = await manager.reminders.create(body)
         return ok({ ok: true, reminder: item }, 201)
@@ -1195,6 +1244,9 @@ export async function dispatchLarkApiRequest(
 
     return ok({ ok: false, error: 'not_found' }, 404)
   } catch (err) {
+    if (err instanceof SessionIdentityError) {
+      return ok({ ok: false, code: err.code, error: err.message }, err.status)
+    }
     const message = err instanceof Error ? err.message : String(err)
     return ok({ ok: false, error: message }, 400)
   } finally {
@@ -1299,10 +1351,15 @@ export function createLarkHttpHandler(
       }
     }
 
+    const externalSessionHeader =
+      typeof req.headers[EXTERNAL_SESSION_ID_HEADER] === 'string'
+        ? req.headers[EXTERNAL_SESSION_ID_HEADER].trim() || undefined
+        : undefined
     const response = await dispatchLarkApiRequest(ctx, manager, {
       method,
       path: rawUrl,
       body,
+      ...(externalSessionHeader ? { externalSessionId: externalSessionHeader } : {}),
       isCliAuthenticated,
       isOperatorAuthenticated,
       principalKind,

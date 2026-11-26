@@ -221,6 +221,7 @@ export interface PrefetchedQuotedMessageSummary {
 export interface LarkConversationContextInput {
   readonly bot: Pick<LarkBotConfig, 'id' | 'name' | 'larkAppId'>
   readonly botOpenId?: string
+  readonly sessionId?: string
   readonly msg: InboundLarkMessage
   readonly chatName?: string
   readonly senderName?: string
@@ -239,6 +240,7 @@ export function composeLarkContextReminder(input: LarkConversationContextInput):
     `bot_name="${escapeXmlAttr(bot.name)}"`,
     `app_id="${escapeXmlAttr(bot.larkAppId)}"`,
     ...(input.botOpenId ? [`bot_open_id="${escapeXmlAttr(input.botOpenId)}"`] : []),
+    ...(input.sessionId ? [`session_id="${escapeXmlAttr(input.sessionId)}"`] : []),
     `chat_type="${escapeXmlAttr(msg.chatType)}"`,
     `chat_id="${escapeXmlAttr(msg.chatId)}"`,
     ...(input.chatName ? [`chat_name="${escapeXmlAttr(input.chatName)}"`] : []),

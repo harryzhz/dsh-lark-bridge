@@ -198,6 +198,8 @@ function loadEndpointConfig() {
   }
 }
 
+let defaultRequestHeaders = undefined
+
 async function apiRequest(endpoint, method, path, body, extraHeaders) {
   const res = await fetch(`${endpoint.apiBaseUrl}${path}`, {
     method,
@@ -205,6 +207,7 @@ async function apiRequest(endpoint, method, path, body, extraHeaders) {
       authorization: `Bearer ${endpoint.token}`,
       accept: 'application/json',
       ...(body !== undefined ? { 'content-type': 'application/json' } : {}),
+      ...(defaultRequestHeaders || {}),
       ...(extraHeaders || {}),
     },
     ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
@@ -933,12 +936,19 @@ async function main() {
   }
 
   const endpoint = loadEndpointConfig()
-  const explicitOrEnvSessionId = String(flags.session || process.env.DSH_SESSION_ID || '').trim()
-  const fallbackExternalId = !explicitOrEnvSessionId
-    ? String(process.env.ANTIGRAVITY_CONVERSATION_ID || '').trim()
-    : ''
+  const explicitFlagSessionId = flags.session ? String(flags.session).trim() : ''
+  const envDshSessionId = String(process.env.DSH_SESSION_ID || '').trim()
+  const envExternalSessionId = String(process.env.ANTIGRAVITY_CONVERSATION_ID || '').trim()
   const sessionId =
-    explicitOrEnvSessionId || (fallbackExternalId ? `ext:${fallbackExternalId}` : undefined)
+    explicitFlagSessionId ||
+    envDshSessionId ||
+    (envExternalSessionId ? `ext:${envExternalSessionId}` : undefined)
+  // Forward ambient external conversation ID alongside env DSH_SESSION_ID so the server
+  // can detect and fail-closed on cross-process env hijacks (skipped when --session is explicit).
+  defaultRequestHeaders =
+    !explicitFlagSessionId && envExternalSessionId
+      ? { 'x-lark-external-session-id': envExternalSessionId }
+      : undefined
   const qSession = sessionId ? `sessionId=${encodeURIComponent(sessionId)}` : ''
   const inAgentSession = Boolean(
     process.env.DSH_SESSION_ID ||
@@ -1148,10 +1158,13 @@ async function main() {
       ...(files.length > 0 ? { files } : {}),
     }
 
-    if (topLevel && !payload.chatId && sessionId) {
+    if (topLevel && (!payload.chatId || !payload.botId) && sessionId) {
       const ctxData = await apiRequest(endpoint, 'GET', `/agent/context?${qSession}`)
+      if (ctxData.bound === false && !payload.botId && !payload.chatId) {
+        throw new Error(`无法解析当前会话上下文（${sessionId}），请显式指定 --bot 与 --chat`)
+      }
       if (ctxData.botId && !payload.botId) payload.botId = ctxData.botId
-      if (ctxData.chatId) payload.chatId = ctxData.chatId
+      if (ctxData.chatId && !payload.chatId) payload.chatId = ctxData.chatId
     }
 
     printJson(await apiRequest(endpoint, 'POST', '/agent/send', payload))

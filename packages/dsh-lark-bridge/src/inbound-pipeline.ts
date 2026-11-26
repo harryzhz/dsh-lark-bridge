@@ -1599,6 +1599,7 @@ export class InboundPipeline {
           effectiveDecision,
           acquired.isNew,
           resolvedChatName,
+          acquired.sessionId,
         )
         const postPromptDisabled = this.getBatchDisabledScope(bot.id, batchItems)
         if (postPromptDisabled) {
@@ -2977,6 +2978,7 @@ export class InboundPipeline {
     effectiveDecision: AgentDecision,
     isNewSession: boolean,
     resolvedChatName?: string,
+    sessionId?: string,
   ): Promise<ContentBlock[]> {
     const primary = items[items.length - 1]!
     const reminders: string[] = []
@@ -3078,6 +3080,7 @@ export class InboundPipeline {
       composeLarkContextReminder({
         bot,
         botOpenId: transport.state?.botOpenId ?? primary.msg.botOpenId,
+        ...(sessionId ? { sessionId } : {}),
         msg: primary.msg,
         ...(resolvedChatName ? { chatName: resolvedChatName } : {}),
         ...(primary.senderName ? { senderName: primary.senderName } : {}),

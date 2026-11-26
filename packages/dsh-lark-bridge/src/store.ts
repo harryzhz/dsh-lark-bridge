@@ -261,6 +261,23 @@ export class LarkBridgeStore {
     return this.runtimeRepo.getBindingBySessionId(sessionId)
   }
 
+  upsertExternalSessionLink(
+    externalId: string,
+    sessionId: string,
+    driver = '',
+    updatedAtMs = Date.now(),
+  ): void {
+    this.runtimeRepo.upsertExternalSessionLink(externalId, sessionId, driver, updatedAtMs)
+  }
+
+  resolveSessionIdByExternalId(externalId: string): string | undefined {
+    return this.runtimeRepo.resolveSessionIdByExternalId(externalId)
+  }
+
+  hasExternalSessionLinkForSession(sessionId: string): boolean {
+    return this.runtimeRepo.hasExternalSessionLinkForSession(sessionId)
+  }
+
   upsertBinding(binding: LarkSessionBinding): void {
     this.runtimeRepo.upsertBinding(binding)
   }
