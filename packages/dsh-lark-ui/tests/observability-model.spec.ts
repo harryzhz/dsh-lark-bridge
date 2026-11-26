@@ -9,10 +9,13 @@ import {
   formatSubMs,
   formatTokens,
   formatUptime,
+  resolveApiRouteTone,
+  resolveDbQueryTone,
   resolveErrorCodeLabel,
   resolveHeatmapLevel,
   resolveTableLabel,
   resolveTriggerLabel,
+  splitTelemetryVerb,
 } from '../src/views/observability-model.js'
 
 describe('observability-model pure helpers', () => {
@@ -88,5 +91,19 @@ describe('observability-model pure helpers', () => {
     expect(resolveTriggerLabel('substitute')).toBe('代答模式')
     expect(resolveErrorCodeLabel('rate_limited')).toBe('上游限流 / 429')
     expect(resolveTableLabel('telemetry_usage_events')).toBe('遥测明细事件')
+
+    expect(splitTelemetryVerb('GET /observability')).toEqual({ verb: 'GET', target: '/observability' })
+    expect(splitTelemetryVerb('SELECT telemetry_usage_events')).toEqual({
+      verb: 'SELECT',
+      target: 'telemetry_usage_events',
+    })
+    expect(splitTelemetryVerb('SQL')).toEqual({ verb: '', target: 'SQL' })
+
+    expect(resolveDbQueryTone(8, 100)).toBe('primary')
+    expect(resolveDbQueryTone(65, 100)).toBe('warn')
+    expect(resolveDbQueryTone(100, 100)).toBe('error')
+    expect(resolveApiRouteTone(190)).toBe('primary')
+    expect(resolveApiRouteTone(860)).toBe('warn')
+    expect(resolveApiRouteTone(1600)).toBe('error')
   })
 })

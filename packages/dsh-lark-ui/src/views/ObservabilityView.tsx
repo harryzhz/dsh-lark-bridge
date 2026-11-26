@@ -873,8 +873,8 @@ function MonitorPane({
               <div className="fb-obs-kv-row">
                 <span className="fb-obs-muted">SQLite 查询耗时</span>
                 <span className="fb-mono" data-warn={database.slowQueryCount > 0 ? '' : undefined}>
-                  P50 {formatSubMs(database.p50Ms)} · P95 {formatSubMs(database.p95Ms)} · 慢查询{' '}
-                  {database.slowQueryCount}
+                  P50 {formatSubMs(database.p50Ms)} · P95 {formatSubMs(database.p95Ms)} · 慢查询 (≥
+                  {database.slowThresholdMs}ms) {database.slowQueryCount}
                 </span>
               </div>
             )}

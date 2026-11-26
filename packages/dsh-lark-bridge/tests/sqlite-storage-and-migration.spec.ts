@@ -691,6 +691,7 @@ describe('SQLite WAL storage, atomic auto-migration & db CLI', () => {
       expect(store.countPendingTurns()).toBe(2)
       store.deletePendingTurn('pt-count-1')
       expect(store.countPendingTurns()).toBe(1)
+      expect(store.db.getPerfSnapshot().slowThresholdMs).toBe(100)
     } finally {
       store.close()
     }
