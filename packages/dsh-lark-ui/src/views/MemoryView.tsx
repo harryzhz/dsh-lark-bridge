@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
   Button,
   IconChevronDownOutlineRegular,
@@ -17,6 +17,7 @@ import { bridgeApi } from '../api.js'
 import type { ConfirmRequest } from '../components/ConfirmDialog.js'
 import {
   Avatar,
+  CountSegmentedSwitch,
   FilterTabs,
   OverflowMenu,
   resolveEffectiveBotId,
@@ -26,6 +27,26 @@ import type { MemoryDialogRequest } from '../components/MemoryEditDialog.js'
 import { formatTime } from '../state.js'
 import type { BotRecord, GroupView, MemoryEntry, MemoryType } from '../types.js'
 import { MemoryContentBlocks } from './memory-content.js'
+import {
+  buildMemoryGraph,
+  collectMemoryLinkedItems,
+  computeGraphNeighborhood,
+  DEFAULT_MEMORY_GRAPH_SETTINGS,
+  extractLexicalTerms,
+  GRAPH_GROUP_ORDER,
+  matchGraphSearch,
+  resolveMemoryViewMode,
+  type MemoryGraphData,
+  type MemoryGraphEdge,
+  type MemoryGraphEdgeKind,
+  type MemoryGraphGroupKey,
+  type MemoryGraphNeighborhood,
+  type MemoryGraphNode,
+  type MemoryGraphSettings,
+  type MemoryLinkedItem,
+  type MemoryViewMode,
+} from './memory-graph-model.js'
+import { MemoryGraphView } from './MemoryGraphView.js'
 import {
   buildMemoryHierarchy,
   collectTopMemoryTags,
@@ -49,25 +70,42 @@ import {
 } from './memory-model.js'
 
 export {
+  buildMemoryGraph,
   buildMemoryHierarchy,
+  collectMemoryLinkedItems,
   collectTopMemoryTags,
+  computeGraphNeighborhood,
   countMemoriesByHistoryStatus,
   countMemoriesByType,
+  DEFAULT_MEMORY_GRAPH_SETTINGS,
+  extractLexicalTerms,
   filterAndSortMemories,
   findSupersededPredecessors,
+  GRAPH_GROUP_ORDER,
   isSameMemoryNav,
+  matchGraphSearch,
   MEMORY_HISTORY_FILTERS,
   MEMORY_SORT_OPTIONS,
   MEMORY_TYPE_META,
   MEMORY_TYPE_ORDER,
   resolveMemoryScopeLabel,
+  resolveMemoryViewMode,
   resolveNavHeading,
   summarizeMemoryExcerpt,
+  type MemoryGraphData,
+  type MemoryGraphEdge,
+  type MemoryGraphEdgeKind,
+  type MemoryGraphGroupKey,
+  type MemoryGraphNeighborhood,
+  type MemoryGraphNode,
+  type MemoryGraphSettings,
   type MemoryHierarchy,
   type MemoryHistoryFilter,
+  type MemoryLinkedItem,
   type MemoryNavNode,
   type MemorySortBy,
   type MemoryTagStat,
+  type MemoryViewMode,
 }
 
 function formatFullTimestamp(ms?: number): string {
@@ -104,9 +142,19 @@ interface MemoryReaderActions {
 function buildOverflowItems(
   entry: MemoryEntry,
   actions: MemoryReaderActions,
+  compact = false,
 ): Array<MenuEntry & { onSelect?: () => void }> {
   const isActive = entry.status === 'active'
   return [
+    ...(compact
+      ? [
+          { id: 'edit', label: '编辑', onSelect: () => actions.onEdit(entry) },
+          ...(isActive
+            ? [{ id: 'supersede', label: '纠偏替代', onSelect: () => actions.onSupersede(entry) }]
+            : [{ id: 'restore', label: '恢复有效', onSelect: () => actions.onRestore(entry) }]),
+          { type: 'separator' as const, id: 'sep-compact' },
+        ]
+      : []),
     ...(!isActive && entry.supersededBy
       ? [
           {
@@ -648,6 +696,10 @@ function MemoryReaderColumn({
   actions,
   onCreate,
   hasAnyEntries,
+  compact = false,
+  extraTool,
+  onCloseDrawer,
+  linkedItems,
 }: {
   entry: MemoryEntry | null
   bot?: BotRecord
@@ -659,6 +711,10 @@ function MemoryReaderColumn({
   actions: MemoryReaderActions
   onCreate: () => void
   hasAnyEntries: boolean
+  compact?: boolean
+  extraTool?: ReactNode
+  onCloseDrawer?: () => void
+  linkedItems?: readonly MemoryLinkedItem[]
 }) {
   if (!entry) {
     return (
@@ -687,7 +743,7 @@ function MemoryReaderColumn({
   const typeMeta = MEMORY_TYPE_META[entry.type]
   const scopeInfo = resolveMemoryScopeLabel(entry, groups)
   const isActive = entry.status === 'active'
-  const menuItems = buildOverflowItems(entry, actions)
+  const menuItems = buildOverflowItems(entry, actions, compact)
   const hasFootLinks =
     predecessors.length > 0 ||
     Boolean(entry.supersededBy) ||
@@ -721,24 +777,28 @@ function MemoryReaderColumn({
                 )}
                 <span>{entry.pinned ? '已置顶' : '置顶'}</span>
               </button>
-              <button
-                type="button"
-                className="fb-mem-tool-btn"
-                disabled={mutating}
-                onClick={() => actions.onEdit(entry)}
-              >
-                编辑
-              </button>
-              <button
-                type="button"
-                className="fb-mem-tool-btn"
-                disabled={mutating}
-                onClick={() => actions.onSupersede(entry)}
-              >
-                纠偏替代
-              </button>
+              {!compact && (
+                <>
+                  <button
+                    type="button"
+                    className="fb-mem-tool-btn"
+                    disabled={mutating}
+                    onClick={() => actions.onEdit(entry)}
+                  >
+                    编辑
+                  </button>
+                  <button
+                    type="button"
+                    className="fb-mem-tool-btn"
+                    disabled={mutating}
+                    onClick={() => actions.onSupersede(entry)}
+                  >
+                    纠偏替代
+                  </button>
+                </>
+              )}
             </>
-          ) : (
+          ) : !compact ? (
             <>
               <button
                 type="button"
@@ -757,13 +817,24 @@ function MemoryReaderColumn({
                 编辑
               </button>
             </>
-          )}
+          ) : null}
+          {extraTool}
           <OverflowMenu label={`${entry.title} 更多操作`} items={menuItems} />
+          {onCloseDrawer && (
+            <button
+              type="button"
+              className="fb-mem-tool-btn"
+              aria-label="关闭记忆详情"
+              onClick={onCloseDrawer}
+            >
+              <IconCloseOutlineRegular size={13} />
+            </button>
+          )}
         </div>
       </div>
 
       <div className="fb-mem-reader-scroll">
-        <article className="fb-mem-paper">
+        <article className="fb-mem-paper" data-compact={compact ? '' : undefined}>
           <div className="fb-mem-paper-eyebrow">
             <div className="fb-mem-paper-kicker">
               <span className="fb-mem-note-cat" data-type={entry.type}>
@@ -838,6 +909,27 @@ function MemoryReaderColumn({
                   #{tag}
                 </button>
               ))}
+            </div>
+          )}
+
+          {linkedItems && linkedItems.length > 0 && (
+            <div className="fb-mem-graph-links">
+              <div className="fb-mem-graph-links-head">关联记忆（{linkedItems.length}）</div>
+              <div className="fb-mem-graph-links-list">
+                {linkedItems.map((item) => (
+                  <button
+                    key={item.entry.id}
+                    type="button"
+                    className="fb-mem-graph-link-row"
+                    title={item.entry.title}
+                    onClick={() => actions.onJumpToEntry(item.entry.id)}
+                  >
+                    <span className="fb-mem-type-dot" data-type={item.entry.type} aria-hidden="true" />
+                    <span className="fb-mem-graph-link-title">{item.entry.title}</span>
+                    <span className="fb-mem-graph-link-meta">{item.relationLabel}</span>
+                  </button>
+                ))}
+              </div>
             </div>
           )}
 
@@ -936,6 +1028,7 @@ export function MemoryView({
   const memoryCacheKey = singleScopedBotId || '__all__'
   const initialCached = MEMORY_SWR_CACHE.get(memoryCacheKey)
 
+  const [viewMode, setViewMode] = useState<MemoryViewMode>(() => resolveMemoryViewMode())
   const [nav, setNav] = useState<MemoryNavNode>({ kind: 'all' })
   const [sortBy, setSortBy] = useState<MemorySortBy>('priority')
   const [historyFilter, setHistoryFilter] = useState<MemoryHistoryFilter>('all')
@@ -945,6 +1038,7 @@ export function MemoryView({
   const [loading, setLoading] = useState(() => !initialCached)
   const [loadError, setLoadError] = useState('')
   const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [graphSelectedId, setGraphSelectedId] = useState<string | null>(null)
   const [mutatingId, setMutatingId] = useState<string | null>(null)
   const reqSeqRef = useRef(0)
 
@@ -1055,6 +1149,7 @@ export function MemoryView({
       setHistoryFilter('all')
       setQuery('')
       setSelectedId(entryId)
+      setGraphSelectedId(entryId)
       window.requestAnimationFrame(() => {
         document
           .getElementById(`fb-mem-card-${entryId}`)
@@ -1073,6 +1168,7 @@ export function MemoryView({
   const handleBotChange = (nextBotId: string) => {
     onSelectedBotIdChange(nextBotId)
     setQuery('')
+    setGraphSelectedId(null)
     setNav((prev) => (prev.kind === 'history' ? prev : { kind: 'all' }))
   }
 
@@ -1125,6 +1221,11 @@ export function MemoryView({
         .catch(() => onToast('复制失败，请手动选中复制', false))
     },
     onSelectTag: (tag) => {
+      if (viewMode === 'graph') {
+        setQuery(`#${tag}`)
+        setGraphSelectedId(null)
+        return
+      }
       setQuery('')
       setNav((prev) =>
         isSameMemoryNav(prev, { kind: 'tag', tag }) ? { kind: 'all' } : { kind: 'tag', tag },
@@ -1157,68 +1258,194 @@ export function MemoryView({
     ? entriesById.get(selectedEntry.supersededBy)
     : undefined
 
+  const handleSwitchViewMode = (next: MemoryViewMode) => {
+    setViewMode(next)
+    if (next === 'columns' && graphSelectedId) {
+      const target = entriesById.get(graphSelectedId)
+      if (target) {
+        setNav(target.status === 'active' ? { kind: 'all' } : { kind: 'history' })
+        setSelectedId(target.id)
+      }
+    } else if (next === 'graph' && selectedId) {
+      setGraphSelectedId(selectedId)
+    }
+  }
+
   return (
-    <div className="fb-mem-frame">
-      <div className="fb-mem-workspace">
-        <MemoryNavColumn
-          bots={bots}
-          effectiveBotId={effectiveBotId}
-          onBotIdChange={handleBotChange}
-          nav={nav}
-          onSelectNav={(next) => {
-            setNav(next)
-            if (next.kind === 'history') setHistoryFilter('all')
-          }}
-          activeCount={activeScoped.length}
-          pinnedCount={pinnedCount}
-          historyCount={historyScoped.length}
-          typeCounts={typeCounts}
-          hierarchy={hierarchy}
-          topTags={topTags}
+    <div className="fb-mem-shell">
+      <div className="fb-view-bar">
+        <CountSegmentedSwitch<MemoryViewMode>
+          label="记忆库视图模式"
+          value={viewMode}
+          options={[
+            { value: 'graph', label: '关系图谱', count: scopedEntries.length },
+            { value: 'columns', label: '三列阅读' },
+          ]}
+          onChange={handleSwitchViewMode}
         />
 
-        <MemoryListColumn
-          heading={resolveNavHeading(nav, groups)}
-          nav={nav}
-          entries={visibleEntries}
-          selectedId={selectedEntry?.id ?? null}
-          onSelectId={setSelectedId}
-          query={query}
-          onQueryChange={setQuery}
-          sortBy={sortBy}
-          onSortByChange={setSortBy}
-          historyFilter={historyFilter}
-          onHistoryFilterChange={setHistoryFilter}
-          historyCounts={{
-            total: historyScoped.length,
-            superseded: historyStatusCounts.superseded,
-            archived: historyStatusCounts.archived,
-          }}
-          botsById={botsById}
-          showBotName={bots.length > 1 && !effectiveBotId}
-          groups={groups}
-          loading={loading}
-          hasActiveTotal={activeScoped.length > 0}
-          onClearToAll={() => {
-            setQuery('')
-            setHistoryFilter('all')
-            setNav({ kind: 'all' })
-          }}
-          onCreate={openCreate}
-        />
+        {viewMode === 'graph' && (
+          <div className="fb-view-bar-right">
+            {bots.length > 1 && (
+              <SelectMenu
+                size="sm"
+                align="end"
+                value={effectiveBotId}
+                options={[
+                  { value: '', label: '全部智能体' },
+                  ...bots.map((b) => ({ value: b.id, label: b.name })),
+                ]}
+                onChange={handleBotChange}
+              />
+            )}
+            <div className="fb-mem-col-search fb-mem-graph-search">
+              <IconSearchOutlineRegular size={14} className="fb-mem-search-icon" />
+              <input
+                type="text"
+                aria-label="筛选图谱节点或标签"
+                placeholder="筛选节点或 #标签…"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+              />
+              {query && (
+                <button
+                  type="button"
+                  className="fb-mem-search-clear"
+                  aria-label="清空搜索"
+                  onClick={() => setQuery('')}
+                >
+                  <IconCloseOutlineRegular size={12} />
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
 
-        <MemoryReaderColumn
-          entry={selectedEntry}
-          bot={selectedEntry ? botsById.get(selectedEntry.botId) : undefined}
-          groups={groups}
-          replacementEntry={replacementEntry}
-          predecessors={predecessors}
-          markdownPath={markdownPath}
-          mutating={Boolean(selectedEntry && mutatingId === selectedEntry.id)}
-          actions={readerActions}
-          onCreate={openCreate}
-          hasAnyEntries={scopedEntries.length > 0}
-        />
+      <div className="fb-mem-frame">
+        {viewMode === 'graph' ? (
+          <MemoryGraphView
+            entries={scopedEntries}
+            botsById={botsById}
+            groups={groups}
+            query={query}
+            selectedEntryId={graphSelectedId}
+            loading={loading}
+            onSelectEntryId={(id) => {
+              setGraphSelectedId(id)
+              if (id) setSelectedId(id)
+            }}
+            onCreate={openCreate}
+            renderDrawerReader={(entry, linkedItems) => {
+              const entryPreds = findSupersededPredecessors(entry.id, entries)
+              const entryReplacement = entry.supersededBy ? entriesById.get(entry.supersededBy) : undefined
+              return (
+                <MemoryReaderColumn
+                  entry={entry}
+                  bot={botsById.get(entry.botId)}
+                  groups={groups}
+                  replacementEntry={entryReplacement}
+                  predecessors={entryPreds}
+                  markdownPath={markdownPath}
+                  mutating={mutatingId === entry.id}
+                  actions={readerActions}
+                  onCreate={openCreate}
+                  hasAnyEntries={scopedEntries.length > 0}
+                  compact
+                  linkedItems={linkedItems}
+                  extraTool={
+                    <button
+                      type="button"
+                      className="fb-mem-tool-btn"
+                      title="在三列模式中精读此记忆"
+                      onClick={() => handleSwitchViewMode('columns')}
+                    >
+                      三列打开
+                    </button>
+                  }
+                  onCloseDrawer={() => setGraphSelectedId(null)}
+                />
+              )
+            }}
+          />
+        ) : (
+          <div className="fb-mem-workspace">
+            <MemoryNavColumn
+              bots={bots}
+              effectiveBotId={effectiveBotId}
+              onBotIdChange={handleBotChange}
+              nav={nav}
+              onSelectNav={(next) => {
+                setNav(next)
+                if (next.kind === 'history') setHistoryFilter('all')
+              }}
+              activeCount={activeScoped.length}
+              pinnedCount={pinnedCount}
+              historyCount={historyScoped.length}
+              typeCounts={typeCounts}
+              hierarchy={hierarchy}
+              topTags={topTags}
+            />
+
+            <MemoryListColumn
+              heading={resolveNavHeading(nav, groups)}
+              nav={nav}
+              entries={visibleEntries}
+              selectedId={selectedEntry?.id ?? null}
+              onSelectId={setSelectedId}
+              query={query}
+              onQueryChange={setQuery}
+              sortBy={sortBy}
+              onSortByChange={setSortBy}
+              historyFilter={historyFilter}
+              onHistoryFilterChange={setHistoryFilter}
+              historyCounts={{
+                total: historyScoped.length,
+                superseded: historyStatusCounts.superseded,
+                archived: historyStatusCounts.archived,
+              }}
+              botsById={botsById}
+              showBotName={bots.length > 1 && !effectiveBotId}
+              groups={groups}
+              loading={loading}
+              hasActiveTotal={activeScoped.length > 0}
+              onClearToAll={() => {
+                setQuery('')
+                setHistoryFilter('all')
+                setNav({ kind: 'all' })
+              }}
+              onCreate={openCreate}
+            />
+
+            <MemoryReaderColumn
+              entry={selectedEntry}
+              bot={selectedEntry ? botsById.get(selectedEntry.botId) : undefined}
+              groups={groups}
+              replacementEntry={replacementEntry}
+              predecessors={predecessors}
+              markdownPath={markdownPath}
+              mutating={Boolean(selectedEntry && mutatingId === selectedEntry.id)}
+              actions={readerActions}
+              onCreate={openCreate}
+              hasAnyEntries={scopedEntries.length > 0}
+              extraTool={
+                selectedEntry ? (
+                  <button
+                    type="button"
+                    className="fb-mem-tool-btn"
+                    title="切换到关系图谱并定位此记忆"
+                    onClick={() => {
+                      setGraphSelectedId(selectedEntry.id)
+                      setViewMode('graph')
+                    }}
+                  >
+                    图谱定位
+                  </button>
+                ) : undefined
+              }
+            />
+          </div>
+        )}
       </div>
     </div>
   )
