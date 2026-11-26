@@ -235,3 +235,32 @@ export function computeNiceDurationAxisMax(rawMaxMs: number): number {
   const hours = Math.ceil(rawMaxMs / 3_600_000)
   return Math.ceil(hours / 6) * 6 * 3_600_000
 }
+
+export function splitTelemetryVerb(label: string): {
+  readonly verb: string
+  readonly target: string
+} {
+  const trimmed = label.trim()
+  const idx = trimmed.indexOf(' ')
+  if (idx <= 0) return { verb: '', target: trimmed }
+  return {
+    verb: trimmed.slice(0, idx),
+    target: trimmed.slice(idx + 1).trim(),
+  }
+}
+
+export function resolveDbQueryTone(
+  maxMs: number,
+  slowThresholdMs = 100,
+): 'primary' | 'warn' | 'error' {
+  const threshold = Math.max(10, slowThresholdMs)
+  if (maxMs >= threshold) return 'error'
+  if (maxMs >= Math.max(30, threshold * 0.4)) return 'warn'
+  return 'primary'
+}
+
+export function resolveApiRouteTone(p95Ms: number): 'primary' | 'warn' | 'error' {
+  if (p95Ms >= 1_500) return 'error'
+  if (p95Ms >= 500) return 'warn'
+  return 'primary'
+}

@@ -51,7 +51,7 @@ export interface DatabasePerfSnapshot {
 }
 
 const QUERY_PERF_RING_SIZE = 512
-const QUERY_SLOW_THRESHOLD_MS = 10
+const QUERY_SLOW_THRESHOLD_MS = 100
 const INTEGRITY_CHECK_CACHE_TTL_MS = 5 * 60_000
 const MAX_FINGERPRINT_ENTRIES = 64
 

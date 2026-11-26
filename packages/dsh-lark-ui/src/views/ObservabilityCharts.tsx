@@ -16,7 +16,10 @@ import {
   formatLatencyMs,
   formatSubMs,
   formatTokens,
+  resolveApiRouteTone,
+  resolveDbQueryTone,
   resolveHeatmapLevel,
+  splitTelemetryVerb,
   WEEKDAY_LABELS,
 } from './observability-model.js'
 
@@ -771,6 +774,204 @@ export function ProductTimeSeriesChart({
 
 export type TechChartMode = 'latency' | 'vitals' | 'database'
 
+function DatabasePerfPanel({
+  database,
+}: {
+  readonly database?: ObservabilityDatabasePerf
+}) {
+  const [hovered, setHovered] = useState<
+    { readonly kind: 'api'; readonly index: number } | { readonly kind: 'sql'; readonly index: number } | null
+  >(null)
+
+  const db = database
+  const slowThreshold = db?.slowThresholdMs ?? 100
+  const slowCount = db?.slowQueryCount ?? 0
+  const topRoutes = (db?.apiRoutes ?? []).slice(0, 5)
+  const topQueries = (db?.slowQueries ?? []).slice(0, 5)
+  const rawMaxRoute = Math.max(0, ...topRoutes.map((r) => Math.max(r.p95Ms, r.avgMs)))
+  const rawMaxQuery = Math.max(0, ...topQueries.map((q) => Math.max(q.maxMs, q.avgMs)))
+  const maxRouteScale = rawMaxRoute > 0 ? computeNiceAxisMax(rawMaxRoute) : 100
+  const maxQueryScale = rawMaxQuery > 0 ? computeNiceAxisMax(rawMaxQuery) : 10
+  const thresholdPct =
+    maxQueryScale >= slowThreshold && slowThreshold / maxQueryScale <= 0.96
+      ? (slowThreshold / maxQueryScale) * 100
+      : null
+
+  const hoveredRoute = hovered?.kind === 'api' ? topRoutes[hovered.index] : undefined
+  const hoveredQuery = hovered?.kind === 'sql' ? topQueries[hovered.index] : undefined
+
+  return (
+    <div className="fb-obs-db-wrap" onMouseLeave={() => setHovered(null)}>
+      <div className="fb-obs-hud fb-num">
+        {hoveredRoute ? (
+          <>
+            <strong className="fb-mono">{hoveredRoute.route}</strong>
+            <span>P50 {formatSubMs(hoveredRoute.p50Ms)}</span>
+            <span>P95 {formatSubMs(hoveredRoute.p95Ms)}</span>
+            <span>均耗 {formatSubMs(hoveredRoute.avgMs)}</span>
+            <span>峰值 {formatSubMs(hoveredRoute.maxMs)}</span>
+            <span>{hoveredRoute.count} 次请求</span>
+          </>
+        ) : hoveredQuery ? (
+          <>
+            <strong className="fb-mono">{hoveredQuery.fingerprint}</strong>
+            <span>均耗 {formatSubMs(hoveredQuery.avgMs)}</span>
+            <span>峰值 {formatSubMs(hoveredQuery.maxMs)}</span>
+            <span>{formatCompactNumber(hoveredQuery.count)} 次执行</span>
+          </>
+        ) : (
+          <>
+            <span title={db ? `均耗 ${formatSubMs(db.avgMs)} · 近 ${db.sampleCount} 次采样窗口` : undefined}>
+              SQLite P50{' '}
+              <strong className="fb-mono">
+                {db && db.sampleCount > 0 ? formatSubMs(db.p50Ms) : '—'}
+              </strong>{' '}
+              / P95{' '}
+              <strong className="fb-mono">
+                {db && db.sampleCount > 0 ? formatSubMs(db.p95Ms) : '—'}
+              </strong>
+            </span>
+            <span>
+              峰值{' '}
+              <strong className="fb-mono">
+                {db && db.sampleCount > 0 ? formatSubMs(db.maxMs) : '—'}
+              </strong>
+            </span>
+            <span>
+              慢查询 (≥{slowThreshold}ms){' '}
+              <strong className="fb-mono" data-warn={slowCount > 0 ? '' : undefined}>
+                {slowCount}
+              </strong>
+            </span>
+            <span>
+              累计 <strong className="fb-mono">{formatCompactNumber(db?.totalQueries ?? 0)}</strong> 次
+            </span>
+            {db && db.integrityCheckMs > 0 && (
+              <span title="完整性校验结果 5 分钟缓存复用，不阻塞轮询">
+                校验 <strong className="fb-mono">{formatSubMs(db.integrityCheckMs)}</strong>
+              </span>
+            )}
+            {db?.lastCheckpointMs !== undefined && (
+              <span>
+                WAL <strong className="fb-mono">{formatSubMs(db.lastCheckpointMs)}</strong>
+              </span>
+            )}
+          </>
+        )}
+      </div>
+
+      <div className="fb-obs-db-split">
+        <div className="fb-obs-db-col">
+          <div className="fb-obs-db-col-head">
+            <span className="fb-obs-subhead">后端接口耗时 Top</span>
+            <span className="fb-obs-db-scale fb-mono">P95</span>
+          </div>
+          {topRoutes.length === 0 ? (
+            <div className="fb-obs-empty-inline">等待接口请求采样…</div>
+          ) : (
+            <div className="fb-obs-db-rows fb-num">
+              {topRoutes.map((r, idx) => {
+                const { verb, target } = splitTelemetryVerb(r.route)
+                const tone = resolveApiRouteTone(r.p95Ms)
+                const p95Pct = Math.max(3, Math.min(100, (r.p95Ms / maxRouteScale) * 100))
+                const p50Pct = Math.max(2, Math.min(p95Pct, (r.p50Ms / maxRouteScale) * 100))
+                const active = hovered?.kind === 'api' && hovered.index === idx
+                return (
+                  <div
+                    key={r.route}
+                    className="fb-obs-db-row"
+                    data-active={active ? '' : undefined}
+                    title={`${r.route} · P50 ${formatSubMs(r.p50Ms)} / P95 ${formatSubMs(r.p95Ms)} · ${r.count} 次`}
+                    onMouseEnter={() => setHovered({ kind: 'api', index: idx })}
+                  >
+                    <span className="fb-obs-db-name fb-mono">
+                      {verb && <span className="fb-obs-db-verb">{verb}</span>}
+                      <span className="fb-obs-db-target">{target}</span>
+                    </span>
+                    <div className="fb-obs-db-track" aria-hidden="true">
+                      <div className="fb-obs-db-tail" data-kind={tone} style={{ width: `${p95Pct}%` }} />
+                      <div className="fb-obs-db-core" data-kind={tone} style={{ width: `${p50Pct}%` }} />
+                    </div>
+                    <span
+                      className="fb-obs-db-val fb-mono"
+                      data-tone={tone === 'primary' ? undefined : tone}
+                    >
+                      {formatSubMs(r.p95Ms)}
+                    </span>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </div>
+
+        <div className="fb-obs-db-col" data-bordered="">
+          <div className="fb-obs-db-col-head">
+            <span className="fb-obs-subhead">SQLite 高耗时语句 Top</span>
+            <span className="fb-obs-db-scale fb-mono">峰值</span>
+          </div>
+          {topQueries.length === 0 ? (
+            <div className="fb-obs-empty-inline">暂无 SQLite 语句采样</div>
+          ) : (
+            <div className="fb-obs-db-rows fb-num">
+              {topQueries.map((q, idx) => {
+                const { verb, target } = splitTelemetryVerb(q.fingerprint)
+                const tone = resolveDbQueryTone(q.maxMs, slowThreshold)
+                const maxPct = Math.max(3, Math.min(100, (q.maxMs / maxQueryScale) * 100))
+                const avgPct = Math.max(2, Math.min(maxPct, (q.avgMs / maxQueryScale) * 100))
+                const active = hovered?.kind === 'sql' && hovered.index === idx
+                return (
+                  <div
+                    key={q.fingerprint}
+                    className="fb-obs-db-row"
+                    data-active={active ? '' : undefined}
+                    title={`${q.fingerprint} · 均耗 ${formatSubMs(q.avgMs)} / 峰值 ${formatSubMs(q.maxMs)} · ${q.count} 次`}
+                    onMouseEnter={() => setHovered({ kind: 'sql', index: idx })}
+                  >
+                    <span className="fb-obs-db-name fb-mono">
+                      {verb && <span className="fb-obs-db-verb">{verb}</span>}
+                      <span className="fb-obs-db-target">{target}</span>
+                    </span>
+                    <div className="fb-obs-db-track" aria-hidden="true">
+                      {thresholdPct !== null && (
+                        <span className="fb-obs-db-thresh" style={{ left: `${thresholdPct}%` }} />
+                      )}
+                      <div className="fb-obs-db-tail" data-kind={tone} style={{ width: `${maxPct}%` }} />
+                      <div className="fb-obs-db-core" data-kind={tone} style={{ width: `${avgPct}%` }} />
+                    </div>
+                    <span
+                      className="fb-obs-db-val fb-mono"
+                      data-tone={tone === 'primary' ? undefined : tone}
+                    >
+                      {formatSubMs(q.maxMs)}
+                    </span>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="fb-obs-legend fb-obs-db-legend fb-num">
+        <span className="fb-obs-legend-item">
+          <i className="fb-obs-dot" data-kind="primary" />
+          深色 P50 / 均耗 · 浅色 P95 / 峰值
+        </span>
+        <span className="fb-obs-legend-item">
+          <i className="fb-obs-dot" data-kind="warn" />
+          偏慢
+        </span>
+        <span className="fb-obs-legend-item">
+          <i className="fb-obs-dot" data-kind="error" />
+          慢查询 (SQL ≥{slowThreshold}ms / API ≥1.5s)
+        </span>
+        <span className="fb-obs-db-hint">悬停查看分位与次数</span>
+      </div>
+    </div>
+  )
+}
+
 export function TechnicalTimeSeriesChart({
   series,
   vitals,
@@ -793,112 +994,7 @@ export function TechnicalTimeSeriesChart({
   const plotH = H - padT - padB
 
   if (mode === 'database') {
-    const db = database
-    const routes = db?.apiRoutes ?? []
-    const queries = db?.slowQueries ?? []
-    const maxRouteMs = Math.max(10, ...routes.map((r) => r.p95Ms || r.avgMs))
-    const maxQueryMs = Math.max(5, ...queries.map((q) => q.maxMs || q.avgMs))
-    return (
-      <div ref={wrapRef} className="fb-obs-db-wrap">
-        <div className="fb-obs-db-kpis fb-num">
-          <div className="fb-obs-micro-cell">
-            <span className="fb-obs-micro-lbl">SQLite 查询 P50 / P95</span>
-            <strong className="fb-mono">
-              {db && db.sampleCount > 0 ? `${formatSubMs(db.p50Ms)} / ${formatSubMs(db.p95Ms)}` : '—'}
-            </strong>
-            <span className="fb-obs-muted">
-              均耗 {db && db.sampleCount > 0 ? formatSubMs(db.avgMs) : '—'} · 累计{' '}
-              {formatCompactNumber(db?.totalQueries ?? 0)} 次
-            </span>
-          </div>
-          <div className="fb-obs-micro-cell">
-            <span className="fb-obs-micro-lbl">最大单次查询</span>
-            <strong className="fb-mono">
-              {db && db.sampleCount > 0 ? formatSubMs(db.maxMs) : '—'}
-            </strong>
-            <span className="fb-obs-muted">近 {db?.sampleCount ?? 0} 次采样窗口</span>
-          </div>
-          <div className="fb-obs-micro-cell">
-            <span className="fb-obs-micro-lbl">慢查询 (≥{db?.slowThresholdMs ?? 10}ms)</span>
-            <strong className="fb-mono">{db?.slowQueryCount ?? 0}</strong>
-            <span className="fb-obs-muted">
-              {db?.lastCheckpointMs !== undefined
-                ? `WAL 整理 ${formatSubMs(db.lastCheckpointMs)}`
-                : '进程启动以来累计'}
-            </span>
-          </div>
-          <div className="fb-obs-micro-cell">
-            <span className="fb-obs-micro-lbl">完整性校验耗时</span>
-            <strong className="fb-mono">
-              {db && db.integrityCheckMs > 0 ? formatSubMs(db.integrityCheckMs) : '—'}
-            </strong>
-            <span className="fb-obs-muted">5 分钟缓存复用，不阻塞轮询</span>
-          </div>
-        </div>
-
-        <div className="fb-obs-db-split">
-          <div className="fb-obs-db-col">
-            <div className="fb-obs-subhead">后端接口响应耗时 (P50 / P95)</div>
-            {routes.length === 0 ? (
-              <div className="fb-obs-empty-inline">等待接口请求采样…</div>
-            ) : (
-              <div className="fb-obs-bars-list fb-num">
-                {routes.slice(0, 6).map((r) => {
-                  const tone = r.p95Ms >= 200 ? 'error' : r.p95Ms >= 50 ? 'warn' : 'primary'
-                  return (
-                    <div key={r.route} className="fb-obs-hrow">
-                      <div className="fb-obs-hrow-top">
-                        <code className="fb-obs-inline-code">{r.route}</code>
-                        <span className="fb-mono fb-obs-muted">
-                          {formatSubMs(r.p50Ms)} / P95 {formatSubMs(r.p95Ms)} · {r.count} 次
-                        </span>
-                      </div>
-                      <div className="fb-obs-mini-track">
-                        <div
-                          className="fb-obs-mini-fill"
-                          data-kind={tone}
-                          style={{ width: `${Math.max(4, Math.min(100, (r.p95Ms / maxRouteMs) * 100))}%` }}
-                        />
-                      </div>
-                    </div>
-                  )
-                })}
-              </div>
-            )}
-          </div>
-
-          <div className="fb-obs-db-col" data-bordered="">
-            <div className="fb-obs-subhead">SQLite 高耗时语句 Top (均耗 / 峰值)</div>
-            {queries.length === 0 ? (
-              <div className="fb-obs-empty-inline">暂无 SQLite 语句采样</div>
-            ) : (
-              <div className="fb-obs-bars-list fb-num">
-                {queries.slice(0, 6).map((q) => {
-                  const tone = q.maxMs >= 50 ? 'error' : q.maxMs >= 10 ? 'warn' : 'cache'
-                  return (
-                    <div key={q.fingerprint} className="fb-obs-hrow">
-                      <div className="fb-obs-hrow-top">
-                        <code className="fb-obs-inline-code">{q.fingerprint}</code>
-                        <span className="fb-mono fb-obs-muted">
-                          {formatSubMs(q.avgMs)} / 峰 {formatSubMs(q.maxMs)} · {q.count} 次
-                        </span>
-                      </div>
-                      <div className="fb-obs-mini-track">
-                        <div
-                          className="fb-obs-mini-fill"
-                          data-kind={tone}
-                          style={{ width: `${Math.max(4, Math.min(100, (q.maxMs / maxQueryMs) * 100))}%` }}
-                        />
-                      </div>
-                    </div>
-                  )
-                })}
-              </div>
-            )}
-          </div>
-        </div>
-      </div>
-    )
+    return <DatabasePerfPanel {...(database ? { database } : {})} />
   }
 
   if (mode === 'vitals') {

@@ -86,11 +86,7 @@ function formatDateOnly(ms?: number): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
 }
 
-function shortenMirrorPath(fullPath: string): string {
-  const normalized = fullPath.replace(/\\/g, '/')
-  const idx = normalized.lastIndexOf('/memory/')
-  return idx >= 0 ? normalized.slice(idx + 1) : normalized
-}
+const DEFAULT_VISIBLE_NAV_TAGS = 6
 
 interface MemoryReaderActions {
   readonly onTogglePin: (entry: MemoryEntry) => void
@@ -172,7 +168,15 @@ function MemoryNavColumn({
 }) {
   const [wsExpanded, setWsExpanded] = useState(true)
   const [chatExpanded, setChatExpanded] = useState(true)
+  const [tagsExpanded, setTagsExpanded] = useState(false)
   const singleBot = bots.length === 1 ? bots[0] : undefined
+  const activeTagOutsideDefault =
+    nav.kind === 'tag' &&
+    topTags.findIndex((item) => item.tag.toLowerCase() === nav.tag.toLowerCase()) >=
+      DEFAULT_VISIBLE_NAV_TAGS
+  const showAllTags = tagsExpanded || activeTagOutsideDefault
+  const visibleTags = showAllTags ? topTags : topTags.slice(0, DEFAULT_VISIBLE_NAV_TAGS)
+  const hiddenTagCount = Math.max(0, topTags.length - DEFAULT_VISIBLE_NAV_TAGS)
 
   return (
     <aside className="fb-mem-col-nav" aria-label="记忆目录导航">
@@ -249,15 +253,18 @@ function MemoryNavColumn({
 
       <div className="fb-mem-nav-group">
         <div className="fb-mem-nav-title">层级</div>
-        <button
-          type="button"
-          className="fb-mem-facet-row"
-          aria-current={isSameMemoryNav(nav, { kind: 'scope', scope: 'bot' }) ? 'page' : undefined}
-          onClick={() => onSelectNav({ kind: 'scope', scope: 'bot' })}
-        >
-          <span className="fb-mem-facet-label">全局记忆</span>
-          <span className="fb-mem-facet-cnt fb-num">{hierarchy.globalCount}</span>
-        </button>
+        <div className="fb-mem-branch-row">
+          <span className="fb-mem-branch-spacer" aria-hidden="true" />
+          <button
+            type="button"
+            className="fb-mem-facet-row fb-mem-branch-main"
+            aria-current={isSameMemoryNav(nav, { kind: 'scope', scope: 'bot' }) ? 'page' : undefined}
+            onClick={() => onSelectNav({ kind: 'scope', scope: 'bot' })}
+          >
+            <span className="fb-mem-facet-label">全局记忆</span>
+            <span className="fb-mem-facet-cnt fb-num">{hierarchy.globalCount}</span>
+          </button>
+        </div>
 
         <div className="fb-mem-tree-branch">
           <div className="fb-mem-branch-row">
@@ -378,7 +385,7 @@ function MemoryNavColumn({
         <div className="fb-mem-nav-group">
           <div className="fb-mem-nav-title">常用标签</div>
           <div className="fb-mem-tag-cloud">
-            {topTags.map((item) => {
+            {visibleTags.map((item) => {
               const active = isSameMemoryNav(nav, { kind: 'tag', tag: item.tag })
               return (
                 <button
@@ -395,6 +402,15 @@ function MemoryNavColumn({
                 </button>
               )
             })}
+            {hiddenTagCount > 0 && (
+              <button
+                type="button"
+                className="fb-mem-mini-tag fb-mem-tag-more"
+                onClick={() => setTagsExpanded((v) => !v)}
+              >
+                {showAllTags ? '收起' : `+${hiddenTagCount}`}
+              </button>
+            )}
           </div>
         </div>
       )}
@@ -577,12 +593,26 @@ function MemoryListColumn({
                 data-inactive={entry.status !== 'active' ? '' : undefined}
                 onClick={() => onSelectId(entry.id)}
               >
-                <div className="fb-mem-note-top">
-                  <span className="fb-mem-note-cat" data-type={entry.type}>
-                    <span className="fb-mem-type-dot" data-type={entry.type} aria-hidden="true" />
-                    <span>{typeMeta.label}</span>
+                <div className="fb-mem-note-title">{entry.title}</div>
+                <div className="fb-mem-note-meta fb-num">
+                  <span className="fb-mem-note-meta-left">
+                    <span
+                      className="fb-mem-type-dot"
+                      data-type={entry.type}
+                      title={typeMeta.label}
+                      aria-label={typeMeta.label}
+                    />
+                    <span className="fb-mem-note-scope" title={scopeInfo.fullTitle}>
+                      {scopeInfo.shortLabel}
+                    </span>
+                    {botName && (
+                      <>
+                        <span aria-hidden="true">·</span>
+                        <span className="fb-mem-note-scope">{botName}</span>
+                      </>
+                    )}
                   </span>
-                  <span className="fb-mem-note-time fb-num">
+                  <span className="fb-mem-note-time">
                     {entry.status === 'active' && entry.pinned && (
                       <IconPinFillRegular size={11} className="fb-mem-note-pin" />
                     )}
@@ -592,24 +622,10 @@ function MemoryListColumn({
                     {entry.status === 'archived' && (
                       <span className="fb-mem-status-chip">已归档</span>
                     )}
+                    {sortBy === 'recall' && entry.recallCount > 0 && (
+                      <span>召回 {entry.recallCount} 次</span>
+                    )}
                     <span>{formatTime(entry.lastVerifiedAtMs)}</span>
-                  </span>
-                </div>
-                <div className="fb-mem-note-title">{entry.title}</div>
-                <div className="fb-mem-note-excerpt">{summarizeMemoryExcerpt(entry.content)}</div>
-                <div className="fb-mem-note-foot fb-num">
-                  {botName && (
-                    <>
-                      <span className="fb-mem-note-scope">{botName}</span>
-                      <span aria-hidden="true">·</span>
-                    </>
-                  )}
-                  <span className="fb-mem-note-scope" title={scopeInfo.fullTitle}>
-                    {scopeInfo.label}
-                  </span>
-                  <span aria-hidden="true">·</span>
-                  <span className="fb-mem-note-recall">
-                    {entry.recallCount > 0 ? `召回 ${entry.recallCount} 次` : '未召回'}
                   </span>
                 </div>
               </button>
@@ -748,58 +764,40 @@ function MemoryReaderColumn({
 
       <div className="fb-mem-reader-scroll">
         <article className="fb-mem-paper">
-          <div className="fb-mem-paper-kicker">
-            <span className="fb-mem-note-cat" data-type={entry.type}>
-              <span className="fb-mem-type-dot" data-type={entry.type} aria-hidden="true" />
-              <span>{typeMeta.label}</span>
-            </span>
-            <span className="fb-mem-kicker-sep" aria-hidden="true">
-              ·
-            </span>
-            <span className="fb-mem-kicker-scope" title={scopeInfo.fullTitle}>
-              {scopeInfo.label}
-            </span>
-            {entry.status === 'superseded' && <Tag tone="neutral">已纠偏</Tag>}
-            {entry.status === 'archived' && <Tag tone="quiet">已归档</Tag>}
-            {entry.confidence === 'medium' && <Tag tone="quiet">中置信度</Tag>}
+          <div className="fb-mem-paper-eyebrow">
+            <div className="fb-mem-paper-kicker">
+              <span className="fb-mem-note-cat" data-type={entry.type}>
+                <span className="fb-mem-type-dot" data-type={entry.type} aria-hidden="true" />
+                <span>{typeMeta.label}</span>
+              </span>
+              {entry.status === 'superseded' && <Tag tone="neutral">已纠偏</Tag>}
+              {entry.status === 'archived' && <Tag tone="quiet">已归档</Tag>}
+              {entry.confidence === 'medium' && <Tag tone="quiet">中置信度</Tag>}
+            </div>
+            <div className="fb-mem-paper-meta fb-num">
+              <span
+                title={`创建于 ${formatFullTimestamp(entry.createdAtMs)} · 核验于 ${formatFullTimestamp(entry.lastVerifiedAtMs)}`}
+              >
+                核验于 {formatTime(entry.lastVerifiedAtMs)}
+              </span>
+              {entry.recallCount > 0 && (
+                <>
+                  <span aria-hidden="true">·</span>
+                  <span
+                    title={
+                      entry.lastRecalledAtMs
+                        ? `累计召回 ${entry.recallCount} 次 · 最近召回 ${formatFullTimestamp(entry.lastRecalledAtMs)}`
+                        : `累计召回 ${entry.recallCount} 次`
+                    }
+                  >
+                    召回 {entry.recallCount} 次
+                  </span>
+                </>
+              )}
+            </div>
           </div>
 
           <h2 className="fb-mem-paper-title">{entry.title}</h2>
-
-          <div className="fb-mem-paper-subline fb-num">
-            <button
-              type="button"
-              className="fb-mem-id-copy fb-mono"
-              title="点击复制记忆 ID"
-              onClick={() => actions.onCopy(entry.id, `已复制 ${entry.id}`)}
-            >
-              {entry.id}
-            </button>
-            <span aria-hidden="true">·</span>
-            <span
-              title={
-                entry.lastRecalledAtMs
-                  ? `累计召回 ${entry.recallCount} 次 · 最近召回 ${formatFullTimestamp(entry.lastRecalledAtMs)}`
-                  : `累计召回 ${entry.recallCount} 次`
-              }
-            >
-              累计召回 {entry.recallCount} 次
-            </span>
-            <span aria-hidden="true">·</span>
-            <span title={`创建于 ${formatFullTimestamp(entry.createdAtMs)} · 核验于 ${formatFullTimestamp(entry.lastVerifiedAtMs)}`}>
-              核验于 {formatTime(entry.lastVerifiedAtMs)}
-            </span>
-            <span aria-hidden="true">·</span>
-            <span>
-              {!isActive
-                ? entry.status === 'superseded'
-                  ? '已退出有效召回'
-                  : '已归档停用'
-                : entry.pinned
-                  ? '核心置顶 · 首轮优先注入'
-                  : '按需语义召回'}
-            </span>
-          </div>
 
           {!isActive && (entry.supersedeReason || entry.supersededBy) && (
             <div className="fb-mem-lineage-banner">
@@ -811,11 +809,14 @@ function MemoryReaderColumn({
                 <button
                   type="button"
                   className="fb-mem-foot-action"
+                  title={
+                    replacementEntry
+                      ? `替代后的新记忆：${replacementEntry.title}`
+                      : `查看 ${entry.supersededBy}`
+                  }
                   onClick={() => actions.onJumpToEntry(entry.supersededBy!)}
                 >
-                  <span>
-                    {replacementEntry ? `查看替代记忆：${replacementEntry.title}` : `查看 ${entry.supersededBy}`}
-                  </span>
+                  <span>查看替代后的新记忆</span>
                   <IconChevronRightOutlineRegular size={12} />
                 </button>
               )}
@@ -842,68 +843,56 @@ function MemoryReaderColumn({
 
           {hasFootLinks && (
             <div className="fb-mem-paper-foot">
-              {predecessors.map((old) => (
-                <div key={old.id} className="fb-mem-foot-row">
-                  <span className="fb-mem-foot-text">
-                    替代旧结论：{old.title}
-                    {old.supersededAtMs ? `（${formatDateOnly(old.supersededAtMs)}）` : ''}
+              {predecessors.map((old, idx) => (
+                <button
+                  key={old.id}
+                  type="button"
+                  className="fb-mem-foot-action"
+                  title={`被替代的旧记忆：${old.title}${old.supersededAtMs ? `（${formatDateOnly(old.supersededAtMs)}）` : ''}`}
+                  onClick={() => actions.onJumpToEntry(old.id)}
+                >
+                  <span>
+                    {predecessors.length === 1
+                      ? '查看被替代的旧记忆'
+                      : `查看被替代的旧记忆 #${idx + 1}`}
                   </span>
-                  <button
-                    type="button"
-                    className="fb-mem-foot-action"
-                    onClick={() => actions.onJumpToEntry(old.id)}
-                  >
-                    <span>查看旧版</span>
-                    <IconChevronRightOutlineRegular size={12} />
-                  </button>
-                </div>
+                  <IconChevronRightOutlineRegular size={12} />
+                </button>
               ))}
 
               {entry.supersededBy && isActive && (
-                <div className="fb-mem-foot-row">
-                  <span className="fb-mem-foot-text">
-                    关联替代记忆：{replacementEntry?.title ?? entry.supersededBy}
-                  </span>
-                  <button
-                    type="button"
-                    className="fb-mem-foot-action"
-                    onClick={() => actions.onJumpToEntry(entry.supersededBy!)}
-                  >
-                    <span>查看</span>
-                    <IconChevronRightOutlineRegular size={12} />
-                  </button>
-                </div>
+                <button
+                  type="button"
+                  className="fb-mem-foot-action"
+                  title={`替代后的新记忆：${replacementEntry?.title ?? entry.supersededBy}`}
+                  onClick={() => actions.onJumpToEntry(entry.supersededBy!)}
+                >
+                  <span>查看替代后的新记忆</span>
+                  <IconChevronRightOutlineRegular size={12} />
+                </button>
               )}
 
               {entry.sourceSessionId && actions.onOpenSession && (
-                <div className="fb-mem-foot-row">
-                  <span className="fb-mem-foot-text">
-                    来源会话：<span className="fb-mono">{entry.sourceSessionId}</span>
-                  </span>
-                  <button
-                    type="button"
-                    className="fb-mem-foot-action"
-                    onClick={() => actions.onOpenSession!(entry.sourceSessionId!)}
-                  >
-                    <span>打开会话</span>
-                    <IconChevronRightOutlineRegular size={12} />
-                  </button>
-                </div>
+                <button
+                  type="button"
+                  className="fb-mem-foot-action"
+                  title={`打开来源会话：${entry.sourceSessionId}`}
+                  onClick={() => actions.onOpenSession!(entry.sourceSessionId!)}
+                >
+                  <span>查看来源会话</span>
+                  <IconChevronRightOutlineRegular size={12} />
+                </button>
               )}
 
               {markdownPath && (
-                <div className="fb-mem-foot-row">
-                  <span className="fb-mem-foot-text" title={markdownPath}>
-                    只读镜像：<code className="fb-mono">{shortenMirrorPath(markdownPath)}</code>
-                  </span>
-                  <button
-                    type="button"
-                    className="fb-mem-foot-action"
-                    onClick={() => actions.onCopy(markdownPath, '已复制只读镜像路径')}
-                  >
-                    <span>复制路径</span>
-                  </button>
-                </div>
+                <button
+                  type="button"
+                  className="fb-mem-foot-action"
+                  title={`复制本地只读镜像路径：${markdownPath}`}
+                  onClick={() => actions.onCopy(markdownPath, '已复制只读镜像路径')}
+                >
+                  <span>复制本地镜像路径</span>
+                </button>
               )}
             </div>
           )}
