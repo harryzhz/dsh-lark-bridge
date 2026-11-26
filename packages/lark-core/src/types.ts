@@ -362,6 +362,7 @@ export const LarkBotConfigSchema = z.preprocess(
 
     // Card, signature & feedback
     sendIntermediateMessages: z.boolean().default(false),
+    longTurnProgressNotice: z.boolean().default(true),
     useInteractiveCard: z.boolean().default(true),
     dshSessionLinkInCard: z.boolean().default(true),
     sessionLinkGuestReadOnly: z.boolean().default(true),
@@ -776,6 +777,7 @@ export type RoutingDecision =
       readonly replyMode: GroupReplyMode
       readonly useCard: boolean
       readonly sendIntermediateMessages: boolean
+      readonly longTurnProgressNotice?: boolean
       readonly receivedReactionEmoji?: string
       readonly allowSilentEmptyReply: boolean
       readonly autoCloseAfterCompletion: boolean

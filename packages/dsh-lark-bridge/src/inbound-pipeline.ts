@@ -103,6 +103,15 @@ function canSilenceTurnByControl(
   return turn.allowSilentEmptyReply || turn.trigger === 'active-thread'
 }
 
+function isEligibleForProgressAnchor(decision: AgentDecision): boolean {
+  return (
+    decision.longTurnProgressNotice !== false &&
+    !decision.silentOnly &&
+    !decision.allowSilentEmptyReply &&
+    decision.trigger !== 'listener'
+  )
+}
+
 interface InflightCancelEntry {
   readonly botId: string
   readonly chatId: string
@@ -224,6 +233,8 @@ export interface ActiveTurnRecord {
   handoffTurns?: readonly RouterHandoffTurn[]
   sessionId?: string
   intermediateSentCount: number
+  progressAnchorSent?: boolean
+  queueAnchorSent?: boolean
   recoveryAttempts: number
   gracefulRecoveryAttempts: number
   lastActivityAtMs: number
@@ -248,6 +259,8 @@ export interface InboundPipelineHost {
   readonly runtimeLimiter?: RuntimeConcurrencyLimiter
   readonly listenerDebounceEnabled?: boolean
   readonly listenerDebounceOverrideMs?: number
+  readonly queueWaitAnchorMs?: number
+  readonly longTurnAnchorMs?: number
   readonly memory?: MemoryService
   readonly triage?: LlmTriageService
   readonly titleGuard: SessionTitleGuard
@@ -1644,6 +1657,7 @@ export class InboundPipeline {
       let releaseTurnSlot: (() => void) | undefined
       let runtimeLease: ConcurrencyLease | undefined
       let disposeBatchCancel: (() => void) | undefined
+      let disposeQueueAnchor: (() => void) | undefined
       let finishBatch: (() => void) | undefined
       let shouldDisposeEphemeral = false
       let shouldArchiveEphemeral = false
@@ -1754,6 +1768,74 @@ export class InboundPipeline {
           return
         }
 
+        let queueAnchorTimer: ReturnType<typeof setTimeout> | null = null
+        let queueWaitPhase: 'session' | 'runtime' = 'session'
+        const clearQueueAnchorTimer = () => {
+          if (queueAnchorTimer) {
+            clearTimeout(queueAnchorTimer)
+            queueAnchorTimer = null
+          }
+        }
+        const buildEffectiveDecision = (items: readonly QueuedWorkerTurnItem[]): AgentDecision => {
+          const tail = items[items.length - 1] ?? selfItem
+          return items.length === 1
+            ? tail.decision
+            : {
+                ...tail.decision,
+                allowSilentEmptyReply: items.every((i) => i.decision.allowSilentEmptyReply),
+                autoCloseAfterCompletion: items.every((i) => i.decision.autoCloseAfterCompletion),
+                silentOnly: items.every((i) => Boolean(i.decision.silentOnly)),
+              }
+        }
+        const armQueueAnchorTimer = () => {
+          const queueAnchorMs = this.host.queueWaitAnchorMs ?? 0
+          if (queueAnchorMs <= 0 || queueAnchorTimer || !isEligibleForProgressAnchor(boundDecision)) {
+            return
+          }
+          queueAnchorTimer = setTimeout(() => {
+            queueAnchorTimer = null
+            const targetItem = batchItems[batchItems.length - 1] ?? selfItem
+            const targetDecision = buildEffectiveDecision(batchItems)
+            if (
+              !isEligibleForProgressAnchor(targetDecision) ||
+              batchItems.some(
+                (i) => i.activeTurn.progressAnchorSent || i.activeTurn.intermediateSentCount > 0,
+              ) ||
+              (queueWaitPhase === 'session' &&
+                this.hasUnsettledQueueAnchorForSession(trackedSessionId)) ||
+              batchItems.every((i) => i.activeTurn.settled) ||
+              this.host.isDisposed()
+            ) {
+              return
+            }
+            const text =
+              queueWaitPhase === 'runtime'
+                ? '当前并发任务较多，已加入队列，稍后会自动继续处理。'
+                : '前序任务仍在处理中，已加入队列，完成后会继续处理。'
+            const auditSummary =
+              queueWaitPhase === 'runtime'
+                ? '并发排队较久，已发送排队等待提示'
+                : '同会话前序任务执行中，已发送排队等待提示'
+            void this.sendProgressAnchor({
+              bot,
+              transport,
+              msg: targetItem.msg,
+              decision: targetDecision,
+              activeTurn: targetItem.activeTurn,
+              ...(trackedSessionId ? { sessionId: trackedSessionId } : {}),
+              ...(resolvedChatName ? { resolvedChatName } : {}),
+              isQueueAnchor: true,
+              text,
+              auditSummary,
+              onRouteUpdated: (nextRouteKey) => {
+                trackedRouteKey = nextRouteKey
+              },
+            })
+          }, queueAnchorMs)
+          queueAnchorTimer.unref?.()
+        }
+
+        disposeQueueAnchor = clearQueueAnchorTimer
         const allowCoalesce =
           routerConfig.coalesceQueuedMessages && boundDecision.sessionMode !== 'per_message'
         const sessionSlotWaitStartMs = Date.now()
@@ -1771,15 +1853,18 @@ export class InboundPipeline {
           onLeaderRegistered: () => {
             leaderRegistered = true
             this.host.sessions.markTurnRegistered(trackedSessionId!)
+            armQueueAnchorTimer()
           },
         })
 
         if (slot.role === 'follower') {
+          clearQueueAnchorTimer()
           // Leader owns execution, reply delivery, activeTurn settlement, and reaction cleanup.
           batchItems = []
           return
         }
         if (slot.role === 'aborted') {
+          clearQueueAnchorTimer()
           batchItems = slot.orphanedItems
           const abortNowMs = Date.now()
           let anyCancelled = false
@@ -1860,19 +1945,8 @@ export class InboundPipeline {
         }
 
         if (pruneRecalledFromBatch()) {
+          clearQueueAnchorTimer()
           throw createRecalledAbortError()
-        }
-
-        const buildEffectiveDecision = (items: readonly QueuedWorkerTurnItem[]): AgentDecision => {
-          const tail = items[items.length - 1] ?? selfItem
-          return items.length === 1
-            ? tail.decision
-            : {
-                ...tail.decision,
-                allowSilentEmptyReply: items.every((i) => i.decision.allowSilentEmptyReply),
-                autoCloseAfterCompletion: items.every((i) => i.decision.autoCloseAfterCompletion),
-                silentOnly: items.every((i) => Boolean(i.decision.silentOnly)),
-              }
         }
 
         let latestItem = batchItems[batchItems.length - 1] ?? selfItem
@@ -1920,6 +1994,7 @@ export class InboundPipeline {
           batchItems.every((i) => this.isTurnRecalled(bot.id, i))
 
         if (this.host.runtimeLimiter) {
+          queueWaitPhase = 'runtime'
           const limiterSignal = linkAbortSignals([this.host.shutdownSignal, linkedCancel.signal])
           try {
             runtimeLease = await this.host.runtimeLimiter.acquire({
@@ -1930,6 +2005,7 @@ export class InboundPipeline {
             })
           } finally {
             limiterSignal.dispose()
+            clearQueueAnchorTimer()
           }
           if (!runtimeLease) {
             const waitDisabled = this.getBatchDisabledScope(bot.id, batchItems)
@@ -1941,6 +2017,8 @@ export class InboundPipeline {
             }
             throw new TurnAbortedError('disposed', '服务正在关闭，已取消排队轮次')
           }
+        } else {
+          clearQueueAnchorTimer()
         }
 
         const postLimiterDisabled = this.getBatchDisabledScope(bot.id, batchItems)
@@ -2018,6 +2096,52 @@ export class InboundPipeline {
           resolvedChatName,
         )
         this.executingTurnBySession.set(acquired.sessionId, executingTurnCtx)
+        const execAnchorMs = this.host.longTurnAnchorMs ?? 0
+        let execAnchorTimer: ReturnType<typeof setTimeout> | null = null
+        const clearExecAnchorTimer = () => {
+          if (execAnchorTimer) {
+            clearTimeout(execAnchorTimer)
+            execAnchorTimer = null
+          }
+        }
+        if (
+          execAnchorMs > 0 &&
+          isEligibleForProgressAnchor(effectiveDecision) &&
+          !batchItems.some(
+            (i) => i.activeTurn.progressAnchorSent || i.activeTurn.intermediateSentCount > 0,
+          )
+        ) {
+          execAnchorTimer = setTimeout(() => {
+            execAnchorTimer = null
+            if (
+              effectiveDecision.silentOnly ||
+              isSilenced() ||
+              isBatchCancelled() ||
+              this.host.isDisposed() ||
+              batchItems.some(
+                (i) => i.activeTurn.progressAnchorSent || i.activeTurn.intermediateSentCount > 0,
+              )
+            ) {
+              return
+            }
+            void this.sendProgressAnchor({
+              bot,
+              transport,
+              msg: latestItem.msg,
+              decision: effectiveDecision,
+              activeTurn: latestItem.activeTurn,
+              sessionId: acquired.sessionId,
+              ...(resolvedChatName ? { resolvedChatName } : {}),
+              executingTurnCtx,
+              text: '正在深入处理中，完成后会直接回复结论。',
+              auditSummary: '主引擎执行耗时较长，已发送进度提示',
+              onRouteUpdated: (nextRouteKey) => {
+                trackedRouteKey = nextRouteKey
+              },
+            })
+          }, execAnchorMs)
+          execAnchorTimer.unref?.()
+        }
         const execStartedMs = Date.now()
         let replyText: string
         let execMs = 0
@@ -2042,6 +2166,7 @@ export class InboundPipeline {
                       stepText,
                     )
                     if (intermediate.sent) {
+                      clearExecAnchorTimer()
                       const sentAtMs = Date.now()
                       latestItem.activeTurn.intermediateSentCount += 1
                       latestItem.activeTurn.lastActivityAtMs = sentAtMs
@@ -2070,6 +2195,7 @@ export class InboundPipeline {
           })
           execMs = Math.max(0, Date.now() - execStartedMs)
         } finally {
+          clearExecAnchorTimer()
           if (this.executingTurnBySession.get(acquired.sessionId) === executingTurnCtx) {
             this.executingTurnBySession.delete(acquired.sessionId)
           }
@@ -2108,6 +2234,7 @@ export class InboundPipeline {
         shouldDisposeEphemeral = failure.dispose
         shouldArchiveEphemeral = failure.archive
       } finally {
+        disposeQueueAnchor?.()
         disposeBatchCancel?.()
         runtimeLease?.release()
         for (const item of batchItems) {
@@ -3745,6 +3872,110 @@ export class InboundPipeline {
       if (resolved?.name) modelLabel = resolved.name
     }
     return [runtimeLabel, modelLabel].filter(Boolean).join(' · ')
+  }
+
+  private hasUnsettledQueueAnchorForSession(sessionId: string | undefined): boolean {
+    if (!sessionId) return false
+    for (const turn of this.activeTurns.values()) {
+      if (!turn.settled && turn.sessionId === sessionId && turn.queueAnchorSent) {
+        return true
+      }
+    }
+    return false
+  }
+
+  private async sendProgressAnchor(input: {
+    readonly bot: LarkBotConfig
+    readonly transport: LarkBotTransport
+    readonly msg: InboundLarkMessage
+    readonly decision: AgentDecision
+    readonly activeTurn: ActiveTurnRecord
+    readonly sessionId?: string
+    readonly resolvedChatName?: string
+    readonly executingTurnCtx?: ExecutingTurnContext
+    readonly isQueueAnchor?: boolean
+    readonly text: string
+    readonly auditSummary: string
+    readonly onRouteUpdated?: (nextRouteKey: string) => void
+  }): Promise<boolean> {
+    const {
+      bot,
+      transport,
+      msg,
+      decision,
+      activeTurn,
+      sessionId,
+      resolvedChatName,
+      executingTurnCtx,
+      isQueueAnchor = false,
+      text,
+      auditSummary,
+      onRouteUpdated,
+    } = input
+    if (
+      activeTurn.progressAnchorSent ||
+      activeTurn.settled ||
+      activeTurn.silencedByControl ||
+      activeTurn.cancelledByRecall ||
+      Boolean(activeTurn.cancelledByDisable) ||
+      Boolean(this.getDisabledScope(bot.id, msg.chatType, msg.chatId)) ||
+      this.isMessageRecalled(bot.id, msg.messageId) ||
+      this.host.isDisposed()
+    ) {
+      return false
+    }
+    activeTurn.progressAnchorSent = true
+    if (isQueueAnchor) activeTurn.queueAnchorSent = true
+    try {
+      const sent = await transport.sendReply({
+        chatId: msg.chatId,
+        replyToMessageId: msg.messageId,
+        replyMode: decision.replyMode,
+        text,
+      })
+      const routeKey = this.syncReplyRouteAliases(bot, msg, decision, sent)
+      const nowMs = Date.now()
+      activeTurn.lastActivityAtMs = nowMs
+      activeTurn.lastPersistedActivityAtMs = nowMs
+      if (routeKey !== decision.routeKey) {
+        activeTurn.routeKey = routeKey
+        onRouteUpdated?.(routeKey)
+        if (executingTurnCtx) executingTurnCtx.routeKey = routeKey
+      }
+      if (executingTurnCtx) {
+        if (sent?.threadId) {
+          executingTurnCtx.threadId = sent.threadId
+          executingTurnCtx.replyInThread = true
+        }
+        if (sent?.rootId) {
+          executingTurnCtx.rootId = sent.rootId
+          if (executingTurnCtx.replyInThread) {
+            executingTurnCtx.replyToMessageId = sent.rootId
+          }
+        }
+      }
+      this.host.store.markBindingReplied(routeKey)
+      this.host.store.recordEvent({
+        botId: bot.id,
+        chatId: msg.chatId,
+        ...(resolvedChatName ? { chatName: resolvedChatName } : {}),
+        routeKey,
+        ...(sessionId ? { sessionId } : {}),
+        traceId: activeTurn.traceId,
+        kind: 'lifecycle',
+        summary: auditSummary,
+      })
+      return true
+    } catch (err) {
+      if (isLarkMessageRecalledError(err)) {
+        this.markMessageRecalled(bot.id, msg.messageId)
+        return false
+      }
+      this.host.ctx.logger.warn(
+        `[lark-bridge][trace=${activeTurn.traceId}][bot=${bot.id}] progress anchor send failed: ${err instanceof Error ? err.message : String(err)}`,
+      )
+      return false
+    }
   }
 
   private async deliverIntermediateReply(

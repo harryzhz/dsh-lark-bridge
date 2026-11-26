@@ -141,6 +141,7 @@ export function newBotConfig(
     adminUsers: [],
     adminUserProfiles: [],
     sendIntermediateMessages: false,
+    longTurnProgressNotice: true,
     useInteractiveCard: true,
     dshSessionLinkInCard: true,
     sessionLinkGuestReadOnly: true,
@@ -177,6 +178,7 @@ function toBotConfig(record: BotRecord): BotConfig {
     larkAppSecret: '',
     adminUsers: cloned.adminUsers ?? [],
     adminUserProfiles: cloned.adminUserProfiles ?? [],
+    longTurnProgressNotice: cloned.longTurnProgressNotice ?? true,
     sessionLinkGuestReadOnly: cloned.sessionLinkGuestReadOnly ?? true,
     router: {
       ...DEFAULT_ROUTER_CONFIG,
@@ -1249,6 +1251,16 @@ function BotConversationAndMessageSection({
           label="发送中间过程消息"
           checked={Boolean(draft.sendIntermediateMessages)}
           onChange={(sendIntermediateMessages) => patch({ sendIntermediateMessages })}
+        />
+      </SettingRow>
+      <SettingRow
+        title="长任务进度提示"
+        desc="排队等待或深度处理耗时较长时自动补发一条简短提示，避免长时间无回应"
+      >
+        <Switch
+          label="长任务进度提示"
+          checked={draft.longTurnProgressNotice !== false}
+          onChange={(longTurnProgressNotice) => patch({ longTurnProgressNotice })}
         />
       </SettingRow>
 

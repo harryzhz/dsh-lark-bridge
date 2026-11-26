@@ -927,4 +927,65 @@ describe('Smart triage config, per-group overrides & protocol', () => {
       expect(threadDecision.listenerDebounceMs).toBeUndefined()
     }
   })
+
+  it('tightens passive listener and delegation followup prompts while preserving business-screenshot handoff guardrails and longTurnProgressNotice default', () => {
+    const listenerPrompt = buildTriageSystemPrompt({
+      botName: 'TriageBot',
+      hasActiveWorker: false,
+      trigger: 'listener',
+      listenerName: '项目讨论',
+      listenerPrompt: '仅在需要核查代码或故障时介入',
+      delegationFollowupEnabled: true,
+    })
+    expect(listenerPrompt).toContain('收紧旁听误触发')
+    expect(listenerPrompt).toContain('首次')
+    expect(listenerPrompt).toContain('报错截图、监控图表')
+
+    const silentDelegationPrompt = buildTriageSystemPrompt({
+      botName: 'TriageBot',
+      hasActiveWorker: false,
+      trigger: 'listener',
+      delegationFollowupEnabled: true,
+      silentOnly: true,
+    })
+    expect(silentDelegationPrompt).toContain('首次')
+    expect(silentDelegationPrompt).toContain('同一事项的后续来回沟通')
+
+    const mentionPrompt = buildTriageSystemPrompt({
+      botName: 'TriageBot',
+      hasActiveWorker: false,
+      trigger: 'mention',
+    })
+    expect(mentionPrompt).toContain('纯表情包/梗图/生活趣图')
+    expect(mentionPrompt).toContain('业务图表/报错截图')
+
+    const botDefault = makeBot()
+    expect(botDefault.longTurnProgressNotice).toBe(true)
+    const mentionDecision = decideLarkRouting(
+      botDefault,
+      makeMsg({
+        text: '@_user_1 查下日志',
+        mentions: [{ key: '@_user_1', openId: 'ou_bot', name: 'TriageBot' }],
+      }),
+      { hasActiveSessionForRoute: () => false },
+    )
+    expect(mentionDecision.action).toBe('agent')
+    if (mentionDecision.action === 'agent') {
+      expect(mentionDecision.longTurnProgressNotice).toBe(true)
+    }
+
+    const botDisabled = makeBot({ longTurnProgressNotice: false })
+    const offDecision = decideLarkRouting(
+      botDisabled,
+      makeMsg({
+        text: '@_user_1 查下日志',
+        mentions: [{ key: '@_user_1', openId: 'ou_bot', name: 'TriageBot' }],
+      }),
+      { hasActiveSessionForRoute: () => false },
+    )
+    expect(offDecision.action).toBe('agent')
+    if (offDecision.action === 'agent') {
+      expect(offDecision.longTurnProgressNotice).toBe(false)
+    }
+  })
 })
