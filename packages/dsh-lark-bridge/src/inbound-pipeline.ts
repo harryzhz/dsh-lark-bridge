@@ -2351,10 +2351,19 @@ export class InboundPipeline {
       ...currentImageTargets,
     ]
 
-    const bypass = shouldFastBypassTriage(msg, decision, routerConfig.bypass, {
+    const initialBinding = this.host.store.getBinding(decision.routeKey)
+    const fastBypass = shouldFastBypassTriage(msg, decision, routerConfig.bypass, {
       maxTriageImages: routerConfig.maxTriageImages,
       extraImageCount: quotedImageTargets.length,
     })
+    const bypass = fastBypass.bypass
+      ? fastBypass
+      : decision.trigger === 'mention' && Boolean(initialBinding)
+        ? {
+            bypass: true,
+            reason: '显式 @ 智能体且话题已有活跃会话，直通主运行时',
+          }
+        : fastBypass
     if (bypass.bypass) {
       const bypassDisabled = getDisabledScope()
       if (bypassDisabled) {
@@ -2546,8 +2555,9 @@ export class InboundPipeline {
     })
 
     if (
-      result.verdict.action === 'silent' ||
-      (decision.silentOnly && result.verdict.action === 'quick_reply')
+      decision.trigger !== 'mention' &&
+      (result.verdict.action === 'silent' ||
+        (decision.silentOnly && result.verdict.action === 'quick_reply'))
     ) {
       this.host.store.recordMetric({
         botId: bot.id,

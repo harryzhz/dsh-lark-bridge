@@ -704,4 +704,134 @@ describe('Smart triage config, per-group overrides & protocol', () => {
     expect(downgraded.action).toBe('silent')
     expect(downgraded.reason).toContain('后台观察模式禁止直接回复')
   })
+
+  it('enforces explicit @mention no-silent invariant and blocks listener/active-thread quick_reply hijacking on peer mentions', () => {
+    // 1. Explicit @mention: prompt forbids silent, and parseTriageVerdict upgrades accidental silent -> handoff
+    const mentionSys = buildTriageSystemPrompt({
+      botName: 'TriageBot',
+      hasActiveWorker: false,
+      trigger: 'mention',
+    })
+    expect(mentionSys).toContain('严禁选择 `silent`')
+
+    const mentionActiveSys = buildTriageSystemPrompt({
+      botName: 'TriageBot',
+      hasActiveWorker: true,
+      trigger: 'mention',
+    })
+    expect(mentionActiveSys).toContain('禁止使用 `silent` 与 `quick_reply`')
+
+    const mentionSilentGuarded = parseTriageVerdict({
+      toolCalls: [
+        {
+          name: 'route_message',
+          arguments: '{"action":"silent","reason":"吐槽插话无需回应"}',
+        },
+      ],
+      hasActiveWorker: false,
+      trigger: 'mention',
+    })
+    expect(mentionSilentGuarded.action).toBe('handoff')
+    expect(mentionSilentGuarded.reason).toContain('显式 @ 智能体禁止静默')
+    expect(mentionSilentGuarded.fallback).toBeUndefined()
+
+    // Explicit @mention without active worker still allows quick_reply for lightweight banter
+    const mentionQuickReply = parseTriageVerdict({
+      toolCalls: [
+        {
+          name: 'route_message',
+          arguments: '{"action":"quick_reply","reason":"轻松打招呼","reply_text":"在的，有什么事？"}',
+        },
+      ],
+      hasActiveWorker: false,
+      trigger: 'mention',
+    })
+    expect(mentionQuickReply).toEqual({
+      action: 'quick_reply',
+      reason: '轻松打招呼',
+      replyText: '在的，有什么事？',
+    })
+
+    // 2. Listener / unmentioned active-thread mentioning another peer (e.g. another bot):
+    //    prompt carries bot_name + peer_mentions warning and parser intercepts quick_reply -> silent
+    const listenerPeerSys = buildTriageSystemPrompt({
+      botName: 'TriageBot',
+      hasActiveWorker: false,
+      trigger: 'listener',
+      peerMentions: ['PeerBot'],
+    })
+    expect(listenerPeerSys).toContain('PeerBot')
+    expect(listenerPeerSys).toContain('禁止使用 `quick_reply` 抢答')
+
+    const listenerPeerUser = buildTriageUserMessage({
+      botName: 'TriageBot',
+      trigger: 'listener',
+      senderName: 'Sam',
+      senderType: 'user',
+      peerMentions: ['PeerBot'],
+      userText: '@PeerBot 重生了吗？',
+      hasActiveWorker: false,
+      recentMessages: [],
+    })
+    expect(listenerPeerUser).toContain('bot_name="TriageBot"')
+    expect(listenerPeerUser).toContain('peer_mentions="PeerBot"')
+
+    const listenerHijackBlocked = parseTriageVerdict({
+      toolCalls: [
+        {
+          name: 'route_message',
+          arguments: '{"action":"quick_reply","reason":"轻松寒暄","reply_text":"重生了！"}',
+        },
+      ],
+      hasActiveWorker: false,
+      trigger: 'listener',
+      peerMentions: ['PeerBot'],
+    })
+    expect(listenerHijackBlocked.action).toBe('silent')
+    expect(listenerHijackBlocked.reason).toContain('仅 @ PeerBot')
+    expect(listenerHijackBlocked.reason).toContain('已拦截抢答快回')
+
+    const activeThreadHijackBlocked = parseTriageVerdict({
+      toolCalls: [
+        {
+          name: 'route_message',
+          arguments: '{"action":"quick_reply","reason":"轻松寒暄","reply_text":"收到"}',
+        },
+      ],
+      hasActiveWorker: false,
+      trigger: 'active-thread',
+      peerMentions: ['PeerBot', 'Alex', 'Sam'],
+    })
+    expect(activeThreadHijackBlocked.action).toBe('silent')
+    expect(activeThreadHijackBlocked.reason).toContain('PeerBot、Alex等')
+
+    // Legitimate listener handoff (e.g. delegation followup) and substitute quick_reply remain allowed
+    expect(
+      parseTriageVerdict({
+        toolCalls: [
+          {
+            name: 'route_message',
+            arguments: '{"action":"handoff","reason":"明确行动委派需登记提醒"}',
+          },
+        ],
+        hasActiveWorker: false,
+        trigger: 'listener',
+        peerMentions: ['Alex'],
+      }),
+    ).toEqual({ action: 'handoff', reason: '明确行动委派需登记提醒' })
+
+    expect(
+      parseTriageVerdict({
+        toolCalls: [
+          {
+            name: 'route_message',
+            arguments: '{"action":"quick_reply","reason":"代答简单问候","reply_text":"在的，请讲"}',
+          },
+        ],
+        hasActiveWorker: false,
+        trigger: 'substitute',
+        peerMentions: ['Alex'],
+      }),
+    ).toEqual({ action: 'quick_reply', reason: '代答简单问候', replyText: '在的，请讲' })
+  })
 })
