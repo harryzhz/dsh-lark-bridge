@@ -145,6 +145,7 @@ interface ExternalRuntimeDirectory {
     runtimeId: string,
     profileId?: string,
   ): Promise<readonly ExternalModelMeta[]>
+  resolveSessionIdByExternalId?(externalId: string): string | undefined
 }
 
 interface AgentPresetRow {
@@ -720,6 +721,12 @@ export class RuntimeCatalog {
       .filter((o) => o.group === 'builtin')
       .sort((a, b) => (BUILTIN_ORDER[a.id] ?? 99) - (BUILTIN_ORDER[b.id] ?? 99))
     return [...customItems, ...builtinItems]
+  }
+
+  resolveSessionIdByExternalId(externalId: string): string | undefined {
+    const clean = externalId.trim()
+    if (!clean) return undefined
+    return this.directory()?.resolveSessionIdByExternalId?.(clean)
   }
 
   private directory(): ExternalRuntimeDirectory | undefined {

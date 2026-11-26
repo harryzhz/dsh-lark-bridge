@@ -319,6 +319,7 @@ export {
 export {
   TurnAbortedError,
   TurnFinalReplyTracker,
+  detectRuntimeExecutorErrorBanner,
   runTurnAndCollectReply,
   type RunTurnOptions,
   type TurnAbortKind,

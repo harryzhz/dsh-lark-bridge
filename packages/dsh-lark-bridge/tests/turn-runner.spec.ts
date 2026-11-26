@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from 'vitest'
 import {
   TurnAbortedError,
   TurnFinalReplyTracker,
+  detectRuntimeExecutorErrorBanner,
   runTurnAndCollectReply,
 } from '../src/turn-runner.js'
 
@@ -667,5 +668,94 @@ describe('TurnFinalReplyTracker & runTurnAndCollectReply', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it('rejects standalone runtime executor error banners while allowing multi-line replies quoting the banner', async () => {
+    expect(
+      detectRuntimeExecutorErrorBanner(
+        '\n⚠ agent executor error: expected pending tool step at index 79, got status CORTEX_STEP_STATUS_CANCELED\n',
+      ),
+    ).toBe(
+      'agent executor error: expected pending tool step at index 79, got status CORTEX_STEP_STATUS_CANCELED',
+    )
+    expect(
+      detectRuntimeExecutorErrorBanner(
+        '排查结论：\n⚠ agent executor error: expected pending tool step at index 79\n根因已修复。',
+      ),
+    ).toBeUndefined()
+    expect(detectRuntimeExecutorErrorBanner('正常回答文本')).toBeUndefined()
+
+    const handlers: Array<(s: Session, ev: SessionEvent) => void> = []
+    const session = { id: 'session-executor-banner' } as unknown as Session
+    const ctx = {
+      on(_event: string, fn: (s: Session, ev: SessionEvent) => void) {
+        handlers.push(fn)
+        return () => {
+          const idx = handlers.indexOf(fn)
+          if (idx >= 0) handlers.splice(idx, 1)
+        }
+      },
+    } as unknown as Context
+    const emit = (ev: Record<string, unknown>) => {
+      for (const h of [...handlers]) h(session, ev as unknown as SessionEvent)
+    }
+
+    const failingBannerAgent = {
+      session,
+      followup(msg: { id?: string }) {
+        emit({ type: 'turn/start', data: { turn: 1 } })
+        emit({ type: 'user/message', data: { id: msg.id, source: { kind: 'user' } } })
+        emit({
+          type: 'assistant/message',
+          data: {
+            turn: 1,
+            step: 1,
+            message: {
+              content: [
+                {
+                  type: 'text',
+                  text: '\n⚠ agent executor error: expected pending tool step at index 79, got status CORTEX_STEP_STATUS_CANCELED\n',
+                },
+              ],
+            },
+          },
+        })
+        emit({ type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+      },
+    } as unknown as Agent
+
+    await expect(
+      runTurnAndCollectReply(ctx, failingBannerAgent, [{ type: 'text', text: 'check' }]),
+    ).rejects.toThrow(
+      'agent executor error: expected pending tool step at index 79, got status CORTEX_STEP_STATUS_CANCELED',
+    )
+
+    const quotedExplanationAgent = {
+      session,
+      followup(msg: { id?: string }) {
+        emit({ type: 'turn/start', data: { turn: 2 } })
+        emit({ type: 'user/message', data: { id: msg.id, source: { kind: 'user' } } })
+        emit({
+          type: 'assistant/message',
+          data: {
+            turn: 2,
+            step: 1,
+            message: {
+              content: [
+                {
+                  type: 'text',
+                  text: '复盘说明：\n⚠ agent executor error: expected pending tool step at index 79\n已通过进程池隔离修复。',
+                },
+              ],
+            },
+          },
+        })
+        emit({ type: 'turn/end', data: { turn: 2, reason: { kind: 'completed' } } })
+      },
+    } as unknown as Agent
+
+    await expect(
+      runTurnAndCollectReply(ctx, quotedExplanationAgent, [{ type: 'text', text: 'explain' }]),
+    ).resolves.toContain('已通过进程池隔离修复')
   })
 })

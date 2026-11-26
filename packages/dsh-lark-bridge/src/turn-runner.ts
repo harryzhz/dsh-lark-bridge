@@ -200,6 +200,21 @@ export interface RunTurnOptions {
  * response text for that turn; when `options.onIntermediate` is supplied, intermediate
  * progress messages are dispatched immediately as they arrive.
  */
+const RUNTIME_EXECUTOR_ERROR_BANNER_RE = /^⚠\s*agent executor error:\s*([^\r\n]+)$/u
+
+/**
+ * Secondary guard against external ACP runtimes that surface internal fatal
+ * executor errors (e.g. `⚠ agent executor error: ...`) as a standalone plain
+ * assistant message followed by `turn/end (completed)`.
+ */
+export function detectRuntimeExecutorErrorBanner(text: string): string | undefined {
+  const trimmed = text.trim()
+  if (!trimmed) return undefined
+  const match = RUNTIME_EXECUTOR_ERROR_BANNER_RE.exec(trimmed)
+  if (!match?.[1]) return undefined
+  return `agent executor error: ${match[1].trim()}`
+}
+
 export function runTurnAndCollectReply(
   ctx: Context,
   agent: Agent,
@@ -414,7 +429,17 @@ export function runTurnAndCollectReply(
             // cannot invoke `fail()` and falsely reject an already completed turn.
             phase = 'flushing'
             cleanup()
-            void tracker.flush().then(() => succeed(tracker.result()))
+            void tracker.flush().then(() => {
+              const finalReply = tracker.result()
+              const executorError = detectRuntimeExecutorErrorBanner(finalReply)
+              if (executorError) {
+                if (phase === 'settled') return
+                phase = 'settled'
+                reject(new Error(executorError))
+                return
+              }
+              succeed(finalReply)
+            })
           }
         },
         { global: true },
