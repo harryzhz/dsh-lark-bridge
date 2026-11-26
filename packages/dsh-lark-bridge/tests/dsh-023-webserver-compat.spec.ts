@@ -114,9 +114,15 @@ function createSimulatedDsh023Host(options: {
     }),
   }
 
-  // Note: intentionally omits `authenticatedUrl` (removed in DSH 0.2.3-alpha.2).
-  const connection: ConnectionAdmitter & { fetch: { register: ReturnType<typeof vi.fn> } } = {
+  const makeConnectionForDeps = (
+    deps: readonly string[],
+  ): ConnectionAdmitter & { fetch: { register: ReturnType<typeof vi.fn> } } => ({
     admit: (req) => {
+      // Mirrors Cordis 4.2 + DSH 0.2.3-alpha.2 strict sub-service injection:
+      // `HostConnectionService.admit()` accesses `this.authentication` (`connection.authentication`).
+      if (!deps.includes('connection.authentication')) {
+        throw new Error('cannot get property "connection.authentication" without inject')
+      }
       if (!isTrustedRequest(req)) return { rejection: 403 }
       if (isOwnerCookieAuthed) return { peer: { principal: { kind: 'owner' } } }
       return { rejection: admitRejection }
@@ -124,7 +130,10 @@ function createSimulatedDsh023Host(options: {
     fetch: {
       register: vi.fn(() => () => {}),
     },
-  }
+  })
+
+  // Note: intentionally omits `authenticatedUrl` (removed in DSH 0.2.3-alpha.2).
+  const connection = makeConnectionForDeps(['webServer', 'connection', 'connection.authentication'])
 
   const on = vi.fn((event: string, listener: unknown) => {
     if (event === 'webserver/request') {
@@ -150,33 +159,37 @@ function createSimulatedDsh023Host(options: {
     }
   })
 
-  const ctx = {
-    logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn() },
-    get: (key: string) => {
-      if (key === 'webServer') return webServer
-      if (key === 'connection') return connection
-      return undefined
-    },
-    effect: (fn: () => void | (() => void | Promise<void>)) => {
-      const cleanup = fn()
-      if (typeof cleanup === 'function') disposers.push(cleanup)
-      return () => {}
-    },
-    inject: (_deps: readonly string[], cb: (subCtx: unknown) => void) => {
-      cb({
-        ...ctx,
-        webServer,
-        connection,
-      })
-    },
-    on,
-    emit,
-    llm: { listProviders: () => [], listModels: async () => [] },
-    agents: { get: () => undefined },
-    sessions: { list: () => [] },
-    webServer,
-    connection,
-  } as unknown as Context
+  const makeScopedCtx = (deps: readonly string[]): Context => {
+    const scopedConn = makeConnectionForDeps(deps)
+    const scoped = {
+      logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn() },
+      get: (key: string) => {
+        if (key === 'webServer') return webServer
+        if (key === 'connection') return scopedConn
+        if (key === 'connection.authentication') return { authenticate: vi.fn() }
+        return undefined
+      },
+      effect: (fn: () => void | (() => void | Promise<void>)) => {
+        const cleanup = fn()
+        if (typeof cleanup === 'function') disposers.push(cleanup)
+        return () => {}
+      },
+      inject: (childDeps: readonly string[], cb: (subCtx: unknown) => void) => {
+        const merged = [...new Set([...deps, ...childDeps])]
+        cb(makeScopedCtx(merged))
+      },
+      on,
+      emit,
+      llm: { listProviders: () => [], listModels: async () => [] },
+      agents: { get: () => undefined },
+      sessions: { list: () => [] },
+      webServer,
+      connection: scopedConn,
+    }
+    return scoped as unknown as Context
+  }
+
+  const ctx = makeScopedCtx([])
 
   const dispatchHttp = (reqOpts: {
     readonly method?: string

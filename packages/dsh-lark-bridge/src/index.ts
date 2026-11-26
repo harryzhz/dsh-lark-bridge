@@ -95,44 +95,60 @@ export async function apply(ctx: Context, rawConfig: LarkBridgeConfig): Promise<
   //    Desktop session handoff (`/api/lark-bridge/open`), and sync the live listener origin
   //    (including Desktop's OS-assigned port) into `cli-endpoint.json`.
   ctx.inject(['webServer', 'connection'], (webCtx) => {
-    try {
-      const origin = webCtx.webServer.getOrigin()
-      if (origin) manager.bindLiveWebOrigin(origin, webCtx.connection, webCtx.webServer)
-    } catch {
-      // Listener may not expose an origin on unusual bind addresses.
+    const mountHttpSurface = (routeCtx: typeof webCtx): void => {
+      try {
+        const origin = routeCtx.webServer.getOrigin()
+        if (origin) manager.bindLiveWebOrigin(origin, routeCtx.connection, routeCtx.webServer)
+      } catch {
+        // Listener may not expose an origin on unusual bind addresses.
+      }
+
+      // DSH 0.2.3-alpha.2+: handle GET/HEAD top-level navigations (`/open`, `/console-login`)
+      // in `webserver/request` before outer `webserver/authorize` rejects cross-site clicks from
+      // Feishu Web (`Sec-Fetch-Site: cross-site`). No-op on 0.2.2-rc.5 where the event does not fire.
+      const navigationInterceptor = createLarkNavigationRequestHandler(routeCtx.connection, manager)
+      const routeCtxEvents = routeCtx as unknown as {
+        on?: (
+          event: string,
+          listener: (
+            req: IncomingMessage,
+            res: ServerResponse,
+            next: () => Promise<void>,
+          ) => Promise<void>,
+        ) => void
+      }
+      routeCtxEvents.on?.('webserver/request', navigationInterceptor)
+
+      const handler = createLarkHttpHandler(routeCtx, routeCtx.connection, manager)
+      // DSH 0.2.3-alpha.2+ defaults route auth to `'required'`, which enforces DSH browser cookie
+      // auth before entering plugin handlers and blocks CLI Bearer / Operator tokens with HTTP 401.
+      // Declaring `auth: 'anonymous'` preserves outer Host/Origin trust checks while delegating
+      // fail-closed credential verification (`cliAuth` / `operatorAuth` / `connection.admit`) to the plugin.
+      const route = {
+        kind: 'prefix',
+        path: '/api/lark-bridge',
+        auth: 'anonymous',
+        handler,
+      } as WebRoute
+      routeCtx.effect(
+        () => routeCtx.webServer.register(route),
+        'dsh-lark-bridge.http-api',
+      )
     }
 
-    // DSH 0.2.3-alpha.2+: handle GET/HEAD top-level navigations (`/open`, `/console-login`)
-    // in `webserver/request` before outer `webserver/authorize` rejects cross-site clicks from
-    // Feishu Web (`Sec-Fetch-Site: cross-site`). No-op on 0.2.2-rc.5 where the event does not fire.
-    const navigationInterceptor = createLarkNavigationRequestHandler(webCtx.connection, manager)
-    const webCtxEvents = webCtx as unknown as {
-      on?: (
-        event: string,
-        listener: (
-          req: IncomingMessage,
-          res: ServerResponse,
-          next: () => Promise<void>,
-        ) => Promise<void>,
-      ) => void
+    // DSH 0.2.3-alpha.2+ splits credential verification into Cordis sub-service `connection.authentication`.
+    // Calling `connection.admit(req)` through the Cordis service proxy reads `this.authentication`,
+    // which throws under Cordis 4.2 unless `connection.authentication` is explicitly declared in `inject`.
+    if (webCtx.get('connection.authentication' as never) !== undefined) {
+      ;(webCtx.inject as (deps: readonly string[], cb: (subCtx: typeof webCtx) => void) => void)(
+        ['webServer', 'connection', 'connection.authentication'],
+        (authCtx) => {
+          mountHttpSurface(authCtx)
+        },
+      )
+    } else {
+      mountHttpSurface(webCtx)
     }
-    webCtxEvents.on?.('webserver/request', navigationInterceptor)
-
-    const handler = createLarkHttpHandler(webCtx, webCtx.connection, manager)
-    // DSH 0.2.3-alpha.2+ defaults route auth to `'required'`, which enforces DSH browser cookie
-    // auth before entering plugin handlers and blocks CLI Bearer / Operator tokens with HTTP 401.
-    // Declaring `auth: 'anonymous'` preserves outer Host/Origin trust checks while delegating
-    // fail-closed credential verification (`cliAuth` / `operatorAuth` / `connection.admit`) to the plugin.
-    const route = {
-      kind: 'prefix',
-      path: '/api/lark-bridge',
-      auth: 'anonymous',
-      handler,
-    } as WebRoute
-    webCtx.effect(
-      () => webCtx.webServer.register(route),
-      'dsh-lark-bridge.http-api',
-    )
   })
 
   await manager.start()
