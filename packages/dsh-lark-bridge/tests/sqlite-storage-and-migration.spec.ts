@@ -655,7 +655,12 @@ describe('SQLite WAL storage, atomic auto-migration & db CLI', () => {
     const dir = makeTempDir('dsh-lark-v6-')
     const store = new LarkBridgeStore(dir)
     try {
-      expect(store.getStorageStats().schemaVersion).toBe(9)
+      expect(store.getStorageStats().schemaVersion).toBe(10)
+      const cols = (
+        store.db.prepare('PRAGMA table_info(telemetry_usage_events)').all() as Array<{ name: string }>
+      ).map((c) => c.name)
+      expect(cols).toContain('queue_wait_ms')
+      expect(cols).toContain('exec_ms')
       const plan = store.db
         .prepare(
           'EXPLAIN QUERY PLAN SELECT scope_key, kind, payload_json, updated_at_ms FROM triage_context_scopes WHERE updated_at_ms >= ? ORDER BY updated_at_ms ASC',

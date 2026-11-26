@@ -85,7 +85,12 @@ export class LarkBridgeStore {
     this.memoryRepo = new MemoryRepo(this.db)
     this.telemetryRepo = new TelemetryRepo(this.db, this.configRepo, maxAuditEvents)
     this.observabilityRepo = new ObservabilityRepo(this.db, this.configRepo)
-    this.projector = new CockpitProjector(this.configRepo, this.runtimeRepo, this.telemetryRepo)
+    this.projector = new CockpitProjector(
+      this.configRepo,
+      this.runtimeRepo,
+      this.telemetryRepo,
+      this.observabilityRepo,
+    )
     if (!this.db.getMeta('observability_v7_installed_at_ms')) {
       this.db.setMeta('observability_v7_installed_at_ms', String(Date.now()))
     }
@@ -557,6 +562,8 @@ export class LarkBridgeStore {
     readonly errorCode?: string
     readonly kind: 'inbound' | 'replied' | 'listener' | 'silent_skip' | 'ignored' | 'error'
     readonly latencyMs?: number
+    readonly queueWaitMs?: number
+    readonly execMs?: number
     readonly now?: number
   }): void {
     this.telemetryRepo.recordMetric(input)
@@ -601,6 +608,8 @@ export class LarkBridgeStore {
       ...(input.errorCode ? { errorCode: input.errorCode } : {}),
       outcome,
       ...(input.latencyMs !== undefined ? { latencyMs: input.latencyMs } : {}),
+      ...(input.queueWaitMs !== undefined ? { queueWaitMs: input.queueWaitMs } : {}),
+      ...(input.execMs !== undefined ? { execMs: input.execMs } : {}),
     })
   }
 

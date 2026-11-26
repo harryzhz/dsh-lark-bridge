@@ -362,6 +362,12 @@ export interface LarkCockpitSummary {
   readonly successRate24h: number
   readonly avgLatencyMs: number
   readonly p95LatencyMs: number
+  readonly interactiveLatencySamples24h?: number
+  readonly avgQueueWaitMs24h?: number
+  readonly avgExecMs24h?: number
+  readonly queuedReplies24h?: number
+  readonly proactiveAvgLatencyMs24h?: number
+  readonly proactiveSamples24h?: number
 }
 
 export interface LarkDiagnosticAlert {

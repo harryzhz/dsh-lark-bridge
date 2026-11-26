@@ -1756,6 +1756,7 @@ export class InboundPipeline {
 
         const allowCoalesce =
           routerConfig.coalesceQueuedMessages && boundDecision.sessionMode !== 'per_message'
+        const sessionSlotWaitStartMs = Date.now()
         const slot = await this.host.sessions.acquireCoalescedTurnSlot(trackedSessionId, selfItem, {
           coalesce: allowCoalesce,
           signal: this.host.shutdownSignal,
@@ -1832,6 +1833,7 @@ export class InboundPipeline {
         releaseTurnSlot = slot.release
         finishBatch = slot.finishBatch
         batchItems = slot.items
+        const sessionWaitMs = Math.max(0, Date.now() - sessionSlotWaitStartMs)
 
         const preExecDisabled = this.getBatchDisabledScope(bot.id, batchItems)
         if (preExecDisabled) {
@@ -1951,6 +1953,8 @@ export class InboundPipeline {
         latestItem = batchItems[batchItems.length - 1] ?? latestItem
         effectiveDecision = buildEffectiveDecision(batchItems)
 
+        const queueWaitMs = Math.max(0, Math.round(sessionWaitMs + (runtimeLease?.waitMs ?? 0)))
+
         this.host.titleGuard.ensureCleanSessionTitle(
           acquired.agent.session,
           latestItem.msg,
@@ -2014,7 +2018,9 @@ export class InboundPipeline {
           resolvedChatName,
         )
         this.executingTurnBySession.set(acquired.sessionId, executingTurnCtx)
+        const execStartedMs = Date.now()
         let replyText: string
+        let execMs = 0
         try {
           replyText = await runTurnAndCollectReply(this.host.ctx, acquired.agent, content, {
             signal: this.host.shutdownSignal,
@@ -2062,6 +2068,7 @@ export class InboundPipeline {
                 }
               : {}),
           })
+          execMs = Math.max(0, Date.now() - execStartedMs)
         } finally {
           if (this.executingTurnBySession.get(acquired.sessionId) === executingTurnCtx) {
             this.executingTurnBySession.delete(acquired.sessionId)
@@ -2080,6 +2087,8 @@ export class InboundPipeline {
           effectiveDecision,
           replyText,
           startedMs,
+          queueWaitMs,
+          execMs,
         })
         shouldDisposeEphemeral = settlement.dispose
         shouldArchiveEphemeral = settlement.archive
@@ -2138,6 +2147,8 @@ export class InboundPipeline {
     readonly effectiveDecision: AgentDecision
     readonly replyText: string
     readonly startedMs: number
+    readonly queueWaitMs?: number
+    readonly execMs?: number
   }): Promise<{ readonly dispose: boolean; readonly archive: boolean }> {
     const {
       bot,
@@ -2149,6 +2160,8 @@ export class InboundPipeline {
       effectiveDecision,
       replyText,
       startedMs,
+      queueWaitMs = 0,
+      execMs = 0,
     } = input
     const latestItem = batchItems[batchItems.length - 1]!
     const batchSize = batchItems.length
@@ -2342,6 +2355,8 @@ export class InboundPipeline {
         })
       }
       this.host.store.markBindingReplied(deliveredRouteKey)
+      const normalizedQueueWaitMs = Math.min(latencyMs, Math.max(0, Math.round(queueWaitMs)))
+      const normalizedExecMs = Math.min(latencyMs, Math.max(0, Math.round(execMs)))
       this.host.store.recordMetric({
         botId: bot.id,
         chatId: latestItem.msg.chatId,
@@ -2352,8 +2367,16 @@ export class InboundPipeline {
         ...chatName,
         kind: 'replied',
         latencyMs,
+        queueWaitMs: normalizedQueueWaitMs,
+        execMs: normalizedExecMs,
       })
-      const batchSuffix = batchSize > 1 ? `（合并 ${batchSize} 条消息）` : ''
+      const replyTags = [
+        ...(batchSize > 1 ? [`合并 ${batchSize} 条消息`] : []),
+        ...(normalizedQueueWaitMs >= 2_000
+          ? [`含排队 ${Math.round(normalizedQueueWaitMs / 1000)}s`]
+          : []),
+      ]
+      const batchSuffix = replyTags.length > 0 ? `（${replyTags.join('；')}）` : ''
       const replySummary =
         intermediateSentCount > 0
           ? `已发送 ${intermediateSentCount} 条过程消息${hasFinalText ? ` + 最终回复 ${normalizedReply.length} 字` : ''}`
@@ -2982,6 +3005,8 @@ export class InboundPipeline {
           ...chatName,
           kind: 'replied',
           latencyMs,
+          queueWaitMs: 0,
+          execMs: latencyMs,
         })
         this.host.store.recordEvent({
           botId: bot.id,

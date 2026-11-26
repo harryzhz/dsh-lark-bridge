@@ -19,6 +19,7 @@ import type {
 } from '../observability-types.js'
 import type { ConfigRepo } from './config-repo.js'
 import type { BridgeDatabase } from './database.js'
+import { formatHourKey } from './telemetry-repo.js'
 
 const DETAIL_RETENTION_MS = 90 * 24 * 60 * 60_000
 const MAX_DETAIL_ROWS = 150_000
@@ -199,6 +200,8 @@ interface RawUsageEventRow {
   outcome: string
   error_code: string
   latency_ms: number | null
+  queue_wait_ms: number | null
+  exec_ms: number | null
   input_tokens: number
   output_tokens: number
   cache_read_tokens: number
@@ -236,6 +239,10 @@ interface WindowTotals {
   dreamRuns: number
   sessions: Set<string>
   latencies: number[]
+  queueWaitLatencies: number[]
+  queuedTurnCount: number
+  execLatencies: number[]
+  proactiveLatencies: number[]
   triageLatencies: number[]
 }
 
@@ -267,6 +274,10 @@ function emptyWindowTotals(): WindowTotals {
     dreamRuns: 0,
     sessions: new Set<string>(),
     latencies: [],
+    queueWaitLatencies: [],
+    queuedTurnCount: 0,
+    execLatencies: [],
+    proactiveLatencies: [],
     triageLatencies: [],
   }
 }
@@ -332,8 +343,22 @@ function accumulateRow(target: WindowTotals, row: RawUsageEventRow): void {
 
   if (outcome === 'replied' || outcome === 'quick_reply' || outcome === 'completed') {
     target.replied += 1
-    if (row.latency_ms !== null && Number(row.latency_ms) >= 0) {
-      target.latencies.push(Number(row.latency_ms))
+    if (kind === 'proactive') {
+      if (row.latency_ms !== null && Number(row.latency_ms) >= 0) {
+        target.proactiveLatencies.push(Number(row.latency_ms))
+      }
+    } else {
+      if (row.latency_ms !== null && Number(row.latency_ms) >= 0) {
+        target.latencies.push(Number(row.latency_ms))
+      }
+      if (row.queue_wait_ms !== null && Number(row.queue_wait_ms) >= 0) {
+        const qw = Number(row.queue_wait_ms)
+        target.queueWaitLatencies.push(qw)
+        if (qw >= 1_000) target.queuedTurnCount += 1
+      }
+      if (row.exec_ms !== null && Number(row.exec_ms) >= 0) {
+        target.execLatencies.push(Number(row.exec_ms))
+      }
     }
   } else if (outcome === 'silent_skip') {
     target.silentSkipped += 1
@@ -819,6 +844,16 @@ export class ObservabilityRepo {
       input.latencyMs !== undefined && Number.isFinite(input.latencyMs) && input.latencyMs >= 0
         ? Math.round(input.latencyMs)
         : null
+    const queueWaitMs =
+      input.queueWaitMs !== undefined &&
+      Number.isFinite(input.queueWaitMs) &&
+      input.queueWaitMs >= 0
+        ? Math.round(input.queueWaitMs)
+        : null
+    const execMs =
+      input.execMs !== undefined && Number.isFinite(input.execMs) && input.execMs >= 0
+        ? Math.round(input.execMs)
+        : null
 
     const botId = input.botId || 'unknown'
     const chatId = input.chatId ?? ''
@@ -841,9 +876,10 @@ export class ObservabilityRepo {
              id, timestamp_ms, record_kind, bot_id, chat_id, chat_type, session_id,
              sender_id, sender_name, sender_type,
              trigger, agent_preset, provider, model, outcome, error_code, latency_ms,
+             queue_wait_ms, exec_ms,
              input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
              reasoning_tokens, total_tokens, tool_calls, tool_errors
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           id,
@@ -863,6 +899,8 @@ export class ObservabilityRepo {
           outcome,
           errorCode,
           latencyMs,
+          queueWaitMs,
+          execMs,
           inTok,
           outTok,
           crTok,
@@ -878,7 +916,7 @@ export class ObservabilityRepo {
       const isReplied =
         (input.recordKind === 'turn' || input.recordKind === 'proactive') &&
         (outcome === 'replied' || outcome === 'quick_reply' || outcome === 'completed')
-      const isLatencyCounted = isReplied && latencyMs !== null
+      const isLatencyCounted = input.recordKind === 'turn' && isReplied && latencyMs !== null
       this.db
         .prepare(
           `INSERT INTO telemetry_daily_rollups (
@@ -1599,12 +1637,124 @@ export class ObservabilityRepo {
     const sql = `SELECT timestamp_ms, record_kind, bot_id, chat_id, chat_type, session_id,
                         sender_id, sender_name, sender_type,
                         trigger, agent_preset, provider, model, outcome, error_code, latency_ms,
+                        queue_wait_ms, exec_ms,
                         input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
                         reasoning_tokens, total_tokens, tool_calls, tool_errors
                  FROM telemetry_usage_events
                  WHERE ${clauses.join(' AND ')}
                  ORDER BY timestamp_ms ASC`
     return this.db.prepare(sql).all(...params) as unknown as RawUsageEventRow[]
+  }
+
+  queryRecent24hLatencyStats(nowMs = Date.now()): {
+    readonly interactive: { readonly samples: number; readonly avgMs: number; readonly p95Ms: number }
+    readonly queueWait: {
+      readonly samples: number
+      readonly queuedCount: number
+      readonly avgMs: number
+      readonly p95Ms: number
+    }
+    readonly exec: { readonly samples: number; readonly avgMs: number; readonly p95Ms: number }
+    readonly proactive: { readonly samples: number; readonly avgMs: number; readonly p95Ms: number }
+    readonly byBot: ReadonlyMap<
+      string,
+      { readonly samples: number; readonly avgMs: number; readonly p95Ms: number }
+    >
+    readonly byHour: ReadonlyMap<string, { readonly samples: number; readonly avgMs: number }>
+  } {
+    const fromMs = nowMs - 24 * 3_600_000
+    const rows = this.db
+      .prepare(
+        `SELECT timestamp_ms, record_kind, bot_id, latency_ms, queue_wait_ms, exec_ms
+         FROM telemetry_usage_events
+         WHERE record_kind IN ('turn', 'proactive')
+           AND timestamp_ms >= ?
+           AND timestamp_ms <= ?
+           AND outcome IN ('replied', 'quick_reply', 'completed')
+           AND latency_ms IS NOT NULL`,
+      )
+      .all(fromMs, nowMs) as Array<{
+      timestamp_ms: number
+      record_kind: string
+      bot_id: string
+      latency_ms: number | null
+      queue_wait_ms: number | null
+      exec_ms: number | null
+    }>
+
+    const interactiveLatencies: number[] = []
+    const queueWaitLatencies: number[] = []
+    let queuedCount = 0
+    const execLatencies: number[] = []
+    const proactiveLatencies: number[] = []
+    const botBuckets = new Map<string, number[]>()
+    const hourBuckets = new Map<string, { sum: number; count: number }>()
+
+    for (const row of rows) {
+      const lat = row.latency_ms !== null ? Number(row.latency_ms) : -1
+      if (!Number.isFinite(lat) || lat < 0) continue
+      if (row.record_kind === 'proactive') {
+        proactiveLatencies.push(lat)
+        continue
+      }
+      interactiveLatencies.push(lat)
+      if (row.queue_wait_ms !== null && Number(row.queue_wait_ms) >= 0) {
+        const qw = Number(row.queue_wait_ms)
+        queueWaitLatencies.push(qw)
+        if (qw >= 1_000) queuedCount += 1
+      }
+      if (row.exec_ms !== null && Number(row.exec_ms) >= 0) {
+        execLatencies.push(Number(row.exec_ms))
+      }
+      if (row.bot_id && row.bot_id !== 'system') {
+        const list = botBuckets.get(row.bot_id)
+        if (list) list.push(lat)
+        else botBuckets.set(row.bot_id, [lat])
+      }
+      const hourKey = formatHourKey(Number(row.timestamp_ms))
+      const hb = hourBuckets.get(hourKey)
+      if (hb) {
+        hb.sum += lat
+        hb.count += 1
+      } else {
+        hourBuckets.set(hourKey, { sum: lat, count: 1 })
+      }
+    }
+
+    const inter = calcPercentiles(interactiveLatencies)
+    const qw = calcPercentiles(queueWaitLatencies)
+    const ex = calcPercentiles(execLatencies)
+    const pro = calcPercentiles(proactiveLatencies)
+
+    const byBot = new Map<
+      string,
+      { readonly samples: number; readonly avgMs: number; readonly p95Ms: number }
+    >()
+    for (const [botId, values] of botBuckets.entries()) {
+      const stats = calcPercentiles(values)
+      byBot.set(botId, { samples: stats.samples, avgMs: stats.avgMs, p95Ms: stats.p95Ms })
+    }
+    const byHour = new Map<string, { readonly samples: number; readonly avgMs: number }>()
+    for (const [hourKey, b] of hourBuckets.entries()) {
+      byHour.set(hourKey, {
+        samples: b.count,
+        avgMs: b.count > 0 ? Math.round(b.sum / b.count) : 0,
+      })
+    }
+
+    return {
+      interactive: { samples: inter.samples, avgMs: inter.avgMs, p95Ms: inter.p95Ms },
+      queueWait: {
+        samples: qw.samples,
+        queuedCount,
+        avgMs: qw.avgMs,
+        p95Ms: qw.p95Ms,
+      },
+      exec: { samples: ex.samples, avgMs: ex.avgMs, p95Ms: ex.p95Ms },
+      proactive: { samples: pro.samples, avgMs: pro.avgMs, p95Ms: pro.p95Ms },
+      byBot,
+      byHour,
+    }
   }
 
   private countManagedSessionsInRanges(
@@ -2133,7 +2283,7 @@ export class ObservabilityRepo {
       } else if (row.record_kind === 'turn' || row.record_kind === 'proactive') {
         if (row.outcome === 'replied' || row.outcome === 'quick_reply' || row.outcome === 'completed') {
           cur.replied += 1
-          if (row.latency_ms !== null && Number(row.latency_ms) >= 0) {
+          if (row.record_kind === 'turn' && row.latency_ms !== null && Number(row.latency_ms) >= 0) {
             cur.latencies.push(Number(row.latency_ms))
           }
         } else if (row.outcome === 'silent_skip') {
@@ -2259,7 +2409,7 @@ export class ObservabilityRepo {
       } else if (row.record_kind === 'turn' || row.record_kind === 'proactive') {
         if (row.outcome === 'replied' || row.outcome === 'quick_reply' || row.outcome === 'completed') {
           cur.replied += 1
-          if (row.latency_ms !== null && Number(row.latency_ms) >= 0) {
+          if (row.record_kind === 'turn' && row.latency_ms !== null && Number(row.latency_ms) >= 0) {
             cur.latencySum += Number(row.latency_ms)
             cur.latencyCount += 1
           }
@@ -2440,7 +2590,7 @@ export class ObservabilityRepo {
       } else if (row.record_kind === 'turn' || row.record_kind === 'proactive') {
         if (row.outcome === 'replied' || row.outcome === 'quick_reply' || row.outcome === 'completed') {
           cur.replied += 1
-          if (row.latency_ms !== null && Number(row.latency_ms) >= 0) {
+          if (row.record_kind === 'turn' && row.latency_ms !== null && Number(row.latency_ms) >= 0) {
             cur.latencySum += Number(row.latency_ms)
             cur.latencyCount += 1
           }

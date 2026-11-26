@@ -715,6 +715,9 @@ export class ObservabilityService {
     // Technical metrics
     const curLat = calcPercentiles(cur.latencies)
     const prevLat = calcPercentiles(prev.latencies)
+    const curQueueLat = calcPercentiles(cur.queueWaitLatencies)
+    const curExecLat = calcPercentiles(cur.execLatencies)
+    const curProactiveLat = calcPercentiles(cur.proactiveLatencies)
     const curDenom = cur.replied + cur.errors
     const prevDenom = prev.replied + prev.errors
     const curSuccessRate = curDenom > 0 ? Math.round((cur.replied / curDenom) * 1000) / 10 : 100
@@ -877,6 +880,27 @@ export class ObservabilityService {
           maxMs: curLat.maxMs,
           deltaP95Pct: calcDeltaPct(curLat.p95Ms, prevLat.p95Ms),
           histogram: agg.latencyHistogram,
+          breakdown: {
+            queueWait: {
+              samples: curQueueLat.samples,
+              queuedCount: cur.queuedTurnCount,
+              avgMs: curQueueLat.avgMs,
+              p95Ms: curQueueLat.p95Ms,
+              maxMs: curQueueLat.maxMs,
+            },
+            exec: {
+              samples: curExecLat.samples,
+              avgMs: curExecLat.avgMs,
+              p95Ms: curExecLat.p95Ms,
+              maxMs: curExecLat.maxMs,
+            },
+            proactive: {
+              samples: curProactiveLat.samples,
+              avgMs: curProactiveLat.avgMs,
+              p95Ms: curProactiveLat.p95Ms,
+              maxMs: curProactiveLat.maxMs,
+            },
+          },
         },
         connections: {
           onlineBots,

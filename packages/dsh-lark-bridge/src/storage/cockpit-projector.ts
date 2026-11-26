@@ -21,6 +21,7 @@ import type {
   LarkTriageSession,
 } from '../types.js'
 import type { ConfigRepo } from './config-repo.js'
+import type { ObservabilityRepo } from './observability-repo.js'
 import type { RuntimeRepo } from './runtime-repo.js'
 import { formatHourKey, type TelemetryRepo } from './telemetry-repo.js'
 
@@ -44,6 +45,7 @@ export class CockpitProjector {
     private readonly config: ConfigRepo,
     private readonly runtime: RuntimeRepo,
     private readonly telemetry: TelemetryRepo,
+    private readonly observability?: ObservabilityRepo,
   ) {}
 
   resolveBotWorkspaceName(bot: LarkBotConfig): string {
@@ -205,6 +207,10 @@ export class CockpitProjector {
     const hourlyBuckets = this.telemetry.listHourlyBucketsMap()
     const botMetrics = this.telemetry.listBotMetricsMap()
     const groupTraffic = this.telemetry.listGroupTrafficMap()
+    const recent24h = this.observability?.queryRecent24hLatencyStats(now)
+    const use24hInteractive = Boolean(
+      recent24h && (recent24h.interactive.samples > 0 || recent24h.proactive.samples > 0),
+    )
 
     const hourlySeries: Array<{
       hourKey: string
@@ -231,8 +237,9 @@ export class CockpitProjector {
       const replied = bucket?.replied ?? 0
       const silentSkipped = bucket?.silentSkipped ?? 0
       const errors = bucket?.errors ?? 0
-      const avgLatencyMs =
-        bucket && bucket.latencySamples > 0
+      const avgLatencyMs = use24hInteractive
+        ? (recent24h!.byHour.get(key)?.avgMs ?? 0)
+        : bucket && bucket.latencySamples > 0
           ? Math.round(bucket.totalLatencyMs / bucket.latencySamples)
           : 0
       inbound24h += inbound
@@ -253,7 +260,10 @@ export class CockpitProjector {
     }
 
     const allLatencies = [...botMetrics.values()].flatMap((m) => m.latenciesMs)
-    const latencyStats = calcStats(allLatencies)
+    const fallbackLatencyStats = calcStats(allLatencies)
+    const latencyStats = use24hInteractive
+      ? { avg: recent24h!.interactive.avgMs, p95: recent24h!.interactive.p95Ms }
+      : fallbackLatencyStats
 
     const enabledStatuses = statuses.filter((s) => s.enabled)
     const onlineBots = enabledStatuses.filter((s) => s.connected).length
@@ -262,7 +272,9 @@ export class CockpitProjector {
     const botRows = statuses.map((st) => {
       const bot = botsById.get(st.botId)
       const bm = botMetrics.get(st.botId)
-      const lat = calcStats(bm?.latenciesMs ?? [])
+      const avgLatencyMs = use24hInteractive
+        ? (recent24h!.byBot.get(st.botId)?.avgMs ?? 0)
+        : calcStats(bm?.latenciesMs ?? []).avg
       const avatarUrl = st.avatarUrl || bot?.avatarUrl
       return {
         ...st,
@@ -274,7 +286,7 @@ export class CockpitProjector {
         inboundTotal: bm?.inboundTotal ?? 0,
         repliedTotal: bm?.repliedTotal ?? 0,
         errorTotal: bm?.errorTotal ?? 0,
-        avgLatencyMs: lat.avg,
+        avgLatencyMs,
       }
     })
 
@@ -338,6 +350,16 @@ export class CockpitProjector {
         successRate24h,
         avgLatencyMs: latencyStats.avg,
         p95LatencyMs: latencyStats.p95,
+        ...(recent24h
+          ? {
+              interactiveLatencySamples24h: recent24h.interactive.samples,
+              avgQueueWaitMs24h: recent24h.queueWait.avgMs,
+              avgExecMs24h: recent24h.exec.avgMs,
+              queuedReplies24h: recent24h.queueWait.queuedCount,
+              proactiveAvgLatencyMs24h: recent24h.proactive.avgMs,
+              proactiveSamples24h: recent24h.proactive.samples,
+            }
+          : {}),
       },
       hourlySeries,
       botRows,

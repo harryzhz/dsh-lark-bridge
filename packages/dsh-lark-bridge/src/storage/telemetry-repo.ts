@@ -22,6 +22,10 @@ export function formatHourKey(ms: number): string {
   return `${y}-${m}-${day}T${h}`
 }
 
+export function isProactiveTrigger(trigger?: string): boolean {
+  return trigger === 'schedule' || trigger === 'reminder' || trigger === 'dreaming'
+}
+
 export class TelemetryRepo {
   private auditInsertCounter = 0
 
@@ -35,6 +39,7 @@ export class TelemetryRepo {
     readonly botId: string
     readonly chatId?: string
     readonly chatName?: string
+    readonly trigger?: string
     readonly kind: 'inbound' | 'replied' | 'listener' | 'silent_skip' | 'ignored' | 'error'
     readonly latencyMs?: number
     readonly now?: number
@@ -42,7 +47,10 @@ export class TelemetryRepo {
     const now = input.now ?? Date.now()
     const hourKey = formatHourKey(now)
     const latency =
-      input.kind === 'replied' && input.latencyMs !== undefined && input.latencyMs >= 0
+      input.kind === 'replied' &&
+      !isProactiveTrigger(input.trigger) &&
+      input.latencyMs !== undefined &&
+      input.latencyMs >= 0
         ? Math.round(input.latencyMs)
         : undefined
 

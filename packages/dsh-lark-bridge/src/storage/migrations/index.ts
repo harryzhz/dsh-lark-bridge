@@ -11,6 +11,7 @@ import { TRIAGE_CONTEXT_UPDATED_IDX_MIGRATION } from './006-triage-context-updat
 import { OBSERVABILITY_MIGRATION } from './007-observability.js'
 import { EXTERNAL_SESSION_LINKS_MIGRATION } from './008-external-session-links.js'
 import { TELEMETRY_SENDER_MIGRATION } from './009-telemetry-sender.js'
+import { TELEMETRY_LATENCY_SPLIT_MIGRATION } from './010-telemetry-latency-split.js'
 
 export type { SqlMigration }
 export {
@@ -23,6 +24,7 @@ export {
   OBSERVABILITY_MIGRATION,
   EXTERNAL_SESSION_LINKS_MIGRATION,
   TELEMETRY_SENDER_MIGRATION,
+  TELEMETRY_LATENCY_SPLIT_MIGRATION,
 }
 
 export const ALL_MIGRATIONS: readonly SqlMigration[] = [
@@ -35,6 +37,7 @@ export const ALL_MIGRATIONS: readonly SqlMigration[] = [
   OBSERVABILITY_MIGRATION,
   EXTERNAL_SESSION_LINKS_MIGRATION,
   TELEMETRY_SENDER_MIGRATION,
+  TELEMETRY_LATENCY_SPLIT_MIGRATION,
 ]
 
 export const ENTITY_TABLE_NAMES = [
