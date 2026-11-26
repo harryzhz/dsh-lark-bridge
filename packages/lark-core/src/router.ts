@@ -218,6 +218,39 @@ export interface PrefetchedQuotedMessageSummary {
   readonly hasUnfetchedResources?: boolean
 }
 
+function unescapeXmlAttr(value: string): string {
+  return value
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+}
+
+/**
+ * Extracts Feishu message IDs whose full content has already been injected into a
+ * session prompt (either as an inbound turn message, a coalesced batch item, or an
+ * expanded `<quoted_message>` block). Fallback CLI-hint lines without expanded content
+ * are intentionally ignored so a previously failed quote fetch can still be retried.
+ */
+export function extractInjectedLarkMessageIdsFromText(
+  text: string,
+  target: Set<string> = new Set(),
+): Set<string> {
+  if (!text) return target
+  const tagAttrRe = /<(?:lark_context|quoted_message)\b[^>]*\bmessage_id="([^"]+)"/g
+  for (const match of text.matchAll(tagAttrRe)) {
+    const id = match[1] ? unescapeXmlAttr(match[1]).trim() : ''
+    if (id) target.add(id)
+  }
+  const coalescedRe = /(?:^|\n)\[\d+\]\s+[^\n]*\(message_id="([^"]+)"\):/g
+  for (const match of text.matchAll(coalescedRe)) {
+    const id = match[1] ? unescapeXmlAttr(match[1]).trim() : ''
+    if (id) target.add(id)
+  }
+  return target
+}
+
 export interface LarkConversationContextInput {
   readonly bot: Pick<LarkBotConfig, 'id' | 'name' | 'larkAppId'>
   readonly botOpenId?: string
@@ -231,6 +264,12 @@ export interface LarkConversationContextInput {
   readonly useCard?: boolean
   readonly includeFullGuide?: boolean
   readonly prefetchedQuote?: PrefetchedQuotedMessageSummary
+  /**
+   * True when `msg.parentId` was already injected into an earlier turn (or an earlier
+   * message in the same coalesced batch) of this session, so its full text and images
+   * must not be repeated.
+   */
+  readonly quoteAlreadyInSession?: boolean
 }
 
 export function composeLarkContextReminder(input: LarkConversationContextInput): string {
@@ -267,43 +306,54 @@ export function composeLarkContextReminder(input: LarkConversationContextInput):
     bodyLines.push(`提及成员：${formatted}`)
   }
   if (msg.parentId) {
-    const q = input.prefetchedQuote
-    if (q && q.messageId === msg.parentId) {
-      const qAttrs = [
-        `message_id="${escapeXmlAttr(q.messageId)}"`,
-        `msg_type="${escapeXmlAttr(q.msgType)}"`,
-        ...(q.senderName ? [`sender="${escapeXmlAttr(q.senderName)}"`] : []),
-        ...(q.senderType ? [`sender_type="${q.senderType}"`] : []),
-        ...(q.imageCount > 0 ? [`images="${q.imageCount}"`] : []),
-      ]
-      const rawText = q.text?.trim() ?? ''
-      const maxQuoteChars = 4000
-      const truncated = rawText.length > maxQuoteChars
-      const displayText = truncated ? `${rawText.slice(0, maxQuoteChars)}…` : rawText
-      const notes: string[] = []
-      if (q.attachedImageCount > 0) {
-        notes.push(`已自动附带 ${q.attachedImageCount} 张引用图片`)
-      }
-      if (q.imageCount > q.attachedImageCount) {
-        notes.push(
-          `另有 ${q.imageCount - q.attachedImageCount} 张引用图片未附带，可运行 \`lark-bridge message ${msg.parentId}\` 查看`,
+    if (input.quoteAlreadyInSession) {
+      // Pure thread continuation (`parentId === rootId`) carries the root id on every
+      // reply in Feishu threads; omit the repeated quote body once the root is in context.
+      // Explicit mid-thread quotes keep a minimal pointer without re-sending body/images.
+      if (!msg.rootId || msg.parentId !== msg.rootId) {
+        bodyLines.push(
+          `引用消息：${msg.parentId}（内容已在本会话前文中，可直接结合上文回复；若前文已被压缩可运行 \`lark-bridge message ${msg.parentId}\` 查原文）`,
         )
       }
-      if (truncated || q.hasUnfetchedResources) {
-        notes.push(`完整内容或附件可运行 \`lark-bridge message ${msg.parentId}\``)
-      }
-      const quoteContent =
-        displayText || (q.imageCount > 0 ? `[图片消息，共 ${q.imageCount} 张]` : `[${q.msgType}]`)
-      bodyLines.push(
-        `<quoted_message ${qAttrs.join(' ')}>`,
-        quoteContent,
-        ...(notes.length > 0 ? [`（${notes.join('；')}）`] : []),
-        '</quoted_message>',
-      )
     } else {
-      bodyLines.push(
-        `引用消息：${msg.parentId}（查看全文或下载附件：\`lark-bridge message ${msg.parentId}\`）`,
-      )
+      const q = input.prefetchedQuote
+      if (q && q.messageId === msg.parentId) {
+        const qAttrs = [
+          `message_id="${escapeXmlAttr(q.messageId)}"`,
+          `msg_type="${escapeXmlAttr(q.msgType)}"`,
+          ...(q.senderName ? [`sender="${escapeXmlAttr(q.senderName)}"`] : []),
+          ...(q.senderType ? [`sender_type="${q.senderType}"`] : []),
+          ...(q.imageCount > 0 ? [`images="${q.imageCount}"`] : []),
+        ]
+        const rawText = q.text?.trim() ?? ''
+        const maxQuoteChars = 4000
+        const truncated = rawText.length > maxQuoteChars
+        const displayText = truncated ? `${rawText.slice(0, maxQuoteChars)}…` : rawText
+        const notes: string[] = []
+        if (q.attachedImageCount > 0) {
+          notes.push(`已自动附带 ${q.attachedImageCount} 张引用图片`)
+        }
+        if (q.imageCount > q.attachedImageCount) {
+          notes.push(
+            `另有 ${q.imageCount - q.attachedImageCount} 张引用图片未附带，可运行 \`lark-bridge message ${msg.parentId}\` 查看`,
+          )
+        }
+        if (truncated || q.hasUnfetchedResources) {
+          notes.push(`完整内容或附件可运行 \`lark-bridge message ${msg.parentId}\``)
+        }
+        const quoteContent =
+          displayText || (q.imageCount > 0 ? `[图片消息，共 ${q.imageCount} 张]` : `[${q.msgType}]`)
+        bodyLines.push(
+          `<quoted_message ${qAttrs.join(' ')}>`,
+          quoteContent,
+          ...(notes.length > 0 ? [`（${notes.join('；')}）`] : []),
+          '</quoted_message>',
+        )
+      } else {
+        bodyLines.push(
+          `引用消息：${msg.parentId}（查看全文或下载附件：\`lark-bridge message ${msg.parentId}\`）`,
+        )
+      }
     }
   }
   if (input.trigger === 'mention' && input.allowSilentEmptyReply !== true) {

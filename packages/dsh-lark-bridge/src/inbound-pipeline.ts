@@ -1,6 +1,7 @@
 import { randomBytes, randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
+import { appendPluginRecord, type Session } from '@deepseek-ai/dsh-session'
 import {
   MessageDeduplicator,
   buildReplyCard,
@@ -11,6 +12,7 @@ import {
   composeRouterHandoffReminder,
   composeTurnPrompt,
   decideLarkRouting,
+  extractInjectedLarkMessageIdsFromText,
   extractRouteScope,
   isGroupEnabled,
   isLarkMessageRecalledError,
@@ -63,12 +65,48 @@ import {
   inspectPersistedTurnCompletion,
 } from './turn-recovery.js'
 import { TurnAbortedError, runTurnAndCollectReply } from './turn-runner.js'
-import type {
-  ActiveTurnSummary,
-  LarkPendingTurn,
-  PendingTurnInterruptKind,
-  PendingTurnStatus,
+import {
+  LARK_SENT_MESSAGE_RECORD_TYPE,
+  type ActiveTurnSummary,
+  type LarkPendingTurn,
+  type PendingTurnInterruptKind,
+  type PendingTurnStatus,
 } from './types.js'
+
+function collectSessionInjectedMessageIds(session?: Session): Set<string> {
+  const ids = new Set<string>()
+  if (!session || typeof session.snapshotEvents !== 'function') return ids
+  for (const ev of session.snapshotEvents()) {
+    const raw = ev as { type?: unknown; data?: Record<string, unknown> }
+    if (raw.type === 'user/message') {
+      const data = raw.data as
+        | {
+            content?: ReadonlyArray<{ type?: unknown; text?: unknown }>
+            message?: { content?: ReadonlyArray<{ type?: unknown; text?: unknown }> }
+          }
+        | undefined
+      const blocks = data?.content ?? data?.message?.content ?? []
+      for (const b of blocks) {
+        if (b && b.type === 'text' && typeof b.text === 'string') {
+          extractInjectedLarkMessageIdsFromText(b.text, ids)
+        }
+      }
+      continue
+    }
+    if (raw.type === LARK_SENT_MESSAGE_RECORD_TYPE) {
+      const msgId = raw.data?.messageId
+      if (typeof msgId === 'string' && msgId.trim()) ids.add(msgId.trim())
+      continue
+    }
+    if (raw.type === 'plugin/record' && raw.data?.type === LARK_SENT_MESSAGE_RECORD_TYPE) {
+      const payload = raw.data?.data as { messageId?: unknown } | undefined
+      if (typeof payload?.messageId === 'string' && payload.messageId.trim()) {
+        ids.add(payload.messageId.trim())
+      }
+    }
+  }
+  return ids
+}
 
 const SHUTDOWN_TURN_CLEANUP_TIMEOUT_MS = 2_000
 const STALE_PENDING_TURN_MAX_AGE_MS = 24 * 60 * 60_000
@@ -373,6 +411,7 @@ export class InboundPipeline {
   private readonly inflightCancels = new Set<InflightCancelEntry>()
   private readonly recoveringTurnIds = new Set<string>()
   private readonly recoveryTasks = new Set<Promise<void>>()
+  private readonly sentMessageIdsBySession = new Map<string, Set<string>>()
   private readonly listenerDebounce: ListenerDebounceBuffer<DebouncedInboundItem>
 
   constructor(private readonly host: InboundPipelineHost) {
@@ -1527,9 +1566,17 @@ export class InboundPipeline {
         return
       }
 
+      const needsTriage =
+        !recovery && Boolean(this.host.triage) && shouldRunTriage(decision, routerConfig)
+      const skipQuotePrefetch = Boolean(
+        msg.parentId &&
+          !needsTriage &&
+          this.isMessageAlreadyInRouteSession(decision.routeKey, msg.parentId),
+      )
+
       const [senderName, prefetchedQuote] = await Promise.all([
         this.resolveSenderName(bot.id, transport, msg),
-        msg.parentId
+        msg.parentId && !skipQuotePrefetch
           ? mediaCache.prefetchQuotedMessage(transport, msg.parentId, {
               signal: msgCancelController.signal,
             })
@@ -2074,6 +2121,7 @@ export class InboundPipeline {
           acquired.isNew,
           resolvedChatName,
           acquired.sessionId,
+          acquired.agent.session,
         )
         const postPromptDisabled = this.getBatchDisabledScope(bot.id, batchItems)
         if (postPromptDisabled) {
@@ -2164,6 +2212,7 @@ export class InboundPipeline {
                       latestItem.msg,
                       effectiveDecision,
                       stepText,
+                      acquired.agent.session,
                     )
                     if (intermediate.sent) {
                       clearExecAnchorTimer()
@@ -2452,6 +2501,7 @@ export class InboundPipeline {
             normalizedReply,
             groupConfig,
             fallbackText,
+            acquired.agent.session,
           )
         } catch (err) {
           if (isLarkMessageRecalledError(err)) {
@@ -3658,6 +3708,55 @@ export class InboundPipeline {
     await Promise.all(tasks)
   }
 
+  private collectInjectedMessageIds(sessionId?: string, session?: Session): Set<string> {
+    const ids = collectSessionInjectedMessageIds(session)
+    if (sessionId) {
+      const mem = this.sentMessageIdsBySession.get(sessionId)
+      if (mem) {
+        for (const id of mem) ids.add(id)
+      }
+    }
+    return ids
+  }
+
+  private isMessageAlreadyInRouteSession(routeKey: string, messageId: string): boolean {
+    const cleanId = messageId.trim()
+    if (!cleanId) return false
+    const binding = this.host.store.getBinding(routeKey)
+    if (!binding) return false
+    const liveAgent = this.host.ctx.agents?.get?.(binding.sessionId as never)
+    const ids = this.collectInjectedMessageIds(binding.sessionId, liveAgent?.session)
+    return ids.has(cleanId)
+  }
+
+  private recordSentLarkMessage(
+    sessionId: string | undefined,
+    session: Session | undefined,
+    messageId: string | undefined,
+  ): void {
+    const cleanId = messageId?.trim()
+    if (!cleanId) return
+    const sid = sessionId?.trim() || (session?.id as string | undefined)
+    if (sid) {
+      let bucket = this.sentMessageIdsBySession.get(sid)
+      if (!bucket) {
+        bucket = new Set<string>()
+        this.sentMessageIdsBySession.set(sid, bucket)
+        if (this.sentMessageIdsBySession.size > 1_000) {
+          const oldest = this.sentMessageIdsBySession.keys().next().value
+          if (oldest) this.sentMessageIdsBySession.delete(oldest)
+        }
+      }
+      bucket.add(cleanId)
+    }
+    if (!session) return
+    try {
+      appendPluginRecord(session, LARK_SENT_MESSAGE_RECORD_TYPE, { messageId: cleanId })
+    } catch {
+      // Best-effort durable dedup tracking; never fail reply delivery.
+    }
+  }
+
   private async buildBatchPrompt(
     bot: LarkBotConfig,
     transport: LarkBotTransport,
@@ -3666,9 +3765,27 @@ export class InboundPipeline {
     isNewSession: boolean,
     resolvedChatName?: string,
     sessionId?: string,
+    session?: Session,
   ): Promise<ContentBlock[]> {
     const primary = items[items.length - 1]!
     const reminders: string[] = []
+    const sessionInjectedIds = isNewSession
+      ? new Set<string>()
+      : this.collectInjectedMessageIds(sessionId, session)
+    const batchOwnMessageIds = new Set<string>(
+      items.map((item) => item.msg.messageId).filter((id): id is string => Boolean(id)),
+    )
+    const earlierBatchMessageIds = new Set<string>(
+      items
+        .slice(0, -1)
+        .map((item) => item.msg.messageId)
+        .filter((id): id is string => Boolean(id)),
+    )
+    const primaryQuoteAlreadyInSession = Boolean(
+      primary.msg.parentId &&
+        (sessionInjectedIds.has(primary.msg.parentId) ||
+          earlierBatchMessageIds.has(primary.msg.parentId)),
+    )
 
     if (isNewSession && effectiveDecision.roleReminder) {
       reminders.push(effectiveDecision.roleReminder)
@@ -3709,7 +3826,7 @@ export class InboundPipeline {
       if (item.recoveryReminder) reminders.push(item.recoveryReminder)
     }
 
-    const primaryQuote = primary.prefetchedQuote
+    const primaryQuote = primaryQuoteAlreadyInSession ? undefined : primary.prefetchedQuote
     const admittedQuoteBlocks: ContentBlock[] = []
     const admittedMessageBlocks: ContentBlock[] = []
     const seenImageKeys = new Set<string>()
@@ -3739,10 +3856,14 @@ export class InboundPipeline {
     let primaryQuoteAttachedImages = 0
     for (const item of items) {
       if (item.prefetchedQuote && item.prefetchedQuote.imageKeys.length > 0) {
+        const quoteId = item.prefetchedQuote.messageId
+        if (sessionInjectedIds.has(quoteId) || batchOwnMessageIds.has(quoteId)) {
+          continue
+        }
         const count = await collectFromCache(
           item.mediaCache,
           item.prefetchedQuote.imageKeys.map((imageKey) => ({
-            messageId: item.prefetchedQuote!.messageId,
+            messageId: quoteId,
             imageKey,
           })),
           admittedQuoteBlocks,
@@ -3779,6 +3900,7 @@ export class InboundPipeline {
         replyMode: effectiveDecision.replyMode,
         useCard: effectiveDecision.useCard,
         includeFullGuide: isNewSession,
+        ...(primaryQuoteAlreadyInSession ? { quoteAlreadyInSession: true } : {}),
         ...(primaryQuote
           ? {
               prefetchedQuote: {
@@ -3984,6 +4106,7 @@ export class InboundPipeline {
     msg: InboundLarkMessage,
     decision: AgentDecision,
     stepText: string,
+    session?: Session,
   ): Promise<{
     readonly sent: boolean
     readonly routeKey: string
@@ -4006,6 +4129,7 @@ export class InboundPipeline {
       replyMode: decision.replyMode,
       ...(card ? { card } : { text }),
     })
+    this.recordSentLarkMessage(session?.id as string | undefined, session, sent?.messageId)
     const routeKey = this.syncReplyRouteAliases(bot, msg, decision, sent)
     return {
       sent: true,
@@ -4024,6 +4148,7 @@ export class InboundPipeline {
     replyText: string,
     groupConfig?: LarkGroupConfig,
     fallbackText?: string,
+    session?: Session,
   ): Promise<string> {
     const text =
       normalizeReplyText(replyText, { allowSilentSentinel: true }) ||
@@ -4055,6 +4180,7 @@ export class InboundPipeline {
       replyMode: decision.replyMode,
       ...(card ? { card } : { text }),
     })
+    this.recordSentLarkMessage(sessionId, session, sent?.messageId)
     return this.syncReplyRouteAliases(bot, msg, decision, sent)
   }
 

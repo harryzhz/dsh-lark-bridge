@@ -79,6 +79,7 @@ export {
   composeSystemReminder,
   composeTurnPrompt,
   decideLarkRouting,
+  extractInjectedLarkMessageIdsFromText,
   extractPeerUserMentions,
   extractRouteScope,
   isGroupEnabled,

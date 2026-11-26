@@ -25,6 +25,7 @@ import {
   composeTurnPrompt,
   decideLarkRouting,
   expandWorkingDir,
+  extractInjectedLarkMessageIdsFromText,
   extractPureUserIntent,
   extractReminderTriggerOutput,
   formatMarkdownForLarkCard,
@@ -236,6 +237,68 @@ describe('Workspace name, ~ expansion, card images & <system_reminder> compositi
     expect(aggregated).toContain('<role name="研发主力助手">')
     expect(aggregated).toContain('<lark_context ')
     expect(aggregated).toContain('<user_message>\n请检查配置\n</user_message>')
+  })
+
+  it('extracts already-injected message IDs and suppresses repeated <quoted_message> blocks on follow-up turns', () => {
+    const bot = createBot()
+    const extracted = extractInjectedLarkMessageIdsFromText(
+      [
+        '<system_reminder>',
+        '<lark_context bot_id="b1" message_id="om_turn_1" thread_id="om_root_1" quoted_message_id="om_root_1">',
+        '<quoted_message message_id="om_root_1" msg_type="text">原始长消息</quoted_message>',
+        '引用消息：om_failed_fetch（查看全文或下载附件：`lark-bridge message om_failed_fetch`）',
+        '</lark_context>',
+        '</system_reminder>',
+        '<user_message>',
+        '以下 2 条消息在你上一轮处理期间连续到达，请结合上下文统一处理并回复：',
+        '[1] Alex (message_id="om_batch_1"): 第一句',
+        '[2] Sam (message_id="om_batch_2"): 第二句',
+        '</user_message>',
+      ].join('\n'),
+    )
+    expect([...extracted]).toEqual(['om_turn_1', 'om_root_1', 'om_batch_1', 'om_batch_2'])
+    expect(extracted.has('om_failed_fetch')).toBe(false)
+
+    // Pure thread continuation (`parentId === rootId`) with already-injected root omits body entirely
+    const threadFollowup = composeLarkContextReminder({
+      bot,
+      botOpenId: 'ou_bot',
+      msg: createMessage({
+        messageId: 'om_turn_2',
+        rootId: 'om_root_1',
+        parentId: 'om_root_1',
+      }),
+      includeFullGuide: false,
+      quoteAlreadyInSession: true,
+      prefetchedQuote: {
+        messageId: 'om_root_1',
+        msgType: 'text',
+        text: '不应该重复出现',
+        imageCount: 1,
+        attachedImageCount: 1,
+      },
+    })
+    expect(threadFollowup).toMatch(/^<lark_context\b[^>]*\/>$/)
+    expect(threadFollowup).toContain('thread_id="om_root_1"')
+    expect(threadFollowup).toContain('quoted_message_id="om_root_1"')
+    expect(threadFollowup).not.toContain('<quoted_message')
+    expect(threadFollowup).not.toContain('不应该重复出现')
+
+    // Explicit quote of an earlier non-root message in the same session keeps a short pointer only
+    const midThreadQuote = composeLarkContextReminder({
+      bot,
+      botOpenId: 'ou_bot',
+      msg: createMessage({
+        messageId: 'om_turn_3',
+        rootId: 'om_root_1',
+        parentId: 'om_reply_2',
+      }),
+      includeFullGuide: false,
+      quoteAlreadyInSession: true,
+    })
+    expect(midThreadQuote).not.toContain('<quoted_message')
+    expect(midThreadQuote).toContain('引用消息：om_reply_2（内容已在本会话前文中')
+    expect(midThreadQuote).toContain('lark-bridge message om_reply_2')
   })
 })
 
