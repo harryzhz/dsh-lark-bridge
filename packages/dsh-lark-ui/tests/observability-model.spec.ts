@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest'
+import { resolveModelDisplayName } from '../src/components/options.js'
 import {
   buildSparklineGeometry,
   computeNiceAxisMax,
   computeNiceDurationAxisMax,
+  formatAgentModelsSummary,
   formatBytes,
   formatDeltaBadge,
   formatLatencyMs,
@@ -13,9 +15,13 @@ import {
   resolveDbQueryTone,
   resolveErrorCodeLabel,
   resolveHeatmapLevel,
+  resolveObservabilityAgentLabel,
+  resolveObservabilityModelLabel,
   resolveTableLabel,
   resolveTriggerLabel,
   splitTelemetryVerb,
+  TRIAGE_AGENT_KEY,
+  UNATTRIBUTED_AGENT_KEY,
 } from '../src/views/observability-model.js'
 
 describe('observability-model pure helpers', () => {
@@ -105,5 +111,73 @@ describe('observability-model pure helpers', () => {
     expect(resolveApiRouteTone(190)).toBe('primary')
     expect(resolveApiRouteTone(860)).toBe('warn')
     expect(resolveApiRouteTone(1600)).toBe('error')
+  })
+
+  it('resolves orthogonal Agent labels and concrete Model names without fabricating default labels', () => {
+    const runtimes = [
+      {
+        id: 'agy',
+        name: 'Antigravity',
+        description: '',
+        kind: 'external' as const,
+        providerId: 'agy-cli',
+        defaultModel: 'gemini-4-neon',
+        supportsReasoningEffort: true,
+        isDefault: false,
+      },
+      {
+        id: 'codex',
+        name: 'Codex',
+        description: '',
+        kind: 'external' as const,
+        providerId: 'codex-cli',
+        defaultModel: 'gpt-6.1-sol',
+        supportsReasoningEffort: true,
+        isDefault: false,
+      },
+    ]
+    const models = [
+      {
+        provider: 'agy-cli',
+        models: [
+          { id: 'gemini-4-carbon', name: 'Gemini 4 Carbon' },
+          { id: 'gemini-4-neon', name: 'Gemini 4 Neon' },
+        ],
+      },
+      {
+        provider: 'codex-cli',
+        models: [{ id: 'gpt-6.1-sol', name: 'GPT-6.1-Sol' }],
+      },
+    ]
+
+    expect(resolveObservabilityAgentLabel('agy', runtimes)).toBe('Antigravity')
+    expect(resolveObservabilityAgentLabel('codex-cli', runtimes)).toBe('Codex')
+    expect(resolveObservabilityAgentLabel('standard', runtimes)).toBe('标准模式')
+    expect(resolveObservabilityAgentLabel(TRIAGE_AGENT_KEY, runtimes)).toBe('智能分流')
+    expect(resolveObservabilityAgentLabel(UNATTRIBUTED_AGENT_KEY, runtimes)).toBe('其他运行时')
+
+    expect(
+      resolveObservabilityModelLabel('gemini-4-carbon', 'agy', runtimes, models, resolveModelDisplayName),
+    ).toEqual({ label: 'Gemini 4 Carbon', unattributed: false })
+    // Empty model must never silently fall back to runtime default or "<agent> (default)"
+    expect(
+      resolveObservabilityModelLabel('', 'codex', runtimes, models, resolveModelDisplayName),
+    ).toEqual({ label: '未记录模型', unattributed: true })
+
+    expect(
+      formatAgentModelsSummary(
+        [
+          { model: 'gemini-4-carbon', totalTokens: 1000, sharePct: 60 },
+          { model: 'gemini-4-neon', totalTokens: 600, sharePct: 40 },
+        ],
+        'agy',
+        runtimes,
+        models,
+        resolveModelDisplayName,
+      ),
+    ).toEqual({
+      text: 'Gemini 4 Carbon · Gemini 4 Neon',
+      title: 'Gemini 4 Carbon · Gemini 4 Neon',
+    })
   })
 })

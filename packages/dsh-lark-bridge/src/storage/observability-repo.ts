@@ -1,11 +1,13 @@
 import { buildGroupKey } from '@dsh-lark/lark-core'
 import type {
+  ObservabilityAgentBreakdown,
   ObservabilityChatFilterOption,
   ObservabilityChatRow,
   ObservabilityErrorBreakdown,
   ObservabilityHeatmapCell,
   ObservabilityLatencyBucket,
   ObservabilityModelBreakdown,
+  ObservabilityRankModelSummary,
   ObservabilitySeriesPoint,
   ObservabilityTriggerBreakdown,
   ObservabilityWindow,
@@ -20,6 +22,8 @@ const ROLLUP_RETENTION_DAYS = 365
 const PRUNE_EVERY_INSERTS = 200
 
 export const P2P_CHAT_FILTER_VALUE = '__p2p__'
+export const TRIAGE_AGENT_KEY = '__triage__'
+export const UNATTRIBUTED_AGENT_KEY = '__unknown__'
 
 export interface WindowSpec {
   readonly window: ObservabilityWindow
@@ -335,6 +339,57 @@ function accumulateRow(target: WindowTotals, row: RawUsageEventRow): void {
   }
 }
 
+function isToolErrorMarkerRow(row: RawUsageEventRow): boolean {
+  return (
+    row.record_kind === 'llm_step' &&
+    (Number(row.total_tokens) || 0) === 0 &&
+    (Number(row.tool_calls) || 0) === 0 &&
+    (Number(row.tool_errors) || 0) > 0
+  )
+}
+
+function resolveEventAgentKey(row: RawUsageEventRow): string {
+  if (row.record_kind === 'triage' || row.trigger.trim() === 'triage') {
+    return TRIAGE_AGENT_KEY
+  }
+  const preset = row.agent_preset.trim()
+  if (preset) return preset
+  return ''
+}
+
+function addTopModelToken(
+  target: Map<string, { model: string; agentPreset: string; totalTokens: number }>,
+  row: RawUsageEventRow,
+  tokens: number,
+): void {
+  const model = row.model.trim()
+  if (!model || tokens <= 0) return
+  const key = model.toLowerCase()
+  const existing = target.get(key)
+  const agentKey = resolveEventAgentKey(row)
+  if (existing) {
+    existing.totalTokens += tokens
+    if (!existing.agentPreset && agentKey) {
+      existing.agentPreset = agentKey
+    }
+  } else {
+    target.set(key, {
+      model,
+      agentPreset: agentKey,
+      totalTokens: tokens,
+    })
+  }
+}
+
+function finalizeTopModels(
+  source: Map<string, { model: string; agentPreset: string; totalTokens: number }>,
+  limit = 4,
+): ObservabilityRankModelSummary[] {
+  return [...source.values()]
+    .sort((a, b) => b.totalTokens - a.totalTokens)
+    .slice(0, limit)
+}
+
 export interface ObservabilityRepoAggregate {
   readonly window: ObservabilityWindow
   readonly fromMs: number
@@ -348,6 +403,7 @@ export interface ObservabilityRepoAggregate {
   readonly series: readonly ObservabilitySeriesPoint[]
   readonly latencyHistogram: readonly ObservabilityLatencyBucket[]
   readonly models: readonly ObservabilityModelBreakdown[]
+  readonly agents: readonly ObservabilityAgentBreakdown[]
   readonly triggers: readonly ObservabilityTriggerBreakdown[]
   readonly errors: readonly ObservabilityErrorBreakdown[]
   readonly heatmap: { readonly maxCount: number; readonly cells: readonly ObservabilityHeatmapCell[] }
@@ -360,8 +416,12 @@ export interface ObservabilityRepoAggregate {
       readonly silentSkipped: number
       readonly errors: number
       readonly totalTokens: number
-      readonly promptTokens: number
+      readonly inputTokens: number
       readonly cacheReadTokens: number
+      readonly cacheWriteTokens: number
+      readonly outputTokens: number
+      readonly promptTokens: number
+      readonly topModels: readonly ObservabilityRankModelSummary[]
       readonly latencies: number[]
     }
   >
@@ -582,6 +642,77 @@ export class ObservabilityRepo {
     return map
   }
 
+  listSessionsNeedingAttributionRepair(limit = 400): string[] {
+    const safeLimit = Math.max(1, Math.min(2000, Math.floor(limit)))
+    const rows = this.db
+      .prepare(
+        `SELECT session_id, MAX(timestamp_ms) AS latest_ts
+         FROM telemetry_usage_events
+         WHERE record_kind = 'llm_step'
+           AND session_id != ''
+           AND (trim(model) = '' OR trim(provider) = '' OR trim(agent_preset) = '')
+         GROUP BY session_id
+         ORDER BY latest_ts DESC
+         LIMIT ?`,
+      )
+      .all(safeLimit) as Array<{ session_id: string }>
+    return rows.map((r) => r.session_id)
+  }
+
+  repairUsageEventAttribution(
+    updates: ReadonlyArray<{
+      readonly id: string
+      readonly agentPreset?: string
+      readonly provider?: string
+      readonly model?: string
+    }>,
+  ): number {
+    if (updates.length === 0) return 0
+    const stmt = this.db.prepare(
+      `UPDATE telemetry_usage_events
+       SET agent_preset = CASE WHEN ? != '' THEN ? ELSE agent_preset END,
+           provider     = CASE WHEN ? != '' THEN ? ELSE provider END,
+           model        = CASE WHEN ? != '' THEN ? ELSE model END
+       WHERE id = ?
+         AND (
+           (? != '' AND agent_preset != ?)
+           OR (? != '' AND provider != ?)
+           OR (? != '' AND model != ?)
+         )`,
+    )
+    let updated = 0
+    this.db.transaction(() => {
+      for (const item of updates) {
+        const id = item.id.trim()
+        if (!id) continue
+        const preset = item.agentPreset?.trim() ?? ''
+        const provider = item.provider?.trim() ?? ''
+        const model = item.model?.trim() ?? ''
+        if (!preset && !provider && !model) continue
+        const res = stmt.run(
+          preset,
+          preset,
+          provider,
+          provider,
+          model,
+          model,
+          id,
+          preset,
+          preset,
+          provider,
+          provider,
+          model,
+          model,
+        )
+        if (Number(res.changes) > 0) updated += Number(res.changes)
+      }
+    })
+    if (updated > 0) {
+      this.invalidateAggregateCache()
+    }
+    return updated
+  }
+
   prune(nowMs = Date.now()): void {
     const detailCutoff = nowMs - DETAIL_RETENTION_MS
     this.db.prepare('DELETE FROM telemetry_usage_events WHERE timestamp_ms < ?').run(detailCutoff)
@@ -649,6 +780,7 @@ export class ObservabilityRepo {
     const series = this.buildTimeSeries(currentRows, fromMs, alignedEndMs, spec)
     const latencyHistogram = buildLatencyHistogram(current.latencies)
     const models = this.buildModelBreakdown(currentRows, current.totalTokens)
+    const agents = this.buildAgentBreakdown(currentRows, current.totalTokens)
     const triggers = this.buildTriggerBreakdown(currentRows)
     const errors = this.buildErrorBreakdown(currentRows)
     const heatmap = this.buildHeatmap(currentRows)
@@ -677,6 +809,7 @@ export class ObservabilityRepo {
       series,
       latencyHistogram,
       models,
+      agents,
       triggers,
       errors,
       heatmap,
@@ -846,8 +979,8 @@ export class ObservabilityRepo {
       string,
       {
         model: string
-        provider: string
-        agentPreset: string
+        providerWeights: Map<string, number>
+        agentWeights: Map<string, number>
         steps: number
         inputTokens: number
         cacheReadTokens: number
@@ -859,16 +992,16 @@ export class ObservabilityRepo {
     >()
 
     for (const row of rows) {
+      if (isToolErrorMarkerRow(row)) continue
       const tot = Number(row.total_tokens) || 0
       const isStep = row.record_kind === 'llm_step' || row.record_kind === 'triage'
       if (!isStep && tot === 0) continue
-      const model = row.model.trim() || (row.agent_preset ? `${row.agent_preset} (default)` : 'unknown')
-      const provider = row.provider.trim()
-      const key = `${provider}::${model}`
+      const rawModel = row.model.trim()
+      const key = rawModel ? rawModel.toLowerCase() : '__unattributed__'
       const cur = map.get(key) ?? {
-        model,
-        provider,
-        agentPreset: row.agent_preset.trim(),
+        model: rawModel,
+        providerWeights: new Map<string, number>(),
+        agentWeights: new Map<string, number>(),
         steps: 0,
         inputTokens: 0,
         cacheReadTokens: 0,
@@ -877,8 +1010,17 @@ export class ObservabilityRepo {
         reasoningTokens: 0,
         totalTokens: 0,
       }
-      if (!cur.agentPreset && row.agent_preset.trim()) {
-        cur.agentPreset = row.agent_preset.trim()
+      if (!cur.model && rawModel) {
+        cur.model = rawModel
+      }
+      const weight = Math.max(1, tot)
+      const provider = row.provider.trim()
+      if (provider) {
+        cur.providerWeights.set(provider, (cur.providerWeights.get(provider) ?? 0) + weight)
+      }
+      const agentKey = resolveEventAgentKey(row)
+      if (agentKey) {
+        cur.agentWeights.set(agentKey, (cur.agentWeights.get(agentKey) ?? 0) + weight)
       }
       if (isStep) cur.steps += 1
       cur.inputTokens += Number(row.input_tokens) || 0
@@ -900,7 +1042,132 @@ export class ObservabilityRepo {
           promptTotal > 0 ? Math.round((m.cacheReadTokens / promptTotal) * 1000) / 10 : 0
         const sharePct =
           grandTotalTokens > 0 ? Math.round((m.totalTokens / grandTotalTokens) * 1000) / 10 : 0
-        return { ...m, cacheHitRate, sharePct }
+        const sortedAgents = [...m.agentWeights.entries()]
+          .sort((a, b) => b[1] - a[1])
+          .map(([k]) => k)
+        const primaryRuntimePreset =
+          sortedAgents.find((k) => k !== TRIAGE_AGENT_KEY && k !== UNATTRIBUTED_AGENT_KEY) ?? ''
+        const primaryProvider =
+          [...m.providerWeights.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? ''
+        return {
+          model: m.model,
+          provider: primaryProvider,
+          agentPreset: primaryRuntimePreset,
+          agents: sortedAgents,
+          steps: m.steps,
+          inputTokens: m.inputTokens,
+          cacheReadTokens: m.cacheReadTokens,
+          cacheWriteTokens: m.cacheWriteTokens,
+          outputTokens: m.outputTokens,
+          reasoningTokens: m.reasoningTokens,
+          totalTokens: m.totalTokens,
+          cacheHitRate,
+          sharePct,
+        }
+      })
+  }
+
+  private buildAgentBreakdown(
+    rows: readonly RawUsageEventRow[],
+    grandTotalTokens: number,
+  ): ObservabilityAgentBreakdown[] {
+    const map = new Map<
+      string,
+      {
+        agentKey: string
+        sessions: Set<string>
+        steps: number
+        inputTokens: number
+        cacheReadTokens: number
+        cacheWriteTokens: number
+        outputTokens: number
+        reasoningTokens: number
+        totalTokens: number
+        modelTokens: Map<string, { model: string; totalTokens: number }>
+      }
+    >()
+
+    for (const row of rows) {
+      if (isToolErrorMarkerRow(row)) continue
+      const tot = Number(row.total_tokens) || 0
+      const isStep = row.record_kind === 'llm_step' || row.record_kind === 'triage'
+      if (!isStep && tot === 0) continue
+      const agentKey = resolveEventAgentKey(row) || UNATTRIBUTED_AGENT_KEY
+      const cur = map.get(agentKey) ?? {
+        agentKey,
+        sessions: new Set<string>(),
+        steps: 0,
+        inputTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        outputTokens: 0,
+        reasoningTokens: 0,
+        totalTokens: 0,
+        modelTokens: new Map<string, { model: string; totalTokens: number }>(),
+      }
+      if (row.session_id) cur.sessions.add(row.session_id)
+      if (isStep) cur.steps += 1
+      cur.inputTokens += Number(row.input_tokens) || 0
+      cur.cacheReadTokens += Number(row.cache_read_tokens) || 0
+      cur.cacheWriteTokens += Number(row.cache_write_tokens) || 0
+      cur.outputTokens += Number(row.output_tokens) || 0
+      cur.reasoningTokens += Number(row.reasoning_tokens) || 0
+      cur.totalTokens += tot
+
+      const rawModel = row.model.trim()
+      if (rawModel && (tot > 0 || isStep)) {
+        const mKey = rawModel.toLowerCase()
+        const existing = cur.modelTokens.get(mKey)
+        if (existing) {
+          existing.totalTokens += tot
+        } else {
+          cur.modelTokens.set(mKey, { model: rawModel, totalTokens: tot })
+        }
+      }
+      map.set(agentKey, cur)
+    }
+
+    return [...map.values()]
+      .filter((a) => a.totalTokens > 0 || a.steps > 0)
+      .sort((a, b) => b.totalTokens - a.totalTokens || b.steps - a.steps)
+      .slice(0, 12)
+      .map((a) => {
+        const promptTotal = a.inputTokens + a.cacheReadTokens + a.cacheWriteTokens
+        const cacheHitRate =
+          promptTotal > 0 ? Math.round((a.cacheReadTokens / promptTotal) * 1000) / 10 : 0
+        const sharePct =
+          grandTotalTokens > 0 ? Math.round((a.totalTokens / grandTotalTokens) * 1000) / 10 : 0
+        const kind: ObservabilityAgentBreakdown['kind'] =
+          a.agentKey === TRIAGE_AGENT_KEY
+            ? 'triage'
+            : a.agentKey === UNATTRIBUTED_AGENT_KEY
+              ? 'unknown'
+              : 'runtime'
+        const models = [...a.modelTokens.values()]
+          .sort((x, y) => y.totalTokens - x.totalTokens)
+          .slice(0, 6)
+          .map((m) => ({
+            model: m.model,
+            totalTokens: m.totalTokens,
+            sharePct:
+              a.totalTokens > 0 ? Math.round((m.totalTokens / a.totalTokens) * 1000) / 10 : 0,
+          }))
+        return {
+          agentKey: a.agentKey,
+          agentPreset: kind === 'runtime' ? a.agentKey : '',
+          kind,
+          sessions: a.sessions.size,
+          steps: a.steps,
+          inputTokens: a.inputTokens,
+          cacheReadTokens: a.cacheReadTokens,
+          cacheWriteTokens: a.cacheWriteTokens,
+          outputTokens: a.outputTokens,
+          reasoningTokens: a.reasoningTokens,
+          totalTokens: a.totalTokens,
+          cacheHitRate,
+          sharePct,
+          models,
+        }
       })
   }
 
@@ -1054,8 +1321,12 @@ export class ObservabilityRepo {
         silentSkipped: number
         errors: number
         totalTokens: number
-        promptTokens: number
+        inputTokens: number
         cacheReadTokens: number
+        cacheWriteTokens: number
+        outputTokens: number
+        promptTokens: number
+        modelTokens: Map<string, { model: string; agentPreset: string; totalTokens: number }>
         latencies: number[]
       }
     >()
@@ -1069,17 +1340,27 @@ export class ObservabilityRepo {
         silentSkipped: 0,
         errors: 0,
         totalTokens: 0,
-        promptTokens: 0,
+        inputTokens: 0,
         cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        outputTokens: 0,
+        promptTokens: 0,
+        modelTokens: new Map<string, { model: string; agentPreset: string; totalTokens: number }>(),
         latencies: [],
       }
       if (row.session_id) cur.sessions.add(row.session_id)
       const inTok = Number(row.input_tokens) || 0
       const crTok = Number(row.cache_read_tokens) || 0
       const cwTok = Number(row.cache_write_tokens) || 0
-      cur.totalTokens += Number(row.total_tokens) || 0
-      cur.promptTokens += inTok + crTok + cwTok
+      const outTok = Number(row.output_tokens) || 0
+      const totTok = Number(row.total_tokens) || 0
+      cur.totalTokens += totTok
+      cur.inputTokens += inTok
       cur.cacheReadTokens += crTok
+      cur.cacheWriteTokens += cwTok
+      cur.outputTokens += outTok
+      cur.promptTokens += inTok + crTok + cwTok
+      addTopModelToken(cur.modelTokens, row, totTok)
 
       if (row.record_kind === 'inbound' && row.outcome !== 'ignored') {
         cur.inbound += 1
@@ -1107,8 +1388,12 @@ export class ObservabilityRepo {
         readonly silentSkipped: number
         readonly errors: number
         readonly totalTokens: number
-        readonly promptTokens: number
+        readonly inputTokens: number
         readonly cacheReadTokens: number
+        readonly cacheWriteTokens: number
+        readonly outputTokens: number
+        readonly promptTokens: number
+        readonly topModels: readonly ObservabilityRankModelSummary[]
         readonly latencies: number[]
       }
     >()
@@ -1120,8 +1405,12 @@ export class ObservabilityRepo {
         silentSkipped: v.silentSkipped,
         errors: v.errors,
         totalTokens: v.totalTokens,
-        promptTokens: v.promptTokens,
+        inputTokens: v.inputTokens,
         cacheReadTokens: v.cacheReadTokens,
+        cacheWriteTokens: v.cacheWriteTokens,
+        outputTokens: v.outputTokens,
+        promptTokens: v.promptTokens,
+        topModels: finalizeTopModels(v.modelTokens),
         latencies: v.latencies,
       })
     }
@@ -1144,8 +1433,12 @@ export class ObservabilityRepo {
         replied: number
         errors: number
         totalTokens: number
-        promptTokens: number
+        inputTokens: number
         cacheReadTokens: number
+        cacheWriteTokens: number
+        outputTokens: number
+        promptTokens: number
+        modelTokens: Map<string, { model: string; agentPreset: string; totalTokens: number }>
         latencySum: number
         latencyCount: number
         lastActiveMs: number
@@ -1170,8 +1463,12 @@ export class ObservabilityRepo {
         replied: 0,
         errors: 0,
         totalTokens: 0,
-        promptTokens: 0,
+        inputTokens: 0,
         cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        outputTokens: 0,
+        promptTokens: 0,
+        modelTokens: new Map<string, { model: string; agentPreset: string; totalTokens: number }>(),
         latencySum: 0,
         latencyCount: 0,
         lastActiveMs: 0,
@@ -1180,9 +1477,15 @@ export class ObservabilityRepo {
       const inTok = Number(row.input_tokens) || 0
       const crTok = Number(row.cache_read_tokens) || 0
       const cwTok = Number(row.cache_write_tokens) || 0
-      cur.totalTokens += Number(row.total_tokens) || 0
-      cur.promptTokens += inTok + crTok + cwTok
+      const outTok = Number(row.output_tokens) || 0
+      const totTok = Number(row.total_tokens) || 0
+      cur.totalTokens += totTok
+      cur.inputTokens += inTok
       cur.cacheReadTokens += crTok
+      cur.cacheWriteTokens += cwTok
+      cur.outputTokens += outTok
+      cur.promptTokens += inTok + crTok + cwTok
+      addTopModelToken(cur.modelTokens, row, totTok)
       cur.lastActiveMs = Math.max(cur.lastActiveMs, Number(row.timestamp_ms))
 
       if (row.record_kind === 'inbound' && row.outcome !== 'ignored') {
@@ -1236,6 +1539,11 @@ export class ObservabilityRepo {
           replied: v.replied,
           errors: v.errors,
           totalTokens: v.totalTokens,
+          inputTokens: v.inputTokens,
+          cacheReadTokens: v.cacheReadTokens,
+          cacheWriteTokens: v.cacheWriteTokens,
+          outputTokens: v.outputTokens,
+          topModels: finalizeTopModels(v.modelTokens),
           cacheHitRate,
           avgLatencyMs: v.latencyCount > 0 ? Math.round(v.latencySum / v.latencyCount) : 0,
           lastActiveMs: v.lastActiveMs,

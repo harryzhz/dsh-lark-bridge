@@ -8,7 +8,11 @@ import { brandString } from '@deepseek-ai/dsh-brand'
 import type { TokenUsage } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent, SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
-import type { LarkBotStatus, TransportDiagnosticsSnapshot } from '@dsh-lark/lark-core'
+import {
+  resolveEffectiveAgentRuntime,
+  type LarkBotStatus,
+  type TransportDiagnosticsSnapshot,
+} from '@dsh-lark/lark-core'
 import { assessWalBloat } from './diagnostics.js'
 import type {
   ObservabilityBotRow,
@@ -199,12 +203,61 @@ async function safeFileSizeAsync(filePath: string): Promise<number> {
   }
 }
 
+function readHeaderAgentPreset(header: unknown): string {
+  const raw = (header as { agentPreset?: unknown } | undefined)?.agentPreset
+  return typeof raw === 'string' ? raw.trim() : ''
+}
+
+function extractMessageSource(data: unknown): { readonly provider: string; readonly model: string } {
+  const src = (
+    data as {
+      message?: {
+        source?: { kind?: unknown; provider?: unknown; model?: unknown }
+      }
+    } | undefined
+  )?.message?.source
+  if (!src || typeof src !== 'object') return { provider: '', model: '' }
+  return {
+    provider: typeof src.provider === 'string' ? src.provider.trim() : '',
+    model: typeof src.model === 'string' ? src.model.trim() : '',
+  }
+}
+
+function extractModelSelectionFromEvent(event: SessionEvent): {
+  readonly provider?: string
+  readonly model?: string
+  readonly agentPreset?: string
+} | null {
+  const eventType = String(event.type)
+  if (eventType === 'agent-preset/selected') {
+    const raw = (event.data as { agentPreset?: unknown } | undefined)?.agentPreset
+    const agentPreset = typeof raw === 'string' ? raw.trim() : ''
+    return agentPreset ? { agentPreset } : null
+  }
+  if (eventType === 'model/selection') {
+    const data = event.data as { provider?: unknown; model?: unknown } | undefined
+    const provider = typeof data?.provider === 'string' ? data.provider.trim() : ''
+    const model = typeof data?.model === 'string' ? data.model.trim() : ''
+    return provider || model ? { ...(provider ? { provider } : {}), ...(model ? { model } : {}) } : null
+  }
+  if (eventType === 'request/header') {
+    const cfg = (
+      event.data as { header?: { config?: { provider?: unknown; model?: unknown } } } | undefined
+    )?.header?.config
+    const provider = typeof cfg?.provider === 'string' ? cfg.provider.trim() : ''
+    const model = typeof cfg?.model === 'string' ? cfg.model.trim() : ''
+    return provider || model ? { ...(provider ? { provider } : {}), ...(model ? { model } : {}) } : null
+  }
+  return null
+}
+
 /**
  * Runtime observability collector, historical session token backfill engine,
  * process vitals monitor, and async storage telemetry projector.
  */
 export class ObservabilityService {
   private readonly sessionModels = new Map<string, SessionModelState>()
+  private readonly sessionPresets = new Map<string, string>()
   private readonly sessionAttrCache = new Map<string, SessionAttribution | null>()
   private readonly vitals: ProcessVitalPoint[] = []
   private eventLoopMonitor?: IntervalHistogram
@@ -482,6 +535,11 @@ export class ObservabilityService {
         errors,
         successRate,
         totalTokens: stats?.totalTokens ?? 0,
+        inputTokens: stats?.inputTokens ?? 0,
+        cacheReadTokens: stats?.cacheReadTokens ?? 0,
+        cacheWriteTokens: stats?.cacheWriteTokens ?? 0,
+        outputTokens: stats?.outputTokens ?? 0,
+        topModels: stats?.topModels ?? [],
         cacheHitRate,
         avgLatencyMs: lat.avgMs,
         p95LatencyMs: lat.p95Ms,
@@ -653,6 +711,7 @@ export class ObservabilityService {
           totalMemoryRecalls: memoryStats.totalRecalls,
         },
         models: agg.models,
+        agents: agg.agents,
         triggers: agg.triggers,
         heatmap: agg.heatmap,
         botRanking,
@@ -755,12 +814,18 @@ export class ObservabilityService {
 
   private handleLiveSessionEvent(session: Session, event: SessionEvent): void {
     const sid = String(session.id)
-    if (event.type === 'request/header') {
-      const cfg = (
-        event.data as { header?: { config?: { provider?: string; model?: string } } }
-      )?.header?.config
-      if (cfg?.model || cfg?.provider) {
-        this.rememberSessionModel(sid, cfg.provider ?? '', cfg.model ?? '')
+    const metaUpdate = extractModelSelectionFromEvent(event)
+    if (metaUpdate) {
+      if (metaUpdate.agentPreset) {
+        this.rememberSessionPreset(sid, metaUpdate.agentPreset)
+      }
+      if (metaUpdate.provider || metaUpdate.model) {
+        const prev = this.sessionModels.get(sid)
+        this.rememberSessionModel(
+          sid,
+          metaUpdate.provider || prev?.provider || '',
+          metaUpdate.model || prev?.model || '',
+        )
       }
       return
     }
@@ -770,13 +835,24 @@ export class ObservabilityService {
       if (!attr) return
       const data = event.data as {
         usage?: TokenUsage
-        message?: { content?: readonly { type?: string }[] }
+        message?: {
+          content?: readonly { type?: string }[]
+          source?: { provider?: unknown; model?: unknown }
+        }
       }
       const toolCalls = (data.message?.content ?? []).filter((b) => b?.type === 'tool-call').length
       const tokens = normalizeTokenUsage(data.usage)
       if (tokens.totalTokens === 0 && toolCalls === 0) return
 
-      const modelState = this.sessionModels.get(sid)
+      const msgSource = extractMessageSource(data)
+      const modelState = this.resolveLiveSessionModel(sid, session)
+      const resolvedProvider = msgSource.provider || modelState?.provider || ''
+      const resolvedModel = msgSource.model || modelState?.model || attr.model || ''
+      if (msgSource.provider || msgSource.model) {
+        this.rememberSessionModel(sid, resolvedProvider, resolvedModel)
+      }
+      const resolvedPreset =
+        this.sessionPresets.get(sid) || readHeaderAgentPreset(session.header) || attr.agentPreset
       const seq = Number(event.seq ?? 0)
       const ts = typeof event.time === 'number' && Number.isFinite(event.time) ? event.time : Date.now()
       this.host.store.recordUsageEvent({
@@ -788,9 +864,9 @@ export class ObservabilityService {
         chatType: attr.chatType,
         sessionId: sid,
         trigger: attr.trigger,
-        agentPreset: attr.agentPreset,
-        provider: modelState?.provider ?? '',
-        model: modelState?.model || attr.model || '',
+        agentPreset: resolvedPreset,
+        provider: resolvedProvider,
+        model: resolvedModel,
         outcome: 'completed',
         ...tokens,
         toolCalls,
@@ -804,6 +880,9 @@ export class ObservabilityService {
       if (!data?.isError) return
       const attr = this.resolveSessionAttribution(sid, session)
       if (!attr) return
+      const modelState = this.resolveLiveSessionModel(sid, session)
+      const resolvedPreset =
+        this.sessionPresets.get(sid) || readHeaderAgentPreset(session.header) || attr.agentPreset
       const seq = Number(event.seq ?? 0)
       const ts = typeof event.time === 'number' && Number.isFinite(event.time) ? event.time : Date.now()
       this.host.store.recordUsageEvent({
@@ -815,7 +894,9 @@ export class ObservabilityService {
         chatType: attr.chatType,
         sessionId: sid,
         trigger: attr.trigger,
-        agentPreset: attr.agentPreset,
+        agentPreset: resolvedPreset,
+        provider: modelState?.provider ?? '',
+        model: modelState?.model || attr.model || '',
         outcome: 'completed',
         errorCode: 'tool_error',
         toolErrors: 1,
@@ -834,6 +915,53 @@ export class ObservabilityService {
     }
   }
 
+  private rememberSessionPreset(sessionId: string, preset: string): void {
+    const clean = preset.trim()
+    if (!clean) return
+    this.sessionPresets.delete(sessionId)
+    this.sessionPresets.set(sessionId, clean)
+    while (this.sessionPresets.size > MAX_MODEL_CACHE_SESSIONS) {
+      const oldest = this.sessionPresets.keys().next().value
+      if (!oldest) break
+      this.sessionPresets.delete(oldest)
+    }
+  }
+
+  private resolveLiveSessionModel(
+    sessionId: string,
+    liveSession?: Session,
+  ): SessionModelState | undefined {
+    const cached = this.sessionModels.get(sessionId)
+    if (cached?.model) return cached
+    if (!liveSession || typeof liveSession.snapshotEvents !== 'function') return cached
+    const events = liveSession.snapshotEvents()
+    let provider = cached?.provider ?? ''
+    let model = cached?.model ?? ''
+    for (let i = events.length - 1; i >= 0; i -= 1) {
+      const ev = events[i]!
+      if (ev.type === 'assistant/message') {
+        const src = extractMessageSource(ev.data)
+        if (!provider && src.provider) provider = src.provider
+        if (!model && src.model) model = src.model
+      } else {
+        const meta = extractModelSelectionFromEvent(ev)
+        if (meta) {
+          if (!provider && meta.provider) provider = meta.provider
+          if (!model && meta.model) model = meta.model
+          if (meta.agentPreset && !this.sessionPresets.has(sessionId)) {
+            this.rememberSessionPreset(sessionId, meta.agentPreset)
+          }
+        }
+      }
+      if (provider && model) break
+    }
+    if (provider || model) {
+      this.rememberSessionModel(sessionId, provider, model)
+      return { provider, model }
+    }
+    return cached
+  }
+
   private resolveSessionAttribution(
     sessionId: string,
     liveSession?: Session,
@@ -842,6 +970,7 @@ export class ObservabilityService {
     if (cached !== undefined) return cached
 
     let found: SessionAttribution | null = null
+    const headerPreset = readHeaderAgentPreset(liveSession?.header)
 
     const binding = this.host.store.getBindingBySessionId(sessionId)
     if (binding) {
@@ -851,7 +980,7 @@ export class ObservabilityService {
         chatType:
           binding.chatType === 'p2p' || binding.trigger === 'p2p' ? 'p2p' : 'group',
         trigger: binding.trigger || 'mention',
-        agentPreset: binding.agentPreset || '',
+        agentPreset: headerPreset || binding.agentPreset || '',
         ...(binding.model ? { model: binding.model } : {}),
       }
     }
@@ -860,6 +989,11 @@ export class ObservabilityService {
       const ms = this.host.store.getManagedSession(sessionId)
       if (ms) {
         const bot = this.host.store.getBot(ms.botId)
+        const group =
+          bot && ms.chatId && ms.trigger !== 'p2p' && !ms.chatId.startsWith('dream:')
+            ? this.host.store.getGroup(bot.id, ms.chatId)
+            : undefined
+        const effective = bot ? resolveEffectiveAgentRuntime(bot, group) : undefined
         found = {
           botId: ms.botId,
           chatId: ms.chatId,
@@ -870,8 +1004,12 @@ export class ObservabilityService {
                 ? 'internal'
                 : 'group',
           trigger: ms.trigger || 'mention',
-          agentPreset: bot?.agentPreset ?? '',
-          ...(bot?.model ? { model: bot.model } : {}),
+          agentPreset: headerPreset || effective?.agentPreset || bot?.agentPreset || '',
+          ...(effective?.model
+            ? { model: effective.model }
+            : bot?.model
+              ? { model: bot.model }
+              : {}),
         }
       }
     }
@@ -884,14 +1022,23 @@ export class ObservabilityService {
         const origin = (originEvent as unknown as { data?: LarkOriginRecord }).data
         if (origin?.botId) {
           const bot = this.host.store.getBot(origin.botId)
+          const group =
+            bot && origin.chatId && origin.chatType !== 'p2p'
+              ? this.host.store.getGroup(bot.id, origin.chatId)
+              : undefined
+          const effective = bot ? resolveEffectiveAgentRuntime(bot, group) : undefined
           found = {
             botId: origin.botId,
             chatId: origin.chatId ?? '',
             chatType:
               origin.chatType === 'p2p' || origin.trigger === 'p2p' ? 'p2p' : 'group',
             trigger: origin.trigger || 'mention',
-            agentPreset: bot?.agentPreset ?? '',
-            ...(bot?.model ? { model: bot.model } : {}),
+            agentPreset: headerPreset || effective?.agentPreset || bot?.agentPreset || '',
+            ...(effective?.model
+              ? { model: effective.model }
+              : bot?.model
+                ? { model: bot.model }
+                : {}),
           }
         }
       }
@@ -1085,6 +1232,10 @@ export class ObservabilityService {
       }
 
       if (!this.disposed) {
+        await this.repairHistoricalModelAttributionOnce(persistence)
+      }
+
+      if (!this.disposed) {
         this.backfillCompleted = true
         this.backfillLastCompletedAtMs = Date.now()
       }
@@ -1193,6 +1344,7 @@ export class ObservabilityService {
     }
     try {
       const batch: TelemetryUsageEventInput[] = []
+      let agentPreset = readHeaderAgentPreset(handle.header) || item.attr.agentPreset
       let provider = ''
       let model = item.attr.model ?? ''
       let offset = 0
@@ -1204,12 +1356,16 @@ export class ObservabilityService {
         if (!res.events || res.events.length === 0) break
         for (const ev of res.events) {
           const seq = Number(ev.seq ?? offset)
-          if (ev.type === 'request/header') {
-            const cfg = (
-              ev.data as { header?: { config?: { provider?: string; model?: string } } }
-            )?.header?.config
-            if (cfg?.provider) provider = cfg.provider
-            if (cfg?.model) model = cfg.model
+          const metaUpdate = extractModelSelectionFromEvent(ev)
+          if (metaUpdate) {
+            if (metaUpdate.agentPreset) agentPreset = metaUpdate.agentPreset
+            if (metaUpdate.provider) provider = metaUpdate.provider
+            if (metaUpdate.model) model = metaUpdate.model
+          }
+          if (ev.type === 'assistant/message') {
+            const msgSource = extractMessageSource(ev.data)
+            if (msgSource.provider) provider = msgSource.provider
+            if (msgSource.model) model = msgSource.model
           }
           if (seq <= prevSeq) continue
           if (seq > maxSeenSeq) maxSeenSeq = seq
@@ -1217,13 +1373,17 @@ export class ObservabilityService {
           if (ev.type === 'assistant/message') {
             const data = ev.data as {
               usage?: TokenUsage
-              message?: { content?: readonly { type?: string }[] }
+              message?: {
+                content?: readonly { type?: string }[]
+                source?: { provider?: unknown; model?: unknown }
+              }
             }
             const toolCalls = (data.message?.content ?? []).filter(
               (b) => b?.type === 'tool-call',
             ).length
             const tokens = normalizeTokenUsage(data.usage)
             if (tokens.totalTokens === 0 && toolCalls === 0) continue
+            const msgSource = extractMessageSource(data)
             const ts = typeof ev.time === 'number' && Number.isFinite(ev.time) ? ev.time : Date.now()
             batch.push({
               id: `step:${item.sessionId}:${seq}`,
@@ -1234,9 +1394,9 @@ export class ObservabilityService {
               chatType: item.attr.chatType,
               sessionId: item.sessionId,
               trigger: item.attr.trigger,
-              agentPreset: item.attr.agentPreset,
-              provider,
-              model,
+              agentPreset,
+              provider: msgSource.provider || provider,
+              model: msgSource.model || model,
               outcome: 'completed',
               ...tokens,
               toolCalls,
@@ -1254,7 +1414,7 @@ export class ObservabilityService {
               chatType: item.attr.chatType,
               sessionId: item.sessionId,
               trigger: item.attr.trigger,
-              agentPreset: item.attr.agentPreset,
+              agentPreset,
               provider,
               model,
               outcome: 'completed',
@@ -1276,6 +1436,104 @@ export class ObservabilityService {
       }
     } catch {
       // Ignore corrupted or concurrently truncated session log.
+    } finally {
+      await handle.close().catch(() => {})
+    }
+  }
+
+  /**
+   * One-time idempotent repair for historical `llm_step` rows recorded before
+   * `assistant/message.data.message.source` & `model/selection` capture existed.
+   */
+  private async repairHistoricalModelAttributionOnce(
+    persistence: SessionPersistence,
+  ): Promise<void> {
+    if (this.host.store.db.getMeta('observability_model_source_repair_v1') === '1') return
+    const sessionIds = this.host.store.observabilityRepo.listSessionsNeedingAttributionRepair(
+      MAX_BACKFILL_SESSIONS,
+    )
+    for (let i = 0; i < sessionIds.length; i += 1) {
+      if (this.disposed) return
+      await this.repairSinglePersistedSessionAttribution(persistence, sessionIds[i]!)
+      if ((i + 1) % BACKFILL_YIELD_BATCH === 0) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 0))
+      }
+    }
+    if (!this.disposed) {
+      this.host.store.db.setMeta('observability_model_source_repair_v1', '1')
+    }
+  }
+
+  private async repairSinglePersistedSessionAttribution(
+    persistence: SessionPersistence,
+    sessionId: string,
+  ): Promise<void> {
+    let handle
+    try {
+      handle = await persistence.open(brandString<SessionId>(sessionId), 'read')
+    } catch {
+      return
+    }
+    try {
+      let agentPreset = readHeaderAgentPreset(handle.header)
+      let provider = ''
+      let model = ''
+      let offset = 0
+      let totalRead = 0
+      const updates: Array<{
+        readonly id: string
+        readonly agentPreset?: string
+        readonly provider?: string
+        readonly model?: string
+      }> = []
+
+      while (!this.disposed && totalRead < MAX_EVENTS_PER_BACKFILL_SESSION) {
+        const res = await handle.read(offset, READ_EVENTS_PAGE_SIZE)
+        if (!res.events || res.events.length === 0) break
+        for (const ev of res.events) {
+          const seq = Number(ev.seq ?? offset)
+          const metaUpdate = extractModelSelectionFromEvent(ev)
+          if (metaUpdate) {
+            if (metaUpdate.agentPreset) agentPreset = metaUpdate.agentPreset
+            if (metaUpdate.provider) provider = metaUpdate.provider
+            if (metaUpdate.model) model = metaUpdate.model
+          }
+          if (ev.type === 'assistant/message') {
+            const msgSource = extractMessageSource(ev.data)
+            if (msgSource.provider) provider = msgSource.provider
+            if (msgSource.model) model = msgSource.model
+            const stepProvider = msgSource.provider || provider
+            const stepModel = msgSource.model || model
+            if (agentPreset || stepProvider || stepModel) {
+              updates.push({
+                id: `step:${sessionId}:${seq}`,
+                ...(agentPreset ? { agentPreset } : {}),
+                ...(stepProvider ? { provider: stepProvider } : {}),
+                ...(stepModel ? { model: stepModel } : {}),
+              })
+            }
+          } else if (ev.type === 'tool/result') {
+            const data = ev.data as { isError?: boolean }
+            if (data?.isError && (agentPreset || provider || model)) {
+              updates.push({
+                id: `toolerr:${sessionId}:${seq}`,
+                ...(agentPreset ? { agentPreset } : {}),
+                ...(provider ? { provider } : {}),
+                ...(model ? { model } : {}),
+              })
+            }
+          }
+        }
+        totalRead += res.events.length
+        offset += res.events.length
+        if (res.events.length < READ_EVENTS_PAGE_SIZE) break
+      }
+
+      if (updates.length > 0) {
+        this.host.store.observabilityRepo.repairUsageEventAttribution(updates)
+      }
+    } catch {
+      // Ignore unreadable or truncated session logs.
     } finally {
       await handle.close().catch(() => {})
     }

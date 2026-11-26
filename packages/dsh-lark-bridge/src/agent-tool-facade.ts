@@ -667,6 +667,12 @@ export class AgentToolFacade {
         ...(effectiveRuntime.runtimeProfileId && effectiveRuntime.agentPreset === bindingPreset
           ? { runtimeProfileId: effectiveRuntime.runtimeProfileId }
           : {}),
+        ...(effectiveRuntime.model && effectiveRuntime.agentPreset === bindingPreset
+          ? { model: effectiveRuntime.model }
+          : {}),
+        ...(effectiveRuntime.reasoningEffort && effectiveRuntime.agentPreset === bindingPreset
+          ? { reasoningEffort: effectiveRuntime.reasoningEffort }
+          : {}),
         workingDir: expandWorkingDir(rawDir) || rawDir,
         trigger: 'schedule',
         createdAtMs: now,
@@ -837,6 +843,8 @@ export class AgentToolFacade {
         sessionId,
         agentPreset: runtime.agentPreset,
         ...(runtime.runtimeProfileId ? { runtimeProfileId: runtime.runtimeProfileId } : {}),
+        ...(runtime.model ? { model: runtime.model } : {}),
+        ...(runtime.reasoningEffort ? { reasoningEffort: runtime.reasoningEffort } : {}),
         workingDir: expandWorkingDir(rawDir) || rawDir,
         trigger: 'reminder',
         createdAtMs: now,
