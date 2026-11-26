@@ -153,8 +153,13 @@ export async function dispatchMemoryApiRequest(
 
   if (method === 'POST' && segments.length === 1) {
     const body = bodyRecord(input.body)
-    const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : undefined
-    const hints = resolveSessionContextHints(manager, sessionId)
+    const rawSessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : undefined
+    const sessionId = rawSessionId
+      ? typeof manager.resolveCliSessionId === 'function'
+        ? manager.resolveCliSessionId(rawSessionId)
+        : rawSessionId
+      : undefined
+    const hints = resolveSessionContextHints(manager, sessionId ?? rawSessionId)
     const botId =
       (typeof body.botId === 'string' && body.botId.trim()) || hints.botId || ''
     if (!botId) {
@@ -258,7 +263,12 @@ export async function dispatchMemoryApiRequest(
       body.title.trim().length > 0 &&
       typeof body.content === 'string' &&
       body.content.trim().length > 0
-    const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : undefined
+    const rawSessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : undefined
+    const sessionId = rawSessionId
+      ? typeof manager.resolveCliSessionId === 'function'
+        ? manager.resolveCliSessionId(rawSessionId)
+        : rawSessionId
+      : undefined
     const tags = parseTagsInput(body.tags)
     const scope = parseOptionalEnum(body.scope, (v) => LarkMemoryScopeSchema.parse(v))
     const confidence = parseOptionalEnum(body.confidence, (v) =>

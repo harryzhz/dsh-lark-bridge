@@ -241,6 +241,7 @@ export class LarkBridgeManager {
       getSchedules: () => this.schedules,
       getReminders: () => this.reminders,
       sessionWebUrl: (sid) => this.sessionWebUrl(sid),
+      resolveExternalSessionId: (extId) => this.runtimes.resolveSessionIdByExternalId(extId),
     })
 
     this.schedules = new ScheduleNotifier({
@@ -814,6 +815,10 @@ export class LarkBridgeManager {
   }
 
   // ── Agent CLI Tool Facade ────────────────────────────────────────────────
+
+  resolveCliSessionId(sessionId?: string): string | undefined {
+    return this.facade.canonicalizeSessionId(sessionId)
+  }
 
   resolveAgentContext(sessionId?: string) {
     return this.facade.resolveAgentContext(sessionId)

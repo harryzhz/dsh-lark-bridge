@@ -62,6 +62,7 @@ export interface AgentToolFacadeHost {
   readonly getSchedules: () => ScheduleNotifier
   readonly getReminders: () => ProactiveReminderService
   readonly sessionWebUrl: (sessionId: string) => string
+  readonly resolveExternalSessionId?: (externalId: string) => string | undefined
 }
 
 function extractMessageScope(routeKey: string): string | undefined {
@@ -89,6 +90,22 @@ function extractBindingReplyAnchor(
 export class AgentToolFacade {
   constructor(private readonly host: AgentToolFacadeHost) {}
 
+  /**
+   * Normalize CLI-supplied session identifiers, translating `ext:<externalId>`
+   * tokens (emitted by multiplexed external runtimes) into canonical DSH
+   * `sessionId` values via `externalRuntimes`.
+   */
+  canonicalizeSessionId(rawSessionId?: string): string | undefined {
+    const trimmed = rawSessionId?.trim()
+    if (!trimmed) return undefined
+    if (trimmed.startsWith('ext:')) {
+      const externalId = trimmed.slice(4).trim()
+      if (!externalId) return undefined
+      return this.host.resolveExternalSessionId?.(externalId)
+    }
+    return trimmed
+  }
+
   resolveAgentContext(sessionId?: string): {
     readonly sessionId?: string
     readonly bound: boolean
@@ -110,7 +127,7 @@ export class AgentToolFacade {
   } {
     const bots = this.host.connections.listBotStatuses()
     const groups = this.host.store.listGroupViews()
-    const sid = sessionId?.trim() || undefined
+    const sid = this.canonicalizeSessionId(sessionId)
 
     if (sid) {
       // Ground truth during an active interactive turn: anchor CLI sends/history/reminders
@@ -294,7 +311,7 @@ export class AgentToolFacade {
     readonly reason?: string
     readonly message: string
   } {
-    const sid = input.sessionId?.trim()
+    const sid = this.canonicalizeSessionId(input.sessionId)
     if (!sid) {
       throw new Error('sessionId is required (--session <id> or run inside an active DSH session)')
     }
@@ -428,11 +445,12 @@ export class AgentToolFacade {
         if (sent.messageId) messageIds.push(sent.messageId)
       } else {
         const group = chatId ? this.host.store.getGroup(bot.id, chatId) : undefined
+        const canonicalSessionId = this.canonicalizeSessionId(input.sessionId)
         const card = buildReplyCard({
           ...(input.title ? { title: input.title } : {}),
           markdown: markdown || ' ',
           bot: resolveEffectiveCardBot(bot, group),
-          ...(input.sessionId ? { sessionUrl: this.host.sessionWebUrl(input.sessionId) } : {}),
+          ...(canonicalSessionId ? { sessionUrl: this.host.sessionWebUrl(canonicalSessionId) } : {}),
           ...(uploadedImages.length > 0 ? { images: uploadedImages } : {}),
         })
         const sent = await transport.sendProactiveMessage({
@@ -546,9 +564,10 @@ export class AgentToolFacade {
     const chatId = input.chatId?.trim() || ctxInfo.chatId
     const bot = botId ? this.host.store.getBot(botId) : undefined
     const group = bot && chatId ? this.host.store.getGroup(bot.id, chatId) : undefined
+    const canonicalSessionId = this.canonicalizeSessionId(input.sessionId)
     const sessionBinding =
-      !explicitBotId && !input.chatId?.trim() && input.sessionId?.trim()
-        ? this.host.store.listBindings().find((b) => b.sessionId === input.sessionId!.trim())
+      !explicitBotId && !input.chatId?.trim() && canonicalSessionId
+        ? this.host.store.listBindings().find((b) => b.sessionId === canonicalSessionId)
         : undefined
     const rawCwd =
       input.cwd?.trim() ||

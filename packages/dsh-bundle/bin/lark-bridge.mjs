@@ -404,6 +404,8 @@ async function handlePluginCommand(endpoint, positionals, flags) {
 
       const childEnv = { ...process.env, DSH_LARK_DETACHED_DELAY_SEC: String(delaySec) }
       delete childEnv.DSH_SESSION_ID
+      delete childEnv.DSH_IN_AGENT_SESSION
+      delete childEnv.ANTIGRAVITY_CONVERSATION_ID
       const outFd = openSync(logPath, 'a')
       const child = spawn(process.execPath, [process.argv[1], ...forwarded], {
         detached: true,
@@ -423,7 +425,12 @@ async function handlePluginCommand(endpoint, positionals, flags) {
       return
     }
 
-    if (process.env.DSH_SESSION_ID && !flags['allow-in-session']) {
+    const inAgentSession = Boolean(
+      process.env.DSH_SESSION_ID ||
+        process.env.DSH_IN_AGENT_SESSION ||
+        process.env.ANTIGRAVITY_CONVERSATION_ID,
+    )
+    if (inAgentSession && !flags['allow-in-session']) {
       throw new Error(
         '拒绝在活跃 Agent 会话内直接热更新插件（会中断当前会话）；请使用 --detached 派发后台延迟热更新，或在宿主机终端执行。',
       )
@@ -926,8 +933,18 @@ async function main() {
   }
 
   const endpoint = loadEndpointConfig()
-  const sessionId = String(flags.session || process.env.DSH_SESSION_ID || '').trim() || undefined
+  const explicitOrEnvSessionId = String(flags.session || process.env.DSH_SESSION_ID || '').trim()
+  const fallbackExternalId = !explicitOrEnvSessionId
+    ? String(process.env.ANTIGRAVITY_CONVERSATION_ID || '').trim()
+    : ''
+  const sessionId =
+    explicitOrEnvSessionId || (fallbackExternalId ? `ext:${fallbackExternalId}` : undefined)
   const qSession = sessionId ? `sessionId=${encodeURIComponent(sessionId)}` : ''
+  const inAgentSession = Boolean(
+    process.env.DSH_SESSION_ID ||
+      process.env.DSH_IN_AGENT_SESSION ||
+      process.env.ANTIGRAVITY_CONVERSATION_ID,
+  )
 
   if (cmd === 'lifecycle') {
     const sub = positionals[1] || 'status'
@@ -936,7 +953,7 @@ async function main() {
       return
     }
     if (sub === 'drain' || sub === 'resume-intake') {
-      if (process.env.DSH_SESSION_ID && !flags['allow-in-session']) {
+      if (inAgentSession && !flags['allow-in-session']) {
         throw new Error(
           '拒绝在 Agent 会话内直接变更桥接排空状态；请在宿主机运维终端执行（或在明确需要时传 --allow-in-session）。',
         )

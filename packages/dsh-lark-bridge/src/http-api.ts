@@ -961,7 +961,20 @@ export async function dispatchLarkApiRequest(
         if (!manager.reminders) {
           return ok({ ok: false, error: 'reminder_service_unavailable' }, 400)
         }
-        const body = bodyRecord(request.body) as unknown as CreateReminderInput
+        const rawBody = bodyRecord(request.body) as unknown as CreateReminderInput & {
+          sessionId?: string
+        }
+        const { sessionId: rawSessionId, ...restBody } = rawBody
+        const canonicalSessionId =
+          typeof rawSessionId === 'string'
+            ? typeof manager.resolveCliSessionId === 'function'
+              ? manager.resolveCliSessionId(rawSessionId)
+              : rawSessionId
+            : undefined
+        const body: CreateReminderInput = {
+          ...restBody,
+          ...(canonicalSessionId ? { sessionId: canonicalSessionId } : {}),
+        }
         const item = await manager.reminders.create(body)
         return ok({ ok: true, reminder: item }, 201)
       }
