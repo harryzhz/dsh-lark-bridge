@@ -795,7 +795,7 @@ export class InboundPipeline {
       { ...(threadRouteKey ? { routeKey: threadRouteKey } : {}), now: timestampMs },
     )
 
-    if (!cachedName && msg.senderType === 'user' && msg.senderOpenId) {
+    if (!cachedName && msg.senderOpenId) {
       void this.resolveSenderName(bot.id, transport, msg).then((resolvedName) => {
         if (!resolvedName || this.host.isDisposed()) return
         this.host.triage?.context.recordChatMessage(
@@ -2703,16 +2703,25 @@ export class InboundPipeline {
       openId && typeof transport.getCachedUserProfile === 'function'
         ? transport.getCachedUserProfile(openId)
         : undefined
-    const unionId = msg.senderUnionId?.trim() || cached?.unionId?.trim() || ''
+    const stored =
+      openId && (!cached?.name || !cached?.unionId || !cached?.avatarUrl)
+        ? this.host.store.getSenderProfile?.(botId, openId)
+        : undefined
+    const unionId = msg.senderUnionId?.trim() || cached?.unionId?.trim() || stored?.unionId?.trim() || ''
     const senderType: 'user' | 'bot' = msg.senderType === 'bot' ? 'bot' : 'user'
     const peerBot =
       senderType === 'bot' && openId
         ? this.host.connections.listBotStatuses?.().find((s) => s.botOpenId === openId)
         : undefined
-    const cleanName = resolvedName?.trim() || cached?.name?.trim() || peerBot?.name?.trim() || ''
-    const avatarUrl = cached?.avatarUrl || peerBot?.avatarUrl
+    const cleanName =
+      resolvedName?.trim() ||
+      cached?.name?.trim() ||
+      stored?.name?.trim() ||
+      peerBot?.name?.trim() ||
+      ''
+    const avatarUrl = cached?.avatarUrl || stored?.avatarUrl || peerBot?.avatarUrl
     const senderId = unionId || openId
-    if (openId && (unionId || cleanName || avatarUrl)) {
+    if (openId && (unionId || cleanName || avatarUrl || senderType === 'bot')) {
       this.host.store.upsertSenderProfile?.({
         botId,
         openId,
@@ -2734,23 +2743,69 @@ export class InboundPipeline {
     transport: LarkBotTransport,
     msg: InboundLarkMessage,
   ): Promise<string | undefined> {
-    if (
-      msg.senderType !== 'user' ||
-      !msg.senderOpenId ||
-      typeof transport.resolveUserSummary !== 'function'
-    ) {
-      return undefined
+    const openId = msg.senderOpenId?.trim()
+    if (!openId) return undefined
+    const isGroupChat = msg.chatType !== 'p2p' && Boolean(msg.chatId?.trim())
+
+    if (msg.senderType === 'bot') {
+      const groupProfile =
+        isGroupChat && typeof this.host.connections.resolveGroupMemberProfile === 'function'
+          ? await this.host.connections
+              .resolveGroupMemberProfile(botId, msg.chatId, openId, { includeAvatars: false })
+              .catch(() => undefined)
+          : undefined
+      const peerBot = this.host.connections
+        .listBotStatuses?.()
+        .find((s) => s.botOpenId === openId)
+      const cleanName =
+        groupProfile?.name?.trim() || peerBot?.name?.trim() || undefined
+      const avatarUrl = groupProfile?.avatarUrl || peerBot?.avatarUrl
+      const unionId = msg.senderUnionId?.trim() || undefined
+      if (unionId || cleanName || avatarUrl) {
+        this.host.store.upsertSenderProfile?.({
+          botId,
+          openId,
+          ...(unionId ? { unionId } : {}),
+          ...(cleanName ? { name: cleanName } : {}),
+          ...(avatarUrl ? { avatarUrl } : {}),
+          senderType: 'bot',
+        })
+      }
+      return cleanName
     }
-    const summary = await transport.resolveUserSummary(msg.senderOpenId).catch(() => undefined)
-    const cleanName = summary?.name && summary.name !== msg.senderOpenId ? summary.name : undefined
+
+    const summary =
+      typeof transport.resolveUserSummary === 'function'
+        ? await transport.resolveUserSummary(openId).catch(() => undefined)
+        : undefined
+    let cleanName = summary?.name && summary.name !== openId ? summary.name.trim() : undefined
+    let avatarUrl = summary?.avatarUrl
     const unionId = msg.senderUnionId?.trim() || summary?.unionId?.trim() || undefined
-    if (unionId || cleanName || summary?.avatarUrl) {
+
+    // Fallback to group member directory when Contact API is outside app scope (e.g. 41050)
+    if (
+      !cleanName &&
+      isGroupChat &&
+      typeof this.host.connections.resolveGroupMemberProfile === 'function'
+    ) {
+      const groupProfile = await this.host.connections
+        .resolveGroupMemberProfile(botId, msg.chatId, openId, { includeAvatars: false })
+        .catch(() => undefined)
+      if (groupProfile?.name?.trim()) {
+        cleanName = groupProfile.name.trim()
+      }
+      if (!avatarUrl && groupProfile?.avatarUrl) {
+        avatarUrl = groupProfile.avatarUrl
+      }
+    }
+
+    if (unionId || cleanName || avatarUrl) {
       this.host.store.upsertSenderProfile?.({
         botId,
-        openId: msg.senderOpenId,
+        openId,
         ...(unionId ? { unionId } : {}),
         ...(cleanName ? { name: cleanName } : {}),
-        ...(summary?.avatarUrl ? { avatarUrl: summary.avatarUrl } : {}),
+        ...(avatarUrl ? { avatarUrl } : {}),
         senderType: 'user',
       })
     }

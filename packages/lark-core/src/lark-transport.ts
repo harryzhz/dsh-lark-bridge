@@ -37,6 +37,7 @@ export interface LarkBotProfile {
 
 export interface ListChatMembersOptions {
   readonly userAccessToken?: string
+  readonly resolveUserDetails?: boolean
   readonly userDirectoryLookup?: (
     queries: readonly string[],
   ) => Promise<readonly LarkDirectoryUserHit[]>
@@ -174,12 +175,31 @@ interface CachedUserDetail {
   readonly cachedAtMs: number
 }
 
+interface CachedMemberProfile {
+  readonly openId: string
+  readonly name?: string
+  readonly avatarUrl?: string
+  readonly memberType: 'user' | 'bot'
+  readonly larkAppId?: string
+  readonly cachedAtMs: number
+}
+
 const USER_DETAIL_TTL_MS = 30 * 60_000
+const MEMBER_PROFILE_TTL_MS = 30 * 60_000
+const MAX_MEMBER_PROFILE_CACHE = 2_000
 const CONTACT_DENIED_TTL_MS = 5 * 60_000
 const SENT_MESSAGE_TTL_MS = 10 * 60_000
 const MAX_SENT_MESSAGE_CACHE = 500
 const MAX_ACK_SAMPLES = 100
 const SPLIT_BRAIN_STARTUP_GRACE_MS = 5_000
+const RAW_FEISHU_ID_RE = /^(?:ou|on|cli)_[a-zA-Z0-9_-]+$/
+
+function isReadableMemberName(name: string | undefined, openId?: string): boolean {
+  const clean = name?.trim() ?? ''
+  if (!clean) return false
+  if (openId && clean === openId.trim()) return false
+  return !RAW_FEISHU_ID_RE.test(clean)
+}
 
 async function searchDirectoryWithUserToken(
   query: string,
@@ -258,6 +278,7 @@ export class LarkBotTransport {
   private lastEventAtMs?: number
   private lastError?: string
   private readonly userCache = new Map<string, CachedUserDetail>()
+  private readonly memberProfileCache = new Map<string, CachedMemberProfile>()
   private readonly contactDeniedUntilMs = new Map<string, number>()
   private readonly observedChatBots = new Map<string, Map<string, string>>()
   private readonly sentMessageIds = new Map<string, number>()
@@ -574,30 +595,98 @@ export class LarkBotTransport {
     await this.stop()
   }
 
-  /** Zero-network-cost lookup of a cached Feishu user display name. */
+  /** Zero-network-cost lookup of a cached Feishu user or bot display name. */
   getCachedUserName(openId: string | undefined, now = Date.now()): string | undefined {
     const key = openId?.trim()
     if (!key) return undefined
     const cached = this.userCache.get(key)
-    if (!cached || now - cached.cachedAtMs >= USER_DETAIL_TTL_MS) return undefined
-    return cached.name && cached.name !== key ? cached.name : undefined
+    if (cached && now - cached.cachedAtMs < USER_DETAIL_TTL_MS && isReadableMemberName(cached.name, key)) {
+      return cached.name.trim()
+    }
+    const member = this.memberProfileCache.get(key)
+    if (
+      member &&
+      now - member.cachedAtMs < MEMBER_PROFILE_TTL_MS &&
+      isReadableMemberName(member.name, key)
+    ) {
+      return member.name!.trim()
+    }
+    return undefined
   }
 
-  /** Zero-network-cost lookup of cached Feishu user profile metadata (name, unionId, avatar). */
+  /** Zero-network-cost lookup of cached Feishu user/bot profile metadata (name, unionId, avatar). */
   getCachedUserProfile(
     openId: string | undefined,
     now = Date.now(),
   ): { readonly openId: string; readonly unionId?: string; readonly name?: string; readonly avatarUrl?: string } | undefined {
     const key = openId?.trim()
     if (!key) return undefined
-    const cached = this.userCache.get(key)
-    if (!cached || now - cached.cachedAtMs >= USER_DETAIL_TTL_MS) return undefined
-    const cleanName = cached.name && cached.name !== key ? cached.name : undefined
+    const rawUser = this.userCache.get(key)
+    const user = rawUser && now - rawUser.cachedAtMs < USER_DETAIL_TTL_MS ? rawUser : undefined
+    const rawMember = this.memberProfileCache.get(key)
+    const member =
+      rawMember && now - rawMember.cachedAtMs < MEMBER_PROFILE_TTL_MS ? rawMember : undefined
+    if (!user && !member) return undefined
+    const userName = isReadableMemberName(user?.name, key) ? user!.name.trim() : undefined
+    const memberName = isReadableMemberName(member?.name, key) ? member!.name!.trim() : undefined
+    const cleanName = userName || memberName
+    const unionId = user?.unionId?.trim() || undefined
+    const avatarUrl = user?.avatarUrl?.trim() || member?.avatarUrl?.trim() || undefined
     return {
-      openId: cached.openId,
-      ...(cached.unionId ? { unionId: cached.unionId } : {}),
+      openId: key,
+      ...(unionId ? { unionId } : {}),
       ...(cleanName ? { name: cleanName } : {}),
-      ...(cached.avatarUrl ? { avatarUrl: cached.avatarUrl } : {}),
+      ...(avatarUrl ? { avatarUrl } : {}),
+    }
+  }
+
+  private rememberChatMembers(
+    chatId: string,
+    members: readonly LarkChatMember[],
+    now = Date.now(),
+  ): void {
+    let botsInChat = this.observedChatBots.get(chatId)
+    for (const m of members) {
+      const openId = m.openId?.trim()
+      if (!openId) continue
+      const readableName = isReadableMemberName(m.name, openId) ? m.name.trim() : undefined
+      const avatarUrl = m.avatarUrl?.trim() || undefined
+      const prev = this.memberProfileCache.get(openId)
+      if (readableName || avatarUrl) {
+        this.memberProfileCache.delete(openId)
+        this.memberProfileCache.set(openId, {
+          openId,
+          ...(readableName
+            ? { name: readableName }
+            : prev?.name
+              ? { name: prev.name }
+              : {}),
+          ...(avatarUrl
+            ? { avatarUrl }
+            : prev?.avatarUrl
+              ? { avatarUrl: prev.avatarUrl }
+              : {}),
+          memberType: m.memberType,
+          ...(m.larkAppId
+            ? { larkAppId: m.larkAppId }
+            : prev?.larkAppId
+              ? { larkAppId: prev.larkAppId }
+              : {}),
+          cachedAtMs: now,
+        })
+        while (this.memberProfileCache.size > MAX_MEMBER_PROFILE_CACHE) {
+          const oldest = this.memberProfileCache.keys().next().value
+          if (oldest === undefined) break
+          this.memberProfileCache.delete(oldest)
+        }
+      }
+      if (m.memberType === 'bot' && readableName) {
+        if (!botsInChat) {
+          botsInChat = new Map()
+          this.observedChatBots.set(chatId, botsInChat)
+        }
+        botsInChat.set(openId, readableName)
+      }
     }
   }
 
@@ -1012,7 +1101,15 @@ export class LarkBotTransport {
             })
             continue
           }
-          const detail = await this.lookupUserDetail(openId, item.name || openId)
+          const cachedDetail = this.userCache.get(openId)
+          const freshCached =
+            cachedDetail && Date.now() - cachedDetail.cachedAtMs < USER_DETAIL_TTL_MS
+              ? cachedDetail
+              : undefined
+          const detail =
+            options.resolveUserDetails === false
+              ? freshCached
+              : await this.lookupUserDetail(openId, item.name || openId)
           members.set(openId, {
             openId,
             name: detail?.name || item.name || openId,
@@ -1175,10 +1272,12 @@ export class LarkBotTransport {
       )
     }
 
-    return [...members.values()].sort((a, b) => {
+    const sorted = [...members.values()].sort((a, b) => {
       if (a.memberType !== b.memberType) return a.memberType === 'user' ? -1 : 1
       return a.name.localeCompare(b.name, 'zh-CN')
     })
+    this.rememberChatMembers(chatId, sorted)
+    return sorted
   }
 
   /**

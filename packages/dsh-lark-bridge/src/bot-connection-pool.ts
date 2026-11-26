@@ -19,10 +19,23 @@ import {
 } from '@dsh-lark/lark-core'
 import type { LarkDirectoryEnricher } from './directory-enrichment.js'
 import { assertExistingWorkingDirectory } from './fs-browser.js'
+import type { TelemetrySenderProfileRecord } from './observability-types.js'
 import type { RuntimeCatalog } from './runtime-catalog.js'
 import { SplitBrainDetector } from './split-brain-detector.js'
 import type { LarkBridgeStore } from './store.js'
 import type { WorkspaceGrouping } from './workspace-grouping.js'
+
+const GROUP_MEMBER_SYNC_TTL_MS = 30 * 60_000
+const GROUP_MEMBER_SYNC_ERROR_TTL_MS = 5 * 60_000
+const MAX_GROUP_MEMBER_SYNC_ENTRIES = 500
+const RAW_FEISHU_ID_RE = /^(?:ou|on|cli)_[a-zA-Z0-9_-]+$/
+
+function isReadableMemberLabel(name: string | undefined, openId?: string): boolean {
+  const clean = name?.trim() ?? ''
+  if (!clean) return false
+  if (openId && clean === openId.trim()) return false
+  return !RAW_FEISHU_ID_RE.test(clean)
+}
 
 export interface ManagedTransport {
   readonly config: LarkBotConfig
@@ -61,6 +74,19 @@ export class BotConnectionPool {
   private readonly botSyncQueues = new Map<string, Promise<void>>()
   private readonly preserveLocalDescriptionBots = new Set<string>()
   private readonly hydratedProfileBots = new Set<string>()
+  private readonly groupMemberSyncCache = new Map<
+    string,
+    {
+      readonly syncedAtMs: number
+      readonly ttlMs: number
+      readonly includeAvatars: boolean
+      readonly members: readonly LarkChatMember[]
+    }
+  >()
+  private readonly groupMemberSyncInFlight = new Map<
+    string,
+    Promise<{ readonly members: readonly LarkChatMember[]; readonly updatedProfiles: number }>
+  >()
 
   constructor(private readonly host: BotConnectionPoolHost) {}
 
@@ -210,6 +236,111 @@ export class BotConnectionPool {
     )
   }
 
+  private persistGroupMemberProfiles(
+    botId: string,
+    members: readonly LarkChatMember[],
+    nowMs = Date.now(),
+  ): number {
+    if (members.length === 0) return 0
+    const records: TelemetrySenderProfileRecord[] = []
+    for (const member of members) {
+      const openId = member.openId?.trim()
+      if (!openId) continue
+      const readableName = isReadableMemberLabel(member.name, openId)
+        ? member.name.trim()
+        : ''
+      const avatarUrl = member.avatarUrl?.trim() || ''
+      const confirmedBot = member.memberType === 'bot' && Boolean(member.larkAppId?.trim())
+      if (!readableName && !avatarUrl && !confirmedBot) continue
+      records.push({
+        botId,
+        openId,
+        ...(readableName ? { name: readableName } : {}),
+        ...(avatarUrl ? { avatarUrl } : {}),
+        ...(confirmedBot ? { senderType: 'bot' as const } : {}),
+        updatedAtMs: nowMs,
+      })
+    }
+    if (records.length === 0) return 0
+    if (typeof this.host.store.upsertSenderProfilesBatch === 'function') {
+      return this.host.store.upsertSenderProfilesBatch(records)
+    }
+    let updated = 0
+    for (const rec of records) {
+      if (this.host.store.upsertSenderProfile?.(rec)) updated += 1
+    }
+    return updated
+  }
+
+  private setGroupMemberSyncCache(
+    key: string,
+    entry: {
+      readonly syncedAtMs: number
+      readonly ttlMs: number
+      readonly includeAvatars: boolean
+      readonly members: readonly LarkChatMember[]
+    },
+  ): void {
+    this.groupMemberSyncCache.delete(key)
+    this.groupMemberSyncCache.set(key, entry)
+    while (this.groupMemberSyncCache.size > MAX_GROUP_MEMBER_SYNC_ENTRIES) {
+      const oldest = this.groupMemberSyncCache.keys().next().value
+      if (oldest === undefined) break
+      this.groupMemberSyncCache.delete(oldest)
+    }
+  }
+
+  private async fetchAndPersistGroupMembers(
+    bot: LarkBotConfig,
+    chatId: string,
+    includeAvatars: boolean,
+  ): Promise<{ readonly members: LarkChatMember[]; readonly updatedProfiles: number }> {
+    const uat = includeAvatars
+      ? await this.host.platform.getValidUserAccessToken(bot.id, bot.larkAppId, bot.larkAppSecret)
+      : undefined
+    const members = await this.transportFor(bot).listChatMembersAndBots(chatId, {
+      resolveUserDetails: includeAvatars,
+      ...(uat ? { userAccessToken: uat } : {}),
+      ...(includeAvatars
+        ? {
+            userDirectoryLookup: (queries) =>
+              this.host.directoryEnricher.searchByQueries(queries, bot.id),
+          }
+        : {}),
+      resolveBotAvatar: async (groupBot) => {
+        const allBots = this.host.store.listBots()
+        const peer = allBots.find((candidate) => {
+          if (groupBot.larkAppId && candidate.larkAppId === groupBot.larkAppId) return true
+          const st = this.transports.get(candidate.id)?.transport.state
+          if (st?.botOpenId && st.botOpenId === groupBot.openId) return true
+          if (st?.remoteBotName && st.remoteBotName === groupBot.name) return true
+          return candidate.name === groupBot.name
+        })
+        if (peer) {
+          if (includeAvatars && !peer.avatarUrl) {
+            await this.ensureBotProfileHydrated(peer.id)
+          }
+          const refreshedPeer = this.host.store.getBot(peer.id) ?? peer
+          const peerAvatar =
+            this.transports.get(peer.id)?.transport.state.avatarUrl || refreshedPeer.avatarUrl
+          if (peerAvatar) return peerAvatar
+        }
+        return includeAvatars
+          ? this.host.directoryEnricher.resolveAppAvatar(groupBot.larkAppId)
+          : undefined
+      },
+    })
+    const nowMs = Date.now()
+    const updatedProfiles = this.persistGroupMemberProfiles(bot.id, members, nowMs)
+    this.setGroupMemberSyncCache(`${bot.id}:${chatId}`, {
+      syncedAtMs: nowMs,
+      ttlMs: GROUP_MEMBER_SYNC_TTL_MS,
+      includeAvatars,
+      members,
+    })
+    return { members, updatedProfiles }
+  }
+
   async listGroupMembers(
     botId: string,
     chatId: string,
@@ -218,38 +349,118 @@ export class BotConnectionPool {
     const bot = this.host.store.getBot(botId)
     if (!bot) return []
     const includeAvatars = options.includeAvatars !== false
-    const uat = includeAvatars
-      ? await this.host.platform.getValidUserAccessToken(bot.id, bot.larkAppId, bot.larkAppSecret)
+    const { members } = await this.fetchAndPersistGroupMembers(bot, chatId, includeAvatars)
+    return members
+  }
+
+  /**
+   * TTL-cached, concurrency-deduplicated group member & bot directory sync.
+   * Persists discovered names/avatars into `telemetry_sender_profiles` so both
+   * real-time turns and historical observability queries resolve bot/member names.
+   */
+  async ensureGroupMembersSynced(
+    botId: string,
+    chatId: string,
+    options: { readonly includeAvatars?: boolean; readonly maxAgeMs?: number } = {},
+  ): Promise<{ readonly members: readonly LarkChatMember[]; readonly updatedProfiles: number }> {
+    const cleanBotId = botId.trim()
+    const cleanChatId = chatId.trim()
+    if (!cleanBotId || !cleanChatId) return { members: [], updatedProfiles: 0 }
+    const bot = this.host.store.getBot(cleanBotId)
+    if (!bot) return { members: [], updatedProfiles: 0 }
+
+    const includeAvatars = options.includeAvatars !== false
+    const maxAgeMs = options.maxAgeMs ?? GROUP_MEMBER_SYNC_TTL_MS
+    const cacheKey = `${cleanBotId}:${cleanChatId}`
+    const nowMs = Date.now()
+    const cached = this.groupMemberSyncCache.get(cacheKey)
+    if (
+      cached &&
+      nowMs - cached.syncedAtMs < Math.min(cached.ttlMs, maxAgeMs) &&
+      (!includeAvatars || cached.includeAvatars || cached.members.length === 0)
+    ) {
+      return { members: cached.members, updatedProfiles: 0 }
+    }
+
+    const existing = this.groupMemberSyncInFlight.get(cacheKey)
+    if (existing) return existing
+
+    const task = this.fetchAndPersistGroupMembers(bot, cleanChatId, includeAvatars)
+      .catch(() => {
+        this.setGroupMemberSyncCache(cacheKey, {
+          syncedAtMs: Date.now(),
+          ttlMs: GROUP_MEMBER_SYNC_ERROR_TTL_MS,
+          includeAvatars,
+          members: [],
+        })
+        return { members: [] as readonly LarkChatMember[], updatedProfiles: 0 }
+      })
+      .finally(() => {
+        if (this.groupMemberSyncInFlight.get(cacheKey) === task) {
+          this.groupMemberSyncInFlight.delete(cacheKey)
+        }
+      })
+
+    this.groupMemberSyncInFlight.set(cacheKey, task)
+    return task
+  }
+
+  /**
+   * Resolves a group member or bot profile via a 3-tier lookup:
+   * L1 in-memory transport cache -> L2 SQLite `telemetry_sender_profiles` -> L3 TTL-cached group sync.
+   */
+  async resolveGroupMemberProfile(
+    botId: string,
+    chatId: string,
+    openId: string,
+    options: { readonly includeAvatars?: boolean } = {},
+  ): Promise<
+    | {
+        readonly openId: string
+        readonly name?: string
+        readonly avatarUrl?: string
+        readonly memberType?: 'user' | 'bot'
+        readonly larkAppId?: string
+      }
+    | undefined
+  > {
+    const cleanOpenId = openId.trim()
+    if (!cleanOpenId) return undefined
+
+    const liveCached = this.transports.get(botId)?.transport.getCachedUserProfile?.(cleanOpenId)
+    if (liveCached && isReadableMemberLabel(liveCached.name, cleanOpenId)) {
+      return {
+        openId: cleanOpenId,
+        name: liveCached.name!.trim(),
+        ...(liveCached.avatarUrl ? { avatarUrl: liveCached.avatarUrl } : {}),
+      }
+    }
+
+    const stored = this.host.store.getSenderProfile?.(botId, cleanOpenId)
+    if (stored && isReadableMemberLabel(stored.name, cleanOpenId)) {
+      return {
+        openId: cleanOpenId,
+        name: stored.name!.trim(),
+        ...(stored.avatarUrl ? { avatarUrl: stored.avatarUrl } : {}),
+        ...(stored.senderType ? { memberType: stored.senderType } : {}),
+      }
+    }
+
+    if (!chatId.trim()) return undefined
+    const { members } = await this.ensureGroupMembersSynced(botId, chatId, options)
+    const matched = members.find((m) => m.openId === cleanOpenId)
+    if (!matched) return undefined
+    const readableName = isReadableMemberLabel(matched.name, cleanOpenId)
+      ? matched.name.trim()
       : undefined
-    return this.transportFor(bot).listChatMembersAndBots(chatId, {
-      ...(uat ? { userAccessToken: uat } : {}),
-      ...(includeAvatars
-        ? {
-            userDirectoryLookup: (queries) =>
-              this.host.directoryEnricher.searchByQueries(queries, bot.id),
-            resolveBotAvatar: async (groupBot) => {
-              const allBots = this.host.store.listBots()
-              const peer = allBots.find((candidate) => {
-                if (groupBot.larkAppId && candidate.larkAppId === groupBot.larkAppId) return true
-                const st = this.transports.get(candidate.id)?.transport.state
-                if (st?.botOpenId && st.botOpenId === groupBot.openId) return true
-                if (st?.remoteBotName && st.remoteBotName === groupBot.name) return true
-                return candidate.name === groupBot.name
-              })
-              if (peer) {
-                if (!peer.avatarUrl) {
-                  await this.ensureBotProfileHydrated(peer.id)
-                }
-                const refreshedPeer = this.host.store.getBot(peer.id) ?? peer
-                const peerAvatar =
-                  this.transports.get(peer.id)?.transport.state.avatarUrl || refreshedPeer.avatarUrl
-                if (peerAvatar) return peerAvatar
-              }
-              return this.host.directoryEnricher.resolveAppAvatar(groupBot.larkAppId)
-            },
-          }
-        : {}),
-    })
+    if (!readableName && !matched.avatarUrl) return undefined
+    return {
+      openId: cleanOpenId,
+      ...(readableName ? { name: readableName } : {}),
+      ...(matched.avatarUrl ? { avatarUrl: matched.avatarUrl } : {}),
+      memberType: matched.memberType,
+      ...(matched.larkAppId ? { larkAppId: matched.larkAppId } : {}),
+    }
   }
 
   async searchUsers(botId: string, query: string): Promise<LarkUserSearchHit[]> {

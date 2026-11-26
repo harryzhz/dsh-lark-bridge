@@ -422,6 +422,7 @@ function formatFallbackSenderName(rawId: string): string {
 export interface ResolvedSenderIdentity {
   readonly senderId: string
   readonly senderName: string
+  readonly hasReadableName: boolean
   readonly senderType: 'user' | 'bot'
   readonly avatarUrl: string
   readonly rawOpenId: string
@@ -662,11 +663,15 @@ function createSenderIdentityResolver(
         : 'user'
 
     const metaByName = normName && !isAmbiguous ? nameMeta.get(normName) : undefined
-    const senderName =
+    const resolvedReadableName =
       effectiveUnionInfo?.name ||
       readableName ||
       metaByName?.name ||
-      formatFallbackSenderName(rawId || canonicalId)
+      ''
+    const hasReadableName = isReadableSenderName(resolvedReadableName, rawId || canonicalId)
+    const senderName = hasReadableName
+      ? resolvedReadableName
+      : formatFallbackSenderName(rawId || canonicalId)
 
     const avatarUrl =
       botOpenInfo?.avatarUrl || effectiveUnionInfo?.avatarUrl || metaByName?.avatarUrl || ''
@@ -674,6 +679,7 @@ function createSenderIdentityResolver(
     return {
       senderId: canonicalId,
       senderName,
+      hasReadableName,
       senderType,
       avatarUrl,
       rawOpenId: rawId && !rawId.startsWith('on_') ? rawId : '',
@@ -686,9 +692,11 @@ function createSenderIdentityResolver(
     if (clean.startsWith('name:')) {
       const norm = clean.slice(5)
       const meta = nameMeta.get(norm)
+      const resolvedName = meta?.name || norm
       return {
         senderId: clean,
-        senderName: meta?.name || norm,
+        senderName: resolvedName,
+        hasReadableName: isReadableSenderName(resolvedName),
         senderType: meta?.senderType ?? 'user',
         avatarUrl: meta?.avatarUrl ?? '',
         rawOpenId: '',
@@ -696,9 +704,11 @@ function createSenderIdentityResolver(
     }
     const unionInfo = byUnion.get(clean)
     if (unionInfo) {
+      const hasReadable = isReadableSenderName(unionInfo.name, clean)
       return {
         senderId: clean,
-        senderName: unionInfo.name || formatFallbackSenderName(clean),
+        senderName: hasReadable ? unionInfo.name : formatFallbackSenderName(clean),
+        hasReadableName: hasReadable,
         senderType: unionInfo.senderType,
         avatarUrl: unionInfo.avatarUrl,
         rawOpenId: '',
@@ -706,9 +716,11 @@ function createSenderIdentityResolver(
     }
     const bare = byBareOpen.get(clean)
     if (bare) {
+      const hasReadable = isReadableSenderName(bare.name, clean)
       return {
         senderId: clean,
-        senderName: bare.name || formatFallbackSenderName(clean),
+        senderName: hasReadable ? bare.name : formatFallbackSenderName(clean),
+        hasReadableName: hasReadable,
         senderType: bare.senderType,
         avatarUrl: bare.avatarUrl,
         rawOpenId: clean,
@@ -717,6 +729,7 @@ function createSenderIdentityResolver(
     return {
       senderId: clean,
       senderName: formatFallbackSenderName(clean),
+      hasReadableName: false,
       senderType: 'user',
       avatarUrl: '',
       rawOpenId: clean.startsWith('ou_') ? clean : '',
@@ -766,6 +779,7 @@ export interface ObservabilityRepoAggregate {
   readonly chatFilterOptions: readonly ObservabilityChatFilterOption[]
   readonly senderFilterOptions: readonly ObservabilitySenderFilterOption[]
   readonly matchedSessionIds: ReadonlySet<string>
+  readonly unresolvedSenderChats: ReadonlyArray<{ readonly botId: string; readonly chatId: string }>
 }
 
 const AGGREGATE_CACHE_TTL_MS = 5_000
@@ -1060,20 +1074,20 @@ export class ObservabilityRepo {
     return updated
   }
 
-  upsertSenderProfile(profile: TelemetrySenderProfileRecord): void {
+  upsertSenderProfile(profile: TelemetrySenderProfileRecord): boolean {
     const botId = profile.botId.trim()
     const openId = profile.openId.trim()
-    if (!botId || !openId) return
+    if (!botId || !openId) return false
     const unionId = profile.unionId?.trim() ?? ''
     const rawName = profile.name?.trim() ?? ''
     const name = isReadableSenderName(rawName, openId) ? rawName : ''
     const avatarUrl = profile.avatarUrl?.trim() ?? ''
     const senderType: 'user' | 'bot' = profile.senderType === 'bot' ? 'bot' : 'user'
-    if (!unionId && !name && !avatarUrl && senderType === 'user') return
+    if (!unionId && !name && !avatarUrl && senderType === 'user') return false
 
     const memKey = `${botId}:${openId}`
     const sig = `${unionId}|${name}|${avatarUrl}|${senderType}`
-    if (this.senderProfileMem.get(memKey) === sig) return
+    if (this.senderProfileMem.get(memKey) === sig) return false
     this.senderProfileMem.set(memKey, sig)
     if (this.senderProfileMem.size > 4000) {
       const oldest = this.senderProfileMem.keys().next().value
@@ -1081,7 +1095,7 @@ export class ObservabilityRepo {
     }
 
     const updatedAtMs = profile.updatedAtMs ?? Date.now()
-    this.db
+    const res = this.db
       .prepare(
         `INSERT INTO telemetry_sender_profiles (
            bot_id, open_id, union_id, name, avatar_url, sender_type, updated_at_ms
@@ -1091,10 +1105,111 @@ export class ObservabilityRepo {
            name          = CASE WHEN excluded.name != '' THEN excluded.name ELSE telemetry_sender_profiles.name END,
            avatar_url    = CASE WHEN excluded.avatar_url != '' THEN excluded.avatar_url ELSE telemetry_sender_profiles.avatar_url END,
            sender_type   = CASE WHEN excluded.sender_type = 'bot' THEN 'bot' ELSE telemetry_sender_profiles.sender_type END,
-           updated_at_ms = MAX(telemetry_sender_profiles.updated_at_ms, excluded.updated_at_ms)`,
+           updated_at_ms = MAX(telemetry_sender_profiles.updated_at_ms, excluded.updated_at_ms)
+         WHERE (excluded.union_id != '' AND excluded.union_id != telemetry_sender_profiles.union_id)
+            OR (excluded.name != '' AND excluded.name != telemetry_sender_profiles.name)
+            OR (excluded.avatar_url != '' AND excluded.avatar_url != telemetry_sender_profiles.avatar_url)
+            OR (excluded.sender_type = 'bot' AND telemetry_sender_profiles.sender_type != 'bot')`,
       )
       .run(botId, openId, unionId, name, avatarUrl, senderType, updatedAtMs)
-    this.invalidateAggregateCache()
+    const changed = Number(res.changes) > 0
+    if (changed) {
+      this.invalidateAggregateCache()
+    }
+    return changed
+  }
+
+  upsertSenderProfilesBatch(profiles: readonly TelemetrySenderProfileRecord[]): number {
+    if (profiles.length === 0) return 0
+    let changed = 0
+    this.db.transaction(() => {
+      for (const profile of profiles) {
+        if (this.upsertSenderProfile(profile)) {
+          changed += 1
+        }
+      }
+    })
+    return changed
+  }
+
+  getSenderProfile(botId: string, openId: string): TelemetrySenderProfileRecord | undefined {
+    const cleanBot = botId.trim()
+    const cleanOpen = openId.trim()
+    if (!cleanBot || !cleanOpen) return undefined
+    const row = this.db
+      .prepare(
+        `SELECT bot_id, open_id, union_id, name, avatar_url, sender_type, updated_at_ms
+         FROM telemetry_sender_profiles
+         WHERE bot_id = ? AND open_id = ?`,
+      )
+      .get(cleanBot, cleanOpen) as
+      | {
+          bot_id: string
+          open_id: string
+          union_id: string
+          name: string
+          avatar_url: string
+          sender_type: string
+          updated_at_ms: number
+        }
+      | undefined
+    if (!row) return undefined
+    return {
+      botId: row.bot_id,
+      openId: row.open_id,
+      ...(row.union_id ? { unionId: row.union_id } : {}),
+      ...(row.name ? { name: row.name } : {}),
+      ...(row.avatar_url ? { avatarUrl: row.avatar_url } : {}),
+      senderType: row.sender_type === 'bot' ? 'bot' : 'user',
+      updatedAtMs: Number(row.updated_at_ms),
+    }
+  }
+
+  listChatsWithUnnamedSenders(limit = 20): Array<{ readonly botId: string; readonly chatId: string }> {
+    const safeLimit = Math.max(1, Math.min(100, Math.floor(limit)))
+    const rows = this.db
+      .prepare(
+        `SELECT bot_id, chat_id, sender_id, sender_name, sender_type, MAX(timestamp_ms) AS latest_ts
+         FROM telemetry_usage_events
+         WHERE bot_id != ''
+           AND bot_id != 'system'
+           AND chat_id != ''
+           AND chat_type != 'p2p'
+           AND chat_type != 'internal'
+           AND chat_id NOT LIKE 'dream:%'
+           AND trim(sender_id) != ''
+           AND trim(sender_name) = ''
+         GROUP BY bot_id, chat_id, sender_id, sender_name, sender_type
+         ORDER BY latest_ts DESC
+         LIMIT 500`,
+      )
+      .all() as Array<{
+      bot_id: string
+      chat_id: string
+      sender_id: string
+      sender_name: string
+      sender_type: string
+    }>
+    if (rows.length === 0) return []
+    const profiles = this.listSenderProfiles()
+    const bots = this.config.listBots()
+    const resolver = createSenderIdentityResolver(
+      profiles,
+      bots,
+      rows as unknown as readonly RawUsageEventRow[],
+    )
+    const seen = new Set<string>()
+    const out: Array<{ readonly botId: string; readonly chatId: string }> = []
+    for (const row of rows) {
+      const resolved = resolver.resolve(row)
+      if (!resolved || resolved.hasReadableName) continue
+      const key = buildGroupKey(row.bot_id, row.chat_id)
+      if (seen.has(key)) continue
+      seen.add(key)
+      out.push({ botId: row.bot_id, chatId: row.chat_id })
+      if (out.length >= safeLimit) break
+    }
+    return out
   }
 
   listSenderProfiles(): TelemetrySenderProfileRecord[] {
@@ -1341,9 +1456,29 @@ export class ObservabilityRepo {
 
     const unfilteredCurrentRows: RawUsageEventRow[] = []
     const unfilteredPreviousRows: RawUsageEventRow[] = []
+    const unresolvedChatSeen = new Set<string>()
+    const unresolvedSenderChats: Array<{ readonly botId: string; readonly chatId: string }> = []
     for (const row of combinedRows) {
       if (Number(row.timestamp_ms) >= fromMs) {
         unfilteredCurrentRows.push(row)
+        if (
+          unresolvedSenderChats.length < 16 &&
+          row.bot_id &&
+          row.bot_id !== 'system' &&
+          row.chat_id &&
+          row.chat_type !== 'p2p' &&
+          row.chat_type !== 'internal' &&
+          !row.chat_id.startsWith('dream:')
+        ) {
+          const chatKey = buildGroupKey(row.bot_id, row.chat_id)
+          if (!unresolvedChatSeen.has(chatKey)) {
+            const resolved = senderResolver.resolve(row)
+            if (resolved && !resolved.hasReadableName) {
+              unresolvedChatSeen.add(chatKey)
+              unresolvedSenderChats.push({ botId: row.bot_id, chatId: row.chat_id })
+            }
+          }
+        }
       } else {
         unfilteredPreviousRows.push(row)
       }
@@ -1413,6 +1548,7 @@ export class ObservabilityRepo {
       chatFilterOptions,
       senderFilterOptions,
       matchedSessionIds: current.sessions,
+      unresolvedSenderChats,
     }
     if (isLiveNow) {
       if (this.aggregateCache.size >= MAX_AGGREGATE_CACHE_ENTRIES) {
@@ -2391,6 +2527,13 @@ export class ObservabilityRepo {
         activity: 0,
       }
       if (!cur.avatarUrl && resolved.avatarUrl) cur.avatarUrl = resolved.avatarUrl
+      if (resolved.senderType === 'bot') cur.senderType = 'bot'
+      if (
+        resolved.hasReadableName &&
+        !isReadableSenderName(cur.senderName, cur.senderId)
+      ) {
+        cur.senderName = resolved.senderName
+      }
       if (row.bot_id && row.bot_id !== 'system') cur.botIds.add(row.bot_id)
       cur.totalTokens += Number(row.total_tokens) || 0
       if (row.record_kind === 'inbound' || row.record_kind === 'turn' || row.record_kind === 'triage') {
