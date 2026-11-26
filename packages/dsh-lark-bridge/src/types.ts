@@ -66,6 +66,10 @@ export interface LarkBridgeConfig {
   readonly reminderDispatchStaggerMs?: number
   /** Optional override for top-level passive listener debounce window (ms). */
   readonly listenerDebounceOverrideMs?: number
+  /** Wait threshold (ms) before emitting a queue-wait progress notice for interactive turns (`0` = disabled). */
+  readonly queueWaitAnchorMs?: number
+  /** Execution threshold (ms) before emitting a long-turn progress notice when no output was sent (`0` = disabled). */
+  readonly longTurnAnchorMs?: number
 }
 
 export interface LarkSessionBinding {
