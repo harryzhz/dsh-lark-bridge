@@ -200,6 +200,10 @@ export class TriageSessionRecorder {
       chatType: input.msg.chatType === 'p2p' ? 'p2p' : 'group',
       chatId: input.msg.chatId,
       ...(input.chatName ? { chatName: input.chatName } : {}),
+      ...(input.msg.senderUnionId || input.msg.senderOpenId
+        ? { userOpenId: input.msg.senderUnionId || input.msg.senderOpenId }
+        : {}),
+      ...(input.senderName ? { userName: input.senderName } : {}),
       workspaceName: input.decision.workspaceName,
       routeKey: input.decision.routeKey,
       trigger: 'triage',

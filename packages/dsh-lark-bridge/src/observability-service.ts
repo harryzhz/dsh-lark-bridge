@@ -77,6 +77,17 @@ export interface ObservabilityServiceHost {
   readonly enableBackgroundTimers?: boolean
   readonly listBotStatuses: () => readonly LarkBotStatus[]
   readonly getTransportDiagnostics: (botId: string) => TransportDiagnosticsSnapshot | undefined
+  readonly getCachedUserProfile?: (
+    botId: string,
+    openId: string,
+  ) =>
+    | {
+        readonly openId: string
+        readonly unionId?: string
+        readonly name?: string
+        readonly avatarUrl?: string
+      }
+    | undefined
   readonly listSplitBrainAlerts: () => readonly SplitBrainAlert[]
   readonly getLifecycleStatus: () => BridgeLifecycleStatus
   readonly getConcurrencyStats: () => { readonly activeActors: number; readonly queuedTurns: number }
@@ -251,6 +262,75 @@ function extractModelSelectionFromEvent(event: SessionEvent): {
   return null
 }
 
+interface ExtractedTurnSender {
+  readonly openId: string
+  readonly unionId: string
+  readonly senderId: string
+  readonly senderName: string
+  readonly senderType: 'user' | 'bot'
+}
+
+interface SessionSenderState {
+  currentTurn?: number
+  latest: ExtractedTurnSender | null
+  hasObservedUserMessage: boolean
+  readonly byTurn: Map<number, ExtractedTurnSender | null>
+}
+
+function unescapeXmlAttr(value: string): string {
+  return value
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+}
+
+function extractUserMessageTextFromEvent(event: SessionEvent): string {
+  if (event.type !== 'user/message') return ''
+  const data = event.data as {
+    content?: ReadonlyArray<{ type?: unknown; text?: unknown }>
+    message?: { content?: ReadonlyArray<{ type?: unknown; text?: unknown }> }
+  }
+  const blocks = data?.content ?? data?.message?.content ?? []
+  const parts: string[] = []
+  for (const b of blocks) {
+    if (b && b.type === 'text' && typeof b.text === 'string') {
+      parts.push(b.text)
+    }
+  }
+  return parts.join('\n')
+}
+
+function extractXmlAttrValue(attrBlock: string, attrName: string): string {
+  const re = new RegExp(`\\b${attrName}="([^"]*)"`)
+  const m = re.exec(attrBlock)
+  return m?.[1] ? unescapeXmlAttr(m[1]).trim() : ''
+}
+
+export function extractSenderFromUserMessageEvent(
+  event: SessionEvent,
+): ExtractedTurnSender | null {
+  const text = extractUserMessageTextFromEvent(event)
+  if (!text) return null
+  const ctxMatch = /<lark_context\s+([^>]+?)\s*\/?>/.exec(text)
+  if (!ctxMatch?.[1]) return null
+  const attrs = ctxMatch[1]
+  const openId = extractXmlAttrValue(attrs, 'sender_open_id')
+  const unionId = extractXmlAttrValue(attrs, 'sender_union_id')
+  const senderName = extractXmlAttrValue(attrs, 'sender_name')
+  const rawType = extractXmlAttrValue(attrs, 'sender_type')
+  const senderId = unionId || openId
+  if (!senderId && !senderName) return null
+  return {
+    openId,
+    unionId,
+    senderId,
+    senderName,
+    senderType: rawType === 'bot' || rawType === 'app' ? 'bot' : 'user',
+  }
+}
+
 /**
  * Runtime observability collector, historical session token backfill engine,
  * process vitals monitor, and async storage telemetry projector.
@@ -258,6 +338,7 @@ function extractModelSelectionFromEvent(event: SessionEvent): {
 export class ObservabilityService {
   private readonly sessionModels = new Map<string, SessionModelState>()
   private readonly sessionPresets = new Map<string, string>()
+  private readonly sessionSenders = new Map<string, SessionSenderState>()
   private readonly sessionAttrCache = new Map<string, SessionAttribution | null>()
   private readonly vitals: ProcessVitalPoint[] = []
   private eventLoopMonitor?: IntervalHistogram
@@ -408,6 +489,10 @@ export class ObservabilityService {
     readonly chatType?: 'group' | 'p2p'
     readonly triageSessionId?: string
     readonly traceId?: string
+    readonly senderOpenId?: string
+    readonly senderUnionId?: string
+    readonly senderName?: string
+    readonly senderType?: 'user' | 'bot'
     readonly action: 'silent' | 'quick_reply' | 'handoff'
     readonly fallback?: boolean
     readonly errorCode?: string
@@ -422,6 +507,24 @@ export class ObservabilityService {
       : `triage_trace:${input.traceId || randomUUID()}`
     const tokens = normalizeTokenUsage(input.usage)
     const now = input.timestampMs ?? Date.now()
+    const openId = input.senderOpenId?.trim() || ''
+    const cached = openId ? this.host.getCachedUserProfile?.(input.botId, openId) : undefined
+    const unionId = input.senderUnionId?.trim() || cached?.unionId?.trim() || ''
+    const senderName = input.senderName?.trim() || cached?.name?.trim() || ''
+    const senderId = unionId || openId
+    const senderType: 'user' | 'bot' | undefined =
+      senderId || senderName ? (input.senderType === 'bot' ? 'bot' : 'user') : undefined
+    if (openId && (unionId || senderName || cached?.avatarUrl)) {
+      this.host.store.upsertSenderProfile({
+        botId: input.botId,
+        openId,
+        ...(unionId ? { unionId } : {}),
+        ...(senderName ? { name: senderName } : {}),
+        ...(cached?.avatarUrl ? { avatarUrl: cached.avatarUrl } : {}),
+        ...(senderType ? { senderType } : {}),
+        updatedAtMs: now,
+      })
+    }
     this.host.store.recordUsageEvent({
       id,
       timestampMs: now,
@@ -430,6 +533,9 @@ export class ObservabilityService {
       chatId: input.chatId,
       chatType: input.chatType ?? 'group',
       ...(input.triageSessionId ? { sessionId: input.triageSessionId } : {}),
+      ...(senderId ? { senderId } : {}),
+      ...(senderName ? { senderName } : {}),
+      ...(senderType ? { senderType } : {}),
       trigger: 'triage',
       ...(input.provider ? { provider: input.provider } : {}),
       ...(input.model ? { model: input.model } : {}),
@@ -461,12 +567,14 @@ export class ObservabilityService {
     readonly window?: ObservabilityWindow
     readonly botId?: string
     readonly chatId?: string
+    readonly senderId?: string
     readonly refreshStorage?: boolean
     readonly nowMs?: number
   } = {}): Promise<ObservabilityPayload> {
     const nowMs = options.nowMs ?? Date.now()
     const botId = options.botId?.trim() || ''
     const chatId = options.chatId?.trim() || ''
+    const senderId = options.senderId?.trim() || ''
 
     // Ensure fast SQLite-only historical backfill (audit_events + triage_sessions) has run at least once.
     this.backfillSqliteTablesOnce()
@@ -475,6 +583,7 @@ export class ObservabilityService {
       ...(options.window ? { window: options.window } : {}),
       ...(botId ? { botId } : {}),
       ...(chatId ? { chatId } : {}),
+      ...(senderId ? { senderId } : {}),
       nowMs,
     })
 
@@ -490,8 +599,14 @@ export class ObservabilityService {
     const bindings = this.host.store.listBindings()
     const filteredBindings = bindings.filter((b) => {
       if (botId && b.botId !== botId) return false
-      if (chatId === P2P_CHAT_FILTER_VALUE) return b.chatType === 'p2p' || b.trigger === 'p2p'
-      if (chatId) return b.chatId === chatId
+      if (chatId === P2P_CHAT_FILTER_VALUE) {
+        if (!(b.chatType === 'p2p' || b.trigger === 'p2p')) return false
+      } else if (chatId && b.chatId !== chatId) {
+        return false
+      }
+      if (senderId) {
+        return agg.matchedSessionIds.has(b.sessionId) || b.userOpenId === senderId
+      }
       return true
     })
 
@@ -616,6 +731,7 @@ export class ObservabilityService {
         if (e.timestampMs < agg.fromMs || e.timestampMs > agg.toMs) return false
         if (botId && e.botId !== botId) return false
         if (chatId && chatId !== P2P_CHAT_FILTER_VALUE && e.chatId !== chatId) return false
+        if (senderId && (!e.sessionId || !agg.matchedSessionIds.has(e.sessionId))) return false
         return true
       })
       .slice(0, 12)
@@ -646,7 +762,9 @@ export class ObservabilityService {
       filters: {
         botId,
         chatId,
+        senderId,
         chats: agg.chatFilterOptions,
+        senders: agg.senderFilterOptions,
       },
       backfill: {
         running: this.backfillRunning,
@@ -716,6 +834,7 @@ export class ObservabilityService {
         heatmap: agg.heatmap,
         botRanking,
         chatRanking,
+        senderRanking: agg.senderRanking,
       },
       technical: {
         sla: {
@@ -814,6 +933,34 @@ export class ObservabilityService {
 
   private handleLiveSessionEvent(session: Session, event: SessionEvent): void {
     const sid = String(session.id)
+    if (event.type === 'turn/start') {
+      const turn = Number((event.data as { turn?: unknown } | undefined)?.turn)
+      if (Number.isFinite(turn)) {
+        const state = this.getOrCreateSessionSenderState(sid)
+        state.currentTurn = turn
+      }
+      return
+    }
+    if (event.type === 'user/message') {
+      const state = this.getOrCreateSessionSenderState(sid)
+      const extracted = extractSenderFromUserMessageEvent(event)
+      state.latest = extracted
+      state.hasObservedUserMessage = true
+      const rawTurn = (event.data as { turn?: unknown } | undefined)?.turn
+      const turn =
+        typeof rawTurn === 'number' && Number.isFinite(rawTurn) ? rawTurn : state.currentTurn
+      if (turn !== undefined) {
+        state.byTurn.set(turn, extracted)
+      }
+      if (extracted?.openId) {
+        const attr = this.resolveSessionAttribution(sid, session)
+        if (attr) {
+          this.persistExtractedSenderProfile(attr.botId, extracted, event.time)
+        }
+      }
+      return
+    }
+
     const metaUpdate = extractModelSelectionFromEvent(event)
     if (metaUpdate) {
       if (metaUpdate.agentPreset) {
@@ -834,6 +981,7 @@ export class ObservabilityService {
       const attr = this.resolveSessionAttribution(sid, session)
       if (!attr) return
       const data = event.data as {
+        turn?: number
         usage?: TokenUsage
         message?: {
           content?: readonly { type?: string }[]
@@ -853,6 +1001,7 @@ export class ObservabilityService {
       }
       const resolvedPreset =
         this.sessionPresets.get(sid) || readHeaderAgentPreset(session.header) || attr.agentPreset
+      const resolvedSender = this.resolveLiveSessionSender(sid, attr.botId, data.turn, session)
       const seq = Number(event.seq ?? 0)
       const ts = typeof event.time === 'number' && Number.isFinite(event.time) ? event.time : Date.now()
       this.host.store.recordUsageEvent({
@@ -863,6 +1012,9 @@ export class ObservabilityService {
         chatId: attr.chatId,
         chatType: attr.chatType,
         sessionId: sid,
+        ...(resolvedSender?.senderId ? { senderId: resolvedSender.senderId } : {}),
+        ...(resolvedSender?.senderName ? { senderName: resolvedSender.senderName } : {}),
+        ...(resolvedSender ? { senderType: resolvedSender.senderType } : {}),
         trigger: attr.trigger,
         agentPreset: resolvedPreset,
         provider: resolvedProvider,
@@ -876,13 +1028,14 @@ export class ObservabilityService {
     }
 
     if (event.type === 'tool/result') {
-      const data = event.data as { isError?: boolean; name?: string }
+      const data = event.data as { turn?: number; isError?: boolean; name?: string }
       if (!data?.isError) return
       const attr = this.resolveSessionAttribution(sid, session)
       if (!attr) return
       const modelState = this.resolveLiveSessionModel(sid, session)
       const resolvedPreset =
         this.sessionPresets.get(sid) || readHeaderAgentPreset(session.header) || attr.agentPreset
+      const resolvedSender = this.resolveLiveSessionSender(sid, attr.botId, data.turn, session)
       const seq = Number(event.seq ?? 0)
       const ts = typeof event.time === 'number' && Number.isFinite(event.time) ? event.time : Date.now()
       this.host.store.recordUsageEvent({
@@ -893,6 +1046,9 @@ export class ObservabilityService {
         chatId: attr.chatId,
         chatType: attr.chatType,
         sessionId: sid,
+        ...(resolvedSender?.senderId ? { senderId: resolvedSender.senderId } : {}),
+        ...(resolvedSender?.senderName ? { senderName: resolvedSender.senderName } : {}),
+        ...(resolvedSender ? { senderType: resolvedSender.senderType } : {}),
         trigger: attr.trigger,
         agentPreset: resolvedPreset,
         provider: modelState?.provider ?? '',
@@ -903,6 +1059,107 @@ export class ObservabilityService {
       })
       this.host.store.observabilityRepo.setSessionWatermark(sid, seq, ts)
     }
+  }
+
+  private getOrCreateSessionSenderState(sessionId: string): SessionSenderState {
+    let state = this.sessionSenders.get(sessionId)
+    if (state) {
+      this.sessionSenders.delete(sessionId)
+      this.sessionSenders.set(sessionId, state)
+      return state
+    }
+    state = { latest: null, hasObservedUserMessage: false, byTurn: new Map() }
+    this.sessionSenders.set(sessionId, state)
+    while (this.sessionSenders.size > MAX_MODEL_CACHE_SESSIONS) {
+      const oldest = this.sessionSenders.keys().next().value
+      if (!oldest) break
+      this.sessionSenders.delete(oldest)
+    }
+    return state
+  }
+
+  private persistExtractedSenderProfile(
+    botId: string,
+    sender: ExtractedTurnSender,
+    timestampMs?: number,
+  ): void {
+    if (!sender.openId) return
+    const cached = this.host.getCachedUserProfile?.(botId, sender.openId)
+    const unionId = sender.unionId || cached?.unionId || ''
+    const name = sender.senderName || cached?.name || ''
+    const avatarUrl = cached?.avatarUrl || ''
+    if (!unionId && !name && !avatarUrl && sender.senderType === 'user') return
+    this.host.store.upsertSenderProfile({
+      botId,
+      openId: sender.openId,
+      ...(unionId ? { unionId } : {}),
+      ...(name ? { name } : {}),
+      ...(avatarUrl ? { avatarUrl } : {}),
+      senderType: sender.senderType,
+      ...(typeof timestampMs === 'number' && Number.isFinite(timestampMs)
+        ? { updatedAtMs: timestampMs }
+        : {}),
+    })
+  }
+
+  private enrichExtractedSender(
+    botId: string,
+    sender: ExtractedTurnSender | null,
+  ): ExtractedTurnSender | null {
+    if (!sender) return null
+    if (!sender.openId) return sender
+    const cached = this.host.getCachedUserProfile?.(botId, sender.openId)
+    if (!cached) return sender
+    const unionId = sender.unionId || cached.unionId || ''
+    const senderName = sender.senderName || cached.name || ''
+    return {
+      openId: sender.openId,
+      unionId,
+      senderId: unionId || sender.openId,
+      senderName,
+      senderType: sender.senderType,
+    }
+  }
+
+  private resolveLiveSessionSender(
+    sessionId: string,
+    botId: string,
+    turn: number | undefined,
+    liveSession?: Session,
+  ): ExtractedTurnSender | null {
+    const cached = this.sessionSenders.get(sessionId)
+    if (cached) {
+      if (turn !== undefined && cached.byTurn.has(turn)) {
+        return this.enrichExtractedSender(botId, cached.byTurn.get(turn) ?? null)
+      }
+      if (cached.hasObservedUserMessage) {
+        return this.enrichExtractedSender(botId, cached.latest)
+      }
+    }
+    if (!liveSession || typeof liveSession.snapshotEvents !== 'function') return null
+    const events = liveSession.snapshotEvents()
+    const state = this.getOrCreateSessionSenderState(sessionId)
+    let curTurn: number | undefined
+    for (const ev of events) {
+      if (ev.type === 'turn/start') {
+        const t = Number((ev.data as { turn?: unknown } | undefined)?.turn)
+        if (Number.isFinite(t)) curTurn = t
+      } else if (ev.type === 'user/message') {
+        const extracted = extractSenderFromUserMessageEvent(ev)
+        state.latest = extracted
+        state.hasObservedUserMessage = true
+        const rawTurn = (ev.data as { turn?: unknown } | undefined)?.turn
+        const effectiveTurn =
+          typeof rawTurn === 'number' && Number.isFinite(rawTurn) ? rawTurn : curTurn
+        if (effectiveTurn !== undefined) {
+          state.byTurn.set(effectiveTurn, extracted)
+        }
+      }
+    }
+    if (turn !== undefined && state.byTurn.has(turn)) {
+      return this.enrichExtractedSender(botId, state.byTurn.get(turn) ?? null)
+    }
+    return this.enrichExtractedSender(botId, state.latest)
   }
 
   private rememberSessionModel(sessionId: string, provider: string, model: string): void {
@@ -1162,6 +1419,7 @@ export class ObservabilityService {
         chatId: ts.chatId,
         chatType: 'group',
         sessionId: ts.sessionId,
+        ...(ts.senderName ? { senderName: ts.senderName, senderType: 'user' as const } : {}),
         trigger: 'triage',
         ...(ts.provider ? { provider: ts.provider } : {}),
         ...(ts.model ? { model: ts.model } : {}),
@@ -1233,6 +1491,10 @@ export class ObservabilityService {
 
       if (!this.disposed) {
         await this.repairHistoricalModelAttributionOnce(persistence)
+      }
+
+      if (!this.disposed) {
+        await this.repairHistoricalSenderAttributionOnce(persistence)
       }
 
       if (!this.disposed) {
@@ -1347,6 +1609,9 @@ export class ObservabilityService {
       let agentPreset = readHeaderAgentPreset(handle.header) || item.attr.agentPreset
       let provider = ''
       let model = item.attr.model ?? ''
+      let currentTurn: number | undefined
+      let currentSender: ExtractedTurnSender | null = null
+      const senderByTurn = new Map<number, ExtractedTurnSender | null>()
       let offset = 0
       let maxSeenSeq = prevSeq
       let totalRead = 0
@@ -1356,6 +1621,21 @@ export class ObservabilityService {
         if (!res.events || res.events.length === 0) break
         for (const ev of res.events) {
           const seq = Number(ev.seq ?? offset)
+          if (ev.type === 'turn/start') {
+            const t = Number((ev.data as { turn?: unknown } | undefined)?.turn)
+            if (Number.isFinite(t)) currentTurn = t
+          } else if (ev.type === 'user/message') {
+            currentSender = extractSenderFromUserMessageEvent(ev)
+            const rawTurn = (ev.data as { turn?: unknown } | undefined)?.turn
+            const turn =
+              typeof rawTurn === 'number' && Number.isFinite(rawTurn) ? rawTurn : currentTurn
+            if (turn !== undefined) {
+              senderByTurn.set(turn, currentSender)
+            }
+            if (currentSender?.openId) {
+              this.persistExtractedSenderProfile(item.attr.botId, currentSender, ev.time)
+            }
+          }
           const metaUpdate = extractModelSelectionFromEvent(ev)
           if (metaUpdate) {
             if (metaUpdate.agentPreset) agentPreset = metaUpdate.agentPreset
@@ -1372,6 +1652,7 @@ export class ObservabilityService {
 
           if (ev.type === 'assistant/message') {
             const data = ev.data as {
+              turn?: number
               usage?: TokenUsage
               message?: {
                 content?: readonly { type?: string }[]
@@ -1384,6 +1665,10 @@ export class ObservabilityService {
             const tokens = normalizeTokenUsage(data.usage)
             if (tokens.totalTokens === 0 && toolCalls === 0) continue
             const msgSource = extractMessageSource(data)
+            const stepSender =
+              data.turn !== undefined && senderByTurn.has(data.turn)
+                ? senderByTurn.get(data.turn) ?? null
+                : currentSender
             const ts = typeof ev.time === 'number' && Number.isFinite(ev.time) ? ev.time : Date.now()
             batch.push({
               id: `step:${item.sessionId}:${seq}`,
@@ -1393,6 +1678,9 @@ export class ObservabilityService {
               chatId: item.attr.chatId,
               chatType: item.attr.chatType,
               sessionId: item.sessionId,
+              ...(stepSender?.senderId ? { senderId: stepSender.senderId } : {}),
+              ...(stepSender?.senderName ? { senderName: stepSender.senderName } : {}),
+              ...(stepSender ? { senderType: stepSender.senderType } : {}),
               trigger: item.attr.trigger,
               agentPreset,
               provider: msgSource.provider || provider,
@@ -1402,8 +1690,12 @@ export class ObservabilityService {
               toolCalls,
             })
           } else if (ev.type === 'tool/result') {
-            const data = ev.data as { isError?: boolean }
+            const data = ev.data as { turn?: number; isError?: boolean }
             if (!data?.isError) continue
+            const stepSender =
+              data.turn !== undefined && senderByTurn.has(data.turn)
+                ? senderByTurn.get(data.turn) ?? null
+                : currentSender
             const ts = typeof ev.time === 'number' && Number.isFinite(ev.time) ? ev.time : Date.now()
             batch.push({
               id: `toolerr:${item.sessionId}:${seq}`,
@@ -1413,6 +1705,9 @@ export class ObservabilityService {
               chatId: item.attr.chatId,
               chatType: item.attr.chatType,
               sessionId: item.sessionId,
+              ...(stepSender?.senderId ? { senderId: stepSender.senderId } : {}),
+              ...(stepSender?.senderName ? { senderName: stepSender.senderName } : {}),
+              ...(stepSender ? { senderType: stepSender.senderType } : {}),
               trigger: item.attr.trigger,
               agentPreset,
               provider,
@@ -1531,6 +1826,168 @@ export class ObservabilityService {
 
       if (updates.length > 0) {
         this.host.store.observabilityRepo.repairUsageEventAttribution(updates)
+      }
+    } catch {
+      // Ignore unreadable or truncated session logs.
+    } finally {
+      await handle.close().catch(() => {})
+    }
+  }
+
+  /**
+   * One-time idempotent repair populating `sender_id` / `sender_name` / `sender_type`
+   * on historical telemetry rows by replaying `<lark_context>` blocks from persisted
+   * sessions and `triage_sessions` metadata.
+   */
+  private async repairHistoricalSenderAttributionOnce(
+    persistence: SessionPersistence,
+  ): Promise<void> {
+    if (this.host.store.db.getMeta('observability_sender_attribution_repair_v2') === '1') return
+
+    // 1. Backfill triage rows directly from SQLite `triage_sessions.senderName`
+    const triageUpdates: Array<{
+      readonly id: string
+      readonly senderName: string
+      readonly senderType: 'user'
+    }> = []
+    for (const ts of this.host.store.listTriageSessions()) {
+      const cleanName = ts.senderName?.trim()
+      if (!cleanName) continue
+      triageUpdates.push({
+        id: `triage:${ts.sessionId}`,
+        senderName: cleanName,
+        senderType: 'user',
+      })
+    }
+    if (triageUpdates.length > 0) {
+      this.host.store.observabilityRepo.repairUsageEventSenders(triageUpdates)
+    }
+
+    // 2. Backfill step / toolerr / inbound / turn events from persisted DSH sessions
+    const candidateSet = new Set<string>(
+      this.host.store.observabilityRepo.listSessionsNeedingSenderRepair(MAX_BACKFILL_SESSIONS),
+    )
+    if (this.host.store.db.getMeta('observability_sender_attribution_repair_v1') === '1') {
+      for (const item of this.collectBackfillSessionCandidates()) {
+        if (candidateSet.size >= MAX_BACKFILL_SESSIONS) break
+        candidateSet.add(item.sessionId)
+      }
+    }
+    const sessionIds = [...candidateSet]
+    for (let i = 0; i < sessionIds.length; i += 1) {
+      if (this.disposed) return
+      await this.repairSinglePersistedSessionSenders(persistence, sessionIds[i]!)
+      if ((i + 1) % BACKFILL_YIELD_BATCH === 0) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 0))
+      }
+    }
+
+    if (!this.disposed) {
+      this.host.store.db.setMeta('observability_sender_attribution_repair_v2', '1')
+    }
+  }
+
+  private async repairSinglePersistedSessionSenders(
+    persistence: SessionPersistence,
+    sessionId: string,
+  ): Promise<void> {
+    let handle
+    try {
+      handle = await persistence.open(brandString<SessionId>(sessionId), 'read')
+    } catch {
+      return
+    }
+    try {
+      const attr = this.resolveSessionAttribution(sessionId)
+      const botId = attr?.botId ?? ''
+      let currentTurn: number | undefined
+      let currentSender: ExtractedTurnSender | null = null
+      const senderByTurn = new Map<number, ExtractedTurnSender | null>()
+      const turnWindows: Array<{
+        readonly startMs: number
+        readonly senderId: string
+        readonly senderName: string
+        readonly senderType: 'user' | 'bot' | ''
+      }> = []
+      const updates: Array<{
+        readonly id: string
+        readonly senderId?: string
+        readonly senderName?: string
+        readonly senderType?: 'user' | 'bot' | ''
+      }> = []
+      let offset = 0
+      let totalRead = 0
+
+      while (!this.disposed && totalRead < MAX_EVENTS_PER_BACKFILL_SESSION) {
+        const res = await handle.read(offset, READ_EVENTS_PAGE_SIZE)
+        if (!res.events || res.events.length === 0) break
+        for (const ev of res.events) {
+          const seq = Number(ev.seq ?? offset)
+          if (ev.type === 'turn/start') {
+            const t = Number((ev.data as { turn?: unknown } | undefined)?.turn)
+            if (Number.isFinite(t)) currentTurn = t
+          } else if (ev.type === 'user/message') {
+            currentSender = extractSenderFromUserMessageEvent(ev)
+            const rawTurn = (ev.data as { turn?: unknown } | undefined)?.turn
+            const turn =
+              typeof rawTurn === 'number' && Number.isFinite(rawTurn) ? rawTurn : currentTurn
+            if (turn !== undefined) {
+              senderByTurn.set(turn, currentSender)
+            }
+            const evTime = typeof ev.time === 'number' && Number.isFinite(ev.time) ? ev.time : 0
+            turnWindows.push({
+              startMs: evTime,
+              senderId: currentSender?.senderId ?? '',
+              senderName: currentSender?.senderName ?? '',
+              senderType: currentSender?.senderType ?? '',
+            })
+            if (botId && currentSender?.openId) {
+              this.persistExtractedSenderProfile(botId, currentSender, ev.time)
+            }
+          } else if (ev.type === 'assistant/message') {
+            const data = ev.data as { turn?: number }
+            const stepSender =
+              data.turn !== undefined && senderByTurn.has(data.turn)
+                ? senderByTurn.get(data.turn) ?? null
+                : currentSender
+            if (stepSender && (stepSender.senderId || stepSender.senderName)) {
+              updates.push({
+                id: `step:${sessionId}:${seq}`,
+                ...(stepSender.senderId ? { senderId: stepSender.senderId } : {}),
+                ...(stepSender.senderName ? { senderName: stepSender.senderName } : {}),
+                senderType: stepSender.senderType,
+              })
+            }
+          } else if (ev.type === 'tool/result') {
+            const data = ev.data as { turn?: number; isError?: boolean }
+            const stepSender =
+              data.turn !== undefined && senderByTurn.has(data.turn)
+                ? senderByTurn.get(data.turn) ?? null
+                : currentSender
+            if (data?.isError && stepSender && (stepSender.senderId || stepSender.senderName)) {
+              updates.push({
+                id: `toolerr:${sessionId}:${seq}`,
+                ...(stepSender.senderId ? { senderId: stepSender.senderId } : {}),
+                ...(stepSender.senderName ? { senderName: stepSender.senderName } : {}),
+                senderType: stepSender.senderType,
+              })
+            }
+          }
+        }
+        totalRead += res.events.length
+        offset += res.events.length
+        if (res.events.length < READ_EVENTS_PAGE_SIZE) break
+      }
+
+      if (updates.length > 0) {
+        this.host.store.observabilityRepo.repairUsageEventSenders(updates)
+      }
+      if (turnWindows.length > 0) {
+        this.host.store.observabilityRepo.repairSessionNonStepEventSenders(
+          sessionId,
+          turnWindows,
+          attr?.botId && attr?.chatId ? { botId: attr.botId, chatId: attr.chatId } : undefined,
+        )
       }
     } catch {
       // Ignore unreadable or truncated session logs.

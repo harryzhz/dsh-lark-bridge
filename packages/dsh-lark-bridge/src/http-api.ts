@@ -213,6 +213,7 @@ export async function dispatchLarkApiRequest(
             : '24h'
         const botId = url.searchParams.get('botId')?.trim() || undefined
         const chatId = url.searchParams.get('chatId')?.trim() || undefined
+        const senderId = url.searchParams.get('senderId')?.trim() || undefined
         const refreshStorage =
           url.searchParams.get('refreshStorage') === '1' ||
           url.searchParams.get('refreshStorage') === 'true'
@@ -220,6 +221,7 @@ export async function dispatchLarkApiRequest(
           window,
           ...(botId ? { botId } : {}),
           ...(chatId ? { chatId } : {}),
+          ...(senderId ? { senderId } : {}),
           refreshStorage,
         })
         return ok({ ok: true, ...payload })

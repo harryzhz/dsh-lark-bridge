@@ -10,6 +10,7 @@ import { TURN_RECOVERY_HARDENING_MIGRATION } from './005-turn-recovery-hardening
 import { TRIAGE_CONTEXT_UPDATED_IDX_MIGRATION } from './006-triage-context-updated-idx.js'
 import { OBSERVABILITY_MIGRATION } from './007-observability.js'
 import { EXTERNAL_SESSION_LINKS_MIGRATION } from './008-external-session-links.js'
+import { TELEMETRY_SENDER_MIGRATION } from './009-telemetry-sender.js'
 
 export type { SqlMigration }
 export {
@@ -21,6 +22,7 @@ export {
   TRIAGE_CONTEXT_UPDATED_IDX_MIGRATION,
   OBSERVABILITY_MIGRATION,
   EXTERNAL_SESSION_LINKS_MIGRATION,
+  TELEMETRY_SENDER_MIGRATION,
 }
 
 export const ALL_MIGRATIONS: readonly SqlMigration[] = [
@@ -32,6 +34,7 @@ export const ALL_MIGRATIONS: readonly SqlMigration[] = [
   TRIAGE_CONTEXT_UPDATED_IDX_MIGRATION,
   OBSERVABILITY_MIGRATION,
   EXTERNAL_SESSION_LINKS_MIGRATION,
+  TELEMETRY_SENDER_MIGRATION,
 ]
 
 export const ENTITY_TABLE_NAMES = [
@@ -43,6 +46,7 @@ export const ENTITY_TABLE_NAMES = [
   'telemetry_daily_rollups',
   'telemetry_session_watermarks',
   'external_session_links',
+  'telemetry_sender_profiles',
 ] as const
 
 export type EntityTableName = (typeof ENTITY_TABLE_NAMES)[number]

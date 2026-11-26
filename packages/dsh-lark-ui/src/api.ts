@@ -323,12 +323,14 @@ export const bridgeApi = {
     window?: ObservabilityWindow
     botId?: string
     chatId?: string
+    senderId?: string
     refreshStorage?: boolean
   } = {}) => {
     const qs = new URLSearchParams()
     if (params.window) qs.set('window', params.window)
     if (params.botId?.trim()) qs.set('botId', params.botId.trim())
     if (params.chatId?.trim()) qs.set('chatId', params.chatId.trim())
+    if (params.senderId?.trim()) qs.set('senderId', params.senderId.trim())
     if (params.refreshStorage) qs.set('refreshStorage', '1')
     const suffix = qs.toString()
     return request<ObservabilityPayload>(`/observability${suffix ? `?${suffix}` : ''}`)

@@ -1969,6 +1969,9 @@ body > [role='presentation']:has(> [role='dialog'][aria-modal='true'])
   flex-wrap: wrap;
   gap: 8px;
 }
+.fb-obs-bar-right .fb-select {
+  max-width: 204px;
+}
 .fb-obs-status-chip {
   display: inline-flex;
   align-items: center;
@@ -3077,6 +3080,27 @@ body > [role='presentation']:has(> [role='dialog'][aria-modal='true'])
 }
 .fb-obs-rank-model-chip em {
   font-style: normal;
+}
+.fb-obs-rank-more {
+  margin-top: 4px;
+  align-self: center;
+  height: 28px;
+  padding: 0 12px;
+  border: none;
+  border-radius: var(--dsw-radius-sm);
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 110ms ease, color 110ms ease;
+}
+.fb-obs-rank-more:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}
+.fb-obs-rank-more:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));
 }
 .fb-obs-kv-row {
   display: flex;

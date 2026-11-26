@@ -10,7 +10,11 @@ import type {
   ListenerTemplate,
   SeenMessageEntry,
 } from '@dsh-lark/lark-core'
-import type { ObservabilityWindow, TelemetryUsageEventInput } from './observability-types.js'
+import type {
+  ObservabilityWindow,
+  TelemetrySenderProfileRecord,
+  TelemetryUsageEventInput,
+} from './observability-types.js'
 import { CockpitProjector } from './storage/cockpit-projector.js'
 import { ConfigRepo } from './storage/config-repo.js'
 import {
@@ -514,10 +518,19 @@ export class LarkBridgeStore {
     return this.observabilityRepo.recordUsageEventsBatch(events)
   }
 
+  upsertSenderProfile(profile: TelemetrySenderProfileRecord): void {
+    this.observabilityRepo.upsertSenderProfile(profile)
+  }
+
+  listSenderProfiles(): TelemetrySenderProfileRecord[] {
+    return this.observabilityRepo.listSenderProfiles()
+  }
+
   queryObservabilityAggregate(options: {
     readonly window?: ObservabilityWindow
     readonly botId?: string
     readonly chatId?: string
+    readonly senderId?: string
     readonly nowMs?: number
   }): ObservabilityRepoAggregate {
     return this.observabilityRepo.queryAggregate(options)
@@ -529,6 +542,9 @@ export class LarkBridgeStore {
     readonly chatName?: string
     readonly chatType?: string
     readonly sessionId?: string
+    readonly senderId?: string
+    readonly senderName?: string
+    readonly senderType?: 'user' | 'bot'
     readonly trigger?: string
     readonly errorCode?: string
     readonly kind: 'inbound' | 'replied' | 'listener' | 'silent_skip' | 'ignored' | 'error'
@@ -570,6 +586,9 @@ export class LarkBridgeStore {
       ...(input.chatId ? { chatId: input.chatId } : {}),
       ...(normalizedChatType ? { chatType: normalizedChatType } : {}),
       ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+      ...(input.senderId ? { senderId: input.senderId } : {}),
+      ...(input.senderName ? { senderName: input.senderName } : {}),
+      ...(input.senderType ? { senderType: input.senderType } : {}),
       ...(input.trigger ? { trigger: input.trigger } : {}),
       ...(input.errorCode ? { errorCode: input.errorCode } : {}),
       outcome,

@@ -355,6 +355,8 @@ export class LarkBridgeManager {
       enableBackgroundTimers: config.idleSweepIntervalMs > 0,
       listBotStatuses: () => this.listBotStatuses(),
       getTransportDiagnostics: (botId) => this.connections.getDiagnosticsSnapshot(botId),
+      getCachedUserProfile: (botId, openId) =>
+        this.connections.getTransport(botId)?.getCachedUserProfile?.(openId),
       listSplitBrainAlerts: () => this.splitBrain.listAlerts(),
       getLifecycleStatus: () => this.getLifecycleStatus(),
       getConcurrencyStats: () => this.sessions.getRuntimeConcurrencyStats(),
@@ -635,6 +637,7 @@ export class LarkBridgeManager {
     readonly window?: ObservabilityWindow
     readonly botId?: string
     readonly chatId?: string
+    readonly senderId?: string
     readonly refreshStorage?: boolean
   } = {}): Promise<ObservabilityPayload> {
     return this.observability.getPayload(options)

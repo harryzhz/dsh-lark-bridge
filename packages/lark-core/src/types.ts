@@ -724,6 +724,7 @@ export interface InboundLarkMessage {
   readonly threadId?: string
   readonly msgType: string
   readonly senderOpenId?: string
+  readonly senderUnionId?: string
   readonly senderType: 'user' | 'bot'
   readonly text: string
   readonly rawContent: string

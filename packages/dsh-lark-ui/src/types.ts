@@ -1053,6 +1053,44 @@ export interface ObservabilityChatFilterOption {
   botIds: string[]
 }
 
+export interface ObservabilitySenderBotSummary {
+  botId: string
+  botName: string
+  totalTokens: number
+}
+
+export interface ObservabilitySenderRow {
+  senderId: string
+  senderName: string
+  senderType: 'user' | 'bot'
+  avatarUrl?: string
+  sessions: number
+  activeChats: number
+  inbound: number
+  replied: number
+  silentSkipped: number
+  errors: number
+  llmSteps: number
+  totalTokens: number
+  inputTokens?: number
+  cacheReadTokens?: number
+  cacheWriteTokens?: number
+  outputTokens?: number
+  topModels?: ObservabilityRankModelSummary[]
+  topBots?: ObservabilitySenderBotSummary[]
+  cacheHitRate: number
+  avgLatencyMs: number
+  lastActiveMs: number
+}
+
+export interface ObservabilitySenderFilterOption {
+  senderId: string
+  senderName: string
+  senderType: 'user' | 'bot'
+  avatarUrl?: string
+  botIds: string[]
+}
+
 export interface ObservabilityHeatmapCell {
   dayOfWeek: number
   hour: number
@@ -1132,7 +1170,9 @@ export interface ObservabilityPayload {
   filters: {
     botId: string
     chatId: string
+    senderId?: string
     chats: ObservabilityChatFilterOption[]
+    senders?: ObservabilitySenderFilterOption[]
   }
   backfill: {
     running: boolean
@@ -1203,6 +1243,7 @@ export interface ObservabilityPayload {
     }
     botRanking: ObservabilityBotRow[]
     chatRanking: ObservabilityChatRow[]
+    senderRanking?: ObservabilitySenderRow[]
   }
   technical: {
     sla: {

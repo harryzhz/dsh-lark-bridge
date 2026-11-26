@@ -57,6 +57,7 @@ export const TABLE_LABELS: Readonly<Record<string, string>> = {
   telemetry_usage_events: '遥测明细事件',
   telemetry_daily_rollups: '按天聚合指标',
   telemetry_session_watermarks: '会话索引水位',
+  telemetry_sender_profiles: '触发人档案缓存',
   audit_events: '运行审计日志',
   managed_sessions: '受管会话索引',
   triage_sessions: '智能分流记录',
@@ -344,4 +345,25 @@ export function resolveApiRouteTone(p95Ms: number): 'primary' | 'warn' | 'error'
   if (p95Ms >= 1_500) return 'error'
   if (p95Ms >= 500) return 'warn'
   return 'primary'
+}
+
+export function formatSenderRankMeta(sender: {
+  readonly sessions: number
+  readonly inbound: number
+  readonly replied: number
+  readonly llmSteps: number
+  readonly errors: number
+  readonly cacheHitRate: number
+}): string {
+  const parts: string[] = []
+  if (sender.sessions > 0) parts.push(`会话 ${sender.sessions}`)
+  if (sender.inbound > 0 || sender.replied > 0) {
+    if (sender.inbound > 0) parts.push(`触发 ${sender.inbound}`)
+    if (sender.replied > 0) parts.push(`回复 ${sender.replied}`)
+  } else if (sender.llmSteps > 0) {
+    parts.push(`步数 ${formatCompactNumber(sender.llmSteps)}`)
+    if (sender.cacheHitRate > 0) parts.push(`缓存 ${sender.cacheHitRate}%`)
+  }
+  if (sender.errors > 0) parts.push(`异常 ${sender.errors}`)
+  return parts.join(' · ') || '暂无明细'
 }

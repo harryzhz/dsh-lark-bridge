@@ -770,4 +770,434 @@ describe('ObservabilityRepo, ObservabilityService & HTTP endpoints', () => {
     dispose()
     store.close()
   })
+
+  it('tracks per-turn sender attribution across multi-sender sessions, merges cross-bot identities safely, repairs historical data, and filters consistently by senderId', async () => {
+    const dataDir = makeTempDir('lark-obs-sender-')
+    const store = new LarkBridgeStore(dataDir)
+    const nowMs = Date.now()
+
+    store.upsertBot({
+      id: 'bot-a',
+      name: 'Bot Alpha',
+      larkAppId: 'cli_a',
+      larkAppSecret: 'sec_a',
+      defaultWorkingDir: '/Users/demo/a',
+      agentPreset: 'codex',
+      allowedUserProfiles: [
+        {
+          openId: 'ou_alex_a',
+          name: 'Alex Chen',
+          avatarUrl: 'https://cdn.example.com/alex.png',
+        },
+      ],
+    })
+    store.upsertBot({
+      id: 'bot-b',
+      name: 'Bot Beta',
+      larkAppId: 'cli_b',
+      larkAppSecret: 'sec_b',
+      defaultWorkingDir: '/Users/demo/b',
+      agentPreset: 'agy',
+    })
+    store.upsertGroup({
+      botId: 'bot-a',
+      chatId: 'oc_dev',
+      chatName: 'Dev Group',
+      enabled: true,
+    })
+
+    // Seed managed sessions so scoped session counts can be verified under senderId filter
+    store.upsertManagedSession({
+      sessionId: 'sess-shared-live',
+      botId: 'bot-a',
+      chatId: 'oc_dev',
+      trigger: 'mention',
+      createdAtMs: nowMs - 20_000,
+      lastActivityMs: nowMs - 5_000,
+    })
+    store.upsertManagedSession({
+      sessionId: 'sess-hist-b',
+      botId: 'bot-b',
+      chatId: 'oc_dev',
+      trigger: 'mention',
+      createdAtMs: nowMs - 120_000,
+      lastActivityMs: nowMs - 100_000,
+    })
+    store.upsertManagedSession({
+      sessionId: 'sess-sam-only',
+      botId: 'bot-a',
+      chatId: 'oc_dev',
+      trigger: 'mention',
+      createdAtMs: nowMs - 60_000,
+      lastActivityMs: nowMs - 50_000,
+    })
+
+    // Seed pre-migration historical rows without sender info (high watermark already set)
+    store.recordUsageEvent({
+      id: 'step:sess-hist-b:4',
+      timestampMs: nowMs - 110_000,
+      recordKind: 'llm_step',
+      botId: 'bot-b',
+      chatId: 'oc_dev',
+      chatType: 'group',
+      sessionId: 'sess-hist-b',
+      trigger: 'mention',
+      agentPreset: 'agy',
+      model: 'gemini-4-neon',
+      outcome: 'completed',
+      inputTokens: 1000,
+      cacheReadTokens: 1000,
+      outputTokens: 500,
+    })
+    store.recordMetric({
+      botId: 'bot-b',
+      chatId: 'oc_dev',
+      chatType: 'group',
+      trigger: 'mention',
+      kind: 'inbound',
+      now: nowMs - 115_500,
+    })
+    store.recordMetric({
+      botId: 'bot-b',
+      chatId: 'oc_dev',
+      chatType: 'group',
+      sessionId: 'sess-hist-b',
+      trigger: 'mention',
+      kind: 'replied',
+      latencyMs: 1800,
+      now: nowMs - 108_000,
+    })
+    store.observabilityRepo.setSessionWatermark('sess-hist-b', 10, nowMs - 105_000)
+
+    // Pre-migration historical triage row with senderName only (no sender_id)
+    store.upsertTriageSession({
+      sessionId: 'triage-hist-alex',
+      botId: 'bot-a',
+      botName: 'Bot Alpha',
+      chatId: 'oc_dev',
+      chatName: 'Dev Group',
+      workspaceName: 'a',
+      workingDir: '/Users/demo/a',
+      routeKey: 'bot-a:oc_dev:m1',
+      trigger: 'listener',
+      senderName: 'Alex Chen',
+      action: 'quick_reply',
+      reason: 'simple',
+      model: 'deepseek-chat',
+      durationMs: 320,
+      createdAtMs: nowMs - 95_000,
+      lastActivityMs: nowMs - 94_000,
+    })
+    store.recordUsageEvent({
+      id: 'triage:triage-hist-alex',
+      timestampMs: nowMs - 95_000,
+      recordKind: 'triage',
+      botId: 'bot-a',
+      chatId: 'oc_dev',
+      chatType: 'group',
+      sessionId: 'triage-hist-alex',
+      trigger: 'triage',
+      model: 'deepseek-chat',
+      outcome: 'quick_reply',
+      latencyMs: 320,
+      inputTokens: 200,
+      outputTokens: 50,
+    })
+
+    // Same-bot homonym collision: two distinct open_ids named "林晓" on bot-a must NEVER merge
+    store.recordUsageEvent({
+      id: 'step:sess-hom-1:1',
+      timestampMs: nowMs - 80_000,
+      recordKind: 'llm_step',
+      botId: 'bot-a',
+      chatId: 'oc_dev',
+      chatType: 'group',
+      sessionId: 'sess-hom-1',
+      senderId: 'ou_lin_1',
+      senderName: '林晓',
+      senderType: 'user',
+      trigger: 'mention',
+      agentPreset: 'codex',
+      model: 'gpt-5.4',
+      outcome: 'completed',
+      inputTokens: 600,
+      outputTokens: 100,
+    })
+    store.recordUsageEvent({
+      id: 'step:sess-hom-2:1',
+      timestampMs: nowMs - 75_000,
+      recordKind: 'llm_step',
+      botId: 'bot-a',
+      chatId: 'oc_dev',
+      chatType: 'group',
+      sessionId: 'sess-hom-2',
+      senderId: 'ou_lin_2',
+      senderName: '林晓',
+      senderType: 'user',
+      trigger: 'mention',
+      agentPreset: 'codex',
+      model: 'gpt-5.4',
+      outcome: 'completed',
+      inputTokens: 300,
+      outputTokens: 50,
+    })
+
+    // System scheduled event with no sender must stay excluded from senderRanking
+    store.recordUsageEvent({
+      id: 'step:sess-sched:1',
+      timestampMs: nowMs - 70_000,
+      recordKind: 'llm_step',
+      botId: 'bot-a',
+      chatId: 'oc_dev',
+      chatType: 'group',
+      sessionId: 'sess-sched',
+      trigger: 'schedule',
+      agentPreset: 'codex',
+      model: 'gpt-5.4',
+      outcome: 'completed',
+      inputTokens: 4000,
+      outputTokens: 500,
+    })
+
+    const persistedSessions: Record<string, SessionEvent[]> = {
+      'sess-hist-b': [
+        {
+          type: 'turn/start',
+          seq: 1 as never,
+          time: nowMs - 115_000,
+          data: { turn: 1 },
+        } as unknown as SessionEvent,
+        {
+          type: 'user/message',
+          seq: 2 as never,
+          time: nowMs - 114_000,
+          data: {
+            content: [
+              {
+                type: 'text',
+                text: '<system_reminder>\n<lark_context bot_id="bot-b" chat_id="oc_dev" sender_open_id="ou_alex_b" sender_name="Alex Chen" sender_type="user" />\n</system_reminder>\n\n<user_message>\nhi\n</user_message>',
+              },
+            ],
+          },
+        } as unknown as SessionEvent,
+        {
+          type: 'assistant/message',
+          seq: 4 as never,
+          time: nowMs - 110_000,
+          data: {
+            turn: 1,
+            message: { role: 'assistant', content: [{ type: 'text', text: 'done' }] },
+            usage: { inputTokens: 1000, cacheReadTokens: 1000, outputTokens: 500 },
+          },
+        } as unknown as SessionEvent,
+      ],
+    }
+
+    let sessionEventListener: ((session: Session, event: SessionEvent) => void) | undefined
+    const fakePersistence = {
+      open: async (id: string) => {
+        const events = persistedSessions[id]
+        if (!events) throw new Error('ENOENT')
+        return {
+          header: {},
+          read: async (offset = 0, len = 300) => ({
+            events: events.slice(offset, offset + len),
+          }),
+          close: async () => {},
+        }
+      },
+    }
+
+    const fakeCtx = {
+      on: (name: string, fn: (session: Session, event: SessionEvent) => void) => {
+        if (name === 'session/event') sessionEventListener = fn
+        return () => {
+          sessionEventListener = undefined
+        }
+      },
+      get: (name: string) => (name === 'sessionPersistence' ? fakePersistence : undefined),
+    } as unknown as Context
+
+    const svc = new ObservabilityService({
+      ctx: fakeCtx,
+      dataDir,
+      store,
+      startedAtMs: nowMs - 120_000,
+      enableBackgroundTimers: false,
+      listBotStatuses: () => [],
+      getTransportDiagnostics: () => undefined,
+      listSplitBrainAlerts: () => [],
+      getLifecycleStatus: () => ({
+        phase: 'running',
+        draining: false,
+        drained: true,
+        activeTurns: [],
+        activeTriageCount: 0,
+        activeRemindersCount: 0,
+        activeDreamingCount: 0,
+        totalInFlight: 0,
+        persistedPendingTurns: 0,
+        pid: process.pid,
+        startedAtMs: nowMs - 120_000,
+      }),
+      getConcurrencyStats: () => ({ activeActors: 0, queuedTurns: 0 }),
+      getDiagnosticAlerts: () => [],
+      getConfiguredScheduleCount: () => 1,
+    })
+
+    const dispose = svc.install()
+
+    // Live shared thread session: Turn 1 Alex (with union_id), Turn 2 Sam, Turn 3 schedule reuse (no sender!)
+    const liveSession = {
+      id: 'sess-shared-live',
+      header: { agentPreset: 'codex' },
+    } as unknown as Session
+    sessionEventListener?.(liveSession, {
+      type: 'turn/start',
+      seq: 1 as never,
+      time: nowMs - 18_000,
+      data: { turn: 1 },
+    } as unknown as SessionEvent)
+    sessionEventListener?.(liveSession, {
+      type: 'user/message',
+      seq: 2 as never,
+      time: nowMs - 17_000,
+      data: {
+        content: [
+          {
+            type: 'text',
+            text: '<lark_context bot_id="bot-a" sender_open_id="ou_alex_a" sender_union_id="on_alex_union" sender_name="Alex Chen" sender_type="user" />',
+          },
+        ],
+      },
+    } as unknown as SessionEvent)
+    sessionEventListener?.(liveSession, {
+      type: 'assistant/message',
+      seq: 3 as never,
+      time: nowMs - 16_000,
+      data: {
+        turn: 1,
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'ok' }],
+          source: { provider: 'openai', model: 'gpt-5.4' },
+        },
+        usage: { inputTokens: 1000, cacheReadTokens: 1500, outputTokens: 500 },
+      },
+    } as unknown as SessionEvent)
+    sessionEventListener?.(liveSession, {
+      type: 'turn/start',
+      seq: 4 as never,
+      time: nowMs - 12_000,
+      data: { turn: 2 },
+    } as unknown as SessionEvent)
+    sessionEventListener?.(liveSession, {
+      type: 'user/message',
+      seq: 5 as never,
+      time: nowMs - 11_000,
+      data: {
+        content: [
+          {
+            type: 'text',
+            text: '<lark_context bot_id="bot-a" sender_open_id="ou_sam_a" sender_name="Sam Lin" sender_type="user" />',
+          },
+        ],
+      },
+    } as unknown as SessionEvent)
+    sessionEventListener?.(liveSession, {
+      type: 'assistant/message',
+      seq: 6 as never,
+      time: nowMs - 10_000,
+      data: {
+        turn: 2,
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'sam reply' }],
+          source: { provider: 'openai', model: 'gpt-5.4' },
+        },
+        usage: { inputTokens: 2000, cacheReadTokens: 2500, outputTokens: 500 },
+      },
+    } as unknown as SessionEvent)
+    // Turn 3: scheduled prompt reused the same session -> MUST clear sender (never attribute to Sam!)
+    sessionEventListener?.(liveSession, {
+      type: 'turn/start',
+      seq: 7 as never,
+      time: nowMs - 8_000,
+      data: { turn: 3 },
+    } as unknown as SessionEvent)
+    sessionEventListener?.(liveSession, {
+      type: 'user/message',
+      seq: 8 as never,
+      time: nowMs - 7_000,
+      data: {
+        content: [{ type: 'text', text: '<schedule schedule_id="sch-1" title="Daily Check" />' }],
+      },
+    } as unknown as SessionEvent)
+    sessionEventListener?.(liveSession, {
+      type: 'assistant/message',
+      seq: 9 as never,
+      time: nowMs - 6_000,
+      data: {
+        turn: 3,
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'scheduled done' }],
+          source: { provider: 'openai', model: 'gpt-5.4' },
+        },
+        usage: { inputTokens: 1800, outputTokens: 200 },
+      },
+    } as unknown as SessionEvent)
+
+    await svc.triggerBackfill()
+
+    const fullPayload = await svc.getPayload({ window: '24h', nowMs })
+
+    // Alex Chen merged across bot-a live (3000) + bot-b historical (2500) + triage (250) = 5750
+    const alexRow = fullPayload.product.senderRanking.find((s) => s.senderName === 'Alex Chen')
+    expect(alexRow).toBeDefined()
+    expect(alexRow?.senderId).toBe('on_alex_union')
+    expect(alexRow?.totalTokens).toBe(5750)
+    expect(alexRow?.inbound).toBe(1) // repaired from legacy sessionless inbound row via timestamp match
+    expect(alexRow?.replied).toBe(1) // repaired from sess-hist-b turn metric
+    expect(alexRow?.avatarUrl).toBe('https://cdn.example.com/alex.png')
+    expect(alexRow?.topBots?.map((b) => b.botId)).toEqual(['bot-a', 'bot-b'])
+
+    // Sam Lin strictly gets Turn 2 only (5000), NOT Turn 3 schedule (2000)
+    const samRow = fullPayload.product.senderRanking.find((s) => s.senderName === 'Sam Lin')
+    expect(samRow).toBeDefined()
+    expect(samRow?.totalTokens).toBe(5000)
+
+    // Homonym collision: two distinct "林晓" entries preserved separately
+    const homonymRows = fullPayload.product.senderRanking.filter((s) => s.senderName === '林晓')
+    expect(homonymRows).toHaveLength(2)
+    expect(homonymRows.map((r) => r.totalTokens).sort((a, b) => b - a)).toEqual([700, 350])
+
+    // Total ranked senders = 4 (Alex, Sam, 林晓 #1, 林晓 #2); scheduled turns excluded
+    expect(fullPayload.product.senderRanking).toHaveLength(4)
+    expect(fullPayload.filters.senders).toHaveLength(4)
+
+    // HTTP endpoint with ?senderId=on_alex_union must match Alex's totals & keep full sender filter list
+    const fakeManager = {
+      store,
+      getObservability: (opts: Record<string, unknown>) => svc.getPayload(opts),
+      recordApiTiming: () => {},
+    }
+    const filteredRes = await dispatchLarkApiRequest(fakeCtx, fakeManager as never, {
+      method: 'GET',
+      path: `/api/lark-bridge/observability?window=24h&senderId=${encodeURIComponent('on_alex_union')}`,
+      isCliAuthenticated: false,
+      principalKind: 'owner',
+    })
+    expect(filteredRes.status).toBe(200)
+    const filteredPayload = filteredRes.payload as typeof fullPayload
+    expect(filteredPayload.filters.senderId).toBe('on_alex_union')
+    expect(filteredPayload.filters.senders).toHaveLength(4)
+    expect(filteredPayload.product.tokens.total).toBe(5750)
+    expect(filteredPayload.product.triage.total).toBe(1)
+    // Only Alex's 2 managed sessions (sess-shared-live + sess-hist-b), NOT sess-sam-only
+    expect(filteredPayload.product.sessions.createdInWindow).toBe(2)
+
+    dispose()
+    store.close()
+  })
 })
