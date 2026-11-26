@@ -358,6 +358,12 @@ export class LarkBridgeManager {
       getTransportDiagnostics: (botId) => this.connections.getDiagnosticsSnapshot(botId),
       getCachedUserProfile: (botId, openId) =>
         this.connections.getTransport(botId)?.getCachedUserProfile?.(openId),
+      syncGroupMemberProfiles: async (botId, chatId) => {
+        const res = await this.connections.ensureGroupMembersSynced(botId, chatId, {
+          includeAvatars: false,
+        })
+        return res.updatedProfiles
+      },
       listSplitBrainAlerts: () => this.splitBrain.listAlerts(),
       getLifecycleStatus: () => this.getLifecycleStatus(),
       getConcurrencyStats: () => this.sessions.getRuntimeConcurrencyStats(),

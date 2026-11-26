@@ -88,6 +88,7 @@ export interface ObservabilityServiceHost {
         readonly avatarUrl?: string
       }
     | undefined
+  readonly syncGroupMemberProfiles?: (botId: string, chatId: string) => Promise<number>
   readonly listSplitBrainAlerts: () => readonly SplitBrainAlert[]
   readonly getLifecycleStatus: () => BridgeLifecycleStatus
   readonly getConcurrencyStats: () => { readonly activeActors: number; readonly queuedTurns: number }
@@ -579,13 +580,29 @@ export class ObservabilityService {
     // Ensure fast SQLite-only historical backfill (audit_events + triage_sessions) has run at least once.
     this.backfillSqliteTablesOnce()
 
-    const agg = this.host.store.queryObservabilityAggregate({
+    let agg = this.host.store.queryObservabilityAggregate({
       ...(options.window ? { window: options.window } : {}),
       ...(botId ? { botId } : {}),
       ...(chatId ? { chatId } : {}),
       ...(senderId ? { senderId } : {}),
       nowMs,
     })
+
+    if (agg.unresolvedSenderChats.length > 0 && this.host.syncGroupMemberProfiles) {
+      const updatedProfiles = await this.hydrateSenderProfilesForChats(agg.unresolvedSenderChats, {
+        maxChats: 6,
+        timeoutMs: 2_500,
+      })
+      if (updatedProfiles > 0) {
+        agg = this.host.store.queryObservabilityAggregate({
+          ...(options.window ? { window: options.window } : {}),
+          ...(botId ? { botId } : {}),
+          ...(chatId ? { chatId } : {}),
+          ...(senderId ? { senderId } : {}),
+          nowMs,
+        })
+      }
+    }
 
     const storageScan = await this.getStorageScan(Boolean(options.refreshStorage))
     const storageStats = this.host.store.getStorageStats()
@@ -1497,6 +1514,11 @@ export class ObservabilityService {
         await this.repairHistoricalSenderAttributionOnce(persistence)
       }
 
+      if (!this.disposed && this.host.syncGroupMemberProfiles) {
+        const pendingChats = this.host.store.observabilityRepo.listChatsWithUnnamedSenders(20)
+        await this.hydrateSenderProfilesForChats(pendingChats, { maxChats: 20 })
+      }
+
       if (!this.disposed) {
         this.backfillCompleted = true
         this.backfillLastCompletedAtMs = Date.now()
@@ -1993,6 +2015,35 @@ export class ObservabilityService {
       // Ignore unreadable or truncated session logs.
     } finally {
       await handle.close().catch(() => {})
+    }
+  }
+
+  private async hydrateSenderProfilesForChats(
+    chats: ReadonlyArray<{ readonly botId: string; readonly chatId: string }>,
+    options: { readonly maxChats?: number; readonly timeoutMs?: number } = {},
+  ): Promise<number> {
+    const syncFn = this.host.syncGroupMemberProfiles
+    if (!syncFn || chats.length === 0 || this.disposed) return 0
+    const targets = chats.slice(0, Math.max(1, options.maxChats ?? 6))
+    const runAll = Promise.all(
+      targets.map((c) => syncFn(c.botId, c.chatId).catch(() => 0)),
+    ).then((counts) => counts.reduce((sum, n) => sum + (Number.isFinite(n) && n > 0 ? n : 0), 0))
+
+    const timeoutMs = options.timeoutMs
+    if (typeof timeoutMs !== 'number' || timeoutMs <= 0) {
+      return runAll
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      return await Promise.race([
+        runAll,
+        new Promise<number>((resolve) => {
+          timer = setTimeout(() => resolve(0), timeoutMs)
+          timer.unref?.()
+        }),
+      ])
+    } finally {
+      if (timer) clearTimeout(timer)
     }
   }
 

@@ -610,4 +610,78 @@ describe('LarkBotTransport profile description sync & member/bot avatar resoluti
     expect(destroyedOnTimeout).toBe(true)
     expect(logs.some((l) => l.includes('timed out'))).toBe(true)
   })
+
+  it('populates memberProfileCache on listChatMembersAndBots and skips contact.user.get when resolveUserDetails is false', async () => {
+    const transport = new LarkBotTransport(createBot(), { onMessage: () => {} })
+    const internalClient = (
+      transport as unknown as {
+        client: {
+          request: ReturnType<typeof vi.fn>
+          im: { chatMembers: { get: ReturnType<typeof vi.fn> } }
+          contact: { user: { get: ReturnType<typeof vi.fn> } }
+        }
+      }
+    ).client
+
+    internalClient.request = vi.fn(async (req: { url: string }) => {
+      if (req.url === '/open-apis/bot/v3/info/') {
+        return { bot: { open_id: 'ou_bot_self', app_name: 'AlphaBot' } }
+      }
+      if (req.url.endsWith('/members/list')) {
+        return {
+          data: {
+            bots: [
+              { app_id: 'cli_alert_01', member_id: 'ou_alert_bot', name: 'Alert Bot' },
+            ],
+            has_more: false,
+          },
+        }
+      }
+      if (req.url.endsWith('/members/bots')) {
+        return { data: { items: [], has_more: false } }
+      }
+      return {}
+    })
+    internalClient.im.chatMembers.get = vi.fn(async () => ({
+      data: {
+        items: [
+          { member_id: 'ou_colleague_41050', name: '林晓', is_agent: false },
+        ],
+        has_more: false,
+      },
+    }))
+    internalClient.contact.user.get = vi.fn(async () => {
+      throw new Error('should not call contact.user.get when resolveUserDetails is false')
+    })
+
+    const members = await transport.listChatMembersAndBots('oc_alert', {
+      resolveUserDetails: false,
+      resolveBotAvatar: async (bot) =>
+        bot.larkAppId === 'cli_alert_01' ? 'https://cdn.example.com/alert-bot.png' : undefined,
+    })
+
+    expect(internalClient.contact.user.get).not.toHaveBeenCalled()
+    expect(members).toEqual([
+      { openId: 'ou_colleague_41050', name: '林晓', memberType: 'user' },
+      {
+        openId: 'ou_alert_bot',
+        larkAppId: 'cli_alert_01',
+        name: 'Alert Bot',
+        memberType: 'bot',
+        avatarUrl: 'https://cdn.example.com/alert-bot.png',
+      },
+    ])
+
+    expect(transport.getCachedUserName('ou_alert_bot')).toBe('Alert Bot')
+    expect(transport.getCachedUserProfile('ou_alert_bot')).toEqual({
+      openId: 'ou_alert_bot',
+      name: 'Alert Bot',
+      avatarUrl: 'https://cdn.example.com/alert-bot.png',
+    })
+    expect(transport.getCachedUserName('ou_colleague_41050')).toBe('林晓')
+    expect(transport.getCachedUserProfile('ou_colleague_41050')).toEqual({
+      openId: 'ou_colleague_41050',
+      name: '林晓',
+    })
+  })
 })

@@ -1,10 +1,13 @@
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
+import type { InboundLarkMessage, LarkBotTransport, LarkChatMember } from '@dsh-lark/lark-core'
+import { BotConnectionPool } from '../src/bot-connection-pool.js'
 import { dispatchLarkApiRequest } from '../src/http-api.js'
+import { InboundPipeline } from '../src/inbound-pipeline.js'
 import { ObservabilityService } from '../src/observability-service.js'
 import { P2P_CHAT_FILTER_VALUE } from '../src/storage/observability-repo.js'
 import { LarkBridgeStore } from '../src/store.js'
@@ -1198,6 +1201,352 @@ describe('ObservabilityRepo, ObservabilityService & HTTP endpoints', () => {
     expect(filteredPayload.product.sessions.createdInWindow).toBe(2)
 
     dispose()
+    store.close()
+  })
+
+  it('auto-hydrates unnamed bot and 41050-restricted user display names from group member directory and avoids redundant syncs', async () => {
+    const dataDir = makeTempDir('lark-obs-bot-names-')
+    const store = new LarkBridgeStore(dataDir)
+    const nowMs = Date.now()
+
+    store.upsertBot({
+      id: 'bot-monitor',
+      name: 'Monitor Assistant',
+      larkAppId: 'cli_monitor',
+      larkAppSecret: 'sec_monitor',
+      defaultWorkingDir: '/Users/demo/monitor',
+      agentPreset: 'codex',
+    })
+    store.upsertGroup({
+      botId: 'bot-monitor',
+      chatId: 'oc_alert',
+      chatName: 'Alert Group',
+      enabled: true,
+    })
+
+    // Seed historical unnamed bot senders (open_id only + union_id mapped via profile) and a 41050 human
+    store.upsertSenderProfile({
+      botId: 'bot-monitor',
+      openId: 'ou_pipeline_bot',
+      unionId: 'on_pipeline_bot',
+      senderType: 'bot',
+      updatedAtMs: nowMs - 60_000,
+    })
+    store.recordUsageEvent({
+      id: 'step:alert-1:1',
+      timestampMs: nowMs - 50_000,
+      recordKind: 'llm_step',
+      botId: 'bot-monitor',
+      chatId: 'oc_alert',
+      chatType: 'group',
+      sessionId: 'sess-alert-1',
+      senderId: 'ou_alert_bot',
+      senderType: 'bot',
+      trigger: 'listener',
+      model: 'gpt-5.4',
+      outcome: 'completed',
+      inputTokens: 1000,
+      outputTokens: 200,
+    })
+    store.recordUsageEvent({
+      id: 'step:pipe-old:1',
+      timestampMs: nowMs - 40_000,
+      recordKind: 'llm_step',
+      botId: 'bot-monitor',
+      chatId: 'oc_alert',
+      chatType: 'group',
+      sessionId: 'sess-pipe-1',
+      senderId: 'ou_pipeline_bot',
+      senderType: 'bot',
+      trigger: 'listener',
+      model: 'gpt-5.4',
+      outcome: 'completed',
+      inputTokens: 500,
+      outputTokens: 100,
+    })
+    store.recordUsageEvent({
+      id: 'step:pipe-new:1',
+      timestampMs: nowMs - 30_000,
+      recordKind: 'llm_step',
+      botId: 'bot-monitor',
+      chatId: 'oc_alert',
+      chatType: 'group',
+      sessionId: 'sess-pipe-2',
+      senderId: 'on_pipeline_bot',
+      senderType: 'bot',
+      trigger: 'listener',
+      model: 'gpt-5.4',
+      outcome: 'completed',
+      inputTokens: 400,
+      outputTokens: 100,
+    })
+    store.recordUsageEvent({
+      id: 'step:human-41050:1',
+      timestampMs: nowMs - 20_000,
+      recordKind: 'llm_step',
+      botId: 'bot-monitor',
+      chatId: 'oc_alert',
+      chatType: 'group',
+      sessionId: 'sess-human-1',
+      senderId: 'ou_colleague_41050',
+      senderType: 'user',
+      trigger: 'mention',
+      model: 'gpt-5.4',
+      outcome: 'completed',
+      inputTokens: 300,
+      outputTokens: 50,
+    })
+
+    // Before sync, listChatsWithUnnamedSenders detects oc_alert
+    expect(store.observabilityRepo.listChatsWithUnnamedSenders(10)).toEqual([
+      { botId: 'bot-monitor', chatId: 'oc_alert' },
+    ])
+
+    const syncCalls: Array<{ botId: string; chatId: string }> = []
+    const svc = new ObservabilityService({
+      ctx: {} as unknown as Context,
+      dataDir,
+      store,
+      startedAtMs: nowMs - 60_000,
+      enableBackgroundTimers: false,
+      listBotStatuses: () => [],
+      getTransportDiagnostics: () => undefined,
+      syncGroupMemberProfiles: async (botId, chatId) => {
+        syncCalls.push({ botId, chatId })
+        return store.upsertSenderProfilesBatch([
+          {
+            botId,
+            openId: 'ou_alert_bot',
+            name: 'Alert Bot',
+            avatarUrl: 'https://cdn.example.com/alert.png',
+            senderType: 'bot',
+          },
+          {
+            botId,
+            openId: 'ou_pipeline_bot',
+            name: 'Pipeline Bot',
+            senderType: 'bot',
+          },
+          {
+            botId,
+            openId: 'ou_colleague_41050',
+            name: '林晓',
+          },
+        ])
+      },
+      listSplitBrainAlerts: () => [],
+      getLifecycleStatus: () => ({
+        phase: 'running',
+        draining: false,
+        activeTurns: [],
+        activeTriageCount: 0,
+        activeRemindersCount: 0,
+        activeDreamingCount: 0,
+        persistedPendingTurns: 0,
+      }),
+      getConcurrencyStats: () => ({ activeActors: 0, queuedTurns: 0 }),
+      getDiagnosticAlerts: () => [],
+      getConfiguredScheduleCount: () => 0,
+    })
+
+    const firstPayload = await svc.getPayload({ window: '24h', nowMs })
+    expect(syncCalls).toEqual([{ botId: 'bot-monitor', chatId: 'oc_alert' }])
+
+    // Both filter dropdown options and sender ranking resolve readable bot & colleague names
+    expect(
+      firstPayload.filters.senders.map((s) => ({
+        senderId: s.senderId,
+        senderName: s.senderName,
+        senderType: s.senderType,
+      })),
+    ).toEqual([
+      { senderId: 'name:alert bot', senderName: 'Alert Bot', senderType: 'bot' },
+      { senderId: 'on_pipeline_bot', senderName: 'Pipeline Bot', senderType: 'bot' },
+      { senderId: 'name:林晓', senderName: '林晓', senderType: 'user' },
+    ])
+
+    const alertRow = firstPayload.product.senderRanking.find((r) => r.senderName === 'Alert Bot')
+    expect(alertRow?.senderType).toBe('bot')
+    expect(alertRow?.avatarUrl).toBe('https://cdn.example.com/alert.png')
+    expect(alertRow?.totalTokens).toBe(1200)
+
+    const pipeRow = firstPayload.product.senderRanking.find((r) => r.senderName === 'Pipeline Bot')
+    expect(pipeRow?.senderId).toBe('on_pipeline_bot')
+    expect(pipeRow?.senderType).toBe('bot')
+    expect(pipeRow?.totalTokens).toBe(1100) // merged ou_pipeline_bot (600) + on_pipeline_bot (500)
+
+    const humanRow = firstPayload.product.senderRanking.find((r) => r.senderName === '林晓')
+    expect(humanRow?.senderType).toBe('user')
+    expect(humanRow?.totalTokens).toBe(350)
+
+    // Second query must NOT re-trigger group sync because all senders now have readable names
+    await svc.getPayload({ window: '24h', nowMs: nowMs + 10_000 })
+    expect(syncCalls).toHaveLength(1)
+    expect(store.observabilityRepo.listChatsWithUnnamedSenders(10)).toEqual([])
+
+    store.close()
+  })
+
+  it('deduplicates BotConnectionPool group member sync, preserves user type on non-app members, and resolves bot/41050 sender names in InboundPipeline', async () => {
+    const dataDir = makeTempDir('lark-pool-member-sync-')
+    const store = new LarkBridgeStore(dataDir)
+    const bot = store.upsertBot({
+      id: 'bot-a',
+      name: 'Bot Alpha',
+      larkAppId: 'cli_a',
+      larkAppSecret: 'sec_a',
+      defaultWorkingDir: '/Users/demo/a',
+      agentPreset: 'codex',
+    })
+
+    const fakeMembers: LarkChatMember[] = [
+      {
+        openId: 'ou_alert_bot',
+        name: 'Alert Bot',
+        memberType: 'bot',
+        larkAppId: 'cli_alert',
+        avatarUrl: 'https://cdn.example.com/alert.png',
+      },
+      {
+        // Member flagged without larkAppId must NOT force-flip a human user event into 'bot'
+        openId: 'ou_human_agent_flag',
+        name: '陈明',
+        memberType: 'bot',
+      },
+      {
+        openId: 'ou_colleague_41050',
+        name: '林晓',
+        memberType: 'user',
+      },
+    ]
+
+    let releaseList!: () => void
+    const listChatMembersAndBots = vi.fn(
+      () =>
+        new Promise<LarkChatMember[]>((resolve) => {
+          releaseList = () => resolve(fakeMembers)
+        }),
+    )
+    const fakeTransport = {
+      state: { botOpenId: 'ou_self_bot', name: 'Bot Alpha', connected: true },
+      getCachedUserProfile: vi.fn(() => undefined),
+      resolveUserSummary: vi.fn(async () => undefined),
+      listChatMembersAndBots,
+    } as unknown as LarkBotTransport
+
+    const pool = new BotConnectionPool({
+      ctx: { logger: { info: () => {}, warn: () => {}, error: () => {} } } as unknown as Context,
+      store,
+      runtimes: {} as never,
+      workspaces: {} as never,
+      platform: { getValidUserAccessToken: async () => undefined } as never,
+      directoryEnricher: {
+        searchByQueries: async () => [],
+        resolveAppAvatar: async () => undefined,
+      } as never,
+      isDisposed: () => false,
+      onInboundMessage: async () => {},
+      onCardAction: async () => undefined,
+      onBotReady: () => {},
+    })
+    pool.transports.set(bot.id, { config: bot, transport: fakeTransport })
+
+    // Concurrent calls to ensureGroupMembersSynced share one in-flight Feishu API call
+    const p1 = pool.ensureGroupMembersSynced(bot.id, 'oc_team', { includeAvatars: false })
+    const p2 = pool.ensureGroupMembersSynced(bot.id, 'oc_team', { includeAvatars: false })
+    await Promise.resolve()
+    releaseList()
+    const [r1, r2] = await Promise.all([p1, p2])
+    expect(listChatMembersAndBots).toHaveBeenCalledTimes(1)
+    expect(r1.updatedProfiles).toBe(3)
+    expect(r2.members).toHaveLength(3)
+
+    // Subsequent call within TTL reuses cache without hitting Feishu API again
+    const r3 = await pool.ensureGroupMembersSynced(bot.id, 'oc_team', { includeAvatars: false })
+    expect(listChatMembersAndBots).toHaveBeenCalledTimes(1)
+    expect(r3.updatedProfiles).toBe(0)
+
+    // Verify persisted profiles: confirmed app bot stays 'bot', non-app member stays 'user'
+    expect(store.getSenderProfile(bot.id, 'ou_alert_bot')).toMatchObject({
+      name: 'Alert Bot',
+      avatarUrl: 'https://cdn.example.com/alert.png',
+      senderType: 'bot',
+    })
+    expect(store.getSenderProfile(bot.id, 'ou_human_agent_flag')).toMatchObject({
+      name: '陈明',
+      senderType: 'user',
+    })
+    expect(store.getSenderProfile(bot.id, 'ou_colleague_41050')).toMatchObject({
+      name: '林晓',
+      senderType: 'user',
+    })
+
+    // InboundPipeline resolves both bot senders and 41050-restricted human senders via group directory
+    const pipeline = new InboundPipeline({
+      ctx: { logger: { info: () => {}, warn: () => {}, error: () => {} } } as unknown as Context,
+      store,
+      runtimes: {} as never,
+      connections: pool,
+      sessions: {} as never,
+      titleGuard: {} as never,
+      shutdownSignal: new AbortController().signal,
+      isDisposed: () => false,
+      sessionWebUrl: (sid) => `http://127.0.0.1:3880/sessions/${sid}`,
+    })
+    const resolveSenderName = (
+      pipeline as unknown as {
+        resolveSenderName: (
+          botId: string,
+          transport: LarkBotTransport,
+          msg: InboundLarkMessage,
+        ) => Promise<string | undefined>
+      }
+    ).resolveSenderName.bind(pipeline)
+
+    const botMsg: InboundLarkMessage = {
+      botId: bot.id,
+      larkAppId: bot.larkAppId,
+      messageId: 'om_bot_1',
+      chatId: 'oc_team',
+      chatType: 'group',
+      msgType: 'interactive',
+      senderOpenId: 'ou_alert_bot',
+      senderUnionId: 'on_alert_bot',
+      senderType: 'bot',
+      text: 'CPU high',
+      rawContent: '{}',
+      mentions: [],
+      imageKeys: [],
+      createTimeMs: Date.now(),
+    }
+    const resolvedBotName = await resolveSenderName(bot.id, fakeTransport, botMsg)
+    expect(resolvedBotName).toBe('Alert Bot')
+    expect(store.getSenderProfile(bot.id, 'ou_alert_bot')?.unionId).toBe('on_alert_bot')
+
+    const user41050Msg: InboundLarkMessage = {
+      ...botMsg,
+      messageId: 'om_user_1',
+      senderOpenId: 'ou_colleague_41050',
+      senderUnionId: 'on_colleague_41050',
+      senderType: 'user',
+      text: 'hello',
+    }
+    const resolvedUserName = await resolveSenderName(bot.id, fakeTransport, user41050Msg)
+    expect(resolvedUserName).toBe('林晓')
+    expect(store.getSenderProfile(bot.id, 'ou_colleague_41050')?.unionId).toBe('on_colleague_41050')
+
+    // Error backoff: failed sync for another chat caches failure and skips immediate retry
+    const failingList = vi.fn(async () => {
+      throw new Error('feishu rate limit')
+    })
+    ;(fakeTransport as unknown as { listChatMembersAndBots: typeof failingList }).listChatMembersAndBots =
+      failingList
+    const fail1 = await pool.ensureGroupMembersSynced(bot.id, 'oc_broken', { includeAvatars: false })
+    const fail2 = await pool.ensureGroupMembersSynced(bot.id, 'oc_broken', { includeAvatars: false })
+    expect(fail1.members).toEqual([])
+    expect(fail2.members).toEqual([])
+    expect(failingList).toHaveBeenCalledTimes(1)
+
     store.close()
   })
 })

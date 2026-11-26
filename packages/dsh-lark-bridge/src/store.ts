@@ -518,8 +518,16 @@ export class LarkBridgeStore {
     return this.observabilityRepo.recordUsageEventsBatch(events)
   }
 
-  upsertSenderProfile(profile: TelemetrySenderProfileRecord): void {
-    this.observabilityRepo.upsertSenderProfile(profile)
+  upsertSenderProfile(profile: TelemetrySenderProfileRecord): boolean {
+    return this.observabilityRepo.upsertSenderProfile(profile)
+  }
+
+  upsertSenderProfilesBatch(profiles: readonly TelemetrySenderProfileRecord[]): number {
+    return this.observabilityRepo.upsertSenderProfilesBatch(profiles)
+  }
+
+  getSenderProfile(botId: string, openId: string): TelemetrySenderProfileRecord | undefined {
+    return this.observabilityRepo.getSenderProfile(botId, openId)
   }
 
   listSenderProfiles(): TelemetrySenderProfileRecord[] {
