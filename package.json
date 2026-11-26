@@ -1,6 +1,6 @@
 {
   "name": "@harryzhz/dsh-lark-bridge",
-  "version": "0.4.13",
+  "version": "0.4.14",
   "description": "Lark (Feishu) multi-agent bridge, group governance, Dreaming offline memory & proactive assistant plugin for DeepSeek Harness (Desktop & Web)",
   "license": "SEE LICENSE IN LICENSE",
   "homepage": "https://github.com/harryzhz/dsh-lark-bridge#readme",
