@@ -1272,18 +1272,18 @@ describe('decideLarkRouting, <user_message> format, memberOverrides & title inte
   })
 
   it('converts known Feishu emoji tokens in plain post text into native emotion nodes and preserves Markdown untouched', () => {
-    const noticePayload = buildLarkPostPayload('深度求索中…[敲键盘]') as {
+    const noticePayload = buildLarkPostPayload('当前任务仍在深度求索中，请耐心等待…[敲键盘]') as {
       zh_cn: { content: Array<Array<{ tag: string; text?: string; emoji_type?: string }>> }
     }
     expect(noticePayload.zh_cn.content).toEqual([
       [
-        { tag: 'text', text: '深度求索中…' },
+        { tag: 'text', text: '当前任务仍在深度求索中，请耐心等待…' },
         { tag: 'emotion', emoji_type: 'Typing' },
       ],
     ])
     // Inbound parser round-trips native emotion nodes back into `[敲键盘]`
     expect(parseLarkMessageContent('post', JSON.stringify(noticePayload)).text).toBe(
-      '深度求索中…[敲键盘]',
+      '当前任务仍在深度求索中，请耐心等待…[敲键盘]',
     )
 
     // Mixed known/unknown brackets and direct emoji_type tokens

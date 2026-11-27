@@ -326,8 +326,8 @@ function migrateLegacyWorkspaceField(input: unknown): unknown {
   return rec
 }
 
-export const DEFAULT_LONG_TURN_NOTICE_DELAY_SECONDS = 60
-export const DEFAULT_LONG_TURN_NOTICE_TEXT = '深度求索中…[敲键盘]'
+export const DEFAULT_LONG_TURN_NOTICE_DELAY_SECONDS = 300
+export const DEFAULT_LONG_TURN_NOTICE_TEXT = '当前任务仍在深度求索中，请耐心等待…[敲键盘]'
 
 export const LarkBotConfigSchema = z.preprocess(
   migrateLegacyWorkspaceField,
