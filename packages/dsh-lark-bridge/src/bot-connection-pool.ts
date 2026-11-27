@@ -3,7 +3,10 @@ import {
   DEFAULT_NEW_BOT_PREFERRED_RUNTIME,
   LarkBotTransport,
   buildDefaultNewBotSettings,
+  buildNewGroupGreetingText,
+  isGroupEnabled,
   slugifyBotId,
+  type BotAddedToChatEvent,
   type CardActionEvent,
   type DiscoveredLarkChat,
   type InboundLarkMessage,
@@ -30,6 +33,9 @@ import type { WorkspaceGrouping } from './workspace-grouping.js'
 const GROUP_MEMBER_SYNC_TTL_MS = 30 * 60_000
 const GROUP_MEMBER_SYNC_ERROR_TTL_MS = 5 * 60_000
 const MAX_GROUP_MEMBER_SYNC_ENTRIES = 500
+const BOT_ADDED_EVENT_DEDUP_TTL_MS = 10 * 60_000
+const BOT_ADDED_CHAT_COOLDOWN_MS = 60_000
+const MAX_BOT_ADDED_DEDUP_ENTRIES = 500
 const RAW_FEISHU_ID_RE = /^(?:ou|on|cli)_[a-zA-Z0-9_-]+$/
 
 function isReadableMemberLabel(name: string | undefined, openId?: string): boolean {
@@ -70,6 +76,7 @@ export interface BotConnectionPoolHost {
   readonly platform: LarkPlatformManager
   readonly directoryEnricher: LarkDirectoryEnricher
   readonly isDisposed: () => boolean
+  readonly isDraining?: () => boolean
   readonly onInboundMessage: (
     botId: string,
     transport: LarkBotTransport,
@@ -96,6 +103,8 @@ export class BotConnectionPool {
   private readonly hydratedProfileBots = new Set<string>()
   private readonly profileAttemptedBots = new Set<string>()
   private readonly botCreatorOpenIds = new Map<string, string>()
+  private readonly handledBotAddedEvents = new Map<string, number>()
+  private readonly recentBotAddedChats = new Map<string, number>()
   private readonly groupMemberSyncCache = new Map<
     string,
     {
@@ -826,6 +835,9 @@ export class BotConnectionPool {
       onChatMembershipChange: () => {
         void this.syncJoinedChats(bot.id)
       },
+      onBotAddedToChat: async (event) => {
+        await this.handleBotAddedToChat(bot.id, transport, event)
+      },
       onExternalSelfMessage: (ev) => {
         const currentBot = this.host.store.getBot(bot.id) ?? bot
         const { shouldAudit, alert } = this.splitBrain.recordExternalSelfMessage(
@@ -1011,6 +1023,138 @@ export class BotConnectionPool {
       ...(runtimeProfileId ? { runtimeProfileId } : {}),
       ...(model ? { model } : {}),
       ...(reasoningEffort ? { reasoningEffort } : {}),
+    }
+  }
+
+  /**
+   * Handles real-time `im.chat.member.bot.added_v1` events: optionally enables
+   * the newly joined group by default and sends a concise greeting message.
+   * Deduplicated by event_id + per-chat cooldown so WS retries never double-greet.
+   */
+  async handleBotAddedToChat(
+    botId: string,
+    transport: LarkBotTransport,
+    event: BotAddedToChatEvent,
+  ): Promise<{ readonly enabled: boolean; readonly greeted: boolean }> {
+    if (this.host.isDisposed() || this.host.isDraining?.()) {
+      return { enabled: false, greeted: false }
+    }
+    if (!this.isActiveTransport(botId, transport)) {
+      return { enabled: false, greeted: false }
+    }
+    const chatId = event.chatId.trim()
+    if (!chatId) return { enabled: false, greeted: false }
+
+    const bot = this.host.store.getBot(botId)
+    if (!bot || !bot.enabled) return { enabled: false, greeted: false }
+
+    const nowMs = Date.now()
+    this.pruneBotAddedDedup(nowMs)
+    if (event.eventId) {
+      const evKey = `${bot.id}:${event.eventId}`
+      const seenAt = this.handledBotAddedEvents.get(evKey)
+      if (seenAt !== undefined && nowMs - seenAt < BOT_ADDED_EVENT_DEDUP_TTL_MS) {
+        return { enabled: false, greeted: false }
+      }
+      this.handledBotAddedEvents.set(evKey, nowMs)
+    }
+    const chatDedupKey = `${bot.id}:${chatId}`
+    const recentChatAt = this.recentBotAddedChats.get(chatDedupKey)
+    if (recentChatAt !== undefined && nowMs - recentChatAt < BOT_ADDED_CHAT_COOLDOWN_MS) {
+      return { enabled: false, greeted: false }
+    }
+    this.recentBotAddedChats.set(chatDedupKey, nowMs)
+
+    const existingGroup = this.host.store.getGroup(bot.id, chatId)
+    const chatName =
+      event.chatName?.trim() ||
+      existingGroup?.chatName?.trim() ||
+      this.host.store.resolveChatName(bot.id, chatId) ||
+      ''
+
+    let enabledNow = false
+    let effectiveGroup = existingGroup
+    if (bot.autoEnableNewGroup !== false) {
+      if (!existingGroup) {
+        effectiveGroup = this.host.store.upsertGroup({
+          botId: bot.id,
+          chatId,
+          ...(chatName ? { chatName } : {}),
+          enabled: true,
+        })
+        enabledNow = true
+      } else if (!existingGroup.enabled) {
+        effectiveGroup = this.host.store.upsertGroup({
+          ...existingGroup,
+          ...(chatName && !existingGroup.chatName ? { chatName } : {}),
+          enabled: true,
+        })
+        enabledNow = true
+      }
+      if (enabledNow) {
+        await this.host.workspaces.syncGroup(bot.id, chatId).catch(() => {})
+      }
+    }
+
+    const groupActive = isGroupEnabled(bot, effectiveGroup)
+    let greeted = false
+    let greetError: string | undefined
+    if (bot.newGroupGreetingEnabled !== false && groupActive) {
+      const greetingText = buildNewGroupGreetingText(bot, { ...(chatName ? { chatName } : {}) })
+      try {
+        await transport.sendReply({
+          chatId,
+          replyMode: 'chat',
+          text: greetingText,
+        })
+        greeted = true
+      } catch (err) {
+        greetError = err instanceof Error ? err.message : String(err)
+        this.host.ctx.logger.warn(
+          `[lark-bridge][bot=${bot.id}] failed to greet new group "${chatName || chatId}": ${greetError}`,
+        )
+      }
+    }
+
+    const displayChat = chatName || chatId
+    if (greetError) {
+      this.host.store.recordEvent({
+        botId: bot.id,
+        chatId,
+        kind: 'error',
+        summary: `加入新群「${displayChat}」${enabledNow ? '已默认启用，但' : ''}发送打招呼失败：${greetError}`,
+      })
+    } else if (enabledNow || greeted) {
+      const actions: string[] = []
+      if (enabledNow) actions.push('已默认启用')
+      if (greeted) actions.push('已发送打招呼消息')
+      this.host.store.recordEvent({
+        botId: bot.id,
+        chatId,
+        kind: 'lifecycle',
+        summary: `已加入新群「${displayChat}」（${actions.join('，')}）`,
+      })
+    }
+
+    return { enabled: enabledNow, greeted }
+  }
+
+  private pruneBotAddedDedup(nowMs: number): void {
+    for (const [k, ts] of this.handledBotAddedEvents) {
+      if (nowMs - ts >= BOT_ADDED_EVENT_DEDUP_TTL_MS) this.handledBotAddedEvents.delete(k)
+    }
+    while (this.handledBotAddedEvents.size > MAX_BOT_ADDED_DEDUP_ENTRIES) {
+      const oldest = this.handledBotAddedEvents.keys().next().value
+      if (oldest === undefined) break
+      this.handledBotAddedEvents.delete(oldest)
+    }
+    for (const [k, ts] of this.recentBotAddedChats) {
+      if (nowMs - ts >= BOT_ADDED_CHAT_COOLDOWN_MS) this.recentBotAddedChats.delete(k)
+    }
+    while (this.recentBotAddedChats.size > MAX_BOT_ADDED_DEDUP_ENTRIES) {
+      const oldest = this.recentBotAddedChats.keys().next().value
+      if (oldest === undefined) break
+      this.recentBotAddedChats.delete(oldest)
     }
   }
 

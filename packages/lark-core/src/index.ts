@@ -251,6 +251,17 @@ export {
   type WeightedTierSelectionResult,
 } from './triage.js'
 export {
+  buildPromptGenerationMessages,
+  parseGeneratedListenerOutput,
+  parseGeneratedRoleOutput,
+  type GeneratedListenerDraft,
+  type GeneratedRoleDraft,
+  type PromptGenerationContext,
+  type PromptGenerationKind,
+  type PromptGenerationMessages,
+  type RoleGenerationMode,
+} from './prompt-generator.js'
+export {
   BotDreamingConfigSchema,
   BotExperimentalConfigSchema,
   BotProactiveConfigSchema,
@@ -302,6 +313,7 @@ export {
   buildDefaultNewBotSettings,
   buildDefaultNewBotTierRouting,
   buildGroupKey,
+  buildNewGroupGreetingText,
   expandWorkingDir,
   leafDirectoryName,
   normalizeHHMM,
@@ -314,6 +326,7 @@ export {
   resolveEffectiveWorkingDir,
   resolveEffectiveWorkspaceName,
   toPublicBotView,
+  type BotAddedToChatEvent,
   type BotDreamingConfig,
   type BotExperimentalConfig,
   type BotProactiveConfig,

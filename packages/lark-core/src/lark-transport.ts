@@ -14,6 +14,7 @@ import { buildLarkPostPayload } from './markdown.js'
 import { parseLarkMessageContent } from './message-parser.js'
 import { hasVisibleText } from './reply-text.js'
 import type {
+  BotAddedToChatEvent,
   DiscoveredLarkChat,
   InboundLarkMessage,
   LarkBotConfig,
@@ -81,6 +82,7 @@ export interface LarkTransportCallbacks {
     action: CardActionEvent,
   ) => Promise<{ toast?: string } | void> | { toast?: string } | void
   readonly onChatMembershipChange?: () => Promise<void> | void
+  readonly onBotAddedToChat?: (event: BotAddedToChatEvent) => Promise<void> | void
   readonly onExternalSelfMessage?: (event: ExternalSelfMessageEvent) => void
   readonly onStatusChange?: () => void
   readonly onBotProfile?: (profile: LarkBotProfile) => void
@@ -525,10 +527,23 @@ export class LarkBotTransport {
       'im.message.reaction.deleted_v1': () => {},
       'im.message.updated_v1': () => {},
       'im.message.message_read_v1': () => {},
-      'im.chat.member.bot.added_v1': () => {
+      'im.chat.member.bot.added_v1': (data: unknown) => {
         if (epoch !== this.lifecycleEpoch) return
         this.lastEventAtMs = Date.now()
         void Promise.resolve(this.callbacks.onChatMembershipChange?.()).catch(() => {})
+        try {
+          const parsed = this.normalizeBotAddedEvent(data)
+          if (!parsed || !this.callbacks.onBotAddedToChat) return
+          void Promise.resolve()
+            .then(() => this.callbacks.onBotAddedToChat?.(parsed))
+            .catch((err) => {
+              this.lastError = err instanceof Error ? err.message : String(err)
+              this.log('error', `im.chat.member.bot.added_v1 handler failed: ${this.lastError}`)
+            })
+        } catch (err) {
+          this.lastError = err instanceof Error ? err.message : String(err)
+          this.log('error', `im.chat.member.bot.added_v1 normalize failed: ${this.lastError}`)
+        }
       },
       'im.chat.member.bot.deleted_v1': () => {
         if (epoch !== this.lifecycleEpoch) return
@@ -1864,6 +1879,41 @@ export class LarkBotTransport {
       chatId,
       ...(recallTimeMs ? { recallTimeMs } : {}),
       ...(recallType ? { recallType } : {}),
+    }
+  }
+
+  private normalizeBotAddedEvent(raw: unknown): BotAddedToChatEvent | undefined {
+    const root = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>
+    const chatId = typeof root.chat_id === 'string' ? root.chat_id.trim() : ''
+    if (!chatId) return undefined
+
+    const eventId =
+      typeof root.event_id === 'string' && root.event_id.trim() ? root.event_id.trim() : undefined
+    const i18n = (root.i18n_names && typeof root.i18n_names === 'object'
+      ? root.i18n_names
+      : {}) as Record<string, unknown>
+    const rawName =
+      (typeof root.name === 'string' && root.name.trim()) ||
+      (typeof i18n.zh_cn === 'string' && i18n.zh_cn.trim()) ||
+      (typeof i18n.en_us === 'string' && i18n.en_us.trim()) ||
+      undefined
+    const operator = (root.operator_id && typeof root.operator_id === 'object'
+      ? root.operator_id
+      : {}) as Record<string, unknown>
+    const operatorOpenId =
+      typeof operator.open_id === 'string' && operator.open_id.trim()
+        ? operator.open_id.trim()
+        : undefined
+    const external = typeof root.external === 'boolean' ? root.external : undefined
+
+    return {
+      botId: this.bot.id,
+      larkAppId: this.bot.larkAppId,
+      ...(eventId ? { eventId } : {}),
+      chatId,
+      ...(rawName ? { chatName: rawName } : {}),
+      ...(operatorOpenId ? { operatorOpenId } : {}),
+      ...(external !== undefined ? { external } : {}),
     }
   }
 

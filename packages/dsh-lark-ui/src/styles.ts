@@ -545,6 +545,22 @@ const CSS = `
   background: var(--dsw-alias-bg-module-platform); color: var(--dsw-alias-label-primary);
   font: inherit; font-size: 13px; line-height: 20px;
 }
+.fb-textarea-compact { min-height: 76px; }
+.fb-row-head-actions .fb-select { max-width: 240px; }
+.fb-gen-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  min-height: 32px;
+}
+.fb-gen-status {
+  display: inline-flex; align-items: center; flex-wrap: wrap; gap: 8px;
+  min-width: 0; flex: 1;
+}
+.fb-gen-actions {
+  display: inline-flex; align-items: center; gap: 8px; flex: none;
+}
+.fb-gen-error {
+  font-size: 12px; line-height: 18px; color: var(--dsw-alias-state-error);
+}
 .fb-tags {
   box-sizing: border-box; display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
   min-height: 36px; padding: 6px 10px; border-radius: var(--dsw-radius-md);

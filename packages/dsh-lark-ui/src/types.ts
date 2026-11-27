@@ -356,6 +356,9 @@ export interface BotConfig {
   groupSessionMode: GroupSessionMode
   mentionTriggerMode: MentionTriggerMode
   groupAccessMode: 'configured_only' | 'all_joined'
+  autoEnableNewGroup?: boolean
+  newGroupGreetingEnabled?: boolean
+  newGroupGreetingMessage?: string
   p2pEnabled: boolean
   p2pSessionMode: 'chat' | 'per_message'
   allowedUsers: string[]
@@ -412,6 +415,80 @@ export interface ListenerTemplate {
   senderTypes: ListenerSenderType[]
   prompt: string
 }
+
+export type PromptGenerationKind = 'role' | 'listener'
+export type RoleGenerationMode = 'bot' | 'append' | 'override'
+
+export type PromptGenerationTarget =
+  | { kind: 'auto' }
+  | { kind: 'model'; provider?: string; model?: string }
+  | {
+      kind: 'runtime'
+      agentPreset: string
+      runtimeProfileId?: string
+      model?: string
+      reasoningEffort?: string
+    }
+
+export interface GeneratedRoleDraft {
+  name: string
+  systemPrompt: string
+}
+
+export interface GeneratedListenerDraft {
+  name: string
+  prompt: string
+  scope?: 'top_level' | 'all'
+  mentionFilter?: ListenerMentionFilter
+  replyMode?: GroupReplyMode
+  sessionMode?: GroupSessionMode
+  autoCloseAfterCompletion?: boolean
+  msgTypes?: ListenerMsgType[]
+  senderTypes?: ListenerSenderType[]
+  includeKeywords?: string[]
+  excludeKeywords?: string[]
+}
+
+export interface GeneratedPromptEngineInfo {
+  kind: 'model' | 'runtime'
+  label: string
+  provider?: string
+  model?: string
+  agentPreset?: string
+  runtimeProfileId?: string
+}
+
+export interface GeneratePromptRequest {
+  kind: PromptGenerationKind
+  description: string
+  target?: PromptGenerationTarget
+  botId?: string
+  chatId?: string
+  context?: {
+    botName?: string
+    botDescription?: string
+    chatName?: string
+    roleMode?: RoleGenerationMode
+    baseRoleName?: string
+    baseRolePrompt?: string
+    currentName?: string
+    currentPrompt?: string
+  }
+}
+
+export type GeneratePromptResponse =
+  | {
+      kind: 'role'
+      role: GeneratedRoleDraft
+      engine: GeneratedPromptEngineInfo
+      durationMs: number
+    }
+  | {
+      kind: 'listener'
+      listener: GeneratedListenerDraft
+      engine: GeneratedPromptEngineInfo
+      durationMs: number
+    }
 
 export interface GroupListenerRule {
   enabled: boolean

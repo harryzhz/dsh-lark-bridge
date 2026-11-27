@@ -64,6 +64,7 @@ import {
   reactionOptionsWithInherit,
 } from './options.js'
 import { RuntimeProfilePanel } from './RuntimeProfileDialog.js'
+import { PromptGeneratorPanel } from './PromptGeneratorPanel.js'
 import {
   formatTriageSummary,
   resolveNativeModelLabel,
@@ -549,11 +550,21 @@ export function GroupConfigDialog({
       )}
 
       {section === 'role' && (
-        <GroupRoleSection draft={draft} bot={bot} patch={patch} />
+        <GroupRoleSection
+          draft={draft}
+          bot={bot}
+          runtimes={runtimes}
+          models={models}
+          patch={patch}
+        />
       )}
 
       {section === 'listener' && (
         <ListenerSection
+          draft={draft}
+          bot={bot}
+          runtimes={runtimes}
+          models={models}
           rule={draft.listener}
           templates={listenerTemplates}
           members={members}
@@ -579,13 +590,55 @@ function isMemberMonitored(rule: GroupListenerRule, member: ChatMemberItem): boo
   return !rule.senderOpenIds.includes(member.openId)
 }
 
+function resolveGroupGeneratorContext(
+  draft: GroupConfig,
+  bot: BotRecord | undefined,
+): {
+  readonly currentRuntime: {
+    readonly agentPreset?: string
+    readonly runtimeProfileId?: string
+    readonly model?: string
+    readonly reasoningEffort?: string
+  }
+  readonly preferredNativeModel?: {
+    readonly provider?: string
+    readonly model?: string
+  }
+} {
+  const useGroupRuntime = draft.runtimeMode === 'override' && Boolean(draft.agentPreset?.trim())
+  const agentPreset = useGroupRuntime ? draft.agentPreset : bot?.agentPreset
+  const runtimeProfileId = useGroupRuntime ? draft.runtimeProfileId : bot?.runtimeProfileId
+  const model = useGroupRuntime ? draft.model : bot?.model
+  const reasoningEffort = useGroupRuntime ? draft.reasoningEffort : bot?.reasoningEffort
+  const routerSource = draft.router?.mode === 'override' ? draft.router : bot?.router
+  return {
+    currentRuntime: {
+      ...(agentPreset ? { agentPreset } : {}),
+      ...(runtimeProfileId ? { runtimeProfileId } : {}),
+      ...(model ? { model } : {}),
+      ...(reasoningEffort ? { reasoningEffort } : {}),
+    },
+    ...(routerSource?.provider || routerSource?.model
+      ? { preferredNativeModel: { provider: routerSource.provider, model: routerSource.model } }
+      : {}),
+  }
+}
+
 function ListenerSection({
+  draft,
+  bot,
+  runtimes,
+  models,
   rule,
   templates,
   members,
   loadingMembers,
   onChange,
 }: {
+  draft: GroupConfig
+  bot: BotRecord | undefined
+  runtimes: readonly RuntimeOption[]
+  models: readonly ModelGroup[]
   rule: GroupListenerRule
   templates: readonly ListenerTemplate[]
   members: readonly ChatMemberItem[]
@@ -595,7 +648,8 @@ function ListenerSection({
   const patch = (p: Partial<GroupListenerRule>) => onChange({ ...rule, ...p })
   const activeTemplate =
     templates.find((t) => t.key === rule.templateKey) ??
-    templates.find((t) => !rule.templateKey && t.name === rule.name)
+    templates.find((t) => !rule.templateKey && t.name === rule.name && t.prompt === rule.prompt)
+  const genCtx = resolveGroupGeneratorContext(draft, bot)
 
   const toggleMember = (member: ChatMemberItem, enabled: boolean) => {
     patch({
@@ -621,13 +675,20 @@ function ListenerSection({
       </SettingRow>
       {rule.enabled && (
         <>
-          <SettingRow title="场景模板" desc="修改下方指令并保存时将同步更新所选模板">
+          <SettingRow
+            title="场景模板"
+            desc={activeTemplate ? '修改下方指令并保存时将同步更新所选模板' : '选择预设模板，或在下方通过智能生成快速创建自定义规则'}
+          >
             <SelectMenu
               value={activeTemplate?.key ?? ''}
               options={[{ value: '', label: '自定义' }, ...templates.map((t) => ({ value: t.key, label: t.label }))]}
               onChange={(key) => {
                 if (!key) {
-                  patch({ templateKey: '', name: rule.name || '自定义监听' })
+                  const isBuiltInName = templates.some((t) => t.name === rule.name)
+                  patch({
+                    templateKey: '',
+                    name: !rule.name || isBuiltInName ? '自定义监听' : rule.name,
+                  })
                   return
                 }
                 const t = templates.find((x) => x.key === key)
@@ -647,6 +708,61 @@ function ListenerSection({
               }}
             />
           </SettingRow>
+          {!activeTemplate && (
+            <>
+              <PromptGeneratorPanel
+                kind="listener"
+                botId={draft.botId}
+                chatId={draft.chatId}
+                runtimes={runtimes}
+                models={models}
+                currentRuntime={genCtx.currentRuntime}
+                preferredNativeModel={genCtx.preferredNativeModel}
+                context={{
+                  ...(bot?.name ? { botName: bot.name } : {}),
+                  ...(draft.chatName ? { chatName: draft.chatName } : {}),
+                  currentName: rule.name,
+                  currentPrompt: rule.prompt,
+                }}
+                onApplyListener={(generated) => {
+                  const prevRule = structuredClone(rule)
+                  patch({
+                    templateKey: '',
+                    name: generated.name || rule.name || '自定义监听',
+                    prompt: generated.prompt,
+                    allowSilentEmptyReply: true,
+                    ...(generated.scope ? { scope: generated.scope } : {}),
+                    ...(generated.mentionFilter ? { mentionFilter: generated.mentionFilter } : {}),
+                    ...(generated.replyMode ? { replyMode: generated.replyMode } : {}),
+                    ...(generated.sessionMode ? { sessionMode: generated.sessionMode } : {}),
+                    ...(generated.autoCloseAfterCompletion !== undefined
+                      ? { autoCloseAfterCompletion: generated.autoCloseAfterCompletion }
+                      : {}),
+                    ...(generated.msgTypes && generated.msgTypes.length > 0
+                      ? { msgTypes: [...generated.msgTypes] }
+                      : {}),
+                    ...(generated.senderTypes && generated.senderTypes.length > 0
+                      ? { senderTypes: [...generated.senderTypes] }
+                      : {}),
+                    ...(generated.includeKeywords !== undefined
+                      ? { includeKeywords: [...generated.includeKeywords] }
+                      : {}),
+                    ...(generated.excludeKeywords !== undefined
+                      ? { excludeKeywords: [...generated.excludeKeywords] }
+                      : {}),
+                  })
+                  return () => onChange(prevRule)
+                }}
+              />
+              <SettingRow title="场景名称">
+                <TextField
+                  value={rule.name}
+                  onChange={(name) => patch({ templateKey: '', name })}
+                  placeholder="例如 告警排查"
+                />
+              </SettingRow>
+            </>
+          )}
           <SettingRow
             title="判断指令"
             desc="无需回复时输出空文本即可保持静默"
@@ -983,12 +1099,17 @@ function GroupConversationAndMessageSection({
 function GroupRoleSection({
   draft,
   bot,
+  runtimes,
+  models,
   patch,
 }: {
   draft: GroupConfig
   bot: BotRecord | undefined
+  runtimes: readonly RuntimeOption[]
+  models: readonly ModelGroup[]
   patch: (p: Partial<GroupConfig>) => void
 }) {
+  const genCtx = resolveGroupGeneratorContext(draft, bot)
   const botRoleActive = Boolean(
     bot?.role.enabled && (bot.role.name.trim() || bot.role.systemPrompt.trim()),
   )
@@ -1088,6 +1209,42 @@ function GroupRoleSection({
               }}
             />
           </SettingRow>
+          {!draft.role.presetKey && (
+            <PromptGeneratorPanel
+              kind="role"
+              roleMode={draft.role.mode === 'append' ? 'append' : 'override'}
+              botId={draft.botId}
+              chatId={draft.chatId}
+              runtimes={runtimes}
+              models={models}
+              currentRuntime={genCtx.currentRuntime}
+              preferredNativeModel={genCtx.preferredNativeModel}
+              context={{
+                ...(bot?.name ? { botName: bot.name } : {}),
+                ...(bot?.description ? { botDescription: bot.description } : {}),
+                ...(draft.chatName ? { chatName: draft.chatName } : {}),
+                ...(draft.role.mode === 'append' && botRoleActive && bot
+                  ? { baseRoleName: bot.role.name, baseRolePrompt: botRolePrompt }
+                  : {}),
+                currentName: draft.role.name,
+                currentPrompt: draft.role.systemPrompt,
+              }}
+              onApplyRole={(generated) => {
+                const prevRole = { ...draft.role }
+                patch({
+                  role: {
+                    ...draft.role,
+                    presetKey: undefined,
+                    ...(generated.name || draft.role.mode === 'override'
+                      ? { name: generated.name || draft.role.name }
+                      : {}),
+                    systemPrompt: generated.systemPrompt,
+                  },
+                })
+                return () => patch({ role: prevRole })
+              }}
+            />
+          )}
           <SettingRow title="角色名称">
             <TextField
               value={draft.role.name}

@@ -12,6 +12,8 @@ import type {
   DreamRunState,
   DreamSession,
   ExposedRuntimePreset,
+  GeneratePromptRequest,
+  GeneratePromptResponse,
   GroupConfig,
   GroupView,
   ImportExistingBotInput,
@@ -193,6 +195,12 @@ export const bridgeApi = {
     ).models ?? [],
   listenerTemplates: async () => (await request<{ templates: ListenerTemplate[] }>('/listener-templates')).templates,
   resetListenerTemplates: async () => (await post<{ templates: ListenerTemplate[] }>('/listener-templates')).templates,
+  generatePrompt: (input: GeneratePromptRequest, signal?: AbortSignal) =>
+    request<GeneratePromptResponse>('/generate-prompt', {
+      method: 'POST',
+      body: JSON.stringify(input),
+      ...(signal ? { signal } : {}),
+    }),
 
   authStatus: () => request<AuthStatusPayload>('/auth/status'),
   startOpenPlatformLogin: async () => (await post<{ job: QrJobView }>('/auth/open-platform/login')).job,

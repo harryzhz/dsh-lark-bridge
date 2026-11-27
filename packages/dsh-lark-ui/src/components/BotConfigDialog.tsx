@@ -69,6 +69,7 @@ import {
   reactionOptions,
 } from './options.js'
 import { RuntimeProfilePanel } from './RuntimeProfileDialog.js'
+import { PromptGeneratorPanel } from './PromptGeneratorPanel.js'
 import { TriageConfigFields } from './TriageConfigFields.js'
 import { UserSearchPicker } from './UserSearchPicker.js'
 
@@ -219,6 +220,9 @@ export function newBotConfig(
     groupSessionMode: 'thread',
     mentionTriggerMode: 'mention_and_active_thread',
     groupAccessMode: 'configured_only',
+    autoEnableNewGroup: true,
+    newGroupGreetingEnabled: true,
+    newGroupGreetingMessage: '',
     p2pEnabled: true,
     p2pSessionMode: 'chat',
     allowedUsers: [],
@@ -1340,6 +1344,45 @@ function EditBotDialog({
                   }}
                 />
               </SettingRow>
+              {!draft.role.presetKey && (
+                <PromptGeneratorPanel
+                  kind="role"
+                  roleMode="bot"
+                  botId={existingId}
+                  runtimes={runtimes}
+                  models={models}
+                  currentRuntime={{
+                    agentPreset: draft.agentPreset,
+                    ...(draft.runtimeProfileId ? { runtimeProfileId: draft.runtimeProfileId } : {}),
+                    ...(draft.model ? { model: draft.model } : {}),
+                    ...(draft.reasoningEffort ? { reasoningEffort: draft.reasoningEffort } : {}),
+                  }}
+                  preferredNativeModel={
+                    draft.router?.provider || draft.router?.model
+                      ? { provider: draft.router.provider, model: draft.router.model }
+                      : undefined
+                  }
+                  context={{
+                    botName: draft.name,
+                    botDescription: draft.description,
+                    currentName: draft.role.name,
+                    currentPrompt: draft.role.systemPrompt,
+                  }}
+                  onApplyRole={(generated) => {
+                    const prevRole = { ...draft.role }
+                    patch({
+                      role: {
+                        ...draft.role,
+                        enabled: true,
+                        presetKey: undefined,
+                        ...(generated.name ? { name: generated.name } : {}),
+                        systemPrompt: generated.systemPrompt,
+                      },
+                    })
+                    return () => patch({ role: prevRole })
+                  }}
+                />
+              )}
               <SettingRow title="角色名称">
                 <TextField value={draft.role.name} onChange={(name) => patch({ role: { ...draft.role, name } })} placeholder="例如 研发协作搭档" />
               </SettingRow>
@@ -1398,6 +1441,37 @@ function BotConversationAndMessageSection({
       <SettingRow title="可用范围">
         <SelectMenu value={draft.groupAccessMode} options={ACCESS_MODES} onChange={(groupAccessMode) => patch({ groupAccessMode })} />
       </SettingRow>
+      <SettingRow title="入群默认启用" desc="被拉进新群时自动启用该群，无需手动开关">
+        <Switch
+          label="入群默认启用"
+          checked={draft.autoEnableNewGroup !== false}
+          onChange={(autoEnableNewGroup) => patch({ autoEnableNewGroup })}
+        />
+      </SettingRow>
+      <SettingRow title="入群自动打招呼" desc="被拉进新群并启用后发送简短自我介绍">
+        <Switch
+          label="入群自动打招呼"
+          checked={draft.newGroupGreetingEnabled !== false}
+          onChange={(newGroupGreetingEnabled) => patch({ newGroupGreetingEnabled })}
+        />
+      </SettingRow>
+      {draft.newGroupGreetingEnabled !== false && (
+        <NestedSettings>
+          <SettingRow
+            title="自定义打招呼内容"
+            desc="留空使用默认欢迎语，支持 {{bot_name}} 与 {{chat_name}}"
+            stack
+          >
+            <textarea
+              className="fb-textarea fb-textarea-compact"
+              rows={3}
+              value={draft.newGroupGreetingMessage ?? ''}
+              onChange={(e) => patch({ newGroupGreetingMessage: e.target.value })}
+              placeholder={`大家好，我是 ${draft.name.trim() || '智能体'}，很高兴加入本群！有需要时直接 @我 即可开始协作。`}
+            />
+          </SettingRow>
+        </NestedSettings>
+      )}
       <SettingRow title="触发方式" desc="开启活跃话题后，进行中的话题内追问无需再次 @">
         <SelectMenu value={draft.mentionTriggerMode} options={TRIGGER_MODES} onChange={(mentionTriggerMode) => patch({ mentionTriggerMode })} />
       </SettingRow>

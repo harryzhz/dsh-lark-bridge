@@ -565,6 +565,9 @@ export function buildDefaultNewBotSettings(
   options: DefaultNewBotTierRoutingOptions = {},
 ): {
   readonly groupAccessMode: typeof DEFAULT_BOT_GROUP_ACCESS_MODE
+  readonly autoEnableNewGroup: boolean
+  readonly newGroupGreetingEnabled: boolean
+  readonly newGroupGreetingMessage: string
   readonly mentionTriggerMode: 'mention_and_active_thread'
   readonly groupSessionMode: 'thread'
   readonly idleCloseMinutes: number
@@ -587,6 +590,9 @@ export function buildDefaultNewBotSettings(
 } {
   return {
     groupAccessMode: DEFAULT_BOT_GROUP_ACCESS_MODE,
+    autoEnableNewGroup: true,
+    newGroupGreetingEnabled: true,
+    newGroupGreetingMessage: '',
     mentionTriggerMode: 'mention_and_active_thread',
     groupSessionMode: 'thread',
     idleCloseMinutes: 720,
@@ -667,6 +673,9 @@ export const LarkBotConfigSchema = z.preprocess(
     groupSessionMode: GroupSessionModeSchema.default('thread'),
     mentionTriggerMode: MentionTriggerModeSchema.default('mention_and_active_thread'),
     groupAccessMode: z.enum(['configured_only', 'all_joined']).default(DEFAULT_BOT_GROUP_ACCESS_MODE),
+    autoEnableNewGroup: z.boolean().default(true),
+    newGroupGreetingEnabled: z.boolean().default(true),
+    newGroupGreetingMessage: z.string().default(''),
 
     // Direct message (P2P) & admin policies
     p2pEnabled: z.boolean().default(true),
@@ -1071,6 +1080,46 @@ export interface RecalledLarkMessageEvent {
   readonly chatId: string
   readonly recallTimeMs?: number
   readonly recallType?: string
+}
+
+export interface BotAddedToChatEvent {
+  readonly botId: string
+  readonly larkAppId: string
+  readonly eventId?: string
+  readonly chatId: string
+  readonly chatName?: string
+  readonly operatorOpenId?: string
+  readonly external?: boolean
+}
+
+export function buildNewGroupGreetingText(
+  bot: Pick<LarkBotConfig, 'name' | 'description' | 'role' | 'newGroupGreetingMessage'>,
+  options: { readonly chatName?: string } = {},
+): string {
+  const botName = bot.name.trim() || '智能体'
+  const chatName = options.chatName?.trim() || ''
+  const custom = bot.newGroupGreetingMessage?.trim()
+  if (custom) {
+    return custom
+      .replace(/\{\{\s*bot_name\s*\}\}/g, botName)
+      .replace(/\{\{\s*chat_name\s*\}\}/g, chatName || '本群')
+  }
+
+  const roleName = bot.role?.enabled ? bot.role.name.trim() : ''
+  const intro = `大家好，我是 ${botName}${roleName ? `（${roleName}）` : ''}，很高兴加入${chatName ? `「${chatName}」` : '本群'}！`
+  const descLine = bot.description
+    .trim()
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean)
+  const shortDesc =
+    descLine && descLine.length > 140 ? `${descLine.slice(0, 139).trim()}…` : descLine
+
+  return [
+    intro,
+    ...(shortDesc ? [shortDesc] : []),
+    '有需要时直接 @我 即可开始协作。',
+  ].join('\n')
 }
 
 export interface ParsedSlashCommand {

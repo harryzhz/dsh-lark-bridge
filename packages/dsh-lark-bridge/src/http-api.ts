@@ -19,6 +19,7 @@ import {
   browseHostDirectories,
   createHostSubdirectory,
 } from './fs-browser.js'
+import type { GeneratePromptInput, PromptGenerationTarget } from './prompt-generator-service.js'
 import type { CreateReminderInput, UpdateReminderInput } from './reminder-service.js'
 import { dispatchMemoryApiRequest } from './http-memory-routes.js'
 import type { RuntimeProfileInput } from './runtime-catalog.js'
@@ -119,6 +120,7 @@ function normalizeApiRouteLabel(method: string, segments: readonly string[]): st
   if (s0 === 'bindings' || s0 === 'events' || s0 === 'bots' || s0 === 'groups' || s0 === 'reminders' || s0 === 'schedules' || s0 === 'diagnostics' || s0 === 'runtimes' || s0 === 'models') {
     return segments.length > 1 ? `${method} /${s0}/:id` : `${method} /${s0}`
   }
+  if (s0 === 'generate-prompt') return `${method} /generate-prompt`
   if (s0 === 'plugins' && s1) return `${method} /plugins/${s1}`
   if (s0 === 'lifecycle' && s1) return `${method} /lifecycle/${s1}`
   if (s0 === 'auth' && s1) return `${method} /auth/${s1}`
@@ -611,6 +613,107 @@ export async function dispatchLarkApiRequest(
       if (method === 'POST') {
         return ok({ ok: true, templates: manager.store.resetListenerTemplates() })
       }
+    }
+
+    // ── AI-assisted Role / Listener Prompt Generation (Owner-only) ───────
+    if (method === 'POST' && pathname === 'generate-prompt') {
+      if (!isOwnerWebSession) {
+        return ok({ ok: false, error: 'owner_web_session_required' }, 403)
+      }
+      if (typeof manager.generatePrompt !== 'function') {
+        return ok({ ok: false, error: 'prompt_generator_unavailable' }, 503)
+      }
+      const body = bodyRecord(request.body)
+      const kind = body.kind === 'role' || body.kind === 'listener' ? body.kind : undefined
+      if (!kind) {
+        return ok({ ok: false, error: 'kind must be "role" or "listener"' }, 400)
+      }
+      const description = typeof body.description === 'string' ? body.description.trim() : ''
+      if (!description) {
+        return ok({ ok: false, error: '请先输入简短的需求描述' }, 400)
+      }
+
+      let target: PromptGenerationTarget = { kind: 'auto' }
+      const rawTarget =
+        body.target && typeof body.target === 'object' && !Array.isArray(body.target)
+          ? (body.target as Record<string, unknown>)
+          : undefined
+      if (rawTarget?.kind === 'model') {
+        const provider = typeof rawTarget.provider === 'string' ? rawTarget.provider.trim() : ''
+        const model = typeof rawTarget.model === 'string' ? rawTarget.model.trim() : ''
+        target = {
+          kind: 'model',
+          ...(provider ? { provider } : {}),
+          ...(model ? { model } : {}),
+        }
+      } else if (rawTarget?.kind === 'runtime') {
+        const agentPreset =
+          typeof rawTarget.agentPreset === 'string' ? rawTarget.agentPreset.trim() : ''
+        if (!agentPreset) {
+          return ok({ ok: false, error: '请选择有效的 Agent 运行时' }, 400)
+        }
+        const runtimeProfileId =
+          typeof rawTarget.runtimeProfileId === 'string' ? rawTarget.runtimeProfileId.trim() : ''
+        const model = typeof rawTarget.model === 'string' ? rawTarget.model.trim() : ''
+        const reasoningEffort =
+          typeof rawTarget.reasoningEffort === 'string' ? rawTarget.reasoningEffort.trim() : ''
+        target = {
+          kind: 'runtime',
+          agentPreset,
+          ...(runtimeProfileId ? { runtimeProfileId } : {}),
+          ...(model ? { model } : {}),
+          ...(reasoningEffort ? { reasoningEffort } : {}),
+        }
+      }
+
+      const rawContext =
+        body.context && typeof body.context === 'object' && !Array.isArray(body.context)
+          ? (body.context as Record<string, unknown>)
+          : undefined
+      const roleMode =
+        rawContext?.roleMode === 'bot' ||
+        rawContext?.roleMode === 'append' ||
+        rawContext?.roleMode === 'override'
+          ? rawContext.roleMode
+          : undefined
+
+      const genInput: GeneratePromptInput = {
+        kind,
+        description,
+        target,
+        ...(typeof body.botId === 'string' && body.botId.trim() ? { botId: body.botId.trim() } : {}),
+        ...(typeof body.chatId === 'string' && body.chatId.trim()
+          ? { chatId: body.chatId.trim() }
+          : {}),
+        ...(rawContext
+          ? {
+              context: {
+                ...(typeof rawContext.botName === 'string' ? { botName: rawContext.botName } : {}),
+                ...(typeof rawContext.botDescription === 'string'
+                  ? { botDescription: rawContext.botDescription }
+                  : {}),
+                ...(typeof rawContext.chatName === 'string' ? { chatName: rawContext.chatName } : {}),
+                ...(roleMode ? { roleMode } : {}),
+                ...(typeof rawContext.baseRoleName === 'string'
+                  ? { baseRoleName: rawContext.baseRoleName }
+                  : {}),
+                ...(typeof rawContext.baseRolePrompt === 'string'
+                  ? { baseRolePrompt: rawContext.baseRolePrompt }
+                  : {}),
+                ...(typeof rawContext.currentName === 'string'
+                  ? { currentName: rawContext.currentName }
+                  : {}),
+                ...(typeof rawContext.currentPrompt === 'string'
+                  ? { currentPrompt: rawContext.currentPrompt }
+                  : {}),
+              },
+            }
+          : {}),
+        ...(request.signal ? { signal: request.signal } : {}),
+      }
+
+      const generated = await manager.generatePrompt(genInput)
+      return ok({ ok: true, ...generated })
     }
 
     // ── Bots & Auto-create ────────────────────────────────────────────────
