@@ -81,6 +81,7 @@ export const DISCLOSURE_MODES: readonly Choice<'none' | 'subtle' | 'explicit'>[]
   },
 ]
 
+export const DEFAULT_BOT_SIGNATURE = 'AI 可能出错，请谨慎判断结果~'
 export const DEFAULT_LONG_TURN_NOTICE_DELAY_SECONDS = 300
 export const DEFAULT_LONG_TURN_NOTICE_TEXT = '当前任务仍在深度求索中，请耐心等待…[敲键盘]'
 

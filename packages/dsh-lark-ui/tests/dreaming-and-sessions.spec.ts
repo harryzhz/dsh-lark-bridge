@@ -19,6 +19,7 @@ vi.mock('@deepseek-ai/dsh-client-ui-primitives', () => {
   )
 })
 
+import { newBotConfig } from '../src/components/BotConfigDialog.js'
 import { buildDreamStatusPresentation } from '../src/components/ExperimentalSection.js'
 import { mergeSessionRows } from '../src/views/SessionsView.js'
 import type { DreamRunState, DreamSession, SessionBinding, TriageSession } from '../src/types.js'
@@ -183,5 +184,28 @@ describe('Dreaming status presentation & unified SessionsView merging', () => {
 
     const dreamOnly = mergeSessionRows(bindings, dreams, 'dreaming', triages)
     expect(dreamOnly.map(rowId)).toEqual(['sess-dream-new', 'sess-dream-old'])
+  })
+
+  it('initializes newBotConfig with Citlalin-aligned conversation & message defaults', () => {
+    const draft = newBotConfig(undefined, [])
+    expect(draft).toMatchObject({
+      groupAccessMode: 'configured_only',
+      mentionTriggerMode: 'mention_and_active_thread',
+      groupSessionMode: 'thread',
+      idleCloseMinutes: 720,
+      groupReplyMode: 'reply',
+      receivedReactionEmoji: 'OnIt',
+      sendIntermediateMessages: false,
+      longTurnProgressNotice: true,
+      longTurnNoticeDelaySeconds: 300,
+      longTurnNoticeText: '当前任务仍在深度求索中，请耐心等待…[敲键盘]',
+      useInteractiveCard: true,
+      dshSessionLinkInCard: true,
+      sessionLinkGuestReadOnly: true,
+      replyFooterEnabled: true,
+      replyFooterModel: true,
+      replyFooterSignature: true,
+      signature: 'AI 可能出错，请谨慎判断结果~',
+    })
   })
 })

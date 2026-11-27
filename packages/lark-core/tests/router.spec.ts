@@ -57,6 +57,7 @@ function createBot(overrides: Record<string, unknown> = {}) {
     model: 'gpt-6.1-sol',
     reasoningEffort: 'xhigh',
     defaultWorkingDir: '~',
+    groupAccessMode: 'all_joined',
     allowedUsers: ['ou_owner'],
     allowedUserProfiles: [{ openId: 'ou_owner', name: 'Alex Chen', email: 'alex@example.com' }],
     signature: 'DSH 智能协作签名',
@@ -816,6 +817,47 @@ describe('decideLarkRouting, <user_message> format, memberOverrides & title inte
     expect(followupDecision).toMatchObject({ action: 'agent', trigger: 'active-thread' })
   })
 
+  it('applies expected conversation & message defaults for newly created bots and blocks unconfigured groups by default', () => {
+    const freshBot = LarkBotConfigSchema.parse({
+      id: 'bot-fresh',
+      name: 'FreshBot',
+      larkAppId: 'cli_fresh',
+      larkAppSecret: 'sec_fresh',
+      defaultWorkingDir: '~',
+    })
+    expect(freshBot).toMatchObject({
+      groupAccessMode: 'configured_only',
+      mentionTriggerMode: 'mention_and_active_thread',
+      groupSessionMode: 'thread',
+      idleCloseMinutes: 720,
+      groupReplyMode: 'reply',
+      receivedReactionEmoji: 'OnIt',
+      sendIntermediateMessages: false,
+      longTurnProgressNotice: true,
+      longTurnNoticeDelaySeconds: 300,
+      longTurnNoticeText: '当前任务仍在深度求索中，请耐心等待…[敲键盘]',
+      useInteractiveCard: true,
+      dshSessionLinkInCard: true,
+      sessionLinkGuestReadOnly: true,
+      replyFooterEnabled: true,
+      replyFooterModel: true,
+      replyFooterSignature: true,
+      signature: 'AI 可能出错，请谨慎判断结果~',
+    })
+
+    const unconfiguredMention = decideLarkRouting(
+      freshBot,
+      createMessage({
+        botId: 'bot-fresh',
+        larkAppId: 'cli_fresh',
+        text: '@_user_1 你好',
+        mentions: [{ key: '@_user_1', openId: 'ou_bot', name: 'FreshBot' }],
+      }),
+      { hasActiveSessionForRoute: () => false },
+    )
+    expect(unconfiguredMention).toEqual({ action: 'ignore', reason: 'group_disabled' })
+  })
+
   it('builds runtime-agnostic Dreaming prompts with editable scopes and decoupled Proactive reminder/worktree protocols', () => {
     const workDir = '/Users/demo/workspace/core-service'
     const defaultBot = createBot({ defaultWorkingDir: workDir })
@@ -1464,7 +1506,7 @@ describe('decideLarkRouting, <user_message> format, memberOverrides & title inte
       allowSilentEmptyReply: false,
     })
 
-    // 6. Regular mention-originated active thread remains non-silent with new-topic replyMode
+    // 6. Regular mention-originated active thread remains non-silent and honors bot default replyMode ('reply')
     expect(
       decideLarkRouting(bot, quotedPlain, {
         groupConfig: dailyGroup,
@@ -1475,7 +1517,7 @@ describe('decideLarkRouting, <user_message> format, memberOverrides & title inte
     ).toMatchObject({
       action: 'agent',
       trigger: 'active-thread',
-      replyMode: 'new-topic',
+      replyMode: 'reply',
       allowSilentEmptyReply: false,
     })
   })

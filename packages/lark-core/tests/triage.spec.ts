@@ -32,6 +32,7 @@ function makeBot(overrides: Record<string, unknown> = {}): LarkBotConfig {
     larkAppId: 'cli_triage',
     larkAppSecret: 'sec_triage',
     defaultWorkingDir: '/Users/demo/project',
+    groupAccessMode: 'all_joined',
     ...overrides,
   })
 }

@@ -326,8 +326,18 @@ function migrateLegacyWorkspaceField(input: unknown): unknown {
   return rec
 }
 
+export const DEFAULT_BOT_GROUP_ACCESS_MODE = 'configured_only' as const
+export const DEFAULT_BOT_GROUP_REPLY_MODE = 'reply' as const
+export const DEFAULT_BOT_SIGNATURE = 'AI 可能出错，请谨慎判断结果~'
 export const DEFAULT_LONG_TURN_NOTICE_DELAY_SECONDS = 300
 export const DEFAULT_LONG_TURN_NOTICE_TEXT = '当前任务仍在深度求索中，请耐心等待…[敲键盘]'
+
+/** Default conversation & message overrides applied when configuring a new group. */
+export const DEFAULT_NEW_GROUP_CONVERSATION_CONFIG = {
+  replyMode: 'new-topic',
+  idleCloseMinutes: 360,
+  replyFormat: 'text',
+} as const
 
 export const LarkBotConfigSchema = z.preprocess(
   migrateLegacyWorkspaceField,
@@ -350,10 +360,10 @@ export const LarkBotConfigSchema = z.preprocess(
     workspaceName: z.string().default(''),
 
     // Reply & session lifecycle policies
-    groupReplyMode: GroupReplyModeSchema.default('new-topic'),
+    groupReplyMode: GroupReplyModeSchema.default(DEFAULT_BOT_GROUP_REPLY_MODE),
     groupSessionMode: GroupSessionModeSchema.default('thread'),
     mentionTriggerMode: MentionTriggerModeSchema.default('mention_and_active_thread'),
-    groupAccessMode: z.enum(['configured_only', 'all_joined']).default('all_joined'),
+    groupAccessMode: z.enum(['configured_only', 'all_joined']).default(DEFAULT_BOT_GROUP_ACCESS_MODE),
 
     // Direct message (P2P) & admin policies
     p2pEnabled: z.boolean().default(true),
@@ -379,7 +389,7 @@ export const LarkBotConfigSchema = z.preprocess(
     replyFooterEnabled: z.boolean().default(true),
     replyFooterModel: z.boolean().default(true),
     replyFooterSignature: z.boolean().default(true),
-    signature: z.string().default(''),
+    signature: z.string().default(DEFAULT_BOT_SIGNATURE),
     receivedReactionEmoji: z.string().default('OnIt'),
     idleCloseMinutes: z.number().min(0).default(720),
 

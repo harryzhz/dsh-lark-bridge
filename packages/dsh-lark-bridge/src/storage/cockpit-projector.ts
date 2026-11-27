@@ -1,4 +1,5 @@
 import {
+  DEFAULT_NEW_GROUP_CONVERSATION_CONFIG,
   DEFAULT_TRIAGE_SYSTEM_PROMPT,
   LarkGroupConfigSchema,
   ROUTE_MESSAGE_TOOL_SCHEMA,
@@ -149,6 +150,7 @@ export class CockpitProjector {
       const fullConfig =
         configured ??
         LarkGroupConfigSchema.parse({
+          ...DEFAULT_NEW_GROUP_CONVERSATION_CONFIG,
           key,
           botId,
           chatId,

@@ -65,6 +65,7 @@ describe('LarkBridgeManager prompt injection, title hygiene & auto-archiving', (
       chatId: 'oc_team',
       chatName: '研发协作群',
       enabled: true,
+      idleCloseMinutes: null,
       listener: {
         enabled: true,
         templateKey: 'project',

@@ -3,6 +3,7 @@ import { mkdirSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
   DEFAULT_LISTENER_TEMPLATES,
+  DEFAULT_NEW_GROUP_CONVERSATION_CONFIG,
   LarkBotConfigSchema,
   LarkGroupConfigSchema,
   ListenerTemplateSchema,
@@ -303,7 +304,7 @@ export class ConfigRepo {
     const existing = this.getGroupByKey(key)
 
     const merged: Record<string, unknown> = {
-      ...(existing ?? {}),
+      ...(existing ?? DEFAULT_NEW_GROUP_CONVERSATION_CONFIG),
       ...candidate,
       key,
       botId,
