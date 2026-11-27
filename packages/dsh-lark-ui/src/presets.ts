@@ -3,6 +3,7 @@ import type {
   GroupReplyMode,
   GroupSessionMode,
   Inheritable,
+  ListenerMentionFilter,
   ListenerMsgType,
   ListenerSenderType,
   ListenerTemplate,
@@ -474,6 +475,20 @@ export const SENDER_TYPES: readonly Choice<ListenerSenderType>[] = [
 export const LISTENER_SCOPES: readonly Choice<'top_level' | 'all'>[] = [
   { value: 'top_level', label: '仅群内新消息' },
   { value: 'all', label: '包含话题回复' },
+]
+
+export const LISTENER_MENTION_FILTERS: readonly Choice<ListenerMentionFilter>[] = [
+  { value: 'all', label: '监听全部消息' },
+  {
+    value: 'exclude_peer',
+    label: '不监听 @ 他人',
+    desc: '跳过 @ 其他成员或应用的消息，保留 @ 所有人',
+  },
+  {
+    value: 'exclude_all',
+    label: '不监听所有 @ 消息',
+    desc: '跳过含 @ 他人及 @ 所有人的消息',
+  },
 ]
 
 export const SCHEDULE_DELIVERY_MODES: readonly Choice<ScheduleDeliveryMode>[] = [

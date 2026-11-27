@@ -15,6 +15,7 @@ import {
   cloneRouterBypass,
   DEFAULT_ROUTER_BYPASS,
   INTERMEDIATE_MESSAGE_MODES,
+  LISTENER_MENTION_FILTERS,
   LISTENER_SCOPES,
   MSG_TYPES,
   REPLY_FORMATS,
@@ -719,6 +720,13 @@ function ListenerSection({
           <GroupTitle>消息过滤</GroupTitle>
           <SettingRow title="消息位置" desc="「仅群内新消息」会忽略已有话题下的楼中楼回复">
             <SelectMenu value={rule.scope} options={LISTENER_SCOPES} onChange={(scope) => patch({ scope })} />
+          </SettingRow>
+          <SettingRow title="@ 消息过滤" desc="不影响直接 @ 本智能体的消息">
+            <SelectMenu
+              value={rule.mentionFilter ?? 'all'}
+              options={LISTENER_MENTION_FILTERS}
+              onChange={(mentionFilter) => patch({ mentionFilter })}
+            />
           </SettingRow>
           <SettingRow title="消息类型" stack>
             <ChipToggles values={rule.msgTypes} options={MSG_TYPES} onChange={(msgTypes) => patch({ msgTypes })} />

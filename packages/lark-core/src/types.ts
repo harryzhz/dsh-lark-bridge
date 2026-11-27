@@ -435,6 +435,7 @@ export const GroupReplyModeSchema = z.enum(['new-topic', 'reply', 'chat'])
 export const GroupSessionModeSchema = z.enum(['thread', 'per_message', 'chat'])
 export const MentionTriggerModeSchema = z.enum(['mention_and_active_thread', 'mention_only'])
 export const ListenerMsgTypeSchema = z.enum(['text', 'post', 'interactive', 'image', 'merge_forward'])
+export const ListenerMentionFilterSchema = z.enum(['all', 'exclude_peer', 'exclude_all'])
 
 function migrateLegacyWorkspaceField(input: unknown): unknown {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return input
@@ -575,6 +576,7 @@ export const GroupListenerRuleSchema = z.object({
   allowSilentEmptyReply: z.boolean().default(true),
   autoCloseAfterCompletion: z.boolean().default(false),
   scope: z.enum(['top_level', 'all']).default('top_level'),
+  mentionFilter: ListenerMentionFilterSchema.default('all'),
   msgTypes: z.array(ListenerMsgTypeSchema).default(['text', 'post', 'interactive']),
   senderTypes: z.array(ListenerSenderTypeSchema).default(['user']),
   senderFilterMode: z.enum(['all_except_excluded', 'include_only']).default('all_except_excluded'),
@@ -667,6 +669,7 @@ export const LarkGroupConfigSchema = z.preprocess(
       allowSilentEmptyReply: true,
       autoCloseAfterCompletion: false,
       scope: 'top_level',
+      mentionFilter: 'all',
       msgTypes: ['text', 'post', 'interactive'],
       senderTypes: ['user'],
       senderFilterMode: 'all_except_excluded',
@@ -803,6 +806,7 @@ export type GroupReplyMode = z.infer<typeof GroupReplyModeSchema>
 export type GroupSessionMode = z.infer<typeof GroupSessionModeSchema>
 export type MentionTriggerMode = z.infer<typeof MentionTriggerModeSchema>
 export type ListenerMsgType = z.infer<typeof ListenerMsgTypeSchema>
+export type ListenerMentionFilter = z.infer<typeof ListenerMentionFilterSchema>
 export type ListenerSenderType = z.infer<typeof ListenerSenderTypeSchema>
 export type LarkBotConfig = z.infer<typeof LarkBotConfigSchema>
 export type GroupRoleConfig = z.infer<typeof GroupRoleConfigSchema>

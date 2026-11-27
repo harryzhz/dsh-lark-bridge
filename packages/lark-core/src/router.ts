@@ -510,6 +510,51 @@ export function isListenerSenderEnabled(
   return true
 }
 
+interface MessageMentionFlags {
+  readonly hasAllMention: boolean
+  readonly hasPeerMention: boolean
+}
+
+function classifyListenerMentions(
+  msg: Pick<InboundLarkMessage, 'mentions' | 'text' | 'botOpenId' | 'msgType'>,
+): MessageMentionFlags {
+  let hasAllMention = false
+  let hasPeerMention = false
+
+  for (const m of msg.mentions) {
+    const id = m.openId?.trim()
+    const key = m.key?.trim()
+    if (key === '@_all' || id?.toLowerCase() === 'all') {
+      hasAllMention = true
+      continue
+    }
+    if (msg.botOpenId && id === msg.botOpenId) {
+      continue
+    }
+    if (id || key) {
+      hasPeerMention = true
+    }
+  }
+
+  // Fallback for interactive cards that embed `<at id="...">` tags without populating
+  // `message.mentions`. Scoped to `interactive` so literal `<at ...>` code snippets in
+  // plain `text`/`post` messages never false-positive as mentions.
+  if (msg.msgType === 'interactive' && (!hasAllMention || !hasPeerMention)) {
+    const atTagRe = /<at\s+(?:user_id|id)\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))/gi
+    for (const match of msg.text.matchAll(atTagRe)) {
+      const id = (match[1] ?? match[2] ?? match[3] ?? '').trim()
+      if (!id) continue
+      if (id.toLowerCase() === 'all') {
+        hasAllMention = true
+      } else if (!msg.botOpenId || id !== msg.botOpenId) {
+        hasPeerMention = true
+      }
+    }
+  }
+
+  return { hasAllMention, hasPeerMention }
+}
+
 function matchesListenerRule(
   listener: GroupListenerRule,
   msg: InboundLarkMessage,
@@ -519,6 +564,17 @@ function matchesListenerRule(
 
   if (listener.scope === 'top_level' && (msg.rootId || msg.parentId)) {
     return { ok: false, reason: 'listener_not_top_level' }
+  }
+
+  const mentionFilter = listener.mentionFilter ?? 'all'
+  if (mentionFilter !== 'all') {
+    const mentionFlags = classifyListenerMentions(msg)
+    if (mentionFilter === 'exclude_all' && (mentionFlags.hasPeerMention || mentionFlags.hasAllMention)) {
+      return { ok: false, reason: 'listener_mention_excluded' }
+    }
+    if (mentionFilter === 'exclude_peer' && mentionFlags.hasPeerMention) {
+      return { ok: false, reason: 'listener_peer_mention_excluded' }
+    }
   }
 
   if (
