@@ -425,6 +425,75 @@ export class RuntimeCatalog {
   }
 
   /**
+   * Resolve the live available model list for any `(agentPreset, runtimeProfileId)` —
+   * supporting both external CLI runtimes (including custom launch profiles such as proxies)
+   * and native DSH presets.
+   */
+  async listAvailableModelsForPreset(
+    presetId: string,
+    runtimeProfileId?: string,
+    options?: { readonly force?: boolean },
+  ): Promise<{
+    readonly isExternal: boolean
+    readonly provider?: string
+    readonly models: readonly (ExternalModelMeta & { readonly provider?: string })[]
+  }> {
+    const cleanPreset = presetId.trim()
+    const cleanProfile = runtimeProfileId?.trim() || undefined
+    const ext = this.directory()?.get(cleanPreset)
+    if (ext) {
+      const live = await this.modelsForRuntime(cleanPreset, cleanProfile, options).catch(
+        () => undefined,
+      )
+      const list = live ?? []
+      return {
+        isExternal: true,
+        provider: ext.providerId,
+        models: list.map((m) => ({ ...m, provider: ext.providerId })),
+      }
+    }
+
+    const externalProviders = new Set([
+      ...(this.directory()?.list() ?? []).map((r) => r.providerId),
+      ...this.listExposedPresets().map((p) => p.providerId),
+    ])
+    const nativeProviders = this.listNativeProviderIds(externalProviders)
+    const collected: Array<ExternalModelMeta & { readonly provider?: string }> = []
+    for (const providerId of nativeProviders) {
+      const rawModels = await this.listProviderModelsSafe(providerId)
+      for (const raw of rawModels) {
+        const modelId = raw.id
+        if (!modelId) continue
+        let name = (raw as { readonly name?: string }).name || modelId
+        let reasoningEfforts: readonly string[] | undefined
+        let defaultEffort: string | undefined
+        if (typeof this.ctx.llm?.resolveModelInfo === 'function') {
+          const detail = await this.ctx.llm.resolveModelInfo(providerId, modelId).catch(() => undefined)
+          if (detail?.name) name = detail.name
+          if (detail?.reasoning) {
+            reasoningEfforts = detail.reasoning.efforts.map((e) => String(e.id)).filter(Boolean)
+            if (detail.reasoning.defaultEffort) {
+              defaultEffort = String(detail.reasoning.defaultEffort)
+            }
+          }
+        }
+        collected.push({
+          id: modelId,
+          name,
+          provider: providerId,
+          ...(reasoningEfforts !== undefined ? { reasoningEfforts } : {}),
+          ...(defaultEffort ? { defaultEffort } : {}),
+        })
+      }
+    }
+    return {
+      isExternal: false,
+      ...(nativeProviders[0] ? { provider: nativeProviders[0] } : {}),
+      models: collected,
+    }
+  }
+
+  /**
    * Resolve `provider`, `model`, `reasoningEffort`, `runtimeProfileId`, and preset-plugin mounting for
    * both external runtimes (`dsh-external-agents`) and built-in DSH native presets
    * (`standard`, `ptc`, `minimal`, `cordis`). Mirrors `@deepseek-ai/dsh-api-session-controller`

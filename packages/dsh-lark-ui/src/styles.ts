@@ -3512,6 +3512,27 @@ body > [role='presentation']:has(> [role='dialog'][aria-modal='true'])
 @media (prefers-reduced-motion: reduce) {
   .fb-obs-pulse-dot { animation: none; }
 }
+.fb-tier-panel { display: flex; flex-direction: column; gap: 10px; width: 100%; }
+.fb-tier-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.fb-tier-prompt-row { width: 100%; }
+.fb-tier-prompt-row > *, .fb-tier-prompt-row input { width: 100% !important; max-width: none !important; }
+.fb-tier-empty { padding: 14px 4px; font-size: 12.5px; color: var(--dsw-alias-label-tertiary); text-align: center; border-top: 0.5px solid var(--dsw-alias-border-l2); border-bottom: 0.5px solid var(--dsw-alias-border-l2); }
+.fb-tier-list { display: flex; flex-direction: column; border-top: 0.5px solid var(--dsw-alias-border-l2); }
+.fb-tier-row { display: flex; flex-direction: column; gap: 6px; padding: 10px 0; border-bottom: 0.5px solid var(--dsw-alias-border-l2); }
+.fb-tier-row-top { display: flex; align-items: center; gap: 8px; width: 100%; }
+.fb-tier-row-bottom { display: flex; align-items: center; gap: 8px; width: 100%; padding-right: 36px; box-sizing: border-box; }
+.fb-tier-field { min-width: 0; }
+.fb-tier-field-rt { flex: 1 1 130px; }
+.fb-tier-field-prof { flex: 1 1 120px; }
+.fb-tier-field-model { flex: 1.8 1 200px; }
+.fb-tier-field-effort { flex: 1 1 120px; }
+.fb-tier-weight { display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; margin-left: auto; }
+.fb-tier-weight-label { font-size: 12px; color: var(--dsw-alias-label-tertiary); white-space: nowrap; }
+.fb-tier-weight-input { width: 56px; height: 32px; padding: 0 8px; border-radius: 8px; border: 0.5px solid var(--dsw-alias-border-l2); background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary); font-size: 13px; font-variant-numeric: tabular-nums; text-align: right; outline: none; }
+.fb-tier-weight-input:focus { border-color: var(--dsw-alias-state-business-primary); }
+.fb-tier-share { min-width: 34px; font-size: 12px; color: var(--dsw-alias-label-tertiary); font-variant-numeric: tabular-nums; text-align: right; }
+.fb-tier-remove { flex: 0 0 auto; }
+
 @media (max-width: 960px) {
   .fb-obs-kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .fb-obs-grid-2,

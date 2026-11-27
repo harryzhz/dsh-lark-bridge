@@ -193,6 +193,78 @@ export const ListenerSenderTypeSchema = z.enum(['user', 'bot'])
 export const RouterScopeModeSchema = z.enum(['passive_only', 'active_thread_only', 'all_group'])
 export const GroupRouterModeSchema = z.enum(['inherit', 'override', 'off'])
 export const RouterBypassMsgTypeSchema = z.enum(['interactive', 'text', 'post', 'image'])
+export const TaskDifficultyTierSchema = z.enum(['lite', 'standard', 'heavy'])
+export const TierRoutingBypassTierSchema = z.enum(['default', 'lite', 'standard', 'heavy'])
+
+export const TierRoutingTargetSchema = z.object({
+  id: z
+    .string()
+    .trim()
+    .min(1),
+  agentPreset: z
+    .string()
+    .trim()
+    .min(1),
+  runtimeProfileId: z
+    .string()
+    .default('')
+    .transform((v) => v.trim()),
+  model: z
+    .string()
+    .default('')
+    .transform((v) => v.trim()),
+  reasoningEffort: z
+    .string()
+    .default('')
+    .transform((v) => v.trim()),
+  weight: z.number().int().min(0).max(1000).default(50),
+  enabled: z.boolean().default(true),
+})
+
+export const TierRoutingTierConfigSchema = z.object({
+  prompt: z
+    .string()
+    .default('')
+    .transform((v) => v.trim()),
+  targets: z.array(TierRoutingTargetSchema).default([]),
+})
+
+export const DEFAULT_TIER_ROUTING_TIERS: {
+  readonly lite: z.output<typeof TierRoutingTierConfigSchema>
+  readonly standard: z.output<typeof TierRoutingTierConfigSchema>
+  readonly heavy: z.output<typeof TierRoutingTierConfigSchema>
+} = {
+  lite: { prompt: '', targets: [] },
+  standard: { prompt: '', targets: [] },
+  heavy: { prompt: '', targets: [] },
+}
+
+export const TierRoutingConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+  presetKey: z
+    .string()
+    .default('')
+    .transform((v) => v.trim()),
+  bypassTier: TierRoutingBypassTierSchema.default('default'),
+  tiers: z
+    .object({
+      lite: TierRoutingTierConfigSchema.default({ prompt: '', targets: [] }),
+      standard: TierRoutingTierConfigSchema.default({ prompt: '', targets: [] }),
+      heavy: TierRoutingTierConfigSchema.default({ prompt: '', targets: [] }),
+    })
+    .default(DEFAULT_TIER_ROUTING_TIERS),
+})
+
+export const DEFAULT_TIER_ROUTING_CONFIG: z.output<typeof TierRoutingConfigSchema> = {
+  enabled: false,
+  presetKey: '',
+  bypassTier: 'default',
+  tiers: {
+    lite: { prompt: '', targets: [] },
+    standard: { prompt: '', targets: [] },
+    heavy: { prompt: '', targets: [] },
+  },
+}
 
 export const RouterBypassConfigSchema = z.object({
   senderTypes: z.array(ListenerSenderTypeSchema).default(['bot']),
@@ -246,6 +318,7 @@ export const BotRouterConfigSchema = z.preprocess(
     contextTtlMinutes: z.number().int().min(1).max(1440).default(30),
     includeLastReply: z.boolean().default(true),
     coalesceQueuedMessages: z.boolean().default(true),
+    tierRouting: TierRoutingConfigSchema.default(DEFAULT_TIER_ROUTING_CONFIG),
   }),
 )
 
@@ -266,6 +339,16 @@ export const DEFAULT_BOT_ROUTER_CONFIG: z.output<typeof BotRouterConfigSchema> =
   contextTtlMinutes: 30,
   includeLastReply: true,
   coalesceQueuedMessages: true,
+  tierRouting: {
+    enabled: false,
+    presetKey: '',
+    bypassTier: 'default',
+    tiers: {
+      lite: { prompt: '', targets: [] },
+      standard: { prompt: '', targets: [] },
+      heavy: { prompt: '', targets: [] },
+    },
+  },
 }
 
 export const GroupRouterConfigSchema = z.preprocess(
@@ -283,6 +366,7 @@ export const GroupRouterConfigSchema = z.preprocess(
     contextTtlMinutes: z.number().int().min(1).max(1440).default(30),
     includeLastReply: z.boolean().default(true),
     coalesceQueuedMessages: z.boolean().default(true),
+    tierRouting: TierRoutingConfigSchema.default(DEFAULT_TIER_ROUTING_CONFIG),
   }),
 )
 
@@ -303,6 +387,16 @@ export const DEFAULT_GROUP_ROUTER_CONFIG: z.output<typeof GroupRouterConfigSchem
   contextTtlMinutes: 30,
   includeLastReply: true,
   coalesceQueuedMessages: true,
+  tierRouting: {
+    enabled: false,
+    presetKey: '',
+    bypassTier: 'default',
+    tiers: {
+      lite: { prompt: '', targets: [] },
+      standard: { prompt: '', targets: [] },
+      heavy: { prompt: '', targets: [] },
+    },
+  },
 }
 
 function migrateLegacyExperimentalInput(input: unknown): unknown {
@@ -697,6 +791,11 @@ export type RouterScopeMode = z.infer<typeof RouterScopeModeSchema>
 export type GroupRouterMode = z.infer<typeof GroupRouterModeSchema>
 export type RouterBypassMsgType = z.infer<typeof RouterBypassMsgTypeSchema>
 export type RouterBypassConfig = z.output<typeof RouterBypassConfigSchema>
+export type TaskDifficultyTier = z.infer<typeof TaskDifficultyTierSchema>
+export type TierRoutingBypassTier = z.infer<typeof TierRoutingBypassTierSchema>
+export type TierRoutingTarget = z.output<typeof TierRoutingTargetSchema>
+export type TierRoutingTierConfig = z.output<typeof TierRoutingTierConfigSchema>
+export type TierRoutingConfig = z.output<typeof TierRoutingConfigSchema>
 export type BotRouterConfig = z.output<typeof BotRouterConfigSchema>
 export type GroupRouterConfig = z.output<typeof GroupRouterConfigSchema>
 export type BotExperimentalConfig = z.output<typeof BotExperimentalConfigSchema>
@@ -850,6 +949,10 @@ export type RoutingDecision =
       readonly runtimeProfileId?: string
       readonly model?: string
       readonly reasoningEffort?: string
+      /** True when the session's runtime/model was selected by tier routing or session override and must stay pinned. */
+      readonly runtimePinned?: boolean
+      /** Difficulty tier chosen when spawning a new session via tier routing. */
+      readonly routedTier?: TaskDifficultyTier
       readonly sessionMode: 'thread' | 'per_message' | 'chat'
       readonly replyMode: GroupReplyMode
       readonly useCard: boolean
@@ -1074,6 +1177,7 @@ export interface EffectiveRouterConfig {
   readonly contextTtlMinutes: number
   readonly includeLastReply: boolean
   readonly coalesceQueuedMessages: boolean
+  readonly tierRouting: TierRoutingConfig
 }
 
 export function resolveEffectiveRouterConfig(
@@ -1081,6 +1185,7 @@ export function resolveEffectiveRouterConfig(
   group?: Pick<LarkGroupConfig, 'router'>,
 ): EffectiveRouterConfig {
   const base = bot.router ?? DEFAULT_BOT_ROUTER_CONFIG
+  const baseTierRouting = base.tierRouting ?? DEFAULT_TIER_ROUTING_CONFIG
   const groupRouter = group?.router
   if (!groupRouter || groupRouter.mode === 'inherit') {
     return {
@@ -1097,6 +1202,7 @@ export function resolveEffectiveRouterConfig(
       contextTtlMinutes: base.contextTtlMinutes,
       includeLastReply: base.includeLastReply,
       coalesceQueuedMessages: base.enabled && base.coalesceQueuedMessages,
+      tierRouting: baseTierRouting,
     }
   }
   if (groupRouter.mode === 'off') {
@@ -1114,6 +1220,7 @@ export function resolveEffectiveRouterConfig(
       contextTtlMinutes: base.contextTtlMinutes,
       includeLastReply: base.includeLastReply,
       coalesceQueuedMessages: false,
+      tierRouting: DEFAULT_TIER_ROUTING_CONFIG,
     }
   }
   const groupProvider = groupRouter.provider.trim()
@@ -1134,6 +1241,7 @@ export function resolveEffectiveRouterConfig(
     contextTtlMinutes: groupRouter.contextTtlMinutes,
     includeLastReply: groupRouter.includeLastReply,
     coalesceQueuedMessages: groupRouter.coalesceQueuedMessages,
+    tierRouting: groupRouter.tierRouting ?? DEFAULT_TIER_ROUTING_CONFIG,
   }
 }
 

@@ -12,10 +12,11 @@ import {
   type ToolSchema,
 } from '@deepseek-ai/dsh-llm'
 import {
-  ROUTE_MESSAGE_TOOL_SCHEMA,
+  buildRouteMessageToolSchema,
   buildTriageSystemPrompt,
   buildTriageUserMessage,
   extractPeerUserMentions,
+  hasConfiguredTierRouting,
   parseTriageVerdict,
   type AgentRoutingDecision,
   type EffectiveRouterConfig,
@@ -859,15 +860,25 @@ export class LlmTriageService {
       .map((m) => m.name?.trim() || m.openId?.trim() || '')
       .filter(Boolean)
 
-    const { system, userText } = this.buildTriagePrompts(input, imageBlocks.length, peerMentions)
+    const tierRoutingActive =
+      !input.hasActiveWorker &&
+      !input.decision.silentOnly &&
+      hasConfiguredTierRouting(input.routerConfig)
+    const { system, userText } = this.buildTriagePrompts(
+      input,
+      imageBlocks.length,
+      peerMentions,
+      tierRoutingActive,
+    )
     const userContent: readonly ContentBlock[] = [
       { type: 'text', text: userText },
       ...imageBlocks,
     ]
+    const rawToolSchema = buildRouteMessageToolSchema({ includeTier: tierRoutingActive })
     const toolSchema: ToolSchema = {
-      name: ROUTE_MESSAGE_TOOL_SCHEMA.name,
-      description: ROUTE_MESSAGE_TOOL_SCHEMA.description,
-      parameters: ROUTE_MESSAGE_TOOL_SCHEMA.parameters,
+      name: rawToolSchema.name,
+      description: rawToolSchema.description,
+      parameters: rawToolSchema.parameters,
     }
     const maxTokens = modelCaps.reasoningActive ? 1024 : 256
     const temperature = modelCaps.reasoningActive ? undefined : 0.1
@@ -999,6 +1010,7 @@ export class LlmTriageService {
     peerMentions: readonly string[] = extractPeerUserMentions(input.msg)
       .map((m) => m.name?.trim() || m.openId?.trim() || '')
       .filter(Boolean),
+    tierRoutingActive = false,
   ): {
     readonly system: string
     readonly userText: string
@@ -1051,6 +1063,7 @@ export class LlmTriageService {
         : {}),
       ...(delegationFollowupEnabled ? { delegationFollowupEnabled: true } : {}),
       ...(silentOnly ? { silentOnly: true } : {}),
+      ...(tierRoutingActive ? { tierRouting: input.routerConfig.tierRouting } : {}),
     })
 
     const userText = buildTriageUserMessage({

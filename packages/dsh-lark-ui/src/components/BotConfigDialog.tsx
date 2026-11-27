@@ -17,6 +17,7 @@ import { bridgeApi } from '../api.js'
 import {
   ACCESS_MODES,
   cloneRouterBypass,
+  cloneTierRouting,
   DEFAULT_BOT_SIGNATURE,
   DEFAULT_DREAMING_SCOPES,
   DEFAULT_LONG_TURN_NOTICE_DELAY_SECONDS,
@@ -169,7 +170,11 @@ export function newBotConfig(
     idleCloseMinutes: 720,
     role: { enabled: false, name: '', systemPrompt: '' },
     substituteMode: { enabled: false, targets: [], disclosure: 'none', activeThreadFollowup: true },
-    router: { ...DEFAULT_ROUTER_CONFIG, bypass: cloneRouterBypass(DEFAULT_ROUTER_BYPASS) },
+    router: {
+      ...DEFAULT_ROUTER_CONFIG,
+      bypass: cloneRouterBypass(DEFAULT_ROUTER_BYPASS),
+      tierRouting: cloneTierRouting(),
+    },
     experimental: {
       dreaming: { ...DEFAULT_DREAMING_CONFIG, scopes: [...DEFAULT_DREAMING_CONFIG.scopes] },
       proactive: { ...DEFAULT_PROACTIVE_CONFIG },
@@ -205,6 +210,7 @@ function toBotConfig(record: BotRecord): BotConfig {
       ...DEFAULT_ROUTER_CONFIG,
       ...(cloned.router ?? {}),
       bypass: cloneRouterBypass(cloned.router?.bypass),
+      tierRouting: cloneTierRouting(cloned.router?.tierRouting),
     },
     experimental: {
       dreaming: {
@@ -1206,6 +1212,9 @@ function EditBotDialog({
               runtimes={runtimes}
               models={models}
               triageDefaults={triageDefaults}
+              defaultAgentPreset={draft.agentPreset}
+              {...(draft.runtimeProfileId ? { defaultProfileId: draft.runtimeProfileId } : {})}
+              {...(draft.model ? { defaultModel: draft.model } : {})}
               onChange={(next) => patch({ router: { ...draft.router, ...next } })}
             />
           )}
@@ -1258,6 +1267,7 @@ function EditBotDialog({
           experimental={draft.experimental}
           dreamState={localDreamState}
           runtime={runtimes.find((r) => r.id === draft.agentPreset)}
+          runtimeProfileId={draft.runtimeProfileId}
           models={models}
           botModel={draft.model}
           onChange={(experimental) => patch({ experimental })}

@@ -98,6 +98,10 @@ export interface LarkSessionBinding {
   readonly runtimeProfileId?: string
   readonly model?: string
   readonly reasoningEffort?: string
+  /** True when the session's runtime/model was chosen by tier routing or session-level `/model` and must stay pinned. */
+  readonly runtimePinned?: boolean
+  /** Task difficulty tier assigned when this session was created by tier routing. */
+  readonly routedTier?: 'lite' | 'standard' | 'heavy'
   readonly workingDir: string
   readonly trigger: string
   readonly listenerName?: string

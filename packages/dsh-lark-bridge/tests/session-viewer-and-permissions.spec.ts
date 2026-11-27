@@ -912,11 +912,11 @@ describe('Group slash-command permission tightening', () => {
         replies.push(text)
       },
     })
-    expect(replies.at(-1)).toContain('群聊中禁止通过 /agent 或 /model')
+    expect(replies.at(-1)).toContain('群聊中禁止通过 /agent 修改运行时配置')
     expect(store.getBot('bot-1')?.agentPreset).toBe('standard')
     expect(store.getGroup('bot-1', 'oc_team')?.agentPreset).toBe('')
 
-    // Group /model rejected without mutating config
+    // Group /model without active session is rejected without mutating bot or group config
     await handleSlashCommand(deps, {
       bot,
       group,
@@ -930,10 +930,10 @@ describe('Group slash-command permission tightening', () => {
         replies.push(text)
       },
     })
-    expect(replies.at(-1)).toContain('群聊中禁止通过 /agent 或 /model')
+    expect(replies.at(-1)).toContain('当前话题没有活跃会话')
     expect(store.getBot('bot-1')?.model).toBe('provider/default')
 
-    // Group /help omits /agent & /model commands and notes the restriction
+    // Group /help omits /agent command, documents session-only /model, and notes the restriction
     await handleSlashCommand(deps, {
       bot,
       group,
@@ -948,9 +948,9 @@ describe('Group slash-command permission tightening', () => {
       },
     })
     expect(replies.at(-1)).toContain('/status')
+    expect(replies.at(-1)).toContain('/model [模型 ID] [思考强度]')
     expect(replies.at(-1)).toContain('仅允许在 DSH 控制台或私聊中修改')
     expect(replies.at(-1)).not.toContain('/agent <')
-    expect(replies.at(-1)).not.toContain('/model <')
 
     // Group /status still works
     await handleSlashCommand(deps, {

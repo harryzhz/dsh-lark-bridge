@@ -1,7 +1,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { brandString } from '@deepseek-ai/dsh-brand'
-import type { ContentBlock } from '@deepseek-ai/dsh-llm'
+import type { ContentBlock, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import {
   resolveEffectiveAgentRuntime,
@@ -53,25 +53,33 @@ const P2P_HELP_TEXT = [
   '/close - 关闭并归档当前会话',
   '/cancel - 中断执行中的任务',
   '/agent <运行时 ID> [启动配置 ID] - 切换智能体默认运行时或启动配置',
-  '/model <模型 ID> - 切换当前会话模型',
+  '/model [模型 ID] [思考强度] - 查看可用模型列表或切换当前会话模型',
 ].join('\n')
 
 const GROUP_HELP_TEXT = [
   '可用命令：',
   '/status - 查看当前会话、工作区与会话链接',
+  '/model [模型 ID] [思考强度] - 查看当前会话可用模型，或仅切换当前会话模型（不改群默认配置）',
   '/cot [on|off|inherit|status] - 查看或开关本群思考过程展示（修改仅限管理员）',
   '/console - 私聊获取 DSH 管理面一次性登录链接（仅限管理员）',
   '/new - 归档当前会话并开启新会话',
   '/close - 关闭并归档当前会话',
   '/cancel - 中断执行中的任务',
-  '（安全限制：运行时 /agent 与模型 /model 配置仅允许在 DSH 控制台或私聊中修改）',
+  '（安全限制：运行时 /agent 配置仅允许在 DSH 控制台或私聊中修改）',
 ].join('\n')
 
-const GROUP_CONFIG_COMMAND_DENIED_TEXT =
-  '安全限制：群聊中禁止通过 /agent 或 /model 修改运行时与模型配置，请在 DSH 控制台或私聊中调整。'
+const GROUP_AGENT_COMMAND_DENIED_TEXT =
+  '安全限制：群聊中禁止通过 /agent 修改运行时配置，请在 DSH 控制台或私聊中调整。'
 
 function formatRuntimeWithProfile(presetId: string, profileId?: string): string {
   return profileId ? `${presetId} (${profileId})` : presetId
+}
+
+function formatTierBadge(tier: 'lite' | 'standard' | 'heavy' | undefined): string {
+  if (tier === 'lite') return '轻量档 (lite)'
+  if (tier === 'standard') return '标准档 (standard)'
+  if (tier === 'heavy') return '深度档 (heavy)'
+  return ''
 }
 
 export async function handleSlashCommand(host: SlashCommandHost, input: SlashCommandInput): Promise<void> {
@@ -104,12 +112,16 @@ export async function handleSlashCommand(host: SlashCommandHost, input: SlashCom
         return
       }
       const selection = liveAgent?.model.current()
+      const currentEffort = selection?.reasoningEffort ?? binding.reasoningEffort
+      const effortSuffix = currentEffort ? ` (${currentEffort})` : ''
+      const tierInfo = formatTierBadge(binding.routedTier)
       await reply(
         [
           `会话：${binding.sessionId}`,
           `工作区：${binding.workspaceName}`,
-          `运行时：${formatRuntimeWithProfile(binding.agentPreset, binding.runtimeProfileId)}（${liveAgent?.status ?? '休眠，可恢复'}${effective.source === 'group' ? ' · 群独立配置' : ''}）`,
-          `模型：${selection ? `${selection.provider}/${selection.model}` : binding.model ?? effective.model ?? 'default'}`,
+          `运行时：${formatRuntimeWithProfile(binding.agentPreset, binding.runtimeProfileId)}（${liveAgent?.status ?? '休眠，可恢复'}${binding.runtimePinned ? ' · 会话锁定' : effective.source === 'group' ? ' · 群独立配置' : ''}）`,
+          ...(tierInfo ? [`路由档位：${tierInfo}`] : []),
+          `模型：${selection ? `${selection.provider}/${selection.model}` : binding.model ?? effective.model ?? 'default'}${effortSuffix}`,
           `工作目录：${binding.workingDir}`,
           `接管链接：${host.sessionWebUrl(binding.sessionId)}`,
         ].join('\n'),
@@ -132,17 +144,13 @@ export async function handleSlashCommand(host: SlashCommandHost, input: SlashCom
       return
     case 'agent':
       if (isGroupChat) {
-        await reply(GROUP_CONFIG_COMMAND_DENIED_TEXT)
+        await reply(GROUP_AGENT_COMMAND_DENIED_TEXT)
         return
       }
       await switchRuntime(host, input)
       return
     case 'model':
-      if (isGroupChat) {
-        await reply(GROUP_CONFIG_COMMAND_DENIED_TEXT)
-        return
-      }
-      await switchModel(host, input, liveAgent)
+      await switchModel(host, input, liveAgent, isGroupChat)
       return
   }
 }
@@ -431,42 +439,211 @@ async function switchRuntime(host: SlashCommandHost, input: SlashCommandInput): 
   await input.reply(`默认运行时已切换为 ${displayTarget}，下一条消息生效。`)
 }
 
-async function switchModel(host: SlashCommandHost, input: SlashCommandInput, liveAgent: Agent | undefined): Promise<void> {
-  const model = input.command.args.trim()
-  if (!model) {
-    await input.reply('用法：/model <模型 ID>')
+function parseModelCommandArgs(rawArgs: string): {
+  readonly modelQuery: string
+  readonly effortQuery: string
+} {
+  const parts = rawArgs.trim().split(/\s+/).filter(Boolean)
+  if (parts.length === 0) return { modelQuery: '', effortQuery: '' }
+  if (parts.length === 1) {
+    return { modelQuery: parts[0]!, effortQuery: '' }
+  }
+  return {
+    modelQuery: parts[0]!,
+    effortQuery: parts[1]!.toLowerCase(),
+  }
+}
+
+async function switchModel(
+  host: SlashCommandHost,
+  input: SlashCommandInput,
+  liveAgent: Agent | undefined,
+  isGroupChat: boolean,
+): Promise<void> {
+  const { modelQuery, effortQuery } = parseModelCommandArgs(input.command.args)
+  const binding = host.store.getBinding(input.routeKey)
+  const effective = resolveEffectiveAgentRuntime(input.bot, isGroupChat ? input.group : undefined)
+
+  if (isGroupChat && !binding) {
+    await input.reply(
+      '当前话题没有活跃会话：群聊中 /model 仅用于查看或切换当前活跃会话的模型（不修改群默认配置）。请先发起对话后在对应话题内使用。',
+    )
     return
   }
-  const binding = host.store.getBinding(input.routeKey)
-  const effective = resolveEffectiveAgentRuntime(input.bot, input.group)
+
   const effectivePreset = binding?.agentPreset ?? effective.agentPreset
-  const effectiveProfileId = binding?.runtimeProfileId ?? effective.runtimeProfileId
+  const effectiveProfileId = binding
+    ? binding.runtimeProfileId
+    : effective.runtimeProfileId
+  const runtimeLabel = formatRuntimeWithProfile(effectivePreset, effectiveProfileId)
+  const currentSel = liveAgent?.model.current()
+  const currentModelId = currentSel?.model ?? binding?.model ?? effective.model ?? ''
+  const currentEffort =
+    (currentSel?.reasoningEffort ? String(currentSel.reasoningEffort) : undefined) ??
+    binding?.reasoningEffort ??
+    effective.reasoningEffort ??
+    ''
+
+  const emptyCatalog: {
+    readonly isExternal: boolean
+    readonly provider?: string
+    readonly models: readonly {
+      readonly id: string
+      readonly name: string
+      readonly provider?: string
+      readonly reasoningEfforts?: readonly string[]
+      readonly defaultEffort?: string
+    }[]
+  } = { isExternal: false, models: [] }
+  const catalogResult =
+    typeof host.runtimes.listAvailableModelsForPreset === 'function'
+      ? await host.runtimes
+          .listAvailableModelsForPreset(effectivePreset, effectiveProfileId)
+          .catch(() => emptyCatalog)
+      : emptyCatalog
+  const availableModels = catalogResult.models
+
+  if (!modelQuery) {
+    const header = [
+      `当前运行时：${runtimeLabel}`,
+      `当前模型：${currentModelId || 'default'}${currentEffort ? ` (${currentEffort})` : ''}`,
+    ]
+    if (availableModels.length === 0) {
+      await input.reply(
+        [
+          ...header,
+          '暂未探测到可用模型列表。',
+          '用法：/model <模型 ID> [思考强度]',
+        ].join('\n'),
+      )
+      return
+    }
+    const lines = availableModels.map((m) => {
+      const isCur = Boolean(currentModelId && m.id === currentModelId)
+      const aliasName = m.name && m.name !== m.id ? ` (${m.name})` : ''
+      const efforts =
+        m.reasoningEfforts && m.reasoningEfforts.length > 0
+          ? ` [${m.reasoningEfforts.join('/')}]`
+          : ''
+      return `- ${m.id}${aliasName}${efforts}${isCur ? '  ← 当前' : ''}`
+    })
+    await input.reply(
+      [
+        ...header,
+        '',
+        `真实可用模型（共 ${availableModels.length} 个）：`,
+        ...lines,
+        '',
+        isGroupChat
+          ? '用法：/model <模型 ID> [思考强度]（仅对当前会话生效，不改群默认配置）'
+          : '用法：/model <模型 ID> [思考强度]',
+      ].join('\n'),
+    )
+    return
+  }
+
+  const matchedEntry =
+    availableModels.find((m) => m.id === modelQuery) ??
+    availableModels.find((m) => m.id.toLowerCase() === modelQuery.toLowerCase()) ??
+    availableModels.find((m) => m.name.toLowerCase() === modelQuery.toLowerCase())
+
+  if (availableModels.length > 0 && !matchedEntry) {
+    const preview = availableModels.map((m) => m.id).join('、')
+    await input.reply(
+      `运行时 ${runtimeLabel} 下未找到模型 "${modelQuery}"。\n当前真实可用模型：${preview}\n发送 /model 可查看完整列表与支持的思考强度。`,
+    )
+    return
+  }
+
+  const targetModel = matchedEntry?.id ?? modelQuery
+  let targetEffort: string | undefined
+  if (effortQuery) {
+    if (matchedEntry?.reasoningEfforts !== undefined) {
+      if (matchedEntry.reasoningEfforts.length === 0) {
+        await input.reply(`模型 ${targetModel} 不支持手动调节思考强度，请省略思考强度参数。`)
+        return
+      }
+      const matchedEffort = matchedEntry.reasoningEfforts.find(
+        (e) => e.toLowerCase() === effortQuery,
+      )
+      if (!matchedEffort) {
+        await input.reply(
+          `模型 ${targetModel} 不支持思考强度 "${effortQuery}"，可选：${matchedEntry.reasoningEfforts.join(' / ')}`,
+        )
+        return
+      }
+      targetEffort = matchedEffort
+    } else {
+      targetEffort = effortQuery
+    }
+  } else if (matchedEntry?.reasoningEfforts !== undefined) {
+    if (matchedEntry.reasoningEfforts.length === 0) {
+      targetEffort = undefined
+    } else if (currentEffort && matchedEntry.reasoningEfforts.includes(currentEffort)) {
+      targetEffort = currentEffort
+    } else {
+      targetEffort = matchedEntry.defaultEffort
+    }
+  } else {
+    targetEffort = currentEffort || undefined
+  }
+
   const launch = effectivePreset
     ? await host.runtimes
         .resolveAgentLaunch({
           agentPreset: effectivePreset,
           ...(effectiveProfileId ? { runtimeProfileId: effectiveProfileId } : {}),
-          explicitModel: model,
+          explicitModel: targetModel,
+          ...(targetEffort ? { explicitReasoningEffort: targetEffort } : {}),
         })
         .catch(() => undefined)
     : undefined
   const provider =
+    matchedEntry?.provider ??
     launch?.provider ??
-    liveAgent?.model.current()?.provider ??
+    catalogResult.provider ??
+    currentSel?.provider ??
     (binding ? host.runtimes.providerFor(binding.agentPreset) : undefined)
-  if (liveAgent && provider) {
-    liveAgent.model.select({ provider, model })
-    if (input.group?.runtimeMode === 'override') {
-      host.store.upsertGroup({ ...input.group, model })
+
+  if (binding) {
+    if (liveAgent && provider) {
+      try {
+        liveAgent.model.select({
+          provider,
+          model: targetModel,
+          ...(targetEffort
+            ? { reasoningEffort: brandString<ReasoningEffortId>(targetEffort) }
+            : {}),
+        })
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        await input.reply(`切换当前会话模型失败（${runtimeLabel}）：${msg}`)
+        return
+      }
     }
-    await input.reply(`当前会话模型已切换为 ${model}`)
+    host.store.upsertBinding({
+      ...binding,
+      model: targetModel,
+      ...(targetEffort ? { reasoningEffort: targetEffort } : { reasoningEffort: undefined }),
+      runtimePinned: true,
+    })
+    const displayModel =
+      matchedEntry?.name && matchedEntry.name !== targetModel
+        ? `${matchedEntry.name} (${targetModel})`
+        : targetModel
+    const effortNote = targetEffort ? ` · 思考强度 ${targetEffort}` : ''
+    await input.reply(
+      `当前会话模型已切换为 ${displayModel}${effortNote}（仅对本会话生效，不改默认配置；下一轮对话起生效）。`,
+    )
     return
   }
-  if (input.group?.runtimeMode === 'override') {
-    host.store.upsertGroup({ ...input.group, model })
-    await input.reply(`本群独立模型已更新为 ${model}`)
-    return
-  }
-  host.store.upsertBot({ ...input.bot, model })
-  await input.reply(`默认模型已更新为 ${model}`)
+
+  // P2P without active session: keep updating Bot default model (never reached in group chat).
+  host.store.upsertBot({
+    ...input.bot,
+    model: targetModel,
+    ...(targetEffort ? { reasoningEffort: targetEffort } : { reasoningEffort: undefined }),
+  })
+  const effortNote = targetEffort ? `（思考强度 ${targetEffort}）` : ''
+  await input.reply(`默认模型已更新为 ${targetModel}${effortNote}`)
 }

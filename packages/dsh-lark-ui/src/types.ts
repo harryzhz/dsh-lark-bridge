@@ -31,6 +31,34 @@ export type ReminderCreationMode = 'silent' | 'notify' | 'confirm'
 export type RouterScopeMode = 'passive_only' | 'active_thread_only' | 'all_group'
 export type GroupRouterMode = 'inherit' | 'override' | 'off'
 export type RouterBypassMsgType = 'interactive' | 'text' | 'post' | 'image'
+export type TaskDifficultyTier = 'lite' | 'standard' | 'heavy'
+export type TierRoutingBypassTier = 'default' | TaskDifficultyTier
+
+export interface TierRoutingTarget {
+  id: string
+  agentPreset: string
+  runtimeProfileId: string
+  model: string
+  reasoningEffort: string
+  weight: number
+  enabled: boolean
+}
+
+export interface TierRoutingTierConfig {
+  prompt: string
+  targets: TierRoutingTarget[]
+}
+
+export interface TierRoutingConfig {
+  enabled: boolean
+  presetKey: string
+  bypassTier: TierRoutingBypassTier
+  tiers: {
+    lite: TierRoutingTierConfig
+    standard: TierRoutingTierConfig
+    heavy: TierRoutingTierConfig
+  }
+}
 
 export interface RouterBypassConfig {
   senderTypes: ListenerSenderType[]
@@ -99,6 +127,7 @@ export interface BotRouterConfig {
   contextTtlMinutes: number
   includeLastReply: boolean
   coalesceQueuedMessages: boolean
+  tierRouting?: TierRoutingConfig
 }
 
 export interface GroupRouterConfig {
@@ -114,6 +143,7 @@ export interface GroupRouterConfig {
   contextTtlMinutes: number
   includeLastReply: boolean
   coalesceQueuedMessages: boolean
+  tierRouting?: TierRoutingConfig
 }
 
 export interface BotExperimentalConfig {
@@ -580,6 +610,10 @@ export interface SessionBinding {
   sessionId: string
   agentPreset: string
   runtimeProfileId?: string
+  model?: string
+  reasoningEffort?: string
+  runtimePinned?: boolean
+  routedTier?: TaskDifficultyTier
   workingDir: string
   trigger: string
   listenerName?: string

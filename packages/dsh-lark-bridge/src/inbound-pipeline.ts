@@ -16,6 +16,7 @@ import {
   decideLarkRouting,
   extractInjectedLarkMessageIdsFromText,
   extractRouteScope,
+  hasConfiguredTierRouting,
   isGroupEnabled,
   isLarkMessageRecalledError,
   isSilentReplySentinel,
@@ -23,6 +24,7 @@ import {
   replaceMentionKeysWithNames,
   resolveEffectiveCardBot,
   resolveEffectiveRouterConfig,
+  selectWeightedTierTarget,
   shouldFastBypassTriage,
   shouldRunTriage,
   type EffectiveRouterConfig,
@@ -34,6 +36,8 @@ import {
   type RecalledLarkMessageEvent,
   type RouterHandoffTurn,
   type SendLarkReplyResult,
+  type TaskDifficultyTier,
+  type TierRoutingTarget,
   type TriageActiveListenerSummary,
   type TriageHistoryEntry,
 } from '@dsh-lark/lark-core'
@@ -125,7 +129,31 @@ const TRIAGE_HISTORY_BACKFILL_TIMEOUT_MS = 1_200
 const ACTIVE_TURN_HEARTBEAT_PERSIST_INTERVAL_MS = 15_000
 const RECALLED_MESSAGE_TTL_MS = 10 * 60_000
 const MAX_RECALLED_MESSAGES = 2_000
+const TIER_TARGET_COOLDOWN_MS = 60_000
 const UNEXPECTED_SILENT_SENTINEL_FALLBACK = '抱歉，当前消息不在我的职责范围内或暂无法直接回复。'
+
+interface RoutedTierSelection {
+  readonly tier: TaskDifficultyTier
+  readonly agentPreset: string
+  readonly runtimeProfileId?: string
+  readonly model?: string
+  readonly reasoningEffort?: string
+  readonly summary: string
+}
+
+function tierDisplayName(tier: TaskDifficultyTier): string {
+  if (tier === 'lite') return '轻量'
+  if (tier === 'standard') return '标准'
+  return '深度'
+}
+
+function tierTargetCooldownKey(
+  agentPreset: string,
+  runtimeProfileId?: string,
+  model?: string,
+): string {
+  return `${agentPreset.trim().toLowerCase()}::${(runtimeProfileId ?? '').trim().toLowerCase()}::${(model ?? '').trim().toLowerCase()}`
+}
 
 type DisableCancelScope = 'group' | 'bot'
 
@@ -439,6 +467,7 @@ export class InboundPipeline {
   private readonly recoveringTurnIds = new Set<string>()
   private readonly recoveryTasks = new Set<Promise<void>>()
   private readonly sentMessageIdsBySession = new Map<string, Set<string>>()
+  private readonly tierTargetCooldowns = new Map<string, number>()
   private readonly listenerDebounce: ListenerDebounceBuffer<DebouncedInboundItem>
 
   constructor(private readonly host: InboundPipelineHost) {
@@ -2307,8 +2336,11 @@ export class InboundPipeline {
         return
       }
 
+      const hasExistingBindingForTriage = Boolean(this.host.store.getBinding(decision.routeKey))
       const needsTriage =
-        !recovery && Boolean(this.host.triage) && shouldRunTriage(decision, routerConfig)
+        !recovery &&
+        Boolean(this.host.triage) &&
+        shouldRunTriage(decision, routerConfig, { hasActiveWorker: hasExistingBindingForTriage })
       const skipQuotePrefetch = Boolean(
         msg.parentId &&
           !needsTriage &&
@@ -2337,8 +2369,15 @@ export class InboundPipeline {
       const chatScopeKey = `chat:${bot.id}:${msg.chatId}`
       let triageNote: string | undefined
       let triageSessionId: string | undefined
+      let routedDecision: AgentDecision = decision
 
-      if (!recovery && this.host.triage && shouldRunTriage(decision, routerConfig)) {
+      if (
+        !recovery &&
+        this.host.triage &&
+        shouldRunTriage(decision, routerConfig, {
+          hasActiveWorker: Boolean(this.host.store.getBinding(decision.routeKey)),
+        })
+      ) {
         const triageOutcome = await this.evaluateAndHandleTriage({
           bot,
           transport,
@@ -2370,6 +2409,22 @@ export class InboundPipeline {
         }
         triageNote = triageOutcome.triageNote
         triageSessionId = triageOutcome.triageSessionId
+        if (triageOutcome.routedRuntime) {
+          const rt = triageOutcome.routedRuntime
+          routedDecision = {
+            ...decision,
+            agentPreset: rt.agentPreset,
+            ...(rt.runtimeProfileId
+              ? { runtimeProfileId: rt.runtimeProfileId }
+              : { runtimeProfileId: undefined }),
+            ...(rt.model ? { model: rt.model } : { model: undefined }),
+            ...(rt.reasoningEffort
+              ? { reasoningEffort: rt.reasoningEffort }
+              : { reasoningEffort: undefined }),
+            runtimePinned: true,
+            routedTier: rt.tier,
+          }
+        }
       } else if (!recovery && this.host.triage && msg.chatType === 'group') {
         this.host.triage.context.recordInboundMessage(chatScopeKey, decision.routeKey, {
           role: 'user',
@@ -2438,8 +2493,8 @@ export class InboundPipeline {
       })
 
       let trackedSessionId: string | undefined
-      let trackedRouteKey = decision.routeKey
-      let boundDecision: AgentDecision = decision
+      let trackedRouteKey = routedDecision.routeKey
+      let boundDecision: AgentDecision = routedDecision
       let acquiredRef: AcquiredAgent | undefined
       let leaderRegistered = false
       let releaseTurnSlot: (() => void) | undefined
@@ -2452,7 +2507,7 @@ export class InboundPipeline {
       let batchItems: readonly QueuedWorkerTurnItem[] = [
         {
           msg,
-          decision,
+          decision: routedDecision,
           activeTurn,
           cancelController: msgCancelController,
           mediaCache,
@@ -2468,12 +2523,30 @@ export class InboundPipeline {
       ]
 
       try {
-        const acquired = await this.host.sessions.acquireAgent(bot, msg, decision)
+        const acquired = await this.host.sessions.acquireAgent(bot, msg, routedDecision)
         acquiredRef = acquired
         trackedSessionId = acquired.sessionId
         activeTurn.sessionId = trackedSessionId
-        if (acquired.routeKey !== decision.routeKey) {
-          boundDecision = { ...decision, routeKey: acquired.routeKey }
+        const activeBinding = this.host.store.getBinding(acquired.routeKey)
+        if (acquired.routeKey !== routedDecision.routeKey || activeBinding?.runtimePinned) {
+          boundDecision = {
+            ...routedDecision,
+            routeKey: acquired.routeKey,
+            ...(activeBinding?.runtimePinned
+              ? {
+                  agentPreset: activeBinding.agentPreset,
+                  ...(activeBinding.runtimeProfileId
+                    ? { runtimeProfileId: activeBinding.runtimeProfileId }
+                    : { runtimeProfileId: undefined }),
+                  ...(activeBinding.model ? { model: activeBinding.model } : { model: undefined }),
+                  ...(activeBinding.reasoningEffort
+                    ? { reasoningEffort: activeBinding.reasoningEffort }
+                    : { reasoningEffort: undefined }),
+                  runtimePinned: true,
+                  ...(activeBinding.routedTier ? { routedTier: activeBinding.routedTier } : {}),
+                }
+              : {}),
+          }
           trackedRouteKey = acquired.routeKey
           activeTurn.routeKey = acquired.routeKey
         }
@@ -3088,6 +3161,13 @@ export class InboundPipeline {
         shouldDisposeEphemeral = settlement.dispose
         shouldArchiveEphemeral = settlement.archive
       } catch (err) {
+        if (!(err instanceof TurnAbortedError)) {
+          this.markTierTargetCooldown(
+            boundDecision.agentPreset,
+            boundDecision.runtimeProfileId,
+            boundDecision.model,
+          )
+        }
         const failure = await this.handleBatchFailure({
           bot,
           transport,
@@ -3668,6 +3748,88 @@ export class InboundPipeline {
     return { dispose, archive }
   }
 
+  private markTierTargetCooldown(
+    agentPreset: string,
+    runtimeProfileId?: string,
+    model?: string,
+  ): void {
+    const key = tierTargetCooldownKey(agentPreset, runtimeProfileId, model)
+    this.tierTargetCooldowns.set(key, Date.now() + TIER_TARGET_COOLDOWN_MS)
+  }
+
+  private isTierTargetInCooldown(target: TierRoutingTarget, now = Date.now()): boolean {
+    const key = tierTargetCooldownKey(target.agentPreset, target.runtimeProfileId, target.model)
+    const until = this.tierTargetCooldowns.get(key)
+    if (!until) return false
+    if (now >= until) {
+      this.tierTargetCooldowns.delete(key)
+      return false
+    }
+    return true
+  }
+
+  private async selectTierRoutedTarget(
+    tier: TaskDifficultyTier,
+    routerConfig: EffectiveRouterConfig,
+  ): Promise<RoutedTierSelection | undefined> {
+    if (!hasConfiguredTierRouting(routerConfig)) return undefined
+    const runtimeList = await this.host.runtimes.list().catch(() => [])
+    const availableById = new Map(runtimeList.map((r) => [r.id, r]))
+    const picked = selectWeightedTierTarget({
+      tier,
+      tierRouting: routerConfig.tierRouting,
+      isAvailable: (target) => {
+        if (availableById.size === 0) return true
+        const rt = availableById.get(target.agentPreset)
+        return Boolean(rt && !rt.broken)
+      },
+      hasConcurrencyCapacity: (target) => {
+        if (!this.host.runtimeLimiter) return true
+        const key =
+          typeof this.host.runtimes.resolveConcurrencyKey === 'function'
+            ? this.host.runtimes.resolveConcurrencyKey(
+                target.agentPreset,
+                target.runtimeProfileId || undefined,
+              )
+            : buildRuntimeConcurrencyKey(
+                target.agentPreset,
+                target.runtimeProfileId || undefined,
+              )
+        return this.host.runtimeLimiter.hasCapacity(key)
+      },
+      isInCooldown: (target) => this.isTierTargetInCooldown(target),
+    })
+    if (!picked) return undefined
+
+    const { target } = picked
+    const rt = availableById.get(target.agentPreset)
+    const rtName = rt?.name ?? target.agentPreset
+    const profName = target.runtimeProfileId
+      ? rt?.profiles?.find((p) => p.id === target.runtimeProfileId)?.name ?? target.runtimeProfileId
+      : ''
+    const runtimeDesc = profName ? `${rtName} (${profName})` : rtName
+    const modelDesc = target.model
+      ? target.reasoningEffort
+        ? `${target.model} (${target.reasoningEffort})`
+        : target.model
+      : target.reasoningEffort
+        ? `默认模型 (${target.reasoningEffort})`
+        : '默认模型'
+    const hints: string[] = []
+    if (picked.avoidedBusy) hints.push('避让繁忙')
+    if (picked.avoidedCooldown) hints.push('避让冷却')
+    const hintSuffix = hints.length > 0 ? ` · ${hints.join('/')}` : ''
+
+    return {
+      tier,
+      agentPreset: target.agentPreset,
+      ...(target.runtimeProfileId ? { runtimeProfileId: target.runtimeProfileId } : {}),
+      ...(target.model ? { model: target.model } : {}),
+      ...(target.reasoningEffort ? { reasoningEffort: target.reasoningEffort } : {}),
+      summary: `${tierDisplayName(tier)}档 [${tier}] → ${runtimeDesc} · ${modelDesc}${hintSuffix}`,
+    }
+  }
+
   private async evaluateAndHandleTriage(input: {
     readonly bot: LarkBotConfig
     readonly transport: LarkBotTransport
@@ -3688,6 +3850,7 @@ export class InboundPipeline {
     readonly handled: boolean
     readonly triageNote?: string
     readonly triageSessionId?: string
+    readonly routedRuntime?: RoutedTierSelection
   }> {
     const {
       bot,
@@ -3773,6 +3936,20 @@ export class InboundPipeline {
         timestampMs: startedMs,
         messageId: msg.messageId,
       })
+      let bypassRouted: RoutedTierSelection | undefined
+      if (
+        !initialBinding &&
+        hasConfiguredTierRouting(routerConfig) &&
+        routerConfig.tierRouting.bypassTier !== 'default'
+      ) {
+        bypassRouted = await this.selectTierRoutedTarget(
+          routerConfig.tierRouting.bypassTier,
+          routerConfig,
+        )
+      }
+      const bypassSummary = bypassRouted
+        ? `规则直通：${bypass.reason || '直通主运行时'}（${bypassRouted.summary}）`
+        : `规则直通：${bypass.reason || '直通主运行时'}`
       this.host.store.recordEvent({
         botId: bot.id,
         chatId: msg.chatId,
@@ -3780,9 +3957,13 @@ export class InboundPipeline {
         routeKey: decision.routeKey,
         traceId,
         kind: 'triage',
-        summary: `规则直通：${bypass.reason || '直通主运行时'}`,
+        summary: bypassSummary,
       })
-      return { handled: false, ...(bypass.reason ? { triageNote: bypass.reason } : {}) }
+      return {
+        handled: false,
+        ...(bypass.reason ? { triageNote: bypassSummary } : {}),
+        ...(bypassRouted ? { routedRuntime: bypassRouted } : {}),
+      }
     }
 
     await this.hydrateTriageContextIfNeeded({
@@ -4047,6 +4228,17 @@ export class InboundPipeline {
       }
     }
 
+    let routedRuntime: RoutedTierSelection | undefined
+    if (
+      !hasActiveWorker &&
+      !decision.silentOnly &&
+      !result.verdict.fallback &&
+      hasConfiguredTierRouting(routerConfig)
+    ) {
+      const targetTier: TaskDifficultyTier = result.verdict.tier ?? 'standard'
+      routedRuntime = await this.selectTierRoutedTarget(targetTier, routerConfig)
+    }
+
     const prefix = result.verdict.fallback ? '分流回退直通' : '分流转交'
     const fallbackDiag = result.verdict.fallback
       ? (() => {
@@ -4059,7 +4251,8 @@ export class InboundPipeline {
           return ''
         })()
       : ''
-    if (result.triageSessionId || fallbackDiag) {
+    const routedSuffix = routedRuntime ? `（${routedRuntime.summary}）` : ''
+    if (result.triageSessionId || fallbackDiag || routedRuntime) {
       this.host.store.recordEvent({
         botId: bot.id,
         chatId: msg.chatId,
@@ -4069,13 +4262,14 @@ export class InboundPipeline {
         traceId,
         durationMs: result.durationMs,
         kind: 'triage',
-        summary: `${prefix}：${result.verdict.reason}${fallbackDiag}`,
+        summary: `${prefix}：${result.verdict.reason}${routedSuffix}${fallbackDiag}`,
       })
     }
     return {
       handled: false,
-      triageNote: `${prefix}：${result.verdict.reason}${fallbackDiag}（${result.durationMs}ms）`,
+      triageNote: `${prefix}：${result.verdict.reason}${routedSuffix}${fallbackDiag}（${result.durationMs}ms）`,
       ...(result.triageSessionId ? { triageSessionId: result.triageSessionId } : {}),
+      ...(routedRuntime ? { routedRuntime } : {}),
     }
   }
 
@@ -4927,6 +5121,7 @@ export class InboundPipeline {
     agentPreset: string,
     explicitModel?: string,
     runtimeProfileId?: string,
+    reasoningEffort?: string,
   ): Promise<string> {
     const runtimeList = await this.host.runtimes.list().catch(() => [])
     const runtimeOpt = runtimeList.find((r) => r.id === agentPreset)
@@ -4971,7 +5166,9 @@ export class InboundPipeline {
         .catch(() => undefined)
       if (resolved?.name) modelLabel = resolved.name
     }
-    return [runtimeLabel, modelLabel].filter(Boolean).join(' · ')
+    const effortText = reasoningEffort?.trim()
+    const fullModel = effortText ? `${modelLabel} (${effortText})` : modelLabel
+    return [runtimeLabel, fullModel].filter(Boolean).join(' · ')
   }
 
   private hasUnsettledQueueAnchorForSession(sessionId: string | undefined): boolean {
@@ -5155,6 +5352,7 @@ export class InboundPipeline {
             decision.agentPreset,
             decision.model,
             decision.runtimeProfileId,
+            decision.reasoningEffort,
           )
         : ''
     const card = decision.useCard

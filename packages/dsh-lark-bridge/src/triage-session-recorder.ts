@@ -58,18 +58,27 @@ export interface RecordTriageSessionInput {
   readonly durationMs: number
 }
 
+function tierLabel(tier: TriageVerdict['tier']): string {
+  if (tier === 'lite') return '轻量'
+  if (tier === 'standard') return '标准'
+  if (tier === 'heavy') return '深度'
+  return ''
+}
+
 function actionLabel(verdict: TriageVerdict): string {
   if (verdict.fallback) return '回退'
   if (verdict.action === 'silent') return '静默'
   if (verdict.action === 'quick_reply') return '快回'
-  return '转交'
+  const tl = tierLabel(verdict.tier)
+  return tl ? `转交·${tl}` : '转交'
 }
 
 function conclusionActionTag(verdict: TriageVerdict): string {
   if (verdict.fallback) return `\`${verdict.action}\`（回退直通）`
   if (verdict.action === 'silent') return '`silent`（静默跳过）'
   if (verdict.action === 'quick_reply') return '`quick_reply`（轻回复）'
-  return '`handoff`（转交主运行时）'
+  const tl = tierLabel(verdict.tier)
+  return tl ? `\`handoff\`（转交 · ${tl}档 \`${verdict.tier}\`）` : '`handoff`（转交主运行时）'
 }
 
 export function formatTriageConclusion(verdict: TriageVerdict, errorMessage?: string): string {
@@ -90,7 +99,12 @@ export function formatTriageConclusion(verdict: TriageVerdict, errorMessage?: st
 }
 
 function formatTriageToolOutput(verdict: TriageVerdict, errorMessage?: string): string {
-  const lines = [`裁决：${verdict.action}${verdict.fallback ? '（回退直通）' : ''}`, `原因：${verdict.reason}`]
+  const tl = tierLabel(verdict.tier)
+  const tierSuffix = tl ? ` · 难度档位：${tl} (${verdict.tier})` : ''
+  const lines = [
+    `裁决：${verdict.action}${verdict.fallback ? '（回退直通）' : ''}${tierSuffix}`,
+    `原因：${verdict.reason}`,
+  ]
   if (verdict.replyText) {
     lines.push(`快回内容：${verdict.replyText}`)
   }

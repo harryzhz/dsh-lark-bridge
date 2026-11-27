@@ -14,6 +14,7 @@ import { TELEMETRY_SENDER_MIGRATION } from './009-telemetry-sender.js'
 import { TELEMETRY_LATENCY_SPLIT_MIGRATION } from './010-telemetry-latency-split.js'
 import { HOT_RELOAD_REATTACH_MIGRATION } from './011-hot-reload-reattach.js'
 import { COT_ORPHAN_TRACKING_MIGRATION } from './012-cot-orphan-tracking.js'
+import { SESSION_TIER_ROUTING_MIGRATION } from './013-session-tier-routing.js'
 
 export type { SqlMigration }
 export {
@@ -29,6 +30,7 @@ export {
   TELEMETRY_LATENCY_SPLIT_MIGRATION,
   HOT_RELOAD_REATTACH_MIGRATION,
   COT_ORPHAN_TRACKING_MIGRATION,
+  SESSION_TIER_ROUTING_MIGRATION,
 }
 
 export const ALL_MIGRATIONS: readonly SqlMigration[] = [
@@ -44,6 +46,7 @@ export const ALL_MIGRATIONS: readonly SqlMigration[] = [
   TELEMETRY_LATENCY_SPLIT_MIGRATION,
   HOT_RELOAD_REATTACH_MIGRATION,
   COT_ORPHAN_TRACKING_MIGRATION,
+  SESSION_TIER_ROUTING_MIGRATION,
 ]
 
 export const ENTITY_TABLE_NAMES = [

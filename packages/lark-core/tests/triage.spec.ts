@@ -180,6 +180,16 @@ describe('Smart triage config, per-group overrides & protocol', () => {
       contextTtlMinutes: 60,
       includeLastReply: true,
       coalesceQueuedMessages: false,
+      tierRouting: {
+        enabled: false,
+        presetKey: '',
+        bypassTier: 'default',
+        tiers: {
+          lite: { prompt: '', targets: [] },
+          standard: { prompt: '', targets: [] },
+          heavy: { prompt: '', targets: [] },
+        },
+      },
     })
 
     // Group override leaving provider/model blank inherits Bot router model; explicit fields keep schema defaults
@@ -414,6 +424,7 @@ describe('Smart triage config, per-group overrides & protocol', () => {
       'active_session_rule',
       'listener_name',
       'listener_prompt',
+      'tier_routing_guide',
     ])
 
     const vars = buildTriageSystemPromptVars({

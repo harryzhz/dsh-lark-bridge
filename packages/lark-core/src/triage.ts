@@ -3,6 +3,9 @@ import type {
   InboundLarkMessage,
   RouterBypassConfig,
   RoutingDecision,
+  TaskDifficultyTier,
+  TierRoutingConfig,
+  TierRoutingTarget,
 } from './types.js'
 
 export type TriageAction = 'silent' | 'quick_reply' | 'handoff'
@@ -11,7 +14,175 @@ export interface TriageVerdict {
   readonly action: TriageAction
   readonly reason: string
   readonly replyText?: string
+  readonly tier?: TaskDifficultyTier
   readonly fallback?: boolean
+}
+
+export const TASK_DIFFICULTY_TIERS: readonly TaskDifficultyTier[] = ['lite', 'standard', 'heavy']
+
+export const DEFAULT_TIER_ROUTING_DESCRIPTIONS: Readonly<Record<TaskDifficultyTier, string>> = {
+  lite: '轻量任务：查资料、查飞书消息/文档、读单个文件、简单配置查询、内容总结整理或单步工具操作',
+  standard: '常规研发与协作：常规代码修改、定位常见 Bug、补写单测、常规 PR Review、多工具信息检索与方案整理',
+  heavy: '深度攻坚任务：跨模块架构设计、疑难并发/性能/线上复杂故障根因排查、大规模重构、高风险安全/代码深度审查或复杂长上下文深推',
+}
+
+export const RECOMMENDED_TIER_ROUTING_TARGETS: Readonly<
+  Record<TaskDifficultyTier, readonly TierRoutingTarget[]>
+> = {
+  lite: [
+    {
+      id: 'lite-agy',
+      agentPreset: 'agy',
+      runtimeProfileId: '',
+      model: 'gemini-4-neon',
+      reasoningEffort: 'low',
+      weight: 50,
+      enabled: true,
+    },
+    {
+      id: 'lite-codex',
+      agentPreset: 'codex',
+      runtimeProfileId: '',
+      model: 'gpt-6.1-sol',
+      reasoningEffort: 'low',
+      weight: 50,
+      enabled: true,
+    },
+  ],
+  standard: [
+    {
+      id: 'std-agy',
+      agentPreset: 'agy',
+      runtimeProfileId: '',
+      model: 'gemini-4-neon',
+      reasoningEffort: 'xhigh',
+      weight: 50,
+      enabled: true,
+    },
+    {
+      id: 'std-codex',
+      agentPreset: 'codex',
+      runtimeProfileId: '',
+      model: 'gpt-6.1-sol',
+      reasoningEffort: 'xhigh',
+      weight: 50,
+      enabled: true,
+    },
+  ],
+  heavy: [
+    {
+      id: 'heavy-agy',
+      agentPreset: 'agy',
+      runtimeProfileId: '',
+      model: 'gemini-4-carbon',
+      reasoningEffort: 'high',
+      weight: 50,
+      enabled: true,
+    },
+    {
+      id: 'heavy-codex',
+      agentPreset: 'codex',
+      runtimeProfileId: '',
+      model: 'gpt-6-astra',
+      reasoningEffort: 'xhigh',
+      weight: 50,
+      enabled: true,
+    },
+  ],
+}
+
+export interface WeightedTierSelectionInput {
+  readonly tier: TaskDifficultyTier
+  readonly tierRouting: TierRoutingConfig
+  /** Optional runtime availability check (false = skip broken/uninstalled runtime). */
+  readonly isAvailable?: (target: TierRoutingTarget) => boolean
+  /** Optional concurrency capacity check (true = has free concurrency slot right now). */
+  readonly hasConcurrencyCapacity?: (target: TierRoutingTarget) => boolean
+  /** Optional temporary cooldown/backoff check (true = recently failed / 429). */
+  readonly isInCooldown?: (target: TierRoutingTarget) => boolean
+  /** Injectable RNG in [0, 1) for deterministic testing. */
+  readonly random?: () => number
+}
+
+export interface WeightedTierSelectionResult {
+  readonly tier: TaskDifficultyTier
+  readonly target: TierRoutingTarget
+  readonly totalWeight: number
+  readonly candidateCount: number
+  readonly avoidedBusy: boolean
+  readonly avoidedCooldown: boolean
+}
+
+export function hasConfiguredTierRouting(
+  routerConfig: Pick<EffectiveRouterConfig, 'enabled' | 'tierRouting'> | undefined,
+): boolean {
+  if (!routerConfig?.enabled || !routerConfig.tierRouting?.enabled) return false
+  const tiers = routerConfig.tierRouting.tiers
+  return TASK_DIFFICULTY_TIERS.some((tier) =>
+    (tiers[tier]?.targets ?? []).some(
+      (t) => t.enabled !== false && t.weight > 0 && Boolean(t.agentPreset.trim()),
+    ),
+  )
+}
+
+export function selectWeightedTierTarget(
+  input: WeightedTierSelectionInput,
+): WeightedTierSelectionResult | undefined {
+  const rawTargets = input.tierRouting.tiers[input.tier]?.targets ?? []
+  const eligible = rawTargets.filter(
+    (t) =>
+      t.enabled !== false &&
+      t.weight > 0 &&
+      Boolean(t.agentPreset.trim()) &&
+      (input.isAvailable ? input.isAvailable(t) : true),
+  )
+  if (eligible.length === 0) return undefined
+
+  const healthy = eligible.filter((t) => !(input.isInCooldown?.(t) ?? false))
+  const healthyIdle = healthy.filter((t) => input.hasConcurrencyCapacity?.(t) ?? true)
+  const anyIdle = eligible.filter((t) => input.hasConcurrencyCapacity?.(t) ?? true)
+
+  let pool: readonly TierRoutingTarget[]
+  let avoidedCooldown = false
+  let avoidedBusy = false
+
+  if (healthyIdle.length > 0) {
+    pool = healthyIdle
+    avoidedCooldown = healthy.length < eligible.length
+    avoidedBusy = healthyIdle.length < healthy.length
+  } else if (healthy.length > 0) {
+    pool = healthy
+    avoidedCooldown = healthy.length < eligible.length
+  } else if (anyIdle.length > 0) {
+    pool = anyIdle
+    avoidedBusy = anyIdle.length < eligible.length
+  } else {
+    pool = eligible
+  }
+
+  const totalWeight = pool.reduce((sum, item) => sum + item.weight, 0)
+  if (totalWeight <= 0) return undefined
+
+  const rngVal = input.random ? input.random() : Math.random()
+  const clamped = Number.isFinite(rngVal) ? Math.min(0.999999999, Math.max(0, rngVal)) : 0
+  let cursor = clamped * totalWeight
+  let chosen = pool[pool.length - 1]!
+  for (const item of pool) {
+    cursor -= item.weight
+    if (cursor < 0) {
+      chosen = item
+      break
+    }
+  }
+
+  return {
+    tier: input.tier,
+    target: chosen,
+    totalWeight,
+    candidateCount: pool.length,
+    avoidedBusy,
+    avoidedCooldown,
+  }
 }
 
 export interface TriageToolSchema {
@@ -121,6 +292,44 @@ export const ROUTE_MESSAGE_TOOL_SCHEMA: TriageToolSchema = {
   },
 }
 
+export function buildRouteMessageToolSchema(
+  options: { readonly includeTier?: boolean } = {},
+): TriageToolSchema {
+  if (!options.includeTier) return ROUTE_MESSAGE_TOOL_SCHEMA
+  const baseProps = ROUTE_MESSAGE_TOOL_SCHEMA.parameters.properties as Record<string, unknown>
+  return {
+    name: ROUTE_MESSAGE_TOOL_SCHEMA.name,
+    description: `${ROUTE_MESSAGE_TOOL_SCHEMA.description} When action is "handoff" on a new session, also set "tier" (lite | standard | heavy) based on task complexity.`,
+    parameters: {
+      ...ROUTE_MESSAGE_TOOL_SCHEMA.parameters,
+      properties: {
+        ...baseProps,
+        tier: {
+          type: 'string',
+          enum: ['lite', 'standard', 'heavy'],
+          description:
+            'Task difficulty tier when action is "handoff" for a new session: "lite" (quick lookup/summary/single-step), "standard" (routine coding/debugging/review), or "heavy" (complex architecture/deep debugging/large refactor/hard reasoning).',
+        },
+      },
+    },
+  }
+}
+
+export function buildTierRoutingGuide(tierRouting: TierRoutingConfig | undefined): string {
+  if (!tierRouting?.enabled) return ''
+  const liteDesc = tierRouting.tiers.lite.prompt.trim() || DEFAULT_TIER_ROUTING_DESCRIPTIONS.lite
+  const stdDesc =
+    tierRouting.tiers.standard.prompt.trim() || DEFAULT_TIER_ROUTING_DESCRIPTIONS.standard
+  const heavyDesc = tierRouting.tiers.heavy.prompt.trim() || DEFAULT_TIER_ROUTING_DESCRIPTIONS.heavy
+  return [
+    '## 新会话难度分档（`tier`，仅在 `action="handoff"` 时填写）',
+    `- \`lite\`（轻量）：${liteDesc}`,
+    `- \`standard\`（标准）：${stdDesc}`,
+    `- \`heavy\`（深度）：${heavyDesc}`,
+    '- 判断拿不准时优先选 `standard`；涉及复杂根因定位、大范围代码改动或架构设计时选 `heavy`。',
+  ].join('\n')
+}
+
 export const TRIAGE_PROMPT_VARIABLES: readonly TriagePromptVariable[] = [
   { key: 'bot_name', token: '{{bot_name}}', label: '智能体名称', desc: '当前响应的智能体显示名称' },
   { key: 'bot_role', token: '{{bot_role}}', label: '角色设定', desc: '当前生效的角色名称与说明全文（未配置时为空）' },
@@ -130,6 +339,7 @@ export const TRIAGE_PROMPT_VARIABLES: readonly TriagePromptVariable[] = [
   { key: 'active_session_rule', token: '{{active_session_rule}}', label: '活跃会话约束', desc: '根据是否存在活跃主会话决定是否允许 quick_reply' },
   { key: 'listener_name', token: '{{listener_name}}', label: '监听规则名', desc: '命中主动监听时的规则名称（非监听为空）' },
   { key: 'listener_prompt', token: '{{listener_prompt}}', label: '监听指令全文', desc: '群主动监听配置的完整判断指令（非监听为空）' },
+  { key: 'tier_routing_guide', token: '{{tier_routing_guide}}', label: '难度分档规则', desc: '开启按难度路由且新建会话时自动生成的三档判定说明' },
 ]
 
 export const DEFAULT_TRIAGE_SYSTEM_PROMPT = [
@@ -146,13 +356,15 @@ export const DEFAULT_TRIAGE_SYSTEM_PROMPT = [
   '   - 无需回应的纯陈述确认语（如“收到”“好的”“了解”“+1”“辛苦了”“谢谢”），前提是它**不是**对上一轮提问的确认答复。',
   '{{active_session_rule}}',
   '',
+  '{{tier_routing_guide}}',
+  '',
   '{{trigger_guide}}',
   '',
   '{{listener_prompt}}',
   '',
   '{{bot_role}}',
   '',
-  `请优先调用工具 \`${TRIAGE_TOOL_NAME}\` 返回裁决；若当前通道不支持工具调用，仅输出一行合法 JSON：{"action":"silent|quick_reply|handoff","reason":"...","reply_text":"..."}。`,
+  `请优先调用工具 \`${TRIAGE_TOOL_NAME}\` 返回裁决；若当前通道不支持工具调用，仅输出一行合法 JSON：{"action":"silent|quick_reply|handoff","reason":"...","reply_text":"...","tier":"lite|standard|heavy"}。`,
 ].join('\n')
 
 export interface TriageSystemPromptVars {
@@ -164,19 +376,30 @@ export interface TriageSystemPromptVars {
   readonly active_session_rule: string
   readonly listener_name: string
   readonly listener_prompt: string
+  readonly tier_routing_guide: string
 }
 
 export type AgentRoutingDecision = Extract<RoutingDecision, { action: 'agent' }>
 
 /**
  * Whether an agent-bound routing decision falls under the configured smart-triage scope.
+ * When tier routing is enabled with configured targets, brand-new `@Bot` sessions also
+ * enter triage once to pick the difficulty tier (explicit `@Bot` stays forbidden from silent).
  */
 export function shouldRunTriage(
   decision: AgentRoutingDecision,
   routerConfig: EffectiveRouterConfig,
+  options?: { readonly hasActiveWorker?: boolean },
 ): boolean {
   if (!routerConfig.enabled) return false
   if (decision.trigger === 'p2p') return false
+  if (
+    decision.trigger === 'mention' &&
+    !options?.hasActiveWorker &&
+    hasConfiguredTierRouting(routerConfig)
+  ) {
+    return true
+  }
   if (routerConfig.scope === 'active_thread_only') {
     return decision.trigger === 'active-thread'
   }
@@ -394,11 +617,16 @@ export function buildTriageSystemPromptVars(input: {
   readonly listenerPrompt?: string
   readonly delegationFollowupEnabled?: boolean
   readonly silentOnly?: boolean
+  readonly tierRouting?: TierRoutingConfig
 }): TriageSystemPromptVars {
   const roleParts = [input.botRoleName?.trim(), input.botRoleSummary?.trim()].filter(Boolean)
   const botRole = roleParts.length > 0 ? `## 智能体角色设定\n${roleParts.join('\n')}` : ''
   const rawListener = input.trigger === 'listener' ? input.listenerPrompt?.trim() ?? '' : ''
   const listenerPrompt = rawListener ? `<listener_rule>\n${rawListener}\n</listener_rule>` : ''
+  const tierRoutingGuide =
+    !input.hasActiveWorker && !input.silentOnly && input.tierRouting?.enabled
+      ? buildTierRoutingGuide(input.tierRouting)
+      : ''
 
   return {
     bot_name: input.botName.trim(),
@@ -423,6 +651,7 @@ export function buildTriageSystemPromptVars(input: {
     }),
     listener_name: input.trigger === 'listener' ? (input.listenerName?.trim() ?? '') : '',
     listener_prompt: listenerPrompt,
+    tier_routing_guide: tierRoutingGuide,
   }
 }
 
@@ -440,11 +669,16 @@ export function renderTriageSystemPrompt(
     active_session_rule: vars.active_session_rule,
     listener_name: vars.listener_name,
     listener_prompt: vars.listener_prompt,
+    tier_routing_guide: vars.tier_routing_guide,
   }
-  const rendered = source.replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (full, rawKey: string) => {
+  const hasTierToken = /\{\{\s*tier_routing_guide\s*\}\}/i.test(source)
+  let rendered = source.replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (full, rawKey: string) => {
     const key = rawKey.toLowerCase()
     return Object.prototype.hasOwnProperty.call(table, key) ? table[key]! : full
   })
+  if (vars.tier_routing_guide && !hasTierToken) {
+    rendered = `${rendered.trim()}\n\n${vars.tier_routing_guide}`
+  }
   return rendered.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
 }
 
@@ -461,6 +695,7 @@ export function buildTriageSystemPrompt(input: {
   readonly systemPromptTemplate?: string
   readonly delegationFollowupEnabled?: boolean
   readonly silentOnly?: boolean
+  readonly tierRouting?: TierRoutingConfig
 }): string {
   const vars = buildTriageSystemPromptVars(input)
   return renderTriageSystemPrompt(input.systemPromptTemplate, vars)
@@ -583,6 +818,15 @@ function tryParseJsonObject(raw: string): Record<string, unknown> | undefined {
   return undefined
 }
 
+function parseTaskDifficultyTier(raw: unknown): TaskDifficultyTier | undefined {
+  if (typeof raw !== 'string') return undefined
+  const norm = raw.trim().toLowerCase()
+  if (norm === 'lite' || norm === 'light' || norm === 'fast') return 'lite'
+  if (norm === 'standard' || norm === 'medium' || norm === 'normal') return 'standard'
+  if (norm === 'heavy' || norm === 'hard' || norm === 'deep') return 'heavy'
+  return undefined
+}
+
 function normalizeVerdictObject(
   obj: Record<string, unknown> | undefined,
   hasActiveWorker: boolean,
@@ -604,16 +848,25 @@ function normalizeVerdictObject(
       : typeof obj.replyText === 'string'
         ? obj.replyText.trim()
         : ''
+  const parsedTier = !hasActiveWorker ? parseTaskDifficultyTier(obj.tier) : undefined
 
   if (rawAction === 'silent') {
     // Invariant: explicit @Bot mentions must never be silently swallowed by triage.
     if (options?.trigger === 'mention' && !silentOnly) {
-      return { action: 'handoff', reason: `${reason}（显式 @ 智能体禁止静默，转交主运行时）` }
+      return {
+        action: 'handoff',
+        reason: `${reason}（显式 @ 智能体禁止静默，转交主运行时）`,
+        ...(parsedTier ? { tier: parsedTier } : {}),
+      }
     }
     return { action: 'silent', reason }
   }
   if (rawAction === 'handoff') {
-    return { action: 'handoff', reason }
+    return {
+      action: 'handoff',
+      reason,
+      ...(parsedTier ? { tier: parsedTier } : {}),
+    }
   }
   if (rawAction === 'quick_reply') {
     if (silentOnly) {
@@ -633,7 +886,12 @@ function normalizeVerdictObject(
       }
     }
     if (!rawReply) {
-      return { action: 'handoff', reason: '轻回复内容为空，回退直通主运行时', fallback: true }
+      return {
+        action: 'handoff',
+        reason: '轻回复内容为空，回退直通主运行时',
+        ...(parsedTier ? { tier: parsedTier } : {}),
+        fallback: true,
+      }
     }
     return { action: 'quick_reply', reason, replyText: rawReply }
   }
