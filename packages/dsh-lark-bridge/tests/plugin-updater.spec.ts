@@ -18,9 +18,12 @@ import {
   classifySourceSpec,
   compareSemver,
   dispatchLarkApiRequest,
+  findLockfileEntriesMissingTarballIntegrity,
   holdClientModulesDuringSwap,
+  isMissingTarballIntegrityError,
   isNewerVersion,
   parseSha256Sums,
+  patchLockfileTarballIntegrities,
   relocateStaleModuleUrl,
   resetGlobalPluginUpdateStateForTest,
   type FetchLike,
@@ -918,5 +921,434 @@ describe('PluginUpdateService release detection & restart-free hot update', () =
     await releaseFail()
     expect(dirty.has('@harryzhz/dsh-lark-bridge')).toBe(true)
     expect(flushMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('detects and patches missing remote tarball integrity entries in pnpm-lock.yaml (inline and multi-line)', () => {
+    const urlA =
+      'https://github.com/harryzhz/dsh-external-agents/releases/download/v0.4.6/harryzhz-dsh-external-agents-0.4.6.tgz'
+    const urlB =
+      'https://github.com/harryzhz/dsh-lark-bridge/releases/download/v0.4.31/harryzhz-dsh-lark-bridge-0.4.31.tgz'
+    const urlC =
+      'https://github.com/harryzhz/dsh-lark-bridge/releases/download/v0.4.35/harryzhz-dsh-lark-bridge-0.4.35.tgz'
+    const sample = [
+      "lockfileVersion: '9.0'",
+      'packages:',
+      `  '@harryzhz/dsh-external-agents@${urlA}':`,
+      `    resolution: {tarball: ${urlA}}`,
+      '    version: 0.4.6',
+      `  '@harryzhz/dsh-lark-bridge@${urlB}':`,
+      '    resolution:',
+      `      tarball: '${urlB}'`,
+      '    version: 0.4.31',
+      `  '@harryzhz/dsh-lark-bridge@${urlC}':`,
+      `    resolution: {integrity: sha512-alreadyValid==, tarball: ${urlC}}`,
+      '    version: 0.4.35',
+    ].join('\n')
+
+    expect(findLockfileEntriesMissingTarballIntegrity(sample)).toEqual([urlA, urlB])
+
+    const patched = patchLockfileTarballIntegrities(
+      sample,
+      new Map([
+        [urlA, 'sha512-hashA=='],
+        [urlB, 'sha512-hashB=='],
+        [urlC, 'sha512-shouldNotOverwrite=='],
+      ]),
+    )
+    expect(patched.patchedCount).toBe(2)
+    expect(patched.content).toContain(`    resolution: {integrity: sha512-hashA==, tarball: ${urlA}}`)
+    expect(patched.content).toContain(`    resolution:\n      integrity: sha512-hashB==\n      tarball: '${urlB}'`)
+    expect(patched.content).toContain(`integrity: sha512-alreadyValid==, tarball: ${urlC}`)
+    expect(findLockfileEntriesMissingTarballIntegrity(patched.content)).toEqual([])
+
+    expect(
+      isMissingTarballIntegrityError({
+        application: 'failed',
+        error: {
+          code: 'operation-error',
+          diagnostic:
+            'ERR_PNPM_MISSING_TARBALL_INTEGRITY Cannot install package "@harryzhz/dsh-external-agents@...": its lockfile entry has no "integrity" field, so pnpm cannot verify the downloaded tarball.',
+        },
+      }),
+    ).toBe(true)
+    expect(
+      isMissingTarballIntegrityError({
+        application: 'failed',
+        packageResult: {
+          exitCode: 1,
+          output:
+            '[ERR_PNPM_MISSING_TARBALL_INTEGRITY] 1 lockfile entry failed verification:\n  @demo/pkg@1.0.0 has no "integrity" field, so its downloaded tarball cannot be verified',
+        },
+      }),
+    ).toBe(true)
+    expect(
+      isMissingTarballIntegrityError({
+        application: 'failed',
+        error: { code: 'operation-error', diagnostic: 'ECONNRESET network error' },
+      }),
+    ).toBe(false)
+  })
+
+  it('pre-flight repairs missing tarball integrity in pnpm-lock.yaml with SHA256 verification and ignores undeclared URLs', async () => {
+    const profileDir = makeTempDir('dsh-prof-')
+    const dataDir = makeTempDir('dsh-data-')
+    const extUrl =
+      'https://github.com/harryzhz/dsh-external-agents/releases/download/v0.4.6/harryzhz-dsh-external-agents-0.4.6.tgz'
+    const undeclaredUrl =
+      'https://example.com/untrusted-injected-package-1.0.0.tgz'
+    const extBytes = Buffer.from('verified-external-agents-v0.4.6-tarball')
+    const extSha256 = createHash('sha256').update(extBytes).digest('hex')
+    const extSha512 = `sha512-${createHash('sha512').update(extBytes).digest('base64')}`
+
+    writeProfileFixtures(
+      profileDir,
+      {
+        '@harryzhz/dsh-external-agents': extUrl,
+      },
+      {
+        '@harryzhz/dsh-external-agents': '0.4.6',
+      },
+    )
+    writeFileSync(
+      join(profileDir, 'pnpm-lock.yaml'),
+      [
+        "lockfileVersion: '9.0'",
+        'packages:',
+        `  '@harryzhz/dsh-external-agents@${extUrl}':`,
+        `    resolution: {tarball: ${extUrl}}`,
+        '    version: 0.4.6',
+        `  'evil@${undeclaredUrl}':`,
+        `    resolution: {tarball: ${undeclaredUrl}}`,
+      ].join('\n'),
+      'utf8',
+    )
+
+    const fetchedUrls: string[] = []
+    const fetchImpl: FetchLike = async (url) => {
+      fetchedUrls.push(url)
+      if (url.endsWith('/SHA256SUMS.txt')) {
+        return new Response(`${extSha256}  harryzhz-dsh-external-agents-0.4.6.tgz\n`, { status: 200 })
+      }
+      if (url === extUrl) {
+        return new Response(extBytes, { status: 200 })
+      }
+      return new Response('not found', { status: 404 })
+    }
+
+    const service = new PluginUpdateService({
+      ctx: makeFakeContext({ profileContext: { name: 'web', dir: profileDir } }),
+      dataDir,
+      lifecycle: makeFakeLifecycle(),
+      fetchImpl,
+    })
+
+    const res = await service.repairProfileLockfileIntegrity(profileDir)
+    expect(res).toEqual({ repairedCount: 1, remainingMissing: 1 })
+    expect(fetchedUrls).not.toContain(undeclaredUrl)
+
+    const updatedLock = readFileSync(join(profileDir, 'pnpm-lock.yaml'), 'utf8')
+    expect(updatedLock).toContain(`resolution: {integrity: ${extSha512}, tarball: ${extUrl}}`)
+    expect(updatedLock).toContain(`resolution: {tarball: ${undeclaredUrl}}`)
+  })
+
+  it('re-enables bundle and restores lockfile backup when removeBundle fails mid-swap (never leaves bridge disabled at 404)', async () => {
+    const profileDir = makeTempDir('dsh-prof-')
+    const dataDir = makeTempDir('dsh-data-')
+    const prevSpec =
+      'https://github.com/harryzhz/dsh-lark-bridge/releases/download/v0.4.31/harryzhz-dsh-lark-bridge-0.4.31.tgz'
+    const newUrl =
+      'https://github.com/harryzhz/dsh-lark-bridge/releases/download/v0.4.35/harryzhz-dsh-lark-bridge-0.4.35.tgz'
+    const payload = Buffer.from('valid-bridge-0.4.35-bytes')
+    const sha = createHash('sha256').update(payload).digest('hex')
+
+    writeProfileFixtures(
+      profileDir,
+      { '@harryzhz/dsh-lark-bridge': prevSpec },
+      { '@harryzhz/dsh-lark-bridge': '0.4.31' },
+    )
+    const originalLock = [
+      "lockfileVersion: '9.0'",
+      'packages:',
+      `  '@harryzhz/dsh-lark-bridge@${prevSpec}':`,
+      `    resolution: {integrity: sha512-validPrev==, tarball: ${prevSpec}}`,
+    ].join('\n')
+    writeFileSync(join(profileDir, 'pnpm-lock.yaml'), originalLock, 'utf8')
+
+    const fetchImpl: FetchLike = async (url) => {
+      if (url.endsWith('/releases/latest')) {
+        return new Response(
+          JSON.stringify({
+            tag_name: 'v0.4.35',
+            assets: [
+              {
+                name: 'harryzhz-dsh-lark-bridge-0.4.35.tgz',
+                browser_download_url: newUrl,
+                digest: `sha256:${sha}`,
+              },
+            ],
+          }),
+          { status: 200 },
+        )
+      }
+      return new Response(payload, { status: 200 })
+    }
+
+    const setBundleEnabled = vi.fn(async (): Promise<HostChangeResultLike> => ({
+      changed: true,
+      application: 'applied',
+      stage: 'enable',
+    }))
+    const removeBundle = vi.fn(async (): Promise<HostChangeResultLike> => {
+      // Simulate DSH `removeBundle` corrupting pnpm-lock.yaml & deselecting bundle before pnpm fails
+      writeFileSync(join(profileDir, 'pnpm-lock.yaml'), 'corrupted-by-failed-pnpm-remove', 'utf8')
+      return {
+        changed: true,
+        application: 'failed',
+        stage: 'remove',
+        error: {
+          code: 'operation-error',
+          diagnostic:
+            'ERR_PNPM_MISSING_TARBALL_INTEGRITY Cannot install package "@harryzhz/dsh-external-agents": its lockfile entry has no "integrity" field',
+        },
+      }
+    })
+    const pm: HostPluginManagerLike = {
+      listBundles: vi.fn(async () => [
+        { name: '@harryzhz/dsh-lark-bridge', version: '0.4.31', enabled: true, installed: true, removable: true },
+      ]),
+      removeBundle,
+      installBundle: vi.fn(),
+      setBundleEnabled,
+    }
+
+    const prepareHotReloadSwap = vi.fn()
+    const finishHotReloadSwap = vi.fn()
+    const lifecycle = makeFakeLifecycle({ prepareHotReloadSwap, finishHotReloadSwap })
+
+    const service = new PluginUpdateService({
+      ctx: makeFakeContext({
+        profileContext: { name: 'web', dir: profileDir },
+        pluginManager: pm,
+        hmr: { runExclusive: vi.fn(), reconcileProfile: vi.fn() },
+      }),
+      dataDir,
+      lifecycle,
+      fetchImpl,
+      runningBridgeVersion: '0.4.31',
+    })
+
+    const op = await service.startUpdate({ target: 'bridge' })
+    const settled = await waitForSettledOp(service, op.operationId)
+
+    // Tried removeBundle twice (initial + once after clearing lockfile), then rolled back via setBundleEnabled
+    expect(removeBundle).toHaveBeenCalledTimes(2)
+    expect(setBundleEnabled).toHaveBeenCalledWith('@harryzhz/dsh-lark-bridge', true)
+    expect(pm.installBundle).not.toHaveBeenCalled()
+    expect(finishHotReloadSwap).toHaveBeenCalledWith(op.operationId, { disposeDetached: false })
+    expect(readFileSync(join(profileDir, 'pnpm-lock.yaml'), 'utf8')).toBe(originalLock)
+    expect(settled.status).toBe('rolled_back')
+    expect(settled.message).toContain('已自动恢复原版本并重新启用')
+    expect(settled.error).toContain('升级 pnpm 至 11.x')
+  })
+
+  it('recovers automatically by clearing stale pnpm-lock.yaml on ERR_PNPM_MISSING_TARBALL_INTEGRITY during remove/install', async () => {
+    const profileDir = makeTempDir('dsh-prof-')
+    const dataDir = makeTempDir('dsh-data-')
+    const prevSpec =
+      'https://github.com/harryzhz/dsh-lark-bridge/releases/download/v0.4.31/harryzhz-dsh-lark-bridge-0.4.31.tgz'
+    const newUrl =
+      'https://github.com/harryzhz/dsh-lark-bridge/releases/download/v0.4.35/harryzhz-dsh-lark-bridge-0.4.35.tgz'
+    const payload = Buffer.from('valid-bridge-0.4.35-bytes')
+    const sha = createHash('sha256').update(payload).digest('hex')
+
+    writeProfileFixtures(
+      profileDir,
+      { '@harryzhz/dsh-lark-bridge': prevSpec },
+      { '@harryzhz/dsh-lark-bridge': '0.4.31' },
+    )
+    // Lockfile with an unresolvable transitive tarball missing integrity (pre-flight cannot patch it)
+    writeFileSync(
+      join(profileDir, 'pnpm-lock.yaml'),
+      "lockfileVersion: '9.0'\npackages:\n  'transitive@https://example.com/t.tgz':\n    resolution: {tarball: https://example.com/t.tgz}\n",
+      'utf8',
+    )
+
+    const fetchImpl: FetchLike = async (url) => {
+      if (url.endsWith('/releases/latest')) {
+        return new Response(
+          JSON.stringify({
+            tag_name: 'v0.4.35',
+            assets: [
+              {
+                name: 'harryzhz-dsh-lark-bridge-0.4.35.tgz',
+                browser_download_url: newUrl,
+                digest: `sha256:${sha}`,
+              },
+            ],
+          }),
+          { status: 200 },
+        )
+      }
+      return new Response(payload, { status: 200 })
+    }
+
+    let removeAttempts = 0
+    const pm: HostPluginManagerLike = {
+      listBundles: vi.fn(async () => [
+        { name: '@harryzhz/dsh-lark-bridge', version: '0.4.31', enabled: true, installed: true, removable: true },
+      ]),
+      removeBundle: vi.fn(async (): Promise<HostChangeResultLike> => {
+        removeAttempts += 1
+        if (removeAttempts === 1) {
+          return {
+            changed: true,
+            application: 'failed',
+            stage: 'remove',
+            packageResult: {
+              exitCode: 1,
+              output: '[ERR_PNPM_MISSING_TARBALL_INTEGRITY] transitive@1.0.0 has no "integrity" field',
+            },
+          }
+        }
+        return { changed: true, application: 'applied', stage: 'remove' }
+      }),
+      installBundle: vi.fn(async (): Promise<HostChangeResultLike> => ({
+        changed: true,
+        application: 'applied',
+        stage: 'enable',
+      })),
+    }
+
+    const service = new PluginUpdateService({
+      ctx: makeFakeContext({
+        profileContext: { name: 'web', dir: profileDir },
+        pluginManager: pm,
+        hmr: { runExclusive: vi.fn(), reconcileProfile: vi.fn() },
+      }),
+      dataDir,
+      lifecycle: makeFakeLifecycle(),
+      fetchImpl,
+      runningBridgeVersion: '0.4.31',
+    })
+
+    const op = await service.startUpdate({ target: 'bridge' })
+    const settled = await waitForSettledOp(service, op.operationId)
+    expect(removeAttempts).toBe(2)
+    expect(settled.status).toBe('succeeded')
+    expect(settled.hotReloaded).toBe(true)
+  })
+
+  it('clears stale lockfile on installBundle missing-integrity error and cancels drain when external-agents fails', async () => {
+    const profileDir = makeTempDir('dsh-prof-')
+    const dataDir = makeTempDir('dsh-data-')
+    const prevExt =
+      'https://github.com/harryzhz/dsh-external-agents/releases/download/v0.4.5/harryzhz-dsh-external-agents-0.4.5.tgz'
+    const newExt =
+      'https://github.com/harryzhz/dsh-external-agents/releases/download/v0.4.6/harryzhz-dsh-external-agents-0.4.6.tgz'
+    const prevBridge =
+      'https://github.com/harryzhz/dsh-lark-bridge/releases/download/v0.4.31/harryzhz-dsh-lark-bridge-0.4.31.tgz'
+    const newBridge =
+      'https://github.com/harryzhz/dsh-lark-bridge/releases/download/v0.4.35/harryzhz-dsh-lark-bridge-0.4.35.tgz'
+    const payload = Buffer.from('valid-payload')
+    const sha = createHash('sha256').update(payload).digest('hex')
+
+    writeProfileFixtures(
+      profileDir,
+      {
+        '@harryzhz/dsh-external-agents': prevExt,
+        '@harryzhz/dsh-lark-bridge': prevBridge,
+      },
+      {
+        '@harryzhz/dsh-external-agents': '0.4.5',
+        '@harryzhz/dsh-lark-bridge': '0.4.31',
+      },
+    )
+    writeFileSync(join(profileDir, 'pnpm-lock.yaml'), "lockfileVersion: '9.0'\npackages: {}\n", 'utf8')
+
+    const fetchImpl: FetchLike = async (url) => {
+      if (url.endsWith('/harryzhz/dsh-external-agents/releases/latest')) {
+        return new Response(
+          JSON.stringify({
+            tag_name: 'v0.4.6',
+            assets: [{ name: 'harryzhz-dsh-external-agents-0.4.6.tgz', browser_download_url: newExt, digest: `sha256:${sha}` }],
+          }),
+          { status: 200 },
+        )
+      }
+      if (url.endsWith('/harryzhz/dsh-lark-bridge/releases/latest')) {
+        return new Response(
+          JSON.stringify({
+            tag_name: 'v0.4.35',
+            assets: [{ name: 'harryzhz-dsh-lark-bridge-0.4.35.tgz', browser_download_url: newBridge, digest: `sha256:${sha}` }],
+          }),
+          { status: 200 },
+        )
+      }
+      return new Response(payload, { status: 200 })
+    }
+
+    const installCalls: string[] = []
+    const pm: HostPluginManagerLike = {
+      listBundles: vi.fn(async () => [
+        { name: '@harryzhz/dsh-external-agents', version: '0.4.5', enabled: true, installed: true, removable: true },
+        { name: '@harryzhz/dsh-lark-bridge', version: '0.4.31', enabled: true, installed: true, removable: true },
+      ]),
+      removeBundle: vi.fn(async (): Promise<HostChangeResultLike> => ({
+        changed: true,
+        application: 'applied',
+        stage: 'remove',
+      })),
+      installBundle: vi.fn(async (spec): Promise<HostChangeResultLike> => {
+        installCalls.push(spec)
+        if (spec === newExt) {
+          return {
+            changed: false,
+            application: 'failed',
+            stage: 'install',
+            error: {
+              code: 'operation-error',
+              diagnostic: 'ERR_PNPM_MISSING_TARBALL_INTEGRITY lockfile entry has no "integrity" field',
+            },
+          }
+        }
+        return { changed: true, application: 'applied', stage: 'enable' }
+      }),
+    }
+
+    const cancelDrain = vi.fn(async () => ({
+      phase: 'running' as const,
+      draining: false,
+      drained: true,
+      activeTurns: [],
+      activeTriageCount: 0,
+      activeRemindersCount: 0,
+      activeDreamingCount: 0,
+      totalInFlight: 0,
+      persistedPendingTurns: 0,
+      pid: process.pid,
+      startedAtMs: Date.now(),
+    }))
+    const lifecycle = makeFakeLifecycle({ cancelDrain })
+
+    const service = new PluginUpdateService({
+      ctx: makeFakeContext({
+        profileContext: { name: 'web', dir: profileDir },
+        pluginManager: pm,
+        hmr: { runExclusive: vi.fn(), reconcileProfile: vi.fn() },
+      }),
+      dataDir,
+      lifecycle,
+      fetchImpl,
+      runningBridgeVersion: '0.4.31',
+    })
+
+    const op = await service.startUpdate({ target: 'all' })
+    const settled = await waitForSettledOp(service, op.operationId)
+
+    // Retried newExt once after clearing lockfile, then rolled back to prevExt, and resumed bridge drain
+    expect(installCalls).toEqual([newExt, newExt, prevExt])
+    expect(cancelDrain).toHaveBeenCalledTimes(1)
+    expect(settled.status).toBe('rolled_back')
+    expect(settled.error).toContain('升级 pnpm 至 11.x')
   })
 })

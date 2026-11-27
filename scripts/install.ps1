@@ -433,6 +433,17 @@ function Ensure-ProfilePnpmAllowBuilds([string]$ProfileDir) {
   }
 }
 
+function Test-ProfileLockfileMissingTarballIntegrity([string]$ProfileDir) {
+  $lockFile = Join-Path $ProfileDir 'pnpm-lock.yaml'
+  if (-not (Test-Path -LiteralPath $lockFile)) { return $false }
+  foreach ($line in (Get-Content -LiteralPath $lockFile -Encoding UTF8)) {
+    if ($line -match '^\s*resolution:\s*\{' -and $line -match 'tarball:\s*[''"]?https?://' -and $line -notmatch 'integrity\s*:') {
+      return $true
+    }
+  }
+  return $false
+}
+
 function Install-PluginsIntoProfile([string]$DshBin, [string]$ProfileName, [string]$Label) {
   $profileDir = Join-Path (Join-Path $DshHome 'profiles') $ProfileName
   $rel = Resolve-PluginReleases
@@ -482,9 +493,18 @@ function Install-PluginsIntoProfile([string]$DshBin, [string]$ProfileName, [stri
     if ($LASTEXITCODE -ne 0) {
       $wsFile = Join-Path $profileDir 'pnpm-workspace.yaml'
       $wsText = if (Test-Path -LiteralPath $wsFile) { Get-Content -LiteralPath $wsFile -Raw -Encoding UTF8 } else { '' }
+      $retried = $false
       if ($wsText -and ($wsText -notmatch 'protobufjs')) {
         Write-Info "[$Label] 为 pnpm 11 补充 protobufjs 构建脚本豁免声明后重试一次..."
         Ensure-ProfilePnpmAllowBuilds $profileDir
+        $retried = $true
+      }
+      if (Test-ProfileLockfileMissingTarballIntegrity $profileDir) {
+        Write-Warn "[$Label] 检测到旧版 pnpm-lock.yaml 缺少远端安装包 integrity 校验字段，正在重建锁文件后重试..."
+        Remove-Item -LiteralPath (Join-Path $profileDir 'pnpm-lock.yaml') -Force -ErrorAction SilentlyContinue
+        $retried = $true
+      }
+      if ($retried) {
         & $DshBin plugin --profile $ProfileName add @specs
       }
       if ($LASTEXITCODE -ne 0) {
@@ -542,6 +562,9 @@ function Ensure-PnpmForWeb {
     if (-not (Get-Command pnpm -ErrorAction SilentlyContinue)) {
       $env:PATH = "$DSH_BIN_DIR;$env:PATH"
     }
+    if ($pnpmVer -like '10.34.*') {
+      Write-Warn "检测到 pnpm v${pnpmVer}：该版本在复装远端 .tgz 插件时存在 ERR_PNPM_MISSING_TARBALL_INTEGRITY 已知缺陷，如遇安装/热更新失败请升级至 pnpm 11（pnpm@11）。"
+    }
     return
   }
 
@@ -554,7 +577,7 @@ function Ensure-PnpmForWeb {
   if (Get-Command corepack -ErrorAction SilentlyContinue) {
     try {
       & corepack enable 2>$null
-      & corepack prepare pnpm@10 --activate 2>$null
+      & corepack prepare pnpm@11 --activate 2>$null
       $pnpmVer = Get-PnpmVersion
       if ($pnpmVer) {
         Write-Ok "已通过 corepack 启用 pnpm v$pnpmVer"
@@ -569,7 +592,7 @@ function Ensure-PnpmForWeb {
   if (-not (Test-Path -LiteralPath $pkgFile)) {
     '{"name":"dsh-pnpm-runtime","private":true}' | Set-Content -LiteralPath $pkgFile -Encoding UTF8
   }
-  & npm --prefix $pnpmHome install --no-audit --no-fund pnpm@10
+  & npm --prefix $pnpmHome install --no-audit --no-fund pnpm@11
   if ($LASTEXITCODE -ne 0) { throw '自动安装 pnpm 失败，请手动安装 pnpm 后重试。' }
 
   $pnpmTarget = Join-Path $pnpmHome 'node_modules\.bin\pnpm.cmd'
