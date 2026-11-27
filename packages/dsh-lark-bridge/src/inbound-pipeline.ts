@@ -155,6 +155,7 @@ function canSilenceTurnByControl(
 function isEligibleForProgressAnchor(decision: AgentDecision): boolean {
   return (
     decision.longTurnProgressNotice !== false &&
+    !decision.cotEnabled &&
     !decision.silentOnly &&
     !decision.allowSilentEmptyReply &&
     decision.trigger !== 'listener'

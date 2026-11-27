@@ -639,4 +639,66 @@ describe('Long-turn & queue-wait automatic progress anchors (P2)', () => {
       h.store.close()
     }
   })
+
+  it('suppresses both exec and queue progress anchors whenever native CoT is enabled (bot default or group override)', async () => {
+    const h = createAnchorHarness({ queueWaitAnchorMs: 35, longTurnAnchorMs: 40 })
+    const botDefaultOff = makeBot(h.dir, {
+      id: 'bot-cot-group',
+      name: 'CotGroupBot',
+      larkAppId: 'cli_cot_grp',
+      cotEnabled: false,
+      longTurnProgressNotice: true,
+    })
+    h.store.upsertBot(botDefaultOff)
+    h.store.upsertGroup(
+      LarkGroupConfigSchema.parse({
+        key: 'bot-cot-group:oc_cot_on',
+        botId: 'bot-cot-group',
+        chatId: 'oc_cot_on',
+        enabled: true,
+        cotEnabled: 'on',
+      }),
+    )
+
+    try {
+      // Turn 1 starts in group with cotEnabled='on' and stays silent past longTurnAnchorMs (no CoT bubble yet)
+      const p1 = h.manager.handleInbound(
+        botDefaultOff.id,
+        h.transport,
+        makeMentionMsg('om_cot_1', '长耗时任务一', {
+          botId: botDefaultOff.id,
+          larkAppId: botDefaultOff.larkAppId,
+          chatId: 'oc_cot_on',
+        }),
+      )
+      await vi.waitFor(() => expect(h.pendingTurns).toHaveLength(1))
+
+      // Turn 2 queues behind Turn 1 on the same thread past queueWaitAnchorMs
+      const p2 = h.manager.handleInbound(
+        botDefaultOff.id,
+        h.transport,
+        makeMentionMsg('om_cot_2', '排队任务二', {
+          botId: botDefaultOff.id,
+          larkAppId: botDefaultOff.larkAppId,
+          chatId: 'oc_cot_on',
+          rootId: 'om_cot_1',
+          threadId: 'omt_om_cot_1',
+        }),
+      )
+
+      await sleep(95)
+      // Neither exec progress notice nor queue-wait progress notice should fire when CoT is enabled
+      expect(h.sentReplies).toHaveLength(0)
+
+      h.pendingTurns[0]!.finish('任务一完成')
+      await p1
+      await vi.waitFor(() => expect(h.pendingTurns).toHaveLength(2))
+      h.pendingTurns[1]!.finish('任务二完成')
+      await p2
+      expect(h.sentReplies.map((r) => r.text)).toEqual(['任务一完成', '任务二完成'])
+    } finally {
+      await h.manager.stop()
+      h.store.close()
+    }
+  })
 })
