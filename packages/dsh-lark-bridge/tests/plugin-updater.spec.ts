@@ -652,7 +652,7 @@ describe('PluginUpdateService release detection & restart-free hot update', () =
     expect(relocateStaleModuleUrl(v1Url, undefined, staleMap)).toBeUndefined()
   })
 
-  it('supports immediate force update (bypassing drain wait) and mid-drain force preemption via POST /plugins/update/force', async () => {
+  it('updates bridge seamlessly without draining in-flight Feishu turns, while draining external-agents with force & mid-drain preemption', async () => {
     const profileDir = makeTempDir('dsh-prof-')
     const dataDir = makeTempDir('dsh-data-')
     const tarballBytes = Buffer.from('fake-bridge-tgz-v0.4.4')
@@ -692,12 +692,13 @@ describe('PluginUpdateService release detection & restart-free hot update', () =
       if (url.endsWith('/harryzhz/dsh-external-agents/releases/latest')) {
         return new Response(
           JSON.stringify({
-            tag_name: 'v0.4.1',
+            tag_name: 'v0.4.2',
             assets: [
               {
-                name: 'harryzhz-dsh-external-agents-0.4.1.tgz',
+                name: 'harryzhz-dsh-external-agents-0.4.2.tgz',
                 browser_download_url:
-                  'https://github.com/harryzhz/dsh-external-agents/releases/download/v0.4.1/harryzhz-dsh-external-agents-0.4.1.tgz',
+                  'https://github.com/harryzhz/dsh-external-agents/releases/download/v0.4.2/harryzhz-dsh-external-agents-0.4.2.tgz',
+                digest: `sha256:${sha}`,
               },
             ],
           }),
@@ -728,7 +729,21 @@ describe('PluginUpdateService release detection & restart-free hot update', () =
       phase: 'running' as const,
       draining: false,
       drained: false,
-      activeTurns: [],
+      activeTurns: [
+        {
+          id: 'turn-live-1',
+          botId: 'bot-a',
+          chatId: 'oc_demo',
+          messageId: 'om_demo_1',
+          routeKey: 'cli_a:oc_demo:om_demo_1',
+          sessionId: 'session-live-1',
+          trigger: 'mention',
+          startedAtMs: Date.now() - 5_000,
+          lastActivityAtMs: Date.now(),
+          idleSec: 0,
+          willAutoResume: true,
+        },
+      ],
       activeTriageCount: 0,
       activeRemindersCount: 0,
       activeDreamingCount: 0,
@@ -738,28 +753,19 @@ describe('PluginUpdateService release detection & restart-free hot update', () =
       startedAtMs: Date.now(),
     }
 
-    const waitForDrain = vi.fn(async (_timeoutMs?: number, signal?: AbortSignal) => {
-      await new Promise<void>((resolve) => {
-        if (signal?.aborted) return resolve()
-        const timer = setTimeout(resolve, 60)
-        signal?.addEventListener(
-          'abort',
-          () => {
-            clearTimeout(timer)
-            resolve()
-          },
-          { once: true },
-        )
-      })
-      return { ...busyStatus, draining: true, drained: false }
-    })
+    const waitForDrain = vi.fn(async () => ({ ...busyStatus, draining: true, drained: false }))
+    const prepareHotReloadSwap = vi.fn()
+    const finishHotReloadSwap = vi.fn()
 
+    let activeExternalAgents = 1
     const lifecycle: PluginUpdateLifecycleHost = {
       getLifecycleStatus: vi.fn(() => busyStatus),
       beginDrain: vi.fn(async () => ({ ...busyStatus, draining: true })),
       waitForDrain,
       cancelDrain: vi.fn(async () => busyStatus),
-      countActiveExternalAgents: vi.fn(() => 1),
+      prepareHotReloadSwap,
+      finishHotReloadSwap,
+      countActiveExternalAgents: vi.fn(() => activeExternalAgents),
     }
 
     const service = new PluginUpdateService({
@@ -774,41 +780,43 @@ describe('PluginUpdateService release detection & restart-free hot update', () =
       runningBridgeVersion: '0.4.3',
     })
 
-    // 1. Overview reports active workload counts
+    // 1. Overview reports active workload counts & bridgeSeamlessReload=true
     const overview = await service.getOverview({ check: true })
     expect(overview.inFlightTurns).toBe(1)
     expect(overview.activeExternalAgents).toBe(1)
+    expect(overview.bridgeSeamlessReload).toBe(true)
 
-    // 2. Normal update fails with structured `drain_timeout` failureCode
-    const op1 = await service.startUpdate({ target: 'all', drainTimeoutMs: 50 })
+    // 2. Updating ONLY bridge succeeds immediately without waiting for drain and preserves the live turn
+    const opBridge = await service.startUpdate({ target: 'bridge', drainTimeoutMs: 50 })
+    const settledBridge = await waitForSettledOp(service, opBridge.operationId)
+    expect(settledBridge.status).toBe('succeeded')
+    expect(settledBridge.seamlessBridgeSwap).toBe(true)
+    expect(settledBridge.preservedTurns).toBe(1)
+    expect(settledBridge.message).toContain('无损热更新')
+    expect(settledBridge.message).toContain('1 个后台运行中的会话')
+    expect(waitForDrain).not.toHaveBeenCalled()
+    expect(prepareHotReloadSwap).toHaveBeenCalledWith(opBridge.operationId)
+    expect(removed).toEqual(['@harryzhz/dsh-lark-bridge'])
+
+    // 3. Updating target='all' (including external-agents) while external agent is busy hits drain_timeout
+    removed.length = 0
+    const op1 = await service.startUpdate({ target: 'all', drainTimeoutMs: 80 })
     const settled1 = await waitForSettledOp(service, op1.operationId)
     expect(settled1.status).toBe('failed')
     expect(settled1.failureCode).toBe('drain_timeout')
     expect(settled1.targetSelector).toBe('all')
     expect(removed).toEqual([])
 
-    // 3. Force update with target='all' bypasses waitForDrain completely AND only updates bridge (not up-to-date external-agents)
-    waitForDrain.mockClear()
+    // 4. Force update with target='all' bypasses external drain wait completely
     const op2 = await service.startUpdate({ target: 'all', force: true })
     const settled2 = await waitForSettledOp(service, op2.operationId)
     expect(settled2.status).toBe('succeeded')
     expect(settled2.forced).toBe(true)
-    expect(waitForDrain).not.toHaveBeenCalled()
-    expect(removed).toEqual(['@harryzhz/dsh-lark-bridge'])
+    expect(removed).toEqual(['@harryzhz/dsh-external-agents', '@harryzhz/dsh-lark-bridge'])
 
-    // 4. Mid-drain force preemption via POST /plugins/update/force wakes waitForDrain and succeeds
+    // 5. Mid-drain force preemption via POST /plugins/update/force wakes external-agents drain and succeeds
     removed.length = 0
-    waitForDrain.mockImplementationOnce(
-      async (_timeoutMs?: number, signal?: AbortSignal) =>
-        await new Promise((resolve) => {
-          signal?.addEventListener(
-            'abort',
-            () => resolve({ ...busyStatus, draining: true, drained: false }),
-            { once: true },
-          )
-        }),
-    )
-    const op3 = await service.startUpdate({ target: 'bridge', drainTimeoutMs: 10_000 })
+    const op3 = await service.startUpdate({ target: 'external-agents', drainTimeoutMs: 10_000 })
     const waitDrainingDeadline = Date.now() + 3000
     while (Date.now() < waitDrainingDeadline) {
       if (service.getOperation(op3.operationId)?.status === 'draining') break
@@ -844,7 +852,17 @@ describe('PluginUpdateService release detection & restart-free hot update', () =
     const settled3 = await waitForSettledOp(service, op3.operationId)
     expect(settled3.status).toBe('succeeded')
     expect(settled3.forced).toBe(true)
-    expect(removed).toEqual(['@harryzhz/dsh-lark-bridge'])
+    expect(removed).toEqual(['@harryzhz/dsh-external-agents'])
+
+    // 6. When activeExternalAgents === 0, updating target='all' even with active Feishu turns succeeds without draining
+    removed.length = 0
+    activeExternalAgents = 0
+    const op4 = await service.startUpdate({ target: 'all', drainTimeoutMs: 50 })
+    const settled4 = await waitForSettledOp(service, op4.operationId)
+    expect(settled4.status).toBe('succeeded')
+    expect(settled4.seamlessBridgeSwap).toBe(true)
+    expect(settled4.preservedTurns).toBe(1)
+    expect(removed).toEqual(['@harryzhz/dsh-external-agents', '@harryzhz/dsh-lark-bridge'])
   })
 
   it('holds intermediate client-module deletion during bridge self-swap and converges cleanly on release', async () => {

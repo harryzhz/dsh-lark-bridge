@@ -41,6 +41,12 @@ import {
 import { buildBridgeDiagnostics, type BridgeDiagnosticsPayload } from './diagnostics.js'
 import { LarkDirectoryEnricher } from './directory-enrichment.js'
 import { DreamingService } from './dreaming-service.js'
+import {
+  clearBridgeHotReloadSwap,
+  isBridgeHotReloadSwapping,
+  markBridgeHotReloadSwap,
+  sweepUnclaimedDetachedHandles,
+} from './hot-reload-handoff.js'
 import { InboundPipeline } from './inbound-pipeline.js'
 import { InstanceLock } from './instance-lock.js'
 import { MemoryService } from './memory-service.js'
@@ -193,6 +199,7 @@ export class LarkBridgeManager {
 
     this.sessions = new SessionCoordinator({
       ctx,
+      dataDir: config.dataDir,
       store,
       runtimes: this.runtimes,
       workspaces: this.workspaces,
@@ -334,6 +341,15 @@ export class LarkBridgeManager {
         beginDrain: (opts) => this.beginDrain(opts),
         waitForDrain: (timeoutMs, signal) => this.waitForDrain(timeoutMs, signal),
         cancelDrain: () => this.cancelDrain(),
+        prepareHotReloadSwap: (operationId) => {
+          markBridgeHotReloadSwap(config.dataDir, operationId)
+        },
+        finishHotReloadSwap: (operationId, opts) => {
+          clearBridgeHotReloadSwap(config.dataDir, operationId)
+          if (opts?.disposeDetached) {
+            void sweepUnclaimedDetachedHandles(config.dataDir, { forceAll: true }).catch(() => {})
+          }
+        },
         countActiveExternalAgents: () => {
           try {
             const extSvc = this.ctx.get('externalRuntimes' as never) as
@@ -482,6 +498,8 @@ export class LarkBridgeManager {
         `[lark-bridge] stale pending turn recovery warning: ${err instanceof Error ? err.message : String(err)}`,
       )
     })
+    clearBridgeHotReloadSwap(this.config.dataDir)
+    void sweepUnclaimedDetachedHandles(this.config.dataDir).catch(() => {})
 
     void this.schedules.refreshScheduleContextCache()
     void this.backfillExternalSessionLinks().catch((err) => {
@@ -626,9 +644,12 @@ export class LarkBridgeManager {
   async stop(): Promise<void> {
     this.phase = 'stopping'
     this.disposed = true
+    const preserveLiveAgents = isBridgeHotReloadSwapping(this.config.dataDir)
     // 1. Snapshot recoverable in-flight turns to SQLite BEFORE aborting handles so
-    //    no turn is prematurely failed or stripped of its Feishu reaction.
-    await this.inbound.suspendActiveTurnsForShutdown()
+    //    no turn is prematurely failed or stripped of its Feishu reaction. During a
+    //    `dsh-lark-bridge` hot-reload swap, active host agents are kept alive for
+    //    seamless event-stream reattachment by the reloaded instance.
+    await this.inbound.suspendActiveTurnsForShutdown({ preserveLiveAgents })
     this.runtimeLimiter.dispose()
     this.shutdownController.abort()
     this.sessionHandoff.dispose()
@@ -649,7 +670,7 @@ export class LarkBridgeManager {
     await withShutdownBudget(
       Promise.allSettled([
         this.connections.stopAll(),
-        this.sessions.disposeAll(),
+        this.sessions.disposeAll({ preserveActiveForHotReload: preserveLiveAgents }),
         this.reminders.stop(),
       ]),
       SHUTDOWN_DISPOSE_BUDGET_MS,

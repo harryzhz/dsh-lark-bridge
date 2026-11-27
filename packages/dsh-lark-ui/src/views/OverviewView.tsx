@@ -95,7 +95,7 @@ export function OverviewView({
               </div>
               <div className="fb-alert-detail">
                 {pluginUpdates?.hotReloadSupported
-                  ? '支持原地免重启热更新，点击即可校验发布包并自动排空切换'
+                  ? '支持原地免重启热更新，飞书桥接升级不中断在途会话'
                   : pluginUpdates?.hotReloadUnavailableReason || '点击查看插件更新详情'}
               </div>
             </div>

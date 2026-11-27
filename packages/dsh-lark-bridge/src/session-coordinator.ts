@@ -11,6 +11,11 @@ import {
   type InboundLarkMessage,
   type LarkBotConfig,
 } from '@dsh-lark/lark-core'
+import {
+  claimDetachedAgentHandle,
+  resolveHostAgents,
+  stashDetachedAgentHandle,
+} from './hot-reload-handoff.js'
 import type { RuntimeCatalog } from './runtime-catalog.js'
 import type { LarkBridgeStore } from './store.js'
 import { LARK_ORIGIN_RECORD_TYPE, type LarkSessionBinding } from './types.js'
@@ -61,6 +66,7 @@ export function bindingHasNativeThread(
 
 export interface SessionCoordinatorHost {
   readonly ctx: Context
+  readonly dataDir?: string
   readonly store: LarkBridgeStore
   readonly runtimes: RuntimeCatalog
   readonly workspaces: WorkspaceGrouping
@@ -547,22 +553,62 @@ export class SessionCoordinator {
     return archivedCount
   }
 
-  async disposeAll(): Promise<void> {
+  async disposeAll(options: { readonly preserveActiveForHotReload?: boolean } = {}): Promise<number> {
+    const preserve = Boolean(options.preserveActiveForHotReload)
+    const dataDirKey = this.host.dataDir ?? ''
     const actors = [...this.actors.values()]
+    const prevInFlight = new Map(this.inFlightTurns)
     this.actors.clear()
     this.inFlightTurns.clear()
+    let preservedCount = 0
     await Promise.all(
       actors.map(async (actor) => {
+        const wasBusy =
+          actor.state === 'running' ||
+          actor.pendingCount > 0 ||
+          (prevInFlight.get(actor.sessionId) ?? 0) > 0 ||
+          actor.handle?.agent?.status === 'running'
         actor.state = 'closing'
         actor.abortWaitingBatch()
         const handle = actor.handle
         actor.handle = undefined
         if (handle) {
-          await handle.dispose().catch(() => {})
+          if (preserve && wasBusy) {
+            stashDetachedAgentHandle(dataDirKey, actor.sessionId, handle)
+            preservedCount += 1
+          } else {
+            await handle.dispose().catch(() => {})
+          }
         }
         actor.state = 'archived'
       }),
     )
+    return preservedCount
+  }
+
+  /**
+   * Reclaim a live host agent (and its stashed `AgentHandle`, if any) after a seamless
+   * `dsh-lark-bridge` hot-reload without creating or restarting the agent.
+   */
+  reclaimLiveAgent(sessionId: string): Agent | undefined {
+    const dataDirKey = this.host.dataDir ?? ''
+    const stashed = claimDetachedAgentHandle(dataDirKey, sessionId)
+    const live =
+      stashed?.agent ??
+      resolveHostAgents(this.host.ctx).get(brandString<SessionId>(sessionId)) ??
+      this.host.ctx.agents.get(brandString<SessionId>(sessionId))
+    if (!live) {
+      if (stashed) {
+        void stashed.dispose().catch(() => {})
+      }
+      return undefined
+    }
+    const actor = this.ensureActor(sessionId, 'idle')
+    if (stashed && !actor.handle) {
+      actor.handle = stashed
+    }
+    this.host.instrumentAgent(live)
+    return live
   }
 
   private ensureActor(sessionId: string, initialState: SessionActorState): SessionActor {
@@ -637,7 +683,8 @@ export class SessionCoordinator {
         requireNativeModel: true,
       })
       const resolvedCwd = expandWorkingDir(decision.workingDir) || decision.workingDir
-      const handle = await this.host.ctx.agents.create({
+      const hostAgents = resolveHostAgents(this.host.ctx)
+      const handle = await hostAgents.create({
         sessionId,
         meta: { cwd: resolvedCwd, agentPreset: decision.agentPreset },
         agentOptions: {
@@ -719,7 +766,14 @@ export class SessionCoordinator {
     })
 
     const actor = this.ensureActor(binding.sessionId, 'idle')
-    let agent = this.host.ctx.agents.get(sessionId)
+    const hostAgents = resolveHostAgents(this.host.ctx)
+    const reclaimedHandle = !actor.handle
+      ? claimDetachedAgentHandle(this.host.dataDir ?? '', binding.sessionId)
+      : undefined
+    if (reclaimedHandle) {
+      actor.handle = reclaimedHandle
+    }
+    let agent = reclaimedHandle?.agent ?? hostAgents.get(sessionId) ?? this.host.ctx.agents.get(sessionId)
     if (!agent) {
       actor.state = 'creating'
       try {
@@ -728,7 +782,7 @@ export class SessionCoordinator {
           ...(launch.model ? { model: launch.model } : {}),
           ...(launch.reasoningEffort ? { reasoningEffort: launch.reasoningEffort } : {}),
         }
-        const handle = await this.host.ctx.agents.resume(
+        const handle = await hostAgents.resume(
           launch.isExternal
             ? {
                 resumeSessionId: sessionId,

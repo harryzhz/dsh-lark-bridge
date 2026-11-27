@@ -134,6 +134,10 @@ export interface PluginUpdateOperation {
   readonly items: readonly PluginUpdateItemResult[]
   readonly hotReloaded: boolean
   readonly restartRequired: boolean
+  /** Number of in-flight Feishu turns kept running in the host across bridge hot-reload. */
+  readonly preservedTurns?: number
+  /** True when the bridge swap ran without draining in-flight Feishu turns. */
+  readonly seamlessBridgeSwap?: boolean
   readonly error?: string
 }
 
@@ -147,6 +151,8 @@ export interface PluginUpdatesOverview {
   readonly checkedAtMs?: number
   readonly inFlightTurns: number
   readonly activeExternalAgents: number
+  /** True when `dsh-lark-bridge` self-updates preserve live agents and reattach seamlessly without draining. */
+  readonly bridgeSeamlessReload: boolean
   readonly updatableCount: number
   readonly plugins: readonly ManagedPluginStatus[]
   readonly operation?: PluginUpdateOperation
@@ -208,6 +214,8 @@ export interface PluginUpdateLifecycleHost {
   beginDrain(options?: { readonly reason?: string }): Promise<BridgeLifecycleStatus>
   waitForDrain(timeoutMs?: number, signal?: AbortSignal): Promise<BridgeLifecycleStatus>
   cancelDrain(): Promise<BridgeLifecycleStatus>
+  prepareHotReloadSwap?(operationId: string): void
+  finishHotReloadSwap?(operationId: string, options?: { readonly disposeDetached?: boolean }): void
   countActiveExternalAgents?(): number
   recordUpdateEvent?(summary: string, isError?: boolean): void
 }
@@ -1226,6 +1234,7 @@ export class PluginUpdateService {
       ...(latestCheckedAtMs ? { checkedAtMs: latestCheckedAtMs } : {}),
       inFlightTurns: lcStatus.totalInFlight,
       activeExternalAgents,
+      bridgeSeamlessReload: true,
       updatableCount,
       plugins,
       ...(op ? { operation: op } : {}),
@@ -1434,7 +1443,9 @@ export class PluginUpdateService {
           }
         }
 
-        // Stage 2: Check & gracefully drain in-flight Feishu turns (and external agents if updating external-agents).
+        // Stage 2: Drain only when updating `external-agents` while external agent sessions are active.
+        // Self-updating `dsh-lark-bridge` preserves live host agents and reattaches to their event
+        // streams after HMR reload without blocking on in-flight Feishu turns.
         const includesBridge = planned.some((p) => p.spec.id === 'bridge')
         const includesExternal = planned.some((p) => p.spec.id === 'external-agents')
         const lcStatus = lifecycle.getLifecycleStatus()
@@ -1448,48 +1459,37 @@ export class PluginUpdateService {
             await lifecycle.beginDrain({ reason: `plugin_hot_update_force:${operationId}` }).catch(() => {})
             drainedByUs = true
           }
-        } else if (lcStatus.totalInFlight > 0 || activeExternalCount > 0) {
+        } else if (includesExternal && activeExternalCount > 0) {
           const drainAbort = new AbortController()
           state.drainAbort = drainAbort
           state.drainForceRequested = false
           updateOp({
             status: 'draining',
-            message: `等待在途任务优雅排空（飞书回合 ${lcStatus.totalInFlight}，外部会话 ${activeExternalCount}）…`,
+            message: `等待 ${activeExternalCount} 个外部 Agent 会话排空…`,
           })
           try {
-            if (includesBridge || lcStatus.totalInFlight > 0) {
-              await lifecycle.beginDrain({ reason: `plugin_hot_update:${operationId}` })
+            if (includesBridge) {
+              await lifecycle.beginDrain({ reason: `plugin_hot_update:${operationId}` }).catch(() => {})
               drainedByUs = true
-              const drained = await lifecycle.waitForDrain(drainTimeoutMs, drainAbort.signal)
-              const remainingExternal = includesExternal
-                ? (lifecycle.countActiveExternalAgents?.() ?? 0)
-                : 0
-              if (state.drainForceRequested) {
-                updateOp({ forced: true })
-              } else if (!drained.drained || remainingExternal > 0) {
-                await lifecycle.cancelDrain().catch(() => {})
-                drainedByUs = false
+            }
+            const deadline = Date.now() + drainTimeoutMs
+            while (Date.now() < deadline && !drainAbort.signal.aborted) {
+              if ((lifecycle.countActiveExternalAgents?.() ?? 0) === 0) break
+              await new Promise((r) => setTimeout(r, 400))
+            }
+            if (state.drainForceRequested) {
+              updateOp({ forced: true })
+            } else {
+              const remaining = lifecycle.countActiveExternalAgents?.() ?? 0
+              if (remaining > 0) {
+                if (drainedByUs) {
+                  await lifecycle.cancelDrain().catch(() => {})
+                  drainedByUs = false
+                }
                 throw new TaggedUpdateError(
-                  `在途任务排空超时（剩余飞书回合 ${drained.totalInFlight}，活跃外部会话 ${remainingExternal}），已取消更新并恢复接单；可稍后重试或在弹窗中点击「强制更新」（CLI 使用 --force）`,
+                  `仍有 ${remaining} 个外部 Agent 会话运行中，已取消更新外部运行时；可等待会话空闲后重试或在弹窗中点击「强制更新」（CLI 使用 --force）`,
                   'drain_timeout',
                 )
-              }
-            } else if (activeExternalCount > 0) {
-              const deadline = Date.now() + drainTimeoutMs
-              while (Date.now() < deadline && !drainAbort.signal.aborted) {
-                if ((lifecycle.countActiveExternalAgents?.() ?? 0) === 0) break
-                await new Promise((r) => setTimeout(r, 400))
-              }
-              if (state.drainForceRequested) {
-                updateOp({ forced: true })
-              } else {
-                const remaining = lifecycle.countActiveExternalAgents?.() ?? 0
-                if (remaining > 0) {
-                  throw new TaggedUpdateError(
-                    `仍有 ${remaining} 个外部 Agent 会话运行中，已取消更新外部运行时；可等待会话空闲后重试或在弹窗中点击「强制更新」（CLI 使用 --force）`,
-                    'drain_timeout',
-                  )
-                }
               }
             }
           } finally {
@@ -1497,26 +1497,43 @@ export class PluginUpdateService {
             state.drainForceRequested = false
           }
         } else if (includesBridge) {
-          // Briefly pause inbound intake during self-swap to avoid dropping mid-air messages.
+          // Briefly pause new inbound intake during self-swap so incoming Feishu events
+          // wait for the reloaded WS client rather than getting dropped mid-unload, while
+          // keeping already-running host agents alive for seamless post-reload reattach.
           await lifecycle.beginDrain({ reason: `plugin_hot_update:${operationId}` }).catch(() => {})
           drainedByUs = true
         }
 
+        const postDrainStatus = lifecycle.getLifecycleStatus()
+        const preservedTurns = includesBridge ? postDrainStatus.activeTurns.length : 0
+        if (includesBridge) {
+          updateOp({
+            seamlessBridgeSwap: true,
+            ...(preservedTurns > 0 ? { preservedTurns } : {}),
+          })
+        }
+
         lifecycle.recordUpdateEvent?.(
-          `开始${current.forced ? '强制' : ''}免重启热更新：${planned.map((p) => `${p.spec.displayName} ${p.fromVersion ?? '?'}→${p.release.version}`).join('，')}`,
+          `开始${current.forced ? '强制' : ''}${includesBridge && preservedTurns > 0 ? '无损' : ''}免重启热更新：${planned.map((p) => `${p.spec.displayName} ${p.fromVersion ?? '?'}→${p.release.version}`).join('，')}${preservedTurns > 0 ? `（后台保活 ${preservedTurns} 个在途会话）` : ''}`,
         )
 
         // Stage 3: Execute removeBundle -> installBundle via host-owned `pluginManager` (survives bridge unload!).
         let anyRestartRequired = false
         let allHotReloaded = true
+        let markedHotReloadSwap = false
+        try {
 
         for (let i = 0; i < planned.length; i += 1) {
           const target = planned[i]!
           updateItem(i, { status: 'running' })
+          const preserveSuffix =
+            target.spec.id === 'bridge' && preservedTurns > 0
+              ? `（后台保持 ${preservedTurns} 个在途会话运行，重载后自动续传）`
+              : ''
           updateOp({
             status: 'removing',
             currentTarget: target.spec.id,
-            message: `正在准备切换 ${target.spec.displayName} ${target.fromVersion ? `v${target.fromVersion} → ` : ''}v${target.release.version}…`,
+            message: `正在准备切换 ${target.spec.displayName} ${target.fromVersion ? `v${target.fromVersion} → ` : ''}v${target.release.version}${preserveSuffix}…`,
           })
 
           // Record current realpath before removal so Node's persistent ESM realpathCache
@@ -1525,10 +1542,13 @@ export class PluginUpdateService {
             recordManagedPackageMove(profileDir, target.installedKey, target.spec.packageName)
           }
 
-          // When self-updating bridge, hold intermediate client-module deletion broadcasts so the
-          // browser keeps the UI & sidebar mounted during pnpm swap and transitions atomically via
-          // `entries.replace()` once the new bundle activates.
+          // When self-updating bridge:
+          // 1) Signal `LarkBridgeManager.stop()` to preserve live host agents for seamless reattach.
+          // 2) Hold intermediate client-module deletion broadcasts so the browser keeps the UI &
+          //    sidebar mounted during pnpm swap and transitions atomically via `entries.replace()`.
           if (target.spec.id === 'bridge') {
+            lifecycle.prepareHotReloadSwap?.(operationId)
+            markedHotReloadSwap = true
             releaseClientModulesHold = holdClientModulesDuringSwap(rootCtx, [
               target.installedKey,
               target.spec.packageName,
@@ -1537,6 +1557,10 @@ export class PluginUpdateService {
 
           const removeRes = await pm.removeBundle(target.installedKey)
           if (removeRes.application === 'failed' || removeRes.application === 'cancelled') {
+            if (markedHotReloadSwap) {
+              lifecycle.finishHotReloadSwap?.(operationId, { disposeDetached: false })
+              markedHotReloadSwap = false
+            }
             const errMsg = formatChangeError(removeRes, `卸载旧版 ${target.spec.displayName} 失败`)
             updateItem(i, { status: 'failed', error: errMsg })
             throw new TaggedUpdateError(errMsg, 'install_failed')
@@ -1545,7 +1569,7 @@ export class PluginUpdateService {
           updateOp({
             status: 'installing',
             currentTarget: target.spec.id,
-            message: `正在安装并热重载 ${target.spec.displayName} v${target.release.version}…`,
+            message: `正在安装并热重载 ${target.spec.displayName} v${target.release.version}${preserveSuffix}…`,
           })
 
           const installRes = await pm.installBundle(target.release.tarballUrl, {
@@ -1580,6 +1604,10 @@ export class PluginUpdateService {
                   restoreRes.application !== 'cancelled',
               )
             }
+            if (markedHotReloadSwap) {
+              lifecycle.finishHotReloadSwap?.(operationId, { disposeDetached: !rolledBack })
+              markedHotReloadSwap = false
+            }
             updateItem(i, {
               status: rolledBack ? 'rolled_back' : 'failed',
               error: errMsg,
@@ -1599,6 +1627,10 @@ export class PluginUpdateService {
 
           const hotReloaded = installRes.application === 'applied'
           const restartRequired = installRes.application === 'restart-required'
+          if (target.spec.id === 'bridge' && markedHotReloadSwap && !hotReloaded) {
+            lifecycle.finishHotReloadSwap?.(operationId, { disposeDetached: false })
+            markedHotReloadSwap = false
+          }
           if (restartRequired) anyRestartRequired = true
           if (!hotReloaded) allHotReloaded = false
 
@@ -1620,9 +1652,18 @@ export class PluginUpdateService {
           restartRequired: anyRestartRequired,
           message: anyRestartRequired
             ? `已安装 ${summary}，但当前环境需要重启 DSH Web 后生效`
-            : `已免重启热更新至 ${summary}`,
+            : includesBridge && preservedTurns > 0
+              ? `已无损热更新至 ${summary}（已自动续接 ${preservedTurns} 个后台运行中的会话）`
+              : `已免重启热更新至 ${summary}`,
           finishedAtMs: Date.now(),
         })
+        } catch (stage3Err) {
+          if (markedHotReloadSwap) {
+            lifecycle.finishHotReloadSwap?.(operationId, { disposeDetached: false })
+            markedHotReloadSwap = false
+          }
+          throw stage3Err
+        }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
         const failureCode: PluginUpdateFailureCode =

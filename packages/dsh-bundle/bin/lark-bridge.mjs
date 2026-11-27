@@ -2,7 +2,7 @@
 import { execFileSync, spawn } from 'node:child_process'
 import { existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { basename, join, resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { resolveDataDir, runDbCliCommand, runOfflineDoctor } from '@dsh-lark/dsh-lark-bridge/db-cli'
 
 const HELP = `lark-bridge — DSH 飞书桥接辅助 CLI（零密钥暴露，自动感知当前会话上下文）
@@ -175,7 +175,12 @@ function loadEndpointConfig() {
   const envUrl = process.env.LARK_BRIDGE_API_URL?.trim()
   const envToken = process.env.LARK_BRIDGE_CLI_TOKEN?.trim()
   if (envUrl && envToken) {
-    return { apiBaseUrl: envUrl.replace(/\/+$/, ''), token: envToken }
+    const envDataDir = process.env.LARK_BRIDGE_DATA_DIR?.trim()
+    return {
+      apiBaseUrl: envUrl.replace(/\/+$/, ''),
+      token: envToken,
+      ...(envDataDir ? { dataDir: envDataDir } : {}),
+    }
   }
 
   const dshHome = process.env.DSH_HOME?.trim() || join(homedir(), '.dsh')
@@ -195,34 +200,121 @@ function loadEndpointConfig() {
   return {
     apiBaseUrl: String(parsed.apiBaseUrl).replace(/\/+$/, ''),
     token: String(parsed.token),
+    dataDir: dirname(endpointFile),
   }
 }
 
 let defaultRequestHeaders = undefined
 
-async function apiRequest(endpoint, method, path, body, extraHeaders) {
-  const res = await fetch(`${endpoint.apiBaseUrl}${path}`, {
-    method,
-    headers: {
-      authorization: `Bearer ${endpoint.token}`,
-      accept: 'application/json',
-      ...(body !== undefined ? { 'content-type': 'application/json' } : {}),
-      ...(defaultRequestHeaders || {}),
-      ...(extraHeaders || {}),
-    },
-    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
-  })
-  const data = await res.json().catch(() => ({}))
-  if (!res.ok || data.ok === false) {
-    if (res.status === 401) {
-      const detail = data.error ? ` (${data.error})` : ''
-      throw new Error(
-        `本机桥接接口认证失败（HTTP 401${detail}，并非飞书用户未授权）：请检查 cli-endpoint.json 是否指向当前运行的 DSH 实例、是否存在多实例冲突，或升级 @harryzhz/dsh-lark-bridge 至最新版本。`,
-      )
+const RELOAD_RETRY_DELAYS_MS = [400, 600, 1000, 1500, 2000, 2000, 2000, 2000, 2000, 2000]
+
+function parseCliRetryBudgetMs() {
+  const raw = process.env.LARK_BRIDGE_CLI_RETRY_MAX_MS
+  if (raw === undefined || raw === '') return 18_000
+  const parsed = Number(raw)
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 18_000
+}
+
+function isBridgeHotReloadInProgress(dataDir) {
+  if (!dataDir) return false
+  try {
+    const statusFile = join(dataDir, 'plugin-update-status.json')
+    if (!existsSync(statusFile)) return false
+    const parsed = JSON.parse(readFileSync(statusFile, 'utf8'))
+    if (!parsed || typeof parsed !== 'object') return false
+    const status = String(parsed.status || '')
+    if (status !== 'removing' && status !== 'installing' && status !== 'restoring') return false
+    const updatedAtMs = Number(parsed.updatedAtMs || 0)
+    if (!Number.isFinite(updatedAtMs) || Date.now() - updatedAtMs > 120_000) return false
+    if (parsed.currentTarget === 'bridge') return true
+    if (Array.isArray(parsed.items)) {
+      return parsed.items.some((item) => item && item.id === 'bridge' && item.status === 'running')
     }
-    throw new Error(data.error || `HTTP ${res.status}`)
+    return false
+  } catch {
+    return false
   }
-  return data
+}
+
+function isTransientReloadResponse(status, isJson, parsedJson, rawText, dataDir) {
+  // Never retry structured bridge application errors (`{ ok: false, error }`) or HTTP 403.
+  if (status === 403) return false
+  if (isJson) return false
+  if (parsedJson && typeof parsedJson === 'object' && parsedJson.ok === false) return false
+  // On DSH 0.2.3+, when `/api/lark-bridge` (`auth: 'anonymous'`) is briefly unregistered during an
+  // active `dsh-lark-bridge` HMR swap, outer `webserver/authorize` returns plain-text 401
+  // ("unauthorized"). Only retry plain-text 401 while `plugin-update-status.json` confirms an
+  // active bridge hot-reload swap so genuine auth misconfigurations fail immediately.
+  if (status === 401) {
+    return rawText.trim().toLowerCase() === 'unauthorized' && isBridgeHotReloadInProgress(dataDir)
+  }
+  return status === 404 || status === 502 || status === 503 || status === 504
+}
+
+async function apiRequest(endpoint, method, path, body, extraHeaders, options = {}) {
+  const allowRetry = options.retryOnReload !== false
+  const retryBudgetMs = allowRetry ? parseCliRetryBudgetMs() : 0
+  const deadline = Date.now() + retryBudgetMs
+
+  for (let attempt = 0; ; attempt += 1) {
+    let res
+    try {
+      res = await fetch(`${endpoint.apiBaseUrl}${path}`, {
+        method,
+        headers: {
+          authorization: `Bearer ${endpoint.token}`,
+          accept: 'application/json',
+          ...(body !== undefined ? { 'content-type': 'application/json' } : {}),
+          ...(defaultRequestHeaders || {}),
+          ...(extraHeaders || {}),
+        },
+        ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      })
+    } catch (err) {
+      if (allowRetry && Date.now() < deadline && attempt < RELOAD_RETRY_DELAYS_MS.length) {
+        const delayMs = Math.min(RELOAD_RETRY_DELAYS_MS[attempt], Math.max(50, deadline - Date.now()))
+        await sleepMs(delayMs)
+        continue
+      }
+      throw err
+    }
+
+    const rawText = await res.text().catch(() => '')
+    let data = {}
+    let isJson = false
+    if (rawText) {
+      try {
+        const parsed = JSON.parse(rawText)
+        if (parsed && typeof parsed === 'object') {
+          data = parsed
+          isJson = true
+        }
+      } catch {
+        // Non-JSON response (e.g. plain-text host 401/404 during HMR route swap).
+      }
+    }
+
+    if (!res.ok || data.ok === false) {
+      if (
+        allowRetry &&
+        isTransientReloadResponse(res.status, isJson, data, rawText, endpoint.dataDir) &&
+        Date.now() < deadline &&
+        attempt < RELOAD_RETRY_DELAYS_MS.length
+      ) {
+        const delayMs = Math.min(RELOAD_RETRY_DELAYS_MS[attempt], Math.max(50, deadline - Date.now()))
+        await sleepMs(delayMs)
+        continue
+      }
+      if (res.status === 401) {
+        const detail = data.error ? ` (${data.error})` : ''
+        throw new Error(
+          `本机桥接接口认证失败（HTTP 401${detail}，并非飞书用户未授权）：请检查 cli-endpoint.json 是否指向当前运行的 DSH 实例、是否存在多实例冲突，或升级 @harryzhz/dsh-lark-bridge 至最新版本。`,
+        )
+      }
+      throw new Error(data.error || `HTTP ${res.status}`)
+    }
+    return data
+  }
 }
 
 function loadOperatorToken(flags) {
@@ -334,6 +426,7 @@ async function pollPluginUpdateOperation(endpoint, operationId, headers, maxWait
         `/plugins/update-status?operationId=${encodeURIComponent(operationId)}`,
         undefined,
         headers,
+        { retryOnReload: false },
       )
       consecutiveErrors = 0
       const op = res.operation
@@ -439,9 +532,14 @@ async function handlePluginCommand(endpoint, positionals, flags) {
         process.env.DSH_IN_AGENT_SESSION ||
         process.env.ANTIGRAVITY_CONVERSATION_ID,
     )
-    if (inAgentSession && !flags['allow-in-session']) {
+    const normalizedTarget = target.toLowerCase()
+    const isBridgeOnlyTarget =
+      normalizedTarget === 'bridge' ||
+      normalizedTarget === 'lark-bridge' ||
+      normalizedTarget === '@harryzhz/dsh-lark-bridge'
+    if (inAgentSession && !flags['allow-in-session'] && !isBridgeOnlyTarget) {
       throw new Error(
-        '拒绝在活跃 Agent 会话内直接热更新插件（会中断当前会话）；请使用 --detached 派发后台延迟热更新，或在宿主机终端执行。',
+        '拒绝在活跃 Agent 会话内直接热更新插件（更新外部运行时可能中断当前外部会话）；请使用 --detached 派发后台热更新，或仅指定 `lark-bridge plugin update bridge`（飞书桥接支持无损热更新）。',
       )
     }
 

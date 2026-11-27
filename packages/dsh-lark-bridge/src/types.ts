@@ -120,7 +120,7 @@ export interface LarkManagedSession {
 
 export type PendingTurnStatus = 'running' | 'interrupted' | 'recovering'
 
-export type PendingTurnInterruptKind = 'graceful_shutdown' | 'crash'
+export type PendingTurnInterruptKind = 'graceful_shutdown' | 'crash' | 'hot_reload'
 
 export interface LarkPendingTurn {
   readonly id: string
@@ -147,6 +147,12 @@ export interface LarkPendingTurn {
   readonly interruptedAtMs?: number
   readonly lastActivityAtMs?: number
   readonly interruptKind?: PendingTurnInterruptKind
+  /** DSH session turn number currently executing or detached for seamless reattach. */
+  readonly targetTurn?: number
+  /** DSH `UserMessage.id` submitted via `agent.followup()` for turn matching during reattach. */
+  readonly userMessageId?: string
+  /** Last observed DSH `SessionEvent.seq` processed before detach. */
+  readonly lastEventSeq?: number
 }
 
 export type BridgeLifecyclePhase = 'starting' | 'running' | 'draining' | 'stopping' | 'stopped'

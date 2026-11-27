@@ -960,6 +960,9 @@ export class RuntimeRepo {
       interrupted_at_ms: number | null
       last_activity_at_ms: number | null
       interrupt_kind: string | null
+      target_turn: number | null
+      user_message_id: string | null
+      last_event_seq: number | null
     }>
     return rows.map((row) => {
       let inboundMsg: LarkPendingTurn['inboundMsg']
@@ -984,7 +987,9 @@ export class RuntimeRepo {
           ? row.status
           : 'running'
       const interruptKind =
-        row.interrupt_kind === 'graceful_shutdown' || row.interrupt_kind === 'crash'
+        row.interrupt_kind === 'graceful_shutdown' ||
+        row.interrupt_kind === 'crash' ||
+        row.interrupt_kind === 'hot_reload'
           ? row.interrupt_kind
           : undefined
       return {
@@ -1017,6 +1022,13 @@ export class RuntimeRepo {
         ...(row.interrupted_at_ms !== null ? { interruptedAtMs: Number(row.interrupted_at_ms) } : {}),
         ...(row.last_activity_at_ms !== null ? { lastActivityAtMs: Number(row.last_activity_at_ms) } : {}),
         ...(interruptKind ? { interruptKind } : {}),
+        ...(row.target_turn !== null && row.target_turn !== undefined
+          ? { targetTurn: Number(row.target_turn) }
+          : {}),
+        ...(row.user_message_id ? { userMessageId: row.user_message_id } : {}),
+        ...(row.last_event_seq !== null && row.last_event_seq !== undefined
+          ? { lastEventSeq: Number(row.last_event_seq) }
+          : {}),
       }
     })
   }
@@ -1030,8 +1042,8 @@ export class RuntimeRepo {
            trigger, allow_silent_empty_reply, reaction_id, session_id, trace_id, started_at_ms,
            status, inbound_msg_json, sender_name, intermediate_sent_count, recovery_attempts,
            graceful_recovery_attempts, handoff_turns_json, updated_at_ms, interrupted_at_ms,
-           last_activity_at_ms, interrupt_kind
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           last_activity_at_ms, interrupt_kind, target_turn, user_message_id, last_event_seq
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            bot_id = excluded.bot_id,
            chat_id = excluded.chat_id,
@@ -1055,7 +1067,10 @@ export class RuntimeRepo {
            updated_at_ms = excluded.updated_at_ms,
            interrupted_at_ms = excluded.interrupted_at_ms,
            last_activity_at_ms = excluded.last_activity_at_ms,
-           interrupt_kind = excluded.interrupt_kind`,
+           interrupt_kind = excluded.interrupt_kind,
+           target_turn = excluded.target_turn,
+           user_message_id = excluded.user_message_id,
+           last_event_seq = excluded.last_event_seq`,
       )
       .run(
         turn.id,
@@ -1082,6 +1097,9 @@ export class RuntimeRepo {
         turn.interruptedAtMs ?? null,
         turn.lastActivityAtMs ?? null,
         turn.interruptKind ?? null,
+        turn.targetTurn ?? null,
+        turn.userMessageId ?? null,
+        turn.lastEventSeq ?? null,
       )
     return { ...turn, updatedAtMs }
   }

@@ -240,10 +240,11 @@ export function PluginUpdateDialog({
   const updatableHotPlugins = plugins.filter((p) => p.updateAvailable && p.hotReloadSupported)
   const inFlightTurns = overview?.inFlightTurns ?? 0
   const activeExternalAgents = overview?.activeExternalAgents ?? 0
-  const hasActiveWorkload = inFlightTurns > 0 || activeExternalAgents > 0
-  const workloadParts: string[] = []
-  if (inFlightTurns > 0) workloadParts.push(`${inFlightTurns} 个飞书回合`)
-  if (activeExternalAgents > 0) workloadParts.push(`${activeExternalAgents} 个外部会话`)
+  const bridgeSeamlessReload = overview?.bridgeSeamlessReload !== false
+  const hasUpdatableExternal = updatableHotPlugins.some((p) => p.id === 'external-agents')
+  const externalUpdateNeedsDrain = hasUpdatableExternal && activeExternalAgents > 0
+  const showSeamlessNotice =
+    !externalUpdateNeedsDrain && bridgeSeamlessReload && inFlightTurns > 0 && updatableHotPlugins.length > 0
 
   const handleCheck = async () => {
     setChecking(true)
@@ -328,7 +329,7 @@ export function PluginUpdateDialog({
             overview?.hotReloadSupported
               ? overview.checkedAtMs
                 ? `最近检查：${formatIsoTime(new Date(overview.checkedAtMs).toISOString())}`
-                : '更新过程会自动校验 SHA256、排空在途飞书回复并支持失败回滚'
+                : '校验 SHA256 并原地热重载，支持失败回滚；更新飞书桥接不中断在途会话'
               : overview?.hotReloadUnavailableReason || '请确认 DSH HMR 与 Plugin Manager 已启用'
           }
         >
@@ -343,10 +344,10 @@ export function PluginUpdateDialog({
           </Button>
         </SettingRow>
 
-        {hasActiveWorkload && !activeOpId && updatableHotPlugins.length > 0 && (
+        {externalUpdateNeedsDrain && !activeOpId && updatableHotPlugins.length > 0 && (
           <div className="fb-update-busy-banner">
             <span>
-              当前有 {workloadParts.join('、')} 运行中，普通更新会先等待排空
+              当前有 {activeExternalAgents} 个外部会话运行中，更新外部运行时会先等待排空
             </span>
             {pendingForce?.kind !== 'start-force' && (
               <Button
@@ -367,10 +368,18 @@ export function PluginUpdateDialog({
           </div>
         )}
 
+        {showSeamlessNotice && !activeOpId && (
+          <div className="fb-update-busy-banner">
+            <span>
+              当前有 {inFlightTurns} 个飞书回合运行中，更新飞书桥接将后台保活并在重载后自动续传
+            </span>
+          </div>
+        )}
+
         {pendingForce?.kind === 'start-force' && !showForceRetry && (
           <div className="fb-update-force-confirm" style={{ marginBottom: 10 }}>
             <span>
-              确认跳过排空并强制热更新「{pendingForce.label}」？进行中的会话可能短暂中断（飞书回合会自动恢复）。
+              确认跳过排空并强制热更新「{pendingForce.label}」？进行中的外部会话会短暂中断（飞书回合会自动恢复）。
             </span>
             <div className="fb-update-force-confirm-btns">
               <Button
@@ -403,7 +412,7 @@ export function PluginUpdateDialog({
               </Tag>
               <span className="fb-update-op-msg">
                 {reconnecting
-                  ? '正在安装新版插件并无缝切换，当前界面保持可见，请稍候…'
+                  ? '正在无缝切换至新版插件，后台在途会话不受中断，当前界面保持可见…'
                   : operation.message}
               </span>
             </div>
@@ -431,7 +440,7 @@ export function PluginUpdateDialog({
               <div className="fb-update-op-actions">
                 {pendingForce?.kind === 'preempt-drain' ? (
                   <div className="fb-update-force-confirm">
-                    <span>跳过等待将立即开始热重载，进行中的会话可能短暂中断，确认继续？</span>
+                    <span>跳过等待将立即更新外部运行时，进行中的外部会话可能短暂中断，确认继续？</span>
                     <div className="fb-update-force-confirm-btns">
                       <Button
                         size="sm"
@@ -453,7 +462,7 @@ export function PluginUpdateDialog({
                   </div>
                 ) : (
                   <>
-                    <span className="fb-update-plugin-hint">如无需等待当前任务结束，可立即跳过排空</span>
+                    <span className="fb-update-plugin-hint">如无需等待外部会话结束，可立即跳过排空</span>
                     <Button
                       size="sm"
                       variant="outline"
@@ -473,7 +482,7 @@ export function PluginUpdateDialog({
               <div className="fb-update-op-actions">
                 {pendingForce?.kind === 'start-force' ? (
                   <div className="fb-update-force-confirm">
-                    <span>强制重试将跳过等待在途会话排空（飞书回合会自动恢复），确认继续？</span>
+                    <span>强制重试将跳过等待外部会话排空（飞书回合会自动恢复），确认继续？</span>
                     <div className="fb-update-force-confirm-btns">
                       <Button
                         size="sm"
@@ -495,7 +504,7 @@ export function PluginUpdateDialog({
                   </div>
                 ) : (
                   <>
-                    <span className="fb-update-plugin-hint">存在活跃会话导致排空超时，可选择跳过等待直接热更新</span>
+                    <span className="fb-update-plugin-hint">存在活跃外部会话导致排空超时，可选择跳过等待直接热更新</span>
                     <Button
                       size="sm"
                       variant="primary"
