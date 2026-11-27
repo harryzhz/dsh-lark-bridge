@@ -39,6 +39,7 @@ import {
 } from '@dsh-lark/lark-core'
 import type { BotConnectionPool } from './bot-connection-pool.js'
 import type { IssuedConsoleLoginLink } from './console-login.js'
+import { TurnCotController, closeOrphanCotBubble } from './cot-stream-controller.js'
 import {
   ListenerDebounceBuffer,
   type DebouncedListenerEntry,
@@ -157,6 +158,14 @@ function isEligibleForProgressAnchor(decision: AgentDecision): boolean {
     !decision.silentOnly &&
     !decision.allowSilentEmptyReply &&
     decision.trigger !== 'listener'
+  )
+}
+
+function isEligibleForNativeCot(decision: AgentDecision): boolean {
+  return (
+    Boolean(decision.cotEnabled) &&
+    !decision.silentOnly &&
+    !decision.allowSilentEmptyReply
   )
 }
 
@@ -283,6 +292,9 @@ export interface ActiveTurnRecord {
   targetTurn?: number
   userMessageId?: string
   lastEventSeq?: number
+  cotId?: string
+  cotMessageId?: string
+  cotController?: TurnCotController
   intermediateSentCount: number
   progressAnchorSent?: boolean
   queueAnchorSent?: boolean
@@ -633,6 +645,14 @@ export class InboundPipeline {
       if (pending.reactionId && transport) {
         void transport.removeReaction(pending.messageId, pending.reactionId).catch(() => {})
       }
+      if (pending.cotId && pending.cotMessageId && transport) {
+        void this.closePendingTurnOrphanCot(
+          transport,
+          pending,
+          'error',
+          disabledCancelSummary(scope, '已取消执行'),
+        )
+      }
       this.host.store.recordEvent({
         botId: pending.botId,
         chatId: pending.chatId,
@@ -714,6 +734,14 @@ export class InboundPipeline {
       if (activeTurnIds.has(pending.id)) continue
       matchedAny = true
       this.host.store.deletePendingTurn(pending.id)
+      if (pending.cotId && pending.cotMessageId) {
+        void this.closePendingTurnOrphanCot(
+          transport,
+          pending,
+          'error',
+          '原消息已撤回，已取消执行',
+        )
+      }
       this.host.store.recordEvent({
         botId: pending.botId,
         chatId: pending.chatId,
@@ -823,6 +851,7 @@ export class InboundPipeline {
           bot,
           ...(groupConfig ? { group: groupConfig } : {}),
           chatType: msg.chatType,
+          chatId: msg.chatId,
           ...(msg.senderOpenId ? { senderOpenId: msg.senderOpenId } : {}),
           senderType: msg.senderType,
           command: decision.command,
@@ -1191,6 +1220,15 @@ export class InboundPipeline {
       for (const m of members) {
         if (this.isMessageRecalled(m.botId, m.messageId)) {
           this.host.store.deletePendingTurn(m.id)
+          if (m.cotId && m.cotMessageId) {
+            const recalledTransport = this.host.connections.getTransport(m.botId)
+            void this.closePendingTurnOrphanCot(
+              recalledTransport,
+              m,
+              'error',
+              '原消息已撤回，已取消执行',
+            )
+          }
           this.host.store.recordEvent({
             botId: m.botId,
             chatId: m.chatId,
@@ -1257,6 +1295,12 @@ export class InboundPipeline {
             if (member.reactionId) {
               await transport.removeReaction(member.messageId, member.reactionId).catch(() => {})
             }
+            await this.closePendingTurnOrphanCot(
+              transport,
+              member,
+              'error',
+              disabledCancelSummary(disabledScope, '已跳过重启恢复'),
+            )
             this.host.store.recordEvent({
               botId: member.botId,
               chatId: member.chatId,
@@ -1298,6 +1342,11 @@ export class InboundPipeline {
             for (const member of survivingMembers) {
               this.host.store.deletePendingTurn(member.id)
             }
+            await Promise.all(
+              survivingMembers.map((member) =>
+                this.closePendingTurnOrphanCot(transport, member, 'done'),
+              ),
+            )
             await this.deliverRecoveredCompletedTurn({
               bot,
               transport,
@@ -1392,6 +1441,11 @@ export class InboundPipeline {
         for (const member of survivingMembers) {
           this.host.store.deletePendingTurn(member.id)
         }
+        await Promise.all(
+          survivingMembers.map((member) =>
+            this.closePendingTurnOrphanCot(transport, member, 'error', '本轮执行因服务重启中断'),
+          ),
+        )
         for (const peer of peerItems) {
           if (peer.reactionId) {
             await transport.removeReaction(peer.messageId, peer.reactionId).catch(() => {})
@@ -1450,9 +1504,26 @@ export class InboundPipeline {
       if (peer.reactionId) {
         void transport.removeReaction(peer.messageId, peer.reactionId).catch(() => {})
       }
+      if (peer.cotId && peer.cotMessageId) {
+        void this.closePendingTurnOrphanCot(
+          transport,
+          peer,
+          'error',
+          '服务重启后正在自动恢复执行',
+        )
+      }
     }
+    if (item.cotId && item.cotMessageId) {
+      void this.closePendingTurnOrphanCot(
+        transport,
+        item,
+        'error',
+        '服务重启后正在自动恢复执行',
+      )
+    }
+    const { cotId: _staleCotId, cotMessageId: _staleCotMsgId, ...cleanItem } = item
     this.host.store.upsertPendingTurn({
-      ...item,
+      ...cleanItem,
       status: 'recovering',
       recoveryAttempts: nextCrashAttempts,
       gracefulRecoveryAttempts: nextGracefulAttempts,
@@ -1665,6 +1736,38 @@ export class InboundPipeline {
         Boolean(this.getBatchDisabledScope(bot.id, batchItems)) ||
         batchItems.every((i) => this.isTurnRecalled(bot.id, i))
 
+      // Close any orphan CoT bubble persisted before the hot-reload swap (best-effort).
+      await Promise.all(
+        members.map((member) =>
+          this.closePendingTurnOrphanCot(
+            transport,
+            member,
+            'error',
+            '服务热更新重载，正在继续执行',
+          ),
+        ),
+      )
+
+      const cotController = isEligibleForNativeCot(boundDecision)
+        ? this.createTurnCotController({
+            bot,
+            transport,
+            msg: latestItem.msg,
+            decision: boundDecision,
+            activeTurn: latestItem.activeTurn,
+            sessionId,
+            session: liveAgent.session,
+            canPublish: () =>
+              !boundDecision.silentOnly &&
+              !isSilenced() &&
+              !isBatchCancelled() &&
+              !this.host.isDisposed(),
+          })
+        : undefined
+      if (cotController) {
+        latestItem.activeTurn.cotController = cotController
+      }
+
       const execStartedMs = Date.now()
       const result = await reattachTurnAndCollectReply(this.host.ctx, liveAgent, {
         ...(lead.targetTurn !== undefined ? { targetTurn: lead.targetTurn } : {}),
@@ -1673,6 +1776,7 @@ export class InboundPipeline {
         skipFirstIntermediates,
         signal: this.host.shutdownSignal,
         cancelSignal: batchCancelController.signal,
+        ...(cotController ? { onCotEvent: (ev) => cotController.push(ev) } : {}),
         onActivity: (timestampMs) => {
           for (const bi of batchItems) {
             this.touchActiveTurnActivity(bi.activeTurn, timestampMs)
@@ -1745,6 +1849,9 @@ export class InboundPipeline {
       if (result.outcome === 'not_found') {
         // The live agent no longer owns this turn (e.g. hot-reload happened before submission);
         // release our active slots and fall back cleanly to replay recovery or interrupted cleanup.
+        await this.closeBatchCot(batchItems, 'interrupted', {
+          notice: '未匹配到运行中会话，已切回恢复流程',
+        })
         fellBackToReplay = true
         for (const bi of batchItems) {
           bi.activeTurn.settled = true
@@ -1792,6 +1899,11 @@ export class InboundPipeline {
       if (result.silencedByTool) {
         latestItem.activeTurn.silencedByControl = true
       }
+      await this.closeBatchCot(
+        batchItems,
+        isSilenced() || isBatchCancelled() ? 'interrupted' : 'done',
+        isBatchCancelled() ? { notice: '执行已取消' } : {},
+      )
       const execMs = Math.max(0, Date.now() - execStartedMs)
       const settlement = await this.settleBatchReply({
         bot,
@@ -1903,22 +2015,46 @@ export class InboundPipeline {
       })
     }
 
-    if (nonRecoverable.length === 0) return
-    for (const record of nonRecoverable) {
-      this.host.store.deletePendingTurn(record.id)
+    if (nonRecoverable.length > 0) {
+      for (const record of nonRecoverable) {
+        this.host.store.deletePendingTurn(record.id)
+      }
     }
 
-    const work = Promise.all(
-      nonRecoverable.map((record) =>
-        this.deliverInterruptedTurnCleanup({
+    const recoverableWithCot = recoverable.filter(
+      (r) => Boolean(r.cotController) || Boolean(r.cotId && r.cotMessageId),
+    )
+    if (nonRecoverable.length === 0 && recoverableWithCot.length === 0) return
+
+    const cotCloseTimeoutMs = Math.max(400, SHUTDOWN_TURN_CLEANUP_TIMEOUT_MS - 300)
+    const recoverableCotNotice = preserveLiveAgents
+      ? '服务热更新重载，正在后台继续执行'
+      : '服务重启中，将自动恢复执行'
+
+    const work = Promise.all([
+      ...recoverableWithCot.map(async (record) => {
+        await this.closeTurnCot(record, 'interrupted', {
+          notice: recoverableCotNotice,
+          timeoutMs: cotCloseTimeoutMs,
+        })
+        if (!record.cotController && !record.cotId) {
+          this.persistActiveTurn(record, { force: true })
+        }
+      }),
+      ...nonRecoverable.map(async (record) => {
+        await this.closeTurnCot(record, 'interrupted', {
+          notice: '本轮执行因服务重载或停机已中断',
+          timeoutMs: cotCloseTimeoutMs,
+        })
+        await this.deliverInterruptedTurnCleanup({
           transport: record.transport,
           turn: record,
           intermediateSentCount: record.intermediateSentCount,
           auditSummary: '本轮执行因服务重载或停机已中断',
           replyText: '本轮执行因服务重载或停机已中断，可重新回复继续。',
-        }),
-      ),
-    )
+        })
+      }),
+    ])
 
     let timer: ReturnType<typeof setTimeout> | undefined
     const timeout = new Promise<void>((resolve) => {
@@ -2772,7 +2908,10 @@ export class InboundPipeline {
           execAnchorMs > 0 &&
           isEligibleForProgressAnchor(effectiveDecision) &&
           !batchItems.some(
-            (i) => i.activeTurn.progressAnchorSent || i.activeTurn.intermediateSentCount > 0,
+            (i) =>
+              i.activeTurn.progressAnchorSent ||
+              i.activeTurn.intermediateSentCount > 0 ||
+              Boolean(i.activeTurn.cotId),
           )
         ) {
           execAnchorTimer = setTimeout(() => {
@@ -2783,7 +2922,10 @@ export class InboundPipeline {
               isBatchCancelled() ||
               this.host.isDisposed() ||
               batchItems.some(
-                (i) => i.activeTurn.progressAnchorSent || i.activeTurn.intermediateSentCount > 0,
+                (i) =>
+                  i.activeTurn.progressAnchorSent ||
+                  i.activeTurn.intermediateSentCount > 0 ||
+                  Boolean(i.activeTurn.cotId),
               )
             ) {
               return
@@ -2806,6 +2948,28 @@ export class InboundPipeline {
           }, execAnchorMs)
           execAnchorTimer.unref?.()
         }
+        const cotController = isEligibleForNativeCot(effectiveDecision)
+          ? this.createTurnCotController({
+              bot,
+              transport,
+              msg: latestItem.msg,
+              decision: effectiveDecision,
+              activeTurn: latestItem.activeTurn,
+              sessionId: acquired.sessionId,
+              session: acquired.agent.session,
+              canPublish: () =>
+                !effectiveDecision.silentOnly &&
+                !isSilenced() &&
+                !isBatchCancelled() &&
+                !this.host.isDisposed(),
+              onFirstCreated: () => {
+                clearExecAnchorTimer()
+              },
+            })
+          : undefined
+        if (cotController) {
+          latestItem.activeTurn.cotController = cotController
+        }
         const execStartedMs = Date.now()
         let replyText: string
         let execMs = 0
@@ -2813,6 +2977,7 @@ export class InboundPipeline {
           replyText = await runTurnAndCollectReply(this.host.ctx, acquired.agent, content, {
             signal: this.host.shutdownSignal,
             cancelSignal: linkedCancel.signal,
+            ...(cotController ? { onCotEvent: (ev) => cotController.push(ev) } : {}),
             onUserMessageSubmitted: (userMessageId) => {
               for (const item of batchItems) {
                 item.activeTurn.sessionId = acquired.sessionId
@@ -2899,6 +3064,12 @@ export class InboundPipeline {
           linkedCancel.dispose()
           disposeBatchCancel = undefined
         }
+
+        await this.closeBatchCot(
+          batchItems,
+          isSilenced() || isBatchCancelled() ? 'interrupted' : 'done',
+          isBatchCancelled() ? { notice: '执行已取消' } : {},
+        )
 
         const settlement = await this.settleBatchReply({
           bot,
@@ -3288,6 +3459,7 @@ export class InboundPipeline {
       err instanceof TurnAbortedError && (err.kind === 'disposed' || err.kind === 'interrupted')
     if (isRestartAbort) {
       const nonRecoverableItems: QueuedWorkerTurnItem[] = []
+      const newlySuspendedItems: QueuedWorkerTurnItem[] = []
       const nowMs = Date.now()
       let suspendedCount = 0
       for (const item of batchItems) {
@@ -3297,14 +3469,30 @@ export class InboundPipeline {
         }
         if (canAutoResumePendingTurn(item.activeTurn, nowMs, { phase: 'shutdown' })) {
           this.suspendSingleTurnForRestart(item.activeTurn, nowMs)
+          newlySuspendedItems.push(item)
           suspendedCount += 1
         } else {
           nonRecoverableItems.push(item)
         }
       }
+      if (newlySuspendedItems.length > 0) {
+        await Promise.all(
+          newlySuspendedItems.map(async (item) => {
+            if (!item.activeTurn.cotController && !item.activeTurn.cotId) return
+            await this.closeTurnCot(item.activeTurn, 'interrupted', {
+              notice: '服务重启中，将自动恢复执行',
+              timeoutMs: 1_500,
+            })
+            if (!item.activeTurn.cotController && !item.activeTurn.cotId) {
+              this.persistActiveTurn(item.activeTurn, { force: true })
+            }
+          }),
+        )
+      }
       if (nonRecoverableItems.length === 0) {
         return { dispose: false, archive: false }
       }
+      await this.closeBatchCot(nonRecoverableItems, 'interrupted', { notice: err.message })
       // Fall through to interrupt-cleanup only for non-recoverable turns.
       for (const item of nonRecoverableItems) {
         this.claimActiveTurn(item.activeTurn)
@@ -3337,6 +3525,9 @@ export class InboundPipeline {
     const isDisabledAbort =
       (err instanceof TurnAbortedError && err.kind === 'disabled') || Boolean(disabledScope)
     if (isDisabledAbort) {
+      await this.closeBatchCot(batchItems, 'interrupted', {
+        notice: disabledCancelSummary(disabledScope ?? 'group', '已停止执行'),
+      })
       let anyDisabledClaimed = false
       for (const item of batchItems) {
         if (this.claimActiveTurn(item.activeTurn)) {
@@ -3372,6 +3563,9 @@ export class InboundPipeline {
       (err instanceof TurnAbortedError && err.kind === 'recalled') ||
       (batchItems.length > 0 && batchItems.every((item) => this.isTurnRecalled(bot.id, item)))
     if (isRecalledAbort) {
+      await this.closeBatchCot(batchItems, 'interrupted', {
+        notice: '原消息已撤回，已取消执行',
+      })
       let anyRecalledClaimed = false
       for (const item of batchItems) {
         if (this.isTurnRecalled(bot.id, item)) {
@@ -3413,6 +3607,7 @@ export class InboundPipeline {
     if (!anyClaimed) return { dispose, archive }
 
     const errorMsg = err instanceof Error ? err.message : String(err)
+    await this.closeBatchCot(batchItems, 'interrupted', { notice: errorMsg })
     this.host.ctx.logger.error(
       `[lark-bridge][trace=${targetTurn.traceId}][bot=${bot.id}][msg=${targetMsg.messageId}] turn handling failed: ${errorMsg}`,
     )
@@ -4277,6 +4472,8 @@ export class InboundPipeline {
       ...(record.targetTurn !== undefined ? { targetTurn: record.targetTurn } : {}),
       ...(record.userMessageId ? { userMessageId: record.userMessageId } : {}),
       ...(record.lastEventSeq !== undefined ? { lastEventSeq: record.lastEventSeq } : {}),
+      ...(record.cotId ? { cotId: record.cotId } : {}),
+      ...(record.cotMessageId ? { cotMessageId: record.cotMessageId } : {}),
       updatedAtMs: Date.now(),
     })
   }
@@ -4288,6 +4485,125 @@ export class InboundPipeline {
     this.host.store.deletePendingTurn(record.id)
     this.host.onActivityChange?.()
     return true
+  }
+
+  private createTurnCotController(input: {
+    readonly bot: LarkBotConfig
+    readonly transport: LarkBotTransport
+    readonly msg: InboundLarkMessage
+    readonly decision: AgentDecision
+    readonly activeTurn: ActiveTurnRecord
+    readonly sessionId: string
+    readonly session?: Session
+    readonly canPublish: () => boolean
+    readonly onFirstCreated?: () => void
+  }): TurnCotController {
+    const {
+      bot,
+      transport,
+      msg,
+      decision,
+      activeTurn,
+      sessionId,
+      session,
+      canPublish,
+      onFirstCreated,
+    } = input
+    return new TurnCotController({
+      transport,
+      chatId: msg.chatId,
+      chatType: msg.chatType,
+      replyMode: decision.replyMode,
+      messageId: msg.messageId,
+      ...(msg.rootId ? { rootId: msg.rootId } : {}),
+      ...(msg.threadId ? { threadId: msg.threadId } : {}),
+      threadKey: sessionId || decision.routeKey,
+      runId: activeTurn.traceId,
+      toolResultEnabled: decision.cotToolResultEnabled !== false,
+      canPublish,
+      onCreated: (created) => {
+        onFirstCreated?.()
+        activeTurn.cotId = created.cotId
+        activeTurn.cotMessageId = created.messageId
+        this.recordSentLarkMessage(sessionId, session, created.messageId)
+        this.persistActiveTurn(activeTurn)
+      },
+      onSettled: () => {
+        activeTurn.cotId = undefined
+        activeTurn.cotMessageId = undefined
+        activeTurn.cotController = undefined
+        if (!activeTurn.settled && !this.host.isDisposed()) {
+          this.persistActiveTurn(activeTurn)
+        }
+      },
+      log: (level, message) => {
+        this.host.ctx.logger[level](
+          `[lark-bridge][trace=${activeTurn.traceId}][bot=${bot.id}] ${message}`,
+        )
+      },
+    })
+  }
+
+  private async closeTurnCot(
+    record: ActiveTurnRecord,
+    status: 'done' | 'interrupted',
+    options: { readonly notice?: string; readonly timeoutMs?: number } = {},
+  ): Promise<void> {
+    if (record.cotController) {
+      const controller = record.cotController
+      await controller.finish(status, options)
+      if (controller.isSettled) {
+        record.cotId = undefined
+        record.cotMessageId = undefined
+        if (record.cotController === controller) {
+          record.cotController = undefined
+        }
+      }
+      return
+    }
+    if (record.cotId && record.cotMessageId) {
+      const cotId = record.cotId
+      const messageId = record.cotMessageId
+      await closeOrphanCotBubble(record.transport, {
+        cotId,
+        messageId,
+        reason: status === 'done' ? 'done' : 'error',
+        ...(options.notice ? { notice: options.notice } : {}),
+      })
+      record.cotId = undefined
+      record.cotMessageId = undefined
+    }
+  }
+
+  private async closeBatchCot(
+    items: readonly QueuedWorkerTurnItem[],
+    status: 'done' | 'interrupted',
+    options: { readonly notice?: string; readonly timeoutMs?: number } = {},
+  ): Promise<void> {
+    const withCot = items.filter(
+      (item) =>
+        Boolean(item.activeTurn.cotController) ||
+        Boolean(item.activeTurn.cotId && item.activeTurn.cotMessageId),
+    )
+    if (withCot.length === 0) return
+    await Promise.all(
+      withCot.map((item) => this.closeTurnCot(item.activeTurn, status, options)),
+    )
+  }
+
+  private async closePendingTurnOrphanCot(
+    transport: LarkBotTransport | undefined,
+    turn: Pick<LarkPendingTurn, 'cotId' | 'cotMessageId'>,
+    reason: 'done' | 'error',
+    notice?: string,
+  ): Promise<void> {
+    if (!transport || !turn.cotId || !turn.cotMessageId) return
+    await closeOrphanCotBubble(transport, {
+      cotId: turn.cotId,
+      messageId: turn.cotMessageId,
+      reason,
+      ...(notice ? { notice } : {}),
+    })
   }
 
   private shouldNotifyInterruptedTurn(

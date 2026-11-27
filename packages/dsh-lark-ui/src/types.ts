@@ -333,6 +333,8 @@ export interface BotConfig {
   adminUsers: string[]
   adminUserProfiles?: SubstituteTarget[]
   sendIntermediateMessages: boolean
+  cotEnabled?: boolean
+  cotToolResultEnabled?: boolean
   longTurnProgressNotice?: boolean
   longTurnNoticeDelaySeconds?: number
   longTurnNoticeText?: string
@@ -423,6 +425,8 @@ export interface GroupConfig {
   idleCloseMinutes?: number | null
   receivedReactionEmoji: string
   intermediateMessages: Inheritable<'on' | 'off'>
+  cotEnabled?: Inheritable<'on' | 'off'>
+  cotToolResultEnabled?: Inheritable<'on' | 'off'>
   replyFormat: Inheritable<'card' | 'text'>
   dshSessionLinkInCard: Inheritable<'on' | 'off'>
   sessionLinkGuestReadOnly: Inheritable<'on' | 'off'>

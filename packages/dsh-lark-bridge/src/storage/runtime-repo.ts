@@ -963,6 +963,8 @@ export class RuntimeRepo {
       target_turn: number | null
       user_message_id: string | null
       last_event_seq: number | null
+      cot_id: string | null
+      cot_message_id: string | null
     }>
     return rows.map((row) => {
       let inboundMsg: LarkPendingTurn['inboundMsg']
@@ -1029,6 +1031,8 @@ export class RuntimeRepo {
         ...(row.last_event_seq !== null && row.last_event_seq !== undefined
           ? { lastEventSeq: Number(row.last_event_seq) }
           : {}),
+        ...(row.cot_id ? { cotId: row.cot_id } : {}),
+        ...(row.cot_message_id ? { cotMessageId: row.cot_message_id } : {}),
       }
     })
   }
@@ -1042,8 +1046,9 @@ export class RuntimeRepo {
            trigger, allow_silent_empty_reply, reaction_id, session_id, trace_id, started_at_ms,
            status, inbound_msg_json, sender_name, intermediate_sent_count, recovery_attempts,
            graceful_recovery_attempts, handoff_turns_json, updated_at_ms, interrupted_at_ms,
-           last_activity_at_ms, interrupt_kind, target_turn, user_message_id, last_event_seq
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           last_activity_at_ms, interrupt_kind, target_turn, user_message_id, last_event_seq,
+           cot_id, cot_message_id
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            bot_id = excluded.bot_id,
            chat_id = excluded.chat_id,
@@ -1070,7 +1075,9 @@ export class RuntimeRepo {
            interrupt_kind = excluded.interrupt_kind,
            target_turn = excluded.target_turn,
            user_message_id = excluded.user_message_id,
-           last_event_seq = excluded.last_event_seq`,
+           last_event_seq = excluded.last_event_seq,
+           cot_id = excluded.cot_id,
+           cot_message_id = excluded.cot_message_id`,
       )
       .run(
         turn.id,
@@ -1100,6 +1107,8 @@ export class RuntimeRepo {
         turn.targetTurn ?? null,
         turn.userMessageId ?? null,
         turn.lastEventSeq ?? null,
+        turn.cotId ?? null,
+        turn.cotMessageId ?? null,
       )
     return { ...turn, updatedAtMs }
   }

@@ -6,6 +6,7 @@ import {
 import { SILENT_REPLY_SENTINEL } from './reply-text.js'
 import {
   resolveEffectiveAgentRuntime,
+  resolveEffectiveCotConfig,
   resolveEffectiveReactionEmoji,
   resolveEffectiveWorkingDir,
   resolveEffectiveWorkspaceName,
@@ -641,6 +642,7 @@ export function decideLarkRouting(
   const effectiveRuntime = resolveEffectiveAgentRuntime(bot, group)
   const { agentPreset, runtimeProfileId, model, reasoningEffort } = effectiveRuntime
   const useCard = resolveUseCard(bot, group)
+  const effectiveCot = resolveEffectiveCotConfig(bot, group)
   const sendIntermediateMessages = resolveSendIntermediateMessages(bot, group)
   const receivedReactionEmoji = resolveEffectiveReactionEmoji(bot, group)
   const idleCloseMs = resolveIdleCloseMs(bot, group)
@@ -680,6 +682,8 @@ export function decideLarkRouting(
       sessionMode: bot.p2pSessionMode,
       replyMode: 'chat',
       useCard: bot.useInteractiveCard,
+      cotEnabled: Boolean(bot.cotEnabled),
+      cotToolResultEnabled: bot.cotToolResultEnabled !== false,
       sendIntermediateMessages: bot.sendIntermediateMessages,
       longTurnProgressNotice: bot.longTurnProgressNotice,
       longTurnNoticeDelaySeconds: bot.longTurnNoticeDelaySeconds,
@@ -748,6 +752,8 @@ export function decideLarkRouting(
       sessionMode: groupSessionMode,
       replyMode: effectiveGroupReplyMode,
       useCard,
+      cotEnabled: effectiveCot.enabled,
+      cotToolResultEnabled: effectiveCot.toolResultEnabled,
       sendIntermediateMessages,
       longTurnProgressNotice: bot.longTurnProgressNotice,
       longTurnNoticeDelaySeconds: bot.longTurnNoticeDelaySeconds,
@@ -883,6 +889,8 @@ export function decideLarkRouting(
       sessionMode: 'thread',
       replyMode: activeThreadReplyMode,
       useCard,
+      cotEnabled: !allowSilentEmptyReply && effectiveCot.enabled,
+      cotToolResultEnabled: effectiveCot.toolResultEnabled,
       sendIntermediateMessages,
       longTurnProgressNotice: bot.longTurnProgressNotice,
       longTurnNoticeDelaySeconds: bot.longTurnNoticeDelaySeconds,
@@ -934,6 +942,8 @@ export function decideLarkRouting(
         sessionMode: effectiveSubSessionMode,
         replyMode: effectiveGroupReplyMode,
         useCard,
+        cotEnabled: effectiveCot.enabled,
+        cotToolResultEnabled: effectiveCot.toolResultEnabled,
         sendIntermediateMessages,
         longTurnProgressNotice: bot.longTurnProgressNotice,
       longTurnNoticeDelaySeconds: bot.longTurnNoticeDelaySeconds,
@@ -987,6 +997,8 @@ export function decideLarkRouting(
         sessionMode: listener.sessionMode,
         replyMode: effectiveListenerReplyMode,
         useCard,
+        cotEnabled: !listener.allowSilentEmptyReply && effectiveCot.enabled,
+        cotToolResultEnabled: effectiveCot.toolResultEnabled,
         sendIntermediateMessages,
         ...(receivedReactionEmoji ? { receivedReactionEmoji } : {}),
         allowSilentEmptyReply: listener.allowSilentEmptyReply,
@@ -1032,6 +1044,8 @@ export function decideLarkRouting(
       sessionMode: 'per_message',
       replyMode: 'new-topic',
       useCard,
+      cotEnabled: false,
+      cotToolResultEnabled: false,
       sendIntermediateMessages: false,
       allowSilentEmptyReply: true,
       autoCloseAfterCompletion: true,

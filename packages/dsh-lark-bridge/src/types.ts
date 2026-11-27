@@ -154,6 +154,10 @@ export interface LarkPendingTurn {
   readonly userMessageId?: string
   /** Last observed DSH `SessionEvent.seq` processed before detach. */
   readonly lastEventSeq?: number
+  /** Active native Feishu CoT entity ID (`im/v1/message_cot`) for orphan closure across restarts. */
+  readonly cotId?: string
+  /** Feishu `message_id` backing `cotId`. */
+  readonly cotMessageId?: string
 }
 
 export type BridgeLifecyclePhase = 'starting' | 'running' | 'draining' | 'stopping' | 'stopped'
