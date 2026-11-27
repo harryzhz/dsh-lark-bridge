@@ -633,7 +633,8 @@ describe('ProactiveReminderService one-shot lifecycle, origin auto-routing & con
       deliverReminderOutput: vi.fn().mockResolvedValue({ messageId: 'om_out_guard' }),
     })
 
-    const baseNow = Date.parse('2026-11-24T02:00:00.000Z')
+    // Use local daytime 10:00 so default overnight Quiet Hours (00:00-08:00) do not defer chain hops on UTC CI runners.
+    const baseNow = new Date(2026, 10, 24, 10, 0, 0).getTime()
 
     // 1. Oversized prompt (> 2400 chars) is rejected immediately
     await expect(
