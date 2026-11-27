@@ -1289,7 +1289,7 @@ function BotConversationAndMessageSection({
           </SettingRow>
           <SettingRow
             title="提示文案"
-            desc="支持飞书表情简码如 [敲键盘]，留空使用默认文案"
+            desc="支持 [敲键盘] 等飞书表情，留空走默认"
           >
             <TextField
               value={draft.longTurnNoticeText ?? ''}
