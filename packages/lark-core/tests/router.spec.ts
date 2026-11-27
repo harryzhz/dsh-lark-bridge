@@ -2244,6 +2244,24 @@ describe('decideLarkRouting, <user_message> format, memberOverrides & title inte
       text: '版本通知：<at id=all>所有人</at> 已上线',
       mentions: [],
     })
+    const postAllAtMsg = createMessage({
+      messageId: 'om_mf_post_all',
+      msgType: 'post',
+      text: '@所有人 下午三点同步发布进度',
+      rawContent: JSON.stringify({
+        content: [[{ tag: 'at', user_id: 'all', user_name: '所有人' }, { tag: 'text', text: ' 下午三点同步发布进度' }]],
+      }),
+      mentions: [],
+    })
+    const postPeerAtMsg = createMessage({
+      messageId: 'om_mf_post_peer',
+      msgType: 'post',
+      text: '@Sam 麻烦看下这个变更',
+      rawContent: JSON.stringify({
+        content: [[{ tag: 'at', user_id: 'ou_peer', user_name: 'Sam' }, { tag: 'text', text: ' 麻烦看下这个变更' }]],
+      }),
+      mentions: [],
+    })
     const directBotMentionMsg = createMessage({
       messageId: 'om_mf_bot',
       text: '@_bot_1 @_user_1 帮我看下日志',
@@ -2291,7 +2309,19 @@ describe('decideLarkRouting, <user_message> format, memberOverrides & title inte
       }),
     ).toMatchObject({ action: 'agent', trigger: 'listener' })
     expect(
+      decideLarkRouting(bot, postAllAtMsg, {
+        groupConfig: excludePeerGroup,
+        hasActiveSessionForRoute: () => false,
+      }),
+    ).toMatchObject({ action: 'agent', trigger: 'listener' })
+    expect(
       decideLarkRouting(bot, peerMentionMsg, {
+        groupConfig: excludePeerGroup,
+        hasActiveSessionForRoute: () => false,
+      }),
+    ).toEqual({ action: 'ignore', reason: 'listener_peer_mention_excluded' })
+    expect(
+      decideLarkRouting(bot, postPeerAtMsg, {
         groupConfig: excludePeerGroup,
         hasActiveSessionForRoute: () => false,
       }),
@@ -2324,6 +2354,8 @@ describe('decideLarkRouting, <user_message> format, memberOverrides & title inte
       mixedMentionMsg,
       cardPeerAtMsg,
       cardAllAtMsg,
+      postAllAtMsg,
+      postPeerAtMsg,
     ]) {
       expect(
         decideLarkRouting(bot, msg, {

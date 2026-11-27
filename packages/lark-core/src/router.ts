@@ -515,8 +515,28 @@ interface MessageMentionFlags {
   readonly hasPeerMention: boolean
 }
 
+function collectPostAtUserIds(node: unknown, out: string[]): void {
+  if (!node) return
+  if (Array.isArray(node)) {
+    for (const item of node) collectPostAtUserIds(item, out)
+    return
+  }
+  if (typeof node !== 'object') return
+  const rec = node as Record<string, unknown>
+  if (rec.tag === 'at' && typeof rec.user_id === 'string') {
+    const uid = rec.user_id.trim()
+    if (uid) out.push(uid)
+    return
+  }
+  for (const val of Object.values(rec)) {
+    if (val && typeof val === 'object') {
+      collectPostAtUserIds(val, out)
+    }
+  }
+}
+
 function classifyListenerMentions(
-  msg: Pick<InboundLarkMessage, 'mentions' | 'text' | 'botOpenId' | 'msgType'>,
+  msg: Pick<InboundLarkMessage, 'mentions' | 'text' | 'rawContent' | 'botOpenId' | 'msgType'>,
 ): MessageMentionFlags {
   let hasAllMention = false
   let hasPeerMention = false
@@ -533,6 +553,29 @@ function classifyListenerMentions(
     }
     if (id || key) {
       hasPeerMention = true
+    }
+  }
+
+  // Real Feishu `post` messages omit `@all` (and some bot-authored `at` nodes) from
+  // `message.mentions`, keeping them only as `{ tag: "at", user_id: "..." }` in `rawContent`.
+  if (msg.msgType === 'post' && msg.rawContent && (!hasAllMention || !hasPeerMention)) {
+    try {
+      const parsed: unknown = JSON.parse(msg.rawContent)
+      const atIds: string[] = []
+      collectPostAtUserIds(parsed, atIds)
+      for (const uid of atIds) {
+        if (uid === '@_all' || uid.toLowerCase() === 'all') {
+          hasAllMention = true
+          continue
+        }
+        const resolved = msg.mentions.find((m) => m.key === uid)?.openId?.trim() ?? uid
+        if (msg.botOpenId && resolved === msg.botOpenId) {
+          continue
+        }
+        hasPeerMention = true
+      }
+    } catch {
+      // Ignore malformed rawContent; rely on structured `mentions`.
     }
   }
 
