@@ -2,6 +2,7 @@ import type {
   GroupReplyMode,
   InboundLarkMessage,
   LarkBotStatus,
+  LarkDreamProactiveStats,
   LarkGroupConfig,
   LarkMemoryMutationStats,
   ListenerTemplate,
@@ -197,6 +198,8 @@ export interface LarkDreamRunState {
   readonly lastProcessedCount?: number
   readonly lastSummary?: string
   readonly processedSessionIds: readonly string[]
+  readonly proactiveStats?: LarkDreamProactiveStats
+  readonly backlogRemaining?: number
 }
 
 export interface LarkDreamSession {
@@ -211,6 +214,7 @@ export interface LarkDreamSession {
   readonly status: 'running' | 'succeeded' | 'failed'
   readonly outcome?: 'memory_updated' | 'no_change' | 'failed'
   readonly memoryStats?: LarkMemoryMutationStats
+  readonly proactiveStats?: LarkDreamProactiveStats
   readonly dateKey: string
   readonly processedCount: number
   readonly summary?: string

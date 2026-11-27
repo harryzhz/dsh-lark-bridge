@@ -160,7 +160,10 @@ Memory 严格遵守 `AGENTS.md` 与 [overview.md](./overview.md) 的产物目录
 | --- | --- | --- | --- |
 | `lark-bridge.db`（`memory_entries` + `memory_entries_fts`） | **唯一真相源（Single Source of Truth）** | SQLite `BEGIN IMMEDIATE` 事务，主表与 FTS5 同步更新，文件权限 `0o600` | Schema Migration v3（`003_memory`）自动无损升级 |
 | `memory/<botId>/MEMORY.md` | **只读派生产物（投影镜像）** | 每次记忆变更后 `tmp + chmod 0o600 + renameSync` 原子替换；Auto-Dream 启动前也会刷新 | 严格 ≤ 200 行 / 12 KB，按 `feedback → user → project → reference` 分组，超预算末尾提示使用 CLI 查全量 |
-| `dreaming/<botId>/recent-transcripts.md` | **单次整理临时输入** | 每次 Auto-Dream 执行前覆盖生成 | 最多 20 条有效会话、单会话 ≤ 2800 字符、已过滤静默监听噪音并折叠同主题重复告警 |
+| `dreaming/<botId>/recent-transcripts.md` | **单批增量摘要输入** | 每批执行前原子覆写（`0o600`） | 单会话预算默认 `5000` 字（可配 `1000~20000`），采用头尾保底采样（首 35% + 尾 58%），保留发言人 `open_id`、被提及成员、话题 `thread_reply_to` 与中断状态；按每批 ≤ 15 会话 / 75 KB 动态切批排空全部未处理会话（可配 `maxSessionsPerRun`，`0` = 全部） |
+| `dreaming/<botId>/memory-audit.md` | **存量记忆体检报告** | Stage 2 执行前零 LLM 预生成（`0o600`） | 标记超期未核验条目、长期零召回冷记忆候选与高重叠标签簇 |
+| `dreaming/<botId>/open-loops-snapshot.md` | **实时未闭环现场快照** | Stage 3 执行前纯代码采集（`0o600`） | 汇总当前活跃提醒、近 48h 异常/已触发提醒、活跃仓库残留 `.worktrees/` 与近期中断/报错会话 |
+| `dreaming/<botId>/DREAMS.md` | **离线复盘日记** | 每次整理结束原子倒序追加（`0o600`） | 保留最近 30 次夜间整理的批次数、记忆变更、新建提醒与隔离分支汇总 |
 
 ### 4.2 SQLite Schema v3 与中英文混合检索
 
@@ -251,33 +254,35 @@ sequenceDiagram
 
 ---
 
-## 6. 离线整合链路：Auto-Dream 四阶段与诚信水位线
+## 6. 离线整合链路：Auto-Dream 多阶段深度睡眠与诚信水位线
 
 ```mermaid
 flowchart TD
-    Gate["双闸门触发\n每日 scheduleTime 30min 窗口\n且有效增量会话 ≥ minNewSessions\n(或控制台手动点击「立即整理」)"]
-    Scan["collectNewSessions + prepareTranscriptBatch\n1. 按优先级 FIFO: mention/p2p/active-thread/substitute > listener\n2. 突破 120 截断: 每会话分页读取上限 2000 事件\n3. 过滤静默监听噪音 (lark-bridge silence / <no_reply/>)\n4. 同群同指纹告警折叠 (同主题重复 N 次已折叠)\n5. 收敛本次涉及的 activeWorkingDirs"]
-    Prep["准备离线上下文\n1. 写 dreaming/<botId>/recent-transcripts.md\n2. 刷新 memory/<botId>/MEMORY.md\n3. 注册 MutationTracker(botId)"]
-    Run["拉起隔离 Dreaming 会话\n执行 4-Phase Auto-Dream Prompt:\nPhase 1 摸底现有记忆 (MEMORY.md / list)\nPhase 2 采信增量摘要 & 定向巡检 activeWorkingDirs\nPhase 3 调用 lark-bridge memory upsert / supersede / forget\nPhase 4 输出 3~5 行中文结论"]
-    Audit{"诚信状态判定\n读取 MutationTracker 真实记账"}
-    Fail["status = 'failed' / outcome = 'failed'\n❌ 绝不推进 processedSessionIds 水位线\n下次可重跑不丢会话"]
-    Updated["status = 'succeeded' / outcome = 'memory_updated'\n✅ 推进水位线 (含已过滤的静默噪音 ID)\n记录 memoryStats: 新增/更新/纠偏/归档"]
-    NoChange["status = 'succeeded' / outcome = 'no_change'\n✅ 推进水位线\n诚实标注「无新增记忆」"]
+    Gate["双闸门触发\n每日 scheduleTime（默认 03:00）30min 窗口\n且有效增量会话 ≥ minNewSessions\n(或控制台手动点击「立即整理」)"]
+    Scan["collectNewSessions + prepareTranscriptBatch\n1. 默认扫描全部未处理会话（maxSessionsPerRun=0，可配上限）\n2. 保留发言人姓名/open_id、被提及成员、话题 thread_reply_to 与中断态\n3. 按单会话字数预算（默认 5000 字）头尾保底采样\n4. 过滤静默噪音并折叠重复监听告警，按 15 会话/75KB 动态切批"]
+    S1["Stage 1 · 增量排空 (Light Sleep)\n按批执行增量 Memory 沉淀与未闭环线索摘录\n每批校验写失败并即时推进 processedSessionIds 水位线\n受 maxDurationMinutes 与 background 低优先级并发限流保护"]
+    S2["Stage 2 · 深度验真与反思 (Deep Sleep)\n生成 memory-audit.md（零 LLM）\n对照最新代码验真、合并碎片、治理冷记忆并沉淀 SOP"]
+    S3["Stage 3 & 4 · 前瞻盘点与夜间预备 (Prospective Sleep)\n生成 open-loops-snapshot.md（活跃提醒/残留 worktree/中断会话）\n代码二次验真后按单次硬上限（默认 5 条）静默创建白天提醒\n开启 autoCodeEnabled 时可在 .worktrees/ 隔离预修复并挂白天提审提醒"]
+    Audit{"诚信记账与落盘\nMemoryMutationTracker + ReminderBudgetTracker + Worktree 差集"}
+    Fail["status = 'failed'\n❌ 绝不推进失败批次水位线\n已完早先批次进度安全保留"]
+    Done["status = 'succeeded'\n✅ 写 DREAMS.md 复盘日记\n记录 memoryStats 与 proactiveStats"]
 
-    Gate --> Scan --> Prep --> Run --> Audit
-    Audit -- "异常抛出 或\n(totalMutations == 0 且命中写失败文本)" --> Fail
-    Audit -- "totalMutations > 0" --> Updated
-    Audit -- "totalMutations == 0 且正常核查完成" --> NoChange
+    Gate --> Scan --> S1 --> S2 --> S3 --> Audit
+    Audit -- "异常抛出 或\n零写入且命中写失败文本" --> Fail
+    Audit -- "正常完成" --> Done
 ```
 
-### 真实记账与反“假成功”机制
+### 真实记账、防骚扰护栏与反“假成功”机制
 
-1. **进程内变更追踪（`MemoryService.beginMutationTracker(botId)`）**：
-   - Auto-Dream 执行期间，所有经 `MemoryService` 落盘的 `created / updated / superseded / archived` 写操作都会实时计入该次运行的统计快照 `memoryStats`，最终写入 `dream_sessions.payload_json` 与 `dream_states.last_summary`。
-2. **写失败诚信检测（`detectDreamingMemoryWriteFailure`）**：
-   - 当 `totalMutations === 0` 且模型最终回复匹配明确写失败信号（如「未暴露可写…记忆」「无法写入…记忆」「`lark-bridge: command not found`」「`memory write failed`」等），`DreamingService` 主动抛出异常并将本次标记为 `failed`，**保持 `processedSessionIds` 原状不变**，杜绝丢失待整理会话。
-3. **静默噪音提前退役**：
-   - 在跳过阈值检查或整理成功时，已被识别为空输出/静默监听的纯噪音会话 ID 会安全归入 `processedSessionIds`，避免下次反复重复扫描同一批噪音会话。
+1. **进程内双维度真实记账**：
+   - `MemoryService.beginMutationTracker(botId)` 统计真实 `created / updated / superseded / archived`；
+   - `ProactiveReminderService.beginDreamingReminderTracker(sessionId, { maxPerRun })` 在代码层硬拦截超出 `maxRemindersPerRun`（默认 5，可配 `0~20`）的新增提醒，并精准记入 `proactiveStats.remindersCreated`；
+   - `DreamingService` 通过运行前后只读比对 `.worktrees/` 列表得出真实 `worktreesCreated`，连同 `batchesRun` / `backlogRemaining` 写入 `dream_sessions.payload_json` 与 `DREAMS.md`。
+2. **夜间免打扰保底与并发让路**：
+   - 新建智能体默认开启「夜间免打扰」（`00:00~08:00`）与「静默创建」；即使历史智能体关闭全局免打扰，Dreaming 来源的非高优提醒落入凌晨仍强制顺延至白天；
+   - Dreaming 全程接入 `RuntimeConcurrencyLimiter` 的 `background` 低优先级队列，不抢占实时用户对话槽位；并支持配置独立夜间整理模型与推理强度（默认跟随智能体主配置）。
+3. **写失败诚信检测（`detectDreamingMemoryWriteFailure`）与逐批水位线**：
+   - 单批产生 `totalMutations === 0` 且回复命中明确写失败信号时立即中止该批且绝不推进该批 `processedSessionIds`；多批排空时已成功完成的早先批次进度即时落盘，不重复消费。
 
 ---
 

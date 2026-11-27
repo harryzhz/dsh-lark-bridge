@@ -596,8 +596,8 @@ export class RuntimeRepo {
 
   upsertDreamState(state: LarkDreamRunState): LarkDreamRunState {
     const cappedIds =
-      state.processedSessionIds.length > 400
-        ? state.processedSessionIds.slice(state.processedSessionIds.length - 400)
+      state.processedSessionIds.length > 800
+        ? state.processedSessionIds.slice(state.processedSessionIds.length - 800)
         : [...state.processedSessionIds]
     const normalized: LarkDreamRunState = {
       ...state,

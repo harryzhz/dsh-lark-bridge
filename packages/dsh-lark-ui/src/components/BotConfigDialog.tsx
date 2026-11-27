@@ -85,8 +85,15 @@ const SECTIONS: readonly ConfigSection<Section>[] = [
 
 export const DEFAULT_DREAMING_CONFIG: BotDreamingConfig = {
   enabled: false,
-  scheduleTime: '02:00',
+  scheduleTime: '03:00',
   minNewSessions: 2,
+  maxSessionsPerRun: 0,
+  maxCharsPerSession: 5000,
+  maxRemindersPerRun: 5,
+  maxDurationMinutes: 45,
+  deepConsolidation: true,
+  model: '',
+  reasoningEffort: '',
   scopes: [...DEFAULT_DREAMING_SCOPES],
   cleanupAndCorrect: true,
 }
@@ -95,7 +102,7 @@ export const DEFAULT_PROACTIVE_CONFIG: BotProactiveConfig = {
   remindersEnabled: false,
   reminderCreationMode: 'silent',
   delegationFollowupEnabled: false,
-  quietHoursEnabled: false,
+  quietHoursEnabled: true,
   quietHoursStart: '00:00',
   quietHoursEnd: '08:00',
   autoCodeEnabled: false,
@@ -1246,6 +1253,9 @@ function EditBotDialog({
           botId={existingId}
           experimental={draft.experimental}
           dreamState={localDreamState}
+          runtime={runtimes.find((r) => r.id === draft.agentPreset)}
+          models={models}
+          botModel={draft.model}
           onChange={(experimental) => patch({ experimental })}
           onOpenSession={(sid) => {
             onClose()

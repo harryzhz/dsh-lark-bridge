@@ -861,12 +861,22 @@ describe('decideLarkRouting, <user_message> format, memberOverrides & title inte
   it('builds runtime-agnostic Dreaming prompts with editable scopes and decoupled Proactive reminder/worktree protocols', () => {
     const workDir = '/Users/demo/workspace/core-service'
     const defaultBot = createBot({ defaultWorkingDir: workDir })
-    expect(defaultBot.experimental.dreaming.scopes).toEqual([...DEFAULT_DREAMING_SCOPES])
+    expect(defaultBot.experimental.dreaming).toMatchObject({
+      enabled: false,
+      scheduleTime: '03:00',
+      minNewSessions: 2,
+      maxSessionsPerRun: 0,
+      maxCharsPerSession: 5000,
+      maxRemindersPerRun: 5,
+      deepConsolidation: true,
+      scopes: [...DEFAULT_DREAMING_SCOPES],
+      cleanupAndCorrect: true,
+    })
     expect(defaultBot.experimental.proactive).toEqual({
       remindersEnabled: false,
       reminderCreationMode: 'silent',
       delegationFollowupEnabled: false,
-      quietHoursEnabled: false,
+      quietHoursEnabled: true,
       quietHoursStart: '00:00',
       quietHoursEnd: '08:00',
       autoCodeEnabled: false,
@@ -938,10 +948,18 @@ describe('decideLarkRouting, <user_message> format, memberOverrides & title inte
       }),
     ).toBeUndefined()
 
-    const proactiveReminder = composeProactiveSessionReminder({
+    const defaultQuietReminder = composeProactiveSessionReminder({
       botId: bot.id,
       workingDir: workDir,
       config: bot.experimental.proactive,
+    })
+    expect(defaultQuietReminder).toContain('免打扰 00:00–08:00')
+    expect(defaultQuietReminder).toContain('--urgency high')
+
+    const proactiveReminder = composeProactiveSessionReminder({
+      botId: bot.id,
+      workingDir: workDir,
+      config: { ...bot.experimental.proactive, quietHoursEnabled: false },
     })
     expect(proactiveReminder).toContain('<proactive reminders="confirm" auto_code="on">')
     expect(proactiveReminder).not.toContain('lark_proactive')

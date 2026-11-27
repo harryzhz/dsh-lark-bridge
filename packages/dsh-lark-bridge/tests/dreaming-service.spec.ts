@@ -20,7 +20,9 @@ import { ensureCliAuthEndpoint } from '../src/cli-support.js'
 import { DreamingService } from '../src/dreaming-service.js'
 import { createLarkHttpHandler, type ConnectionAdmitter } from '../src/http-api.js'
 import { MemoryService } from '../src/memory-service.js'
+import { ProactiveReminderService } from '../src/reminder-service.js'
 import { RuntimeCatalog } from '../src/runtime-catalog.js'
+import { RuntimeConcurrencyLimiter } from '../src/runtime-concurrency.js'
 import { LarkBridgeStore } from '../src/store.js'
 import type { WorkspaceGrouping } from '../src/workspace-grouping.js'
 
@@ -191,9 +193,11 @@ describe('DreamingService dual-gate scheduling, product dataDir isolation & nati
     nextDreamReply = '已更新 2 条记忆并清理 1 条过期配置说明'
     await dreaming.tick(new Date(2026, 10, 22, 2, 10, 0))
 
-    expect(runTurnPrompts).toHaveLength(1)
+    // Stage 1 (ingest) + Stage 3 (proactive open-loop audit) run as separate turns
+    expect(runTurnPrompts).toHaveLength(2)
     expect(runTurnPrompts[0]).toContain('核心发布约定')
     expect(runTurnPrompts[0]).not.toMatch(/Claude/i)
+    expect(runTurnPrompts[1]).toContain('open-loops-snapshot.md')
     expect(existsSync(join(workDir, '.local'))).toBe(false)
 
     const digestPath = join(dataDir, 'dreaming', 'dsh-agent', 'recent-transcripts.md')
@@ -689,9 +693,13 @@ describe('DreamingService dual-gate scheduling, product dataDir isolation & nati
         archiveSession: vi.fn().mockResolvedValue(true),
       } as unknown as WorkspaceGrouping,
       runTurn: vi.fn(async (_agent, content) => {
-        capturedPrompts.push(content.map((b) => ('text' in b ? b.text : '')).join('\n'))
+        const promptText = content.map((b) => ('text' in b ? b.text : '')).join('\n')
+        capturedPrompts.push(promptText)
         if (runMode === 'fail_write') {
           return '当前运行时未暴露可写内置 Memory 接口，记忆写入与历史清理未完成。'
+        }
+        if (promptText.includes('stage="deep_consolidate"')) {
+          return '全库核验健康，无需额外变更。'
         }
         memory.supersede(oldEntry.id, {
           reason: '2026-11-24 已调高至 500 QPS',
@@ -844,5 +852,392 @@ describe('DreamingService dual-gate scheduling, product dataDir isolation & nati
     expect(state.status).toBe('succeeded')
     expect(state.lastProcessedCount).toBe(1)
     expect(state.processedSessionIds).toContain('sess-multi-silence')
+  })
+
+  it('preserves speaker open_id/thread metadata with head+tail budgeting, enforces maxRemindersPerRun hard cap, defers overnight reminders to daytime, and writes DREAMS.md', async () => {
+    const dataDir = makeTempDir()
+    const workDir = makeTempDir()
+    const store = new LarkBridgeStore(dataDir)
+    const memory = new MemoryService(dataDir, store)
+
+    store.upsertBot({
+      id: 'night-bot',
+      name: '夜间深度助手',
+      enabled: true,
+      larkAppId: 'cli_night',
+      larkAppSecret: 'sec_night',
+      defaultWorkingDir: workDir,
+      experimental: {
+        dreaming: {
+          enabled: true,
+          scheduleTime: '03:00',
+          minNewSessions: 1,
+          maxSessionsPerRun: 0,
+          maxCharsPerSession: 1200,
+          maxRemindersPerRun: 2,
+          deepConsolidation: true,
+          scopes: ['踩坑与排障经验', '未完成待办'],
+          cleanupAndCorrect: true,
+        },
+        proactive: {
+          remindersEnabled: true,
+          reminderCreationMode: 'silent',
+          quietHoursEnabled: false,
+          quietHoursStart: '00:00',
+          quietHoursEnd: '08:00',
+          autoCodeEnabled: false,
+          branchPrefix: 'agent/',
+        },
+      },
+    })
+
+    // Seed an existing memory so Stage 2 deep audit runs too.
+    memory.upsert({
+      botId: 'night-bot',
+      type: 'project',
+      title: '缓存过期策略',
+      content: '默认 10 分钟过期。',
+      tags: ['cache'],
+    })
+
+    store.upsertManagedSession({
+      sessionId: 'sess-unfinished',
+      botId: 'night-bot',
+      chatId: 'oc_dev_team',
+      trigger: 'mention',
+      createdAtMs: Date.UTC(2026, 10, 26, 10, 0, 0),
+      lastActivityMs: Date.UTC(2026, 10, 26, 12, 0, 0),
+    })
+
+    const longSessionEvents: SessionEvent[] = [
+      {
+        type: 'user/message',
+        data: {
+          content: [
+            {
+              type: 'text',
+              text: [
+                '<system_reminder>',
+                '<lark_context bot_id="night-bot" chat_type="group" chat_id="oc_dev_team" chat_name="核心研发群" trigger="mention" message_id="om_tail_1" thread_id="om_root_99" sender_open_id="ou_alex" sender_name="林晓" sender_type="user">',
+                '提及成员：陈明(open_id="ou_chen")',
+                '</lark_context>',
+                '</system_reminder>',
+                '<user_message>',
+                '开头诉求：排查支付网关偶发 502',
+                '</user_message>',
+              ].join('\n'),
+            },
+          ],
+        },
+      } as unknown as SessionEvent,
+      ...Array.from({ length: 8 }, (_, idx) => ({
+        type: 'assistant/message',
+        data: {
+          message: {
+            content: [{ type: 'text', text: `中间排查日志 ${idx + 1}：${'a'.repeat(300)}` }],
+          },
+        },
+      })) as unknown as SessionEvent[],
+      {
+        type: 'assistant/message',
+        data: { interrupted: true, message: { content: [] } },
+      } as unknown as SessionEvent,
+      {
+        type: 'user/message',
+        data: {
+          content: [
+            {
+              type: 'text',
+              text: '<user_message>\n收尾承诺：明天上午记得复测灰度超时配置\n</user_message>',
+            },
+          ],
+        },
+      } as unknown as SessionEvent,
+    ]
+
+    const fakeCtx = {
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      sessions: {
+        get: (id: string) =>
+          id === 'sess-unfinished'
+            ? ({ id, header: { cwd: workDir }, snapshotEvents: () => longSessionEvents } as unknown as Session)
+            : undefined,
+      },
+      agents: {
+        create: vi.fn(async ({ sessionId, setup }: { sessionId: string; setup?: (c: unknown, a: unknown) => Promise<void> | void }) => {
+          const agent = {
+            session: { id: sessionId, header: { cwd: workDir, agentPreset: 'standard' } },
+          }
+          await setup?.(fakeCtx, agent)
+          return { agent, dispose: vi.fn().mockResolvedValue(undefined) }
+        }),
+      },
+      get: () => undefined,
+    } as unknown as Context
+
+    const runtimes = new RuntimeCatalog(fakeCtx)
+    const workspaces = {
+      attachSession: vi.fn().mockResolvedValue(undefined),
+      archiveSession: vi.fn().mockResolvedValue(true),
+    } as unknown as WorkspaceGrouping
+    const runtimeLimiter = new RuntimeConcurrencyLimiter(2)
+
+    const reminders = new ProactiveReminderService({
+      ctx: fakeCtx,
+      store,
+      runtimes,
+      workspaces,
+      memory,
+      runtimeLimiter,
+      runTurn: vi.fn(async () => 'done'),
+      sendOriginCard: vi.fn(async () => ({ messageId: 'om_card' })),
+      patchOriginCard: vi.fn(async () => {}),
+      deliverReminderOutput: vi.fn(async () => {}),
+    })
+
+    const runNow = new Date(2026, 10, 27, 3, 5, 0)
+    const stagesSeen: string[] = []
+    let capRejectionMessage = ''
+
+    const dreaming = new DreamingService({
+      ctx: fakeCtx,
+      dataDir,
+      store,
+      memory,
+      getReminders: () => reminders,
+      runtimes,
+      workspaces,
+      runtimeLimiter,
+      runTurn: vi.fn(async (agent, content) => {
+        const text = content.map((b) => ('text' in b ? b.text : '')).join('\n')
+        const sid = (agent as unknown as { session: { id: string } }).session.id
+        if (text.includes('stage="ingest"')) {
+          stagesSeen.push('ingest')
+          return '增量记忆整理完成。未闭环线索：复测灰度超时配置。'
+        }
+        if (text.includes('stage="deep_consolidate"')) {
+          stagesSeen.push('deep_consolidate')
+          return '全库核验健康，无需额外变更。'
+        }
+        if (text.includes('stage="proactive_audit"')) {
+          stagesSeen.push('proactive_audit')
+          // Attempt 1: scheduled at 03:30 -> must be silently created AND auto-deferred to 08:00 despite bot quietHoursEnabled=false
+          await reminders.create(
+            {
+              sessionId: sid,
+              botId: 'night-bot',
+              chatId: 'oc_dev_team',
+              replyToMessageId: 'om_root_99',
+              title: '复测灰度超时配置',
+              prompt: '核查灰度超时配置是否已验证完成',
+              at: '2026-11-27 03:30',
+              mentions: [{ openId: 'ou_alex', name: '林晓' }],
+            },
+            runNow.getTime(),
+          )
+          // Attempt 2: second reminder (different thread) succeeds within cap=2
+          await reminders.create(
+            {
+              sessionId: sid,
+              botId: 'night-bot',
+              chatId: 'oc_dev_team',
+              title: '复核连接池指标',
+              prompt: '确认连接池上限调整生效',
+              at: '2026-11-27 10:00',
+              mentions: [{ openId: 'ou_chen', name: '陈明' }],
+            },
+            runNow.getTime(),
+          )
+          // Attempt 3: exceeds maxRemindersPerRun=2 -> MUST throw hard cap error!
+          try {
+            await reminders.create(
+              {
+                sessionId: sid,
+                botId: 'night-bot',
+                chatId: 'oc_dev_team',
+                title: '超限的第三条提醒',
+                prompt: '不应被创建',
+                at: '2026-11-27 10:30',
+                mentions: [{ openId: 'ou_alex', name: '林晓' }],
+              },
+              runNow.getTime(),
+            )
+          } catch (err) {
+            capRejectionMessage = err instanceof Error ? err.message : String(err)
+          }
+          return '已核查未闭环事项并创建 2 条白天跟进提醒。'
+        }
+        return 'ok'
+      }),
+    })
+
+    const state = await dreaming.runForBot('night-bot', { force: false, now: runNow })
+    expect(state.status).toBe('succeeded')
+    expect(stagesSeen).toEqual(['ingest', 'deep_consolidate', 'proactive_audit'])
+    expect(capRejectionMessage).toContain('单次提醒创建上限（2 条）')
+    expect(state.proactiveStats).toMatchObject({
+      batchesRun: 1,
+      backlogRemaining: 0,
+      remindersCreated: 2,
+      deepConsolidated: true,
+      openLoopsAudited: true,
+    })
+
+    // Check digest preserved speaker open_id, thread_reply_to, interrupted flag, and head+tail lines
+    const digest = readFileSync(join(dataDir, 'dreaming', 'night-bot', 'recent-transcripts.md'), 'utf8')
+    expect(digest).toContain('thread_reply_to=om_root_99')
+    expect(digest).toContain('状态:曾中断')
+    expect(digest).toContain('林晓(open_id="ou_alex")')
+    expect(digest).toContain('开头诉求：排查支付网关偶发 502')
+    expect(digest).toContain('收尾承诺：明天上午记得复测灰度超时配置')
+
+    // Check open-loops snapshot, memory audit, and DREAMS.md journal were generated
+    const snapshot = readFileSync(join(dataDir, 'dreaming', 'night-bot', 'open-loops-snapshot.md'), 'utf8')
+    expect(snapshot).toContain('[曾中断会话]')
+    expect(existsSync(join(dataDir, 'dreaming', 'night-bot', 'memory-audit.md'))).toBe(true)
+    const journal = readFileSync(join(dataDir, 'dreaming', 'night-bot', 'DREAMS.md'), 'utf8')
+    expect(journal).toContain('新建提醒 2 条')
+    expect(journal).toContain('复测灰度超时配置')
+
+    // Verify first reminder was silently scheduled and deferred from 03:30 to daytime 08:00
+    const createdReminders = store.listReminders('active')
+    expect(createdReminders).toHaveLength(2)
+    const deferredOne = createdReminders.find((r) => r.title === '复测灰度超时配置')
+    expect(deferredOne?.status).toBe('scheduled')
+    expect(deferredOne?.deferredFromScheduledAt).toBeDefined()
+    expect(new Date(deferredOne!.scheduledAt).getHours()).toBe(8)
+    expect(deferredOne?.origin.replyToMessageId).toBe('om_root_99')
+  })
+
+  it('drains all unprocessed sessions across multiple batches by default (maxSessionsPerRun=0), respects explicit caps, and applies dedicated overnight Dreaming model', async () => {
+    const dataDir = makeTempDir()
+    const workDir = makeTempDir()
+    const store = new LarkBridgeStore(dataDir)
+
+    store.upsertBot({
+      id: 'backlog-bot',
+      name: '积压排空助手',
+      enabled: true,
+      larkAppId: 'cli_backlog',
+      larkAppSecret: 'sec_backlog',
+      defaultWorkingDir: workDir,
+      model: 'fast-day-model',
+      reasoningEffort: 'low',
+      experimental: {
+        dreaming: {
+          enabled: true,
+          scheduleTime: '03:00',
+          minNewSessions: 1,
+          maxSessionsPerRun: 5,
+          maxCharsPerSession: 5000,
+          maxRemindersPerRun: 0,
+          deepConsolidation: false,
+          model: 'deep-night-model',
+          reasoningEffort: 'xhigh',
+          scopes: ['项目领域知识'],
+          cleanupAndCorrect: true,
+        },
+        proactive: {
+          remindersEnabled: false,
+          reminderCreationMode: 'silent',
+          autoCodeEnabled: false,
+          branchPrefix: 'agent/',
+        },
+      },
+    })
+
+    const eventsBySession = new Map<string, SessionEvent[]>()
+    for (let i = 1; i <= 22; i += 1) {
+      const sid = `sess-b-${String(i).padStart(2, '0')}`
+      store.upsertManagedSession({
+        sessionId: sid,
+        botId: 'backlog-bot',
+        chatId: 'oc_team',
+        trigger: 'mention',
+        createdAtMs: i * 1000,
+        lastActivityMs: i * 1000 + 500,
+      })
+      eventsBySession.set(sid, [
+        {
+          type: 'user/message',
+          data: { content: [{ type: 'text', text: `<user_message>\n待整理事项 #${i}\n</user_message>` }] },
+        } as unknown as SessionEvent,
+      ])
+    }
+
+    const createdModels: Array<{ model?: string; reasoningEffort?: string }> = []
+    const fakeCtx = {
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      sessions: {
+        get: (id: string) =>
+          eventsBySession.has(id)
+            ? ({ id, header: { cwd: workDir }, snapshotEvents: () => eventsBySession.get(id)! } as unknown as Session)
+            : undefined,
+      },
+      agents: {
+        listPresets: () => [{ id: 'standard', name: 'Standard', defaultModel: 'fast-day-model' }],
+        create: vi.fn(async ({ sessionId, agentOptions, setup }: {
+          sessionId: string
+          agentOptions?: { model?: string; reasoningEffort?: string }
+          setup?: (c: unknown, a: unknown) => Promise<void> | void
+        }) => {
+          createdModels.push({
+            ...(agentOptions?.model ? { model: agentOptions.model } : {}),
+            ...(agentOptions?.reasoningEffort ? { reasoningEffort: agentOptions.reasoningEffort } : {}),
+          })
+          const agent = { session: { id: sessionId, header: { cwd: workDir } } }
+          await setup?.(fakeCtx, agent)
+          return { agent, dispose: vi.fn().mockResolvedValue(undefined) }
+        }),
+      },
+      llm: {
+        listProviders: () => [{ id: 'mock', name: 'Mock' }],
+        listModels: async () => [
+          { id: 'fast-day-model', name: 'Fast Day' },
+          { id: 'deep-night-model', name: 'Deep Night' },
+        ],
+      },
+      get: () => undefined,
+    } as unknown as Context
+
+    const dreaming = new DreamingService({
+      ctx: fakeCtx,
+      dataDir,
+      store,
+      runtimes: new RuntimeCatalog(fakeCtx),
+      workspaces: {
+        attachSession: vi.fn().mockResolvedValue(undefined),
+        archiveSession: vi.fn().mockResolvedValue(true),
+      } as unknown as WorkspaceGrouping,
+      runTurn: vi.fn(async () => '批次整理完成'),
+    })
+
+    // 1. With maxSessionsPerRun=5 -> processes 5 sessions, reports 17 remaining, and uses dedicated night model
+    const capped = await dreaming.runForBot('backlog-bot', {
+      force: true,
+      now: new Date(2026, 10, 27, 3, 5, 0),
+    })
+    expect(capped.status).toBe('succeeded')
+    expect(capped.lastProcessedCount).toBe(5)
+    expect(capped.proactiveStats).toMatchObject({ batchesRun: 1, backlogRemaining: 17 })
+    expect(createdModels[0]).toEqual({ model: 'deep-night-model', reasoningEffort: 'xhigh' })
+
+    // 2. Switch maxSessionsPerRun=0 (all unprocessed) -> drains remaining 17 sessions across 2 batches (15 + 2)
+    const botCfg = store.getBot('backlog-bot')!
+    store.upsertBot({
+      ...botCfg,
+      experimental: {
+        ...botCfg.experimental,
+        dreaming: { ...botCfg.experimental.dreaming, maxSessionsPerRun: 0 },
+      },
+    })
+    const drained = await dreaming.runForBot('backlog-bot', {
+      force: true,
+      now: new Date(2026, 10, 28, 3, 5, 0),
+    })
+    expect(drained.status).toBe('succeeded')
+    expect(drained.lastProcessedCount).toBe(17)
+    expect(drained.proactiveStats).toMatchObject({ batchesRun: 2, backlogRemaining: 0 })
+    expect(drained.processedSessionIds).toHaveLength(22)
   })
 })

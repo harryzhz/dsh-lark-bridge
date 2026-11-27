@@ -631,7 +631,23 @@ export async function dispatchLarkApiRequest(
               ? await manager.hydrateAdminUserProfiles(bot)
               : bot.adminUserProfiles
           const refreshed = manager.store.getBot(bot.id) ?? bot
-          const dreamState = manager.store.getDreamState?.(refreshed.id)
+          const rawDreamState = manager.store.getDreamState?.(refreshed.id)
+          const lastDreamSession = rawDreamState?.lastSessionId
+            ? manager.store
+                .listDreamSessions?.()
+                .find((s) => s.sessionId === rawDreamState.lastSessionId)
+            : undefined
+          const dreamState = rawDreamState
+            ? {
+                ...rawDreamState,
+                ...(lastDreamSession?.proactiveStats
+                  ? {
+                      proactiveStats: lastDreamSession.proactiveStats,
+                      backlogRemaining: lastDreamSession.proactiveStats.backlogRemaining,
+                    }
+                  : {}),
+              }
+            : undefined
           return {
             ...toPublicBotView(refreshed),
             allowedUserProfiles,

@@ -184,7 +184,12 @@ export function useBridgeData(): BridgeData & {
 
 export function formatDuration(ms: number): string {
   if (!ms) return '—'
-  return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`
+  if (ms < 1000) return `${ms}ms`
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`
+  const totalSec = Math.round(ms / 1000)
+  const mins = Math.floor(totalSec / 60)
+  const secs = totalSec % 60
+  return secs > 0 ? `${mins}m ${secs}s` : `${mins}m`
 }
 
 export function formatTime(ms?: number): string {

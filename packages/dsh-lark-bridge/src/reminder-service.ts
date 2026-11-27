@@ -173,6 +173,26 @@ function extractThreadReplyId(
   return scope.startsWith('om_') ? scope : undefined
 }
 
+export interface DreamingReminderBudgetTracker {
+  bindSessionId(sessionId: string): void
+  createdCount(): number
+  createdItems(): readonly LarkReminderItem[]
+  dispose(): void
+}
+
+interface InternalDreamingReminderTracker {
+  readonly botId: string
+  readonly maxPerRun: number
+  readonly sessionIds: Set<string>
+  readonly items: LarkReminderItem[]
+}
+
+const DREAMING_FALLBACK_QUIET_HOURS = {
+  quietHoursEnabled: true,
+  quietHoursStart: '00:00',
+  quietHoursEnd: '08:00',
+} as const
+
 /**
  * Manages one-shot proactive follow-up reminders:
  * - Auto-derives origin (group thread / group chat / P2P user) from the creating session
@@ -191,6 +211,7 @@ export class ProactiveReminderService {
     string,
     { reminderId: string; silenced: boolean; reason?: string }
   >()
+  private readonly dreamingTrackersBySession = new Map<string, InternalDreamingReminderTracker>()
   private disposed = false
   private dispatchPaused = false
 
@@ -198,6 +219,43 @@ export class ProactiveReminderService {
 
   getActiveCount(): number {
     return this.runningIds.size
+  }
+
+  /**
+   * Registers a scoped reminder creation budget & accounting tracker for an active
+   * Dreaming run, enforcing `maxPerRun` hard caps and daytime quiet-hours safety.
+   */
+  beginDreamingReminderTracker(
+    initialSessionId: string,
+    options: { readonly botId: string; readonly maxPerRun: number },
+  ): DreamingReminderBudgetTracker {
+    const tracker: InternalDreamingReminderTracker = {
+      botId: options.botId,
+      maxPerRun: Math.max(0, Math.floor(options.maxPerRun)),
+      sessionIds: new Set(),
+      items: [],
+    }
+    const bindSessionId = (sid: string) => {
+      const clean = sid.trim()
+      if (!clean) return
+      tracker.sessionIds.add(clean)
+      this.dreamingTrackersBySession.set(clean, tracker)
+    }
+    bindSessionId(initialSessionId)
+
+    return {
+      bindSessionId,
+      createdCount: () => tracker.items.length,
+      createdItems: () => [...tracker.items],
+      dispose: () => {
+        for (const sid of tracker.sessionIds) {
+          if (this.dreamingTrackersBySession.get(sid) === tracker) {
+            this.dreamingTrackersBySession.delete(sid)
+          }
+        }
+        tracker.sessionIds.clear()
+      },
+    }
   }
 
   private clearStaggerTimers(): void {
@@ -348,10 +406,27 @@ export class ProactiveReminderService {
     const bot = this.host.store.getBot(origin.botId)
     if (!bot) throw new Error(`未找到智能体 "${origin.botId}"`)
 
+    const sourceSid = input.sessionId?.trim() || origin.sourceSessionId?.trim() || ''
+    const dreamingTracker = sourceSid ? this.dreamingTrackersBySession.get(sourceSid) : undefined
+    if (dreamingTracker) {
+      if (dreamingTracker.maxPerRun <= 0) {
+        throw new Error('已关闭 Dreaming 期间自动创建提醒（单次提醒上限为 0）')
+      }
+      if (dreamingTracker.items.length >= dreamingTracker.maxPerRun) {
+        throw new Error(
+          `本次 Dreaming 已达到单次提醒创建上限（${dreamingTracker.maxPerRun} 条），请优先保留最高优先级未闭环事项`,
+        )
+      }
+    }
+
     const urgency: ReminderUrgency = input.urgency === 'high' ? 'high' : 'normal'
+    const quietConfig =
+      dreamingTracker && !bot.experimental.proactive.quietHoursEnabled
+        ? DREAMING_FALLBACK_QUIET_HOURS
+        : bot.experimental.proactive
     const quietAdjusted = applyQuietHoursDeferral(
       rawScheduledAt,
-      bot.experimental.proactive,
+      quietConfig,
       urgency,
     )
     const scheduledAt = quietAdjusted.scheduledAt
@@ -451,6 +526,10 @@ export class ProactiveReminderService {
         }
       }
       this.rearmNextDueTimer()
+    }
+
+    if (dreamingTracker) {
+      dreamingTracker.items.push(item)
     }
 
     const deferSuffix = quietAdjusted.deferredFrom
