@@ -611,6 +611,9 @@ export async function dispatchLarkApiRequest(
         return ok({ ok: true, templates: manager.store.listListenerTemplates() })
       }
       if (method === 'POST') {
+        if (!isOwnerWebSession) {
+          return ok({ ok: false, error: 'owner_web_session_required' }, 403)
+        }
         return ok({ ok: true, templates: manager.store.resetListenerTemplates() })
       }
     }
@@ -931,6 +934,9 @@ export async function dispatchLarkApiRequest(
         return ok({ ok: existed }, existed ? 200 : 404)
       }
       if (method === 'POST' && segments[2] === 'toggle') {
+        if (!isOwnerWebSession) {
+          return ok({ ok: false, error: 'owner_web_session_required' }, 403)
+        }
         const bot = manager.store.getBot(botId)
         if (!bot) {
           return ok({ ok: false, error: 'bot_not_found' }, 404)
@@ -944,6 +950,9 @@ export async function dispatchLarkApiRequest(
         return ok({ ok: true, bot: toPublicBotView(updated) })
       }
       if (method === 'POST' && segments[2] === 'reconnect') {
+        if (!isOwnerWebSession) {
+          return ok({ ok: false, error: 'owner_web_session_required' }, 403)
+        }
         const bot = manager.store.getBot(botId)
         if (!bot) {
           return ok({ ok: false, error: 'bot_not_found' }, 404)
@@ -955,6 +964,9 @@ export async function dispatchLarkApiRequest(
         return ok({ ok: true })
       }
       if (method === 'POST' && segments[2] === 'sync-profile') {
+        if (!isOwnerWebSession) {
+          return ok({ ok: false, error: 'owner_web_session_required' }, 403)
+        }
         const profile = await manager.syncBotProfile(botId)
         if (!profile) {
           return ok({ ok: false, error: 'bot_not_found' }, 404)
@@ -962,6 +974,9 @@ export async function dispatchLarkApiRequest(
         return ok({ ok: true, profile })
       }
       if (method === 'POST' && segments[2] === 'sync-chats') {
+        if (!isOwnerWebSession) {
+          return ok({ ok: false, error: 'owner_web_session_required' }, 403)
+        }
         const chats = await manager.syncJoinedChats(botId)
         return ok({ ok: true, count: chats.length })
       }
@@ -997,6 +1012,9 @@ export async function dispatchLarkApiRequest(
     }
 
     if (method === 'POST' && pathname === 'sync-chats') {
+      if (!isOwnerWebSession) {
+        return ok({ ok: false, error: 'owner_web_session_required' }, 403)
+      }
       const chats = await manager.syncJoinedChats()
       const groups = manager.store.listGroupViews()
       return ok({ ok: true, syncedCount: chats.length, groups })
@@ -1023,6 +1041,9 @@ export async function dispatchLarkApiRequest(
         return ok({ ok: true, members })
       }
       if (method === 'PUT' && segments.length === 3) {
+        if (!isOwnerWebSession) {
+          return ok({ ok: false, error: 'owner_web_session_required' }, 403)
+        }
         const body = bodyRecord(request.body)
         const existingGroup = manager.store.getGroup(botId, chatId)
         const nextWorkingDir =
@@ -1050,6 +1071,9 @@ export async function dispatchLarkApiRequest(
         })
       }
       if (method === 'DELETE' && segments.length === 3) {
+        if (!isOwnerWebSession) {
+          return ok({ ok: false, error: 'owner_web_session_required' }, 403)
+        }
         const deleted = manager.store.deleteGroup(botId, chatId)
         manager.cancelDisabledTurns?.(botId, chatId)
         manager.sessionViewer?.invalidateAccess()
@@ -1081,6 +1105,9 @@ export async function dispatchLarkApiRequest(
     }
 
     if (method === 'DELETE' && segments[0] === 'dream-sessions' && segments[1] && segments.length === 2) {
+      if (!isOwnerWebSession) {
+        return ok({ ok: false, error: 'owner_web_session_required' }, 403)
+      }
       const sessionId = segments[1]
       const target = manager.store.listDreamSessions?.().find((s) => s.sessionId === sessionId)
       if (target?.status === 'running') {
@@ -1108,11 +1135,17 @@ export async function dispatchLarkApiRequest(
     }
 
     if (method === 'POST' && pathname === 'sessions/sweep') {
+      if (!isOwnerWebSession) {
+        return ok({ ok: false, error: 'owner_web_session_required' }, 403)
+      }
       const archivedCount = await manager.sweepIdleBindings()
       return ok({ ok: true, archivedCount })
     }
 
     if (method === 'DELETE' && segments[0] === 'bindings' && segments[1]) {
+      if (!isOwnerWebSession) {
+        return ok({ ok: false, error: 'owner_web_session_required' }, 403)
+      }
       const routeKey = segments.slice(1).join('/')
       const deleted = await manager.unbindRoute(routeKey, { archive: true })
       return ok({ ok: deleted }, deleted ? 200 : 404)
@@ -1142,6 +1175,9 @@ export async function dispatchLarkApiRequest(
         return ok({ ok: true, binding: saved })
       }
       if (method === 'DELETE' && segments.length === 2) {
+        if (!isOwnerWebSession) {
+          return ok({ ok: false, error: 'owner_web_session_required' }, 403)
+        }
         const deleted = manager.store.deleteScheduleBinding(scheduleId)
         return ok({ ok: true, deleted })
       }
