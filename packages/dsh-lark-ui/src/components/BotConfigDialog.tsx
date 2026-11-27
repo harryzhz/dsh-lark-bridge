@@ -1524,7 +1524,7 @@ function AccessSection({
       <GroupTitle>管理权限</GroupTitle>
       <SettingRow
         title="智能体管理员"
-        desc={renderSearchHint('仅管理员可点击群内提醒确认/取消按钮；留空时需在 DSH 控制台处理。')}
+        desc={renderSearchHint('默认设为应用创建人，拥有群提醒、/cot 与 /console 权限；留空时需在控制台处理。')}
         stack
       >
         <UserSearchPicker

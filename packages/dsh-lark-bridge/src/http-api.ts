@@ -693,6 +693,8 @@ export async function dispatchLarkApiRequest(
       assertExistingWorkingDirectory(
         typeof body.defaultWorkingDir === 'string' ? body.defaultWorkingDir : '',
       )
+      const requestedId = typeof body.id === 'string' ? body.id.trim() : ''
+      const existedBefore = Boolean(requestedId && manager.store.getBot(requestedId))
       const saved = manager.store.upsertBot(body)
       const hasManualDescription = Boolean(saved.description.trim())
       const platformSync = hasManualDescription
@@ -706,6 +708,9 @@ export async function dispatchLarkApiRequest(
       })
       if (!saved.description.trim() || !saved.avatarUrl.trim()) {
         await manager.ensureBotProfileHydrated?.(saved.id)
+      }
+      if (!existedBefore && saved.adminUsers.length === 0) {
+        await manager.ensureDefaultCreatorAdmin?.(saved.id)
       }
       const refreshed = manager.store.getBot(saved.id) ?? saved
       manager.sessionViewer?.invalidateAccess()

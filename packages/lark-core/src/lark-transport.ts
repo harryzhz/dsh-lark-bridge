@@ -41,6 +41,7 @@ export interface LarkBotProfile {
   readonly name?: string
   readonly avatarUrl?: string
   readonly description?: string
+  readonly creatorOpenId?: string
 }
 
 export interface ListChatMembersOptions {
@@ -280,6 +281,7 @@ export class LarkBotTransport {
   private botOpenId?: string
   private botAvatarUrl?: string
   private botDescription?: string
+  private botCreatorOpenId?: string
   private remoteBotName?: string
   private connected = false
   private startedAtMs?: number
@@ -391,6 +393,7 @@ export class LarkBotTransport {
       name: this.bot.name,
       ...(this.botAvatarUrl ? { avatarUrl: this.botAvatarUrl } : {}),
       ...(this.botDescription ? { description: this.botDescription } : {}),
+      ...(this.botCreatorOpenId ? { creatorOpenId: this.botCreatorOpenId } : {}),
       ...(this.remoteBotName ? { remoteBotName: this.remoteBotName } : {}),
       enabled: this.bot.enabled,
       connected: this.connected,
@@ -711,17 +714,20 @@ export class LarkBotTransport {
     let name = info?.app_name?.trim() || undefined
     let avatarUrl = info?.avatar_url?.trim() || undefined
     let description: string | undefined
+    let creatorOpenId: string | undefined
 
     try {
       const appRes = (await this.client.request({
         method: 'GET',
         url: `/open-apis/application/v6/applications/${encodeURIComponent(this.bot.larkAppId)}`,
-        params: { lang: 'zh_cn' },
+        params: { lang: 'zh_cn', user_id_type: 'open_id' },
       })) as {
         app?: {
           app_name?: string
           avatar_url?: string
           description?: string
+          creator_id?: string
+          owner?: { type?: number; owner_id?: string }
           i18n?: Array<{ i18n_key?: string; name?: string; description?: string }>
         }
         data?: {
@@ -729,6 +735,8 @@ export class LarkBotTransport {
             app_name?: string
             avatar_url?: string
             description?: string
+            creator_id?: string
+            owner?: { type?: number; owner_id?: string }
             i18n?: Array<{ i18n_key?: string; name?: string; description?: string }>
           }
         }
@@ -750,6 +758,13 @@ export class LarkBotTransport {
         if (!name) {
           name = zhEntry?.name?.trim() || app.app_name?.trim() || undefined
         }
+        const rawCreatorId = app.creator_id?.trim()
+        const rawOwnerId =
+          app.owner?.type === 2 ? app.owner.owner_id?.trim() : undefined
+        const candidateCreator = rawCreatorId || rawOwnerId
+        if (candidateCreator && candidateCreator.startsWith('ou_')) {
+          creatorOpenId = candidateCreator
+        }
       }
     } catch {
       // Optional scope (application:application:self_manage); degrade gracefully.
@@ -759,16 +774,40 @@ export class LarkBotTransport {
     if (name) this.remoteBotName = name
     if (avatarUrl) this.botAvatarUrl = avatarUrl
     if (description) this.botDescription = description
+    if (creatorOpenId) this.botCreatorOpenId = creatorOpenId
     const profile: LarkBotProfile = {
       ...(openId ? { openId } : {}),
       ...(name ? { name } : {}),
       ...(avatarUrl ? { avatarUrl } : {}),
       ...(description ? { description } : {}),
+      ...(creatorOpenId ? { creatorOpenId } : {}),
     }
-    if (openId || avatarUrl || name || description) {
+    if (openId || avatarUrl || name || description || creatorOpenId) {
       this.callbacks.onBotProfile?.(profile)
     }
     return profile
+  }
+
+  async resolveOpenIdByEmail(email: string): Promise<string | undefined> {
+    const cleanEmail = email.trim()
+    if (!cleanEmail || !cleanEmail.includes('@')) return undefined
+    try {
+      const res = (await this.client.request({
+        method: 'POST',
+        url: '/open-apis/contact/v3/users/batch_get_id',
+        params: { user_id_type: 'open_id' },
+        data: { emails: [cleanEmail], include_resigned: false },
+      })) as { data?: { user_list?: Array<{ user_id?: string; email?: string }> } }
+      for (const item of res?.data?.user_list ?? []) {
+        const candidate = item.user_id?.trim()
+        if (candidate && candidate.startsWith('ou_')) {
+          return candidate
+        }
+      }
+      return undefined
+    } catch {
+      return undefined
+    }
   }
 
   async addReaction(messageId: string, emojiType: string): Promise<string | undefined> {

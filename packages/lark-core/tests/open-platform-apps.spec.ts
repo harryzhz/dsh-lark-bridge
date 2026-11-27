@@ -476,4 +476,75 @@ describe('LarkPlatformManager Open Platform existing apps listing & credential i
     expect(postedBodies.some((p) => p.pathname.includes('/event/update/'))).toBe(false)
     expect(postedBodies.some((p) => p.pathname.includes('/app_version/create/'))).toBe(false)
   })
+
+  it('caches Open Platform identity, clears on logout, and passes creator hints from startAutoCreateBot', async () => {
+    const dir = makeTempDir()
+    writeFakeSession(dir)
+
+    const fetcher = vi.fn(async (url: string | URL) => {
+      const pathname = new URL(String(url)).pathname
+      if (pathname === '/app') {
+        return new Response(makeConsoleHtml(), { status: 200 })
+      }
+      if (pathname === '/developers/v1/app/upload/image') {
+        return new Response(JSON.stringify({ code: 0, data: { url: 'https://example.com/icon.png' } }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        })
+      }
+      if (pathname === '/developers/v1/manifest/upsert_by_template') {
+        return new Response(JSON.stringify({ code: 0, data: { ClientID: 'cli_auto_creator_1' } }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        })
+      }
+      if (pathname === '/developers/v1/app_version/create/cli_auto_creator_1') {
+        return new Response(JSON.stringify({ code: 0, data: { versionId: 'ver_init_1' } }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        })
+      }
+      if (pathname === '/developers/v1/secret/cli_auto_creator_1') {
+        return new Response(JSON.stringify({ code: 0, data: { secret: 'mock_secret_value' } }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({ code: 0, data: {} }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    })
+
+    const mgr = new LarkPlatformManager(dir, fetcher as unknown as typeof fetch)
+    expect(mgr.getCachedIdentity()).toBeUndefined()
+
+    const captured: Array<Record<string, unknown>> = []
+    const job = mgr.startAutoCreateBot(
+      { mode: 'open_platform', name: 'Auto Creator Bot' },
+      async (created) => {
+        captured.push({ ...created })
+      },
+    )
+
+    await vi.waitFor(() => {
+      expect(mgr.getJob(job.jobId)?.status).toBe('succeeded')
+    })
+
+    expect(mgr.getCachedIdentity()).toMatchObject({
+      userId: 'u_demo_1',
+      userName: 'Alex Chen',
+      email: 'alex@example.com',
+    })
+    expect(captured).toHaveLength(1)
+    expect(captured[0]).toMatchObject({
+      larkAppId: 'cli_auto_creator_1',
+      larkAppSecret: 'mock_secret_value',
+      creatorName: 'Alex Chen',
+      creatorEmail: 'alex@example.com',
+    })
+
+    mgr.logoutOpenPlatform()
+    expect(mgr.getCachedIdentity()).toBeUndefined()
+  })
 })

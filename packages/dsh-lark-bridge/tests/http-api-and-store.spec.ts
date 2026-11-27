@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
 import type { Context } from '@deepseek-ai/cordis'
-import { LarkPlatformManager } from '@dsh-lark/lark-core'
+import { LarkBotTransport, LarkPlatformManager } from '@dsh-lark/lark-core'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { LarkBridgeManager } from '../src/bridge-manager.js'
 import { ensureCliAuthEndpoint, OPERATOR_TOKEN_HEADER } from '../src/cli-support.js'
@@ -1122,5 +1122,284 @@ describe('LarkBridgeStore, RuntimeCatalog, CLI Auth & HTTP API', () => {
     })
 
     store.close()
+  })
+
+  it('defaults the Feishu app creator as bot admin across manual, import-existing, and auto-create flows without resurrecting cleared admins', async () => {
+    const dir = makeTempDir()
+    const validDir = makeTempDir()
+    const store = new LarkBridgeStore(dir)
+    const fakeCtx = {
+      logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn() },
+      sessions: { get: () => undefined },
+      llm: { listProviders: () => [], listModels: async () => [] },
+      on: () => () => {},
+      get: () => undefined,
+    } as unknown as Context
+
+    const manager = new LarkBridgeManager(
+      fakeCtx,
+      {
+        dataDir: dir,
+        publicBaseUrl: 'http://127.0.0.1:3880',
+        idleSweepIntervalMs: 0,
+        maxAuditEvents: 50,
+        autoInstallCliAndSkill: false,
+      },
+      store,
+    )
+
+    const creatorByAppId: Record<string, string | undefined> = {
+      cli_manual_creator: 'ou_creator_manual',
+      cli_manual_explicit: 'ou_creator_manual',
+      cli_import_true_creator: 'ou_true_creator',
+      cli_import_email_fallback: undefined,
+      cli_auto_op: undefined,
+    }
+    const emailOpenIdByApp: Record<string, string | undefined> = {
+      'sam@example.com': 'ou_importer_sam',
+      'alex@example.com': 'ou_auto_alex',
+    }
+    const userSummaryByOpenId: Record<
+      string,
+      { openId: string; name: string; email?: string; avatarUrl?: string } | undefined
+    > = {
+      ou_creator_manual: {
+        openId: 'ou_creator_manual',
+        name: 'Alex Chen',
+        email: 'alex@example.com',
+        avatarUrl: 'https://example.com/alex.png',
+      },
+      ou_device_creator: {
+        openId: 'ou_device_creator',
+        name: 'Lin Xiao',
+        avatarUrl: 'https://example.com/lin.png',
+      },
+      // Simulate 41050 contact scope miss for ou_true_creator so we verify importer's name is NOT misapplied
+      ou_true_creator: undefined,
+    }
+
+    const fetchProfileSpy = vi
+      .spyOn(LarkBotTransport.prototype, 'fetchBotProfile')
+      .mockImplementation(async function (this: LarkBotTransport) {
+        const appId = this.state.larkAppId
+        const creatorOpenId = creatorByAppId[appId]
+        return {
+          openId: `ou_bot_${appId}`,
+          name: this.state.name,
+          avatarUrl: 'https://example.com/bot.png',
+          description: 'desc',
+          ...(creatorOpenId ? { creatorOpenId } : {}),
+        }
+      })
+    const resolveEmailSpy = vi
+      .spyOn(LarkBotTransport.prototype, 'resolveOpenIdByEmail')
+      .mockImplementation(async (email: string) => emailOpenIdByApp[email])
+    const resolveSummarySpy = vi
+      .spyOn(LarkBotTransport.prototype, 'resolveUserSummary')
+      .mockImplementation(async (openId: string, fallbackName?: string) => {
+        const found = userSummaryByOpenId[openId]
+        if (found) return found
+        return fallbackName ? { openId, name: fallbackName } : undefined
+      })
+    const startSpy = vi
+      .spyOn(LarkBotTransport.prototype, 'start')
+      .mockImplementation(async function (this: LarkBotTransport) {
+        const profile = await this.fetchBotProfile()
+        const cbs = (this as unknown as { callbacks?: { onBotProfile?: (p: typeof profile) => void } })
+          .callbacks
+        cbs?.onBotProfile?.(profile)
+      })
+    const stopSpy = vi.spyOn(LarkBotTransport.prototype, 'stop').mockResolvedValue(undefined)
+
+    try {
+      const admitter: ConnectionAdmitter = {
+        admit: () => ({ peer: { principal: { kind: 'owner' } } }),
+      }
+      const handler = createLarkHttpHandler(fakeCtx, admitter, manager)
+
+      // 1. Manual POST /bots with empty adminUsers auto-seeds app creator & profile
+      const manualRes = await invokeHandler(handler, {
+        method: 'POST',
+        url: '/api/lark-bridge/bots',
+        body: {
+          id: 'bot-manual-creator',
+          name: 'ManualCreatorBot',
+          larkAppId: 'cli_manual_creator',
+          larkAppSecret: 'sec_manual_1',
+          defaultWorkingDir: validDir,
+          adminUsers: [],
+        },
+      })
+      expect(manualRes.status).toBe(201)
+      expect(manualRes.json.bot).toMatchObject({
+        id: 'bot-manual-creator',
+        adminUsers: ['ou_creator_manual'],
+        adminUserProfiles: [
+          {
+            openId: 'ou_creator_manual',
+            name: 'Alex Chen',
+            email: 'alex@example.com',
+            avatarUrl: 'https://example.com/alex.png',
+          },
+        ],
+      })
+
+      // 2. Clearing adminUsers via PUT /bots/:id stays empty even after sync-profile
+      const clearRes = await invokeHandler(handler, {
+        method: 'PUT',
+        url: '/api/lark-bridge/bots/bot-manual-creator',
+        body: {
+          ...store.getBot('bot-manual-creator'),
+          larkAppSecret: '',
+          adminUsers: [],
+          adminUserProfiles: [],
+        },
+      })
+      expect(clearRes.status).toBe(200)
+      expect((clearRes.json.bot as Record<string, unknown>).adminUsers).toEqual([])
+      await invokeHandler(handler, {
+        method: 'POST',
+        url: '/api/lark-bridge/bots/bot-manual-creator/sync-profile',
+      })
+      expect(store.getBot('bot-manual-creator')?.adminUsers).toEqual([])
+
+      // 3. Manual POST /bots with explicit adminUsers does NOT overwrite caller's admins
+      const explicitRes = await invokeHandler(handler, {
+        method: 'POST',
+        url: '/api/lark-bridge/bots',
+        body: {
+          id: 'bot-manual-explicit',
+          name: 'ExplicitAdminBot',
+          larkAppId: 'cli_manual_explicit',
+          larkAppSecret: 'sec_manual_2',
+          defaultWorkingDir: validDir,
+          adminUsers: ['ou_explicit_admin'],
+        },
+      })
+      expect(explicitRes.status).toBe(201)
+      expect((explicitRes.json.bot as Record<string, unknown>).adminUsers).toEqual([
+        'ou_explicit_admin',
+      ])
+
+      // 4a. import-existing uses authoritative Feishu app creator_id and does NOT mislabel with importer's name
+      vi.spyOn(manager.platform, 'getCachedIdentity').mockReturnValue({
+        userId: 'u_sam',
+        userName: 'Sam',
+        email: 'sam@example.com',
+        tenantId: 't_demo',
+        tenantName: 'Acme Corp',
+      })
+      vi.spyOn(manager.platform, 'fetchOpenPlatformAppCredentials').mockResolvedValueOnce({
+        appId: 'cli_import_true_creator',
+        appSecret: 'sec_import_1',
+        name: 'ImportedTeamBot',
+        description: 'Team bot',
+        avatarUrl: 'https://example.com/bot.png',
+        hasBotAbility: true,
+      })
+      const importTrueCreatorRes = await invokeHandler(handler, {
+        method: 'POST',
+        url: '/api/lark-bridge/bots/import-existing',
+        body: { larkAppId: 'cli_import_true_creator', defaultWorkingDir: validDir },
+      })
+      expect(importTrueCreatorRes.status).toBe(201)
+      expect(importTrueCreatorRes.json.bot).toMatchObject({
+        adminUsers: ['ou_true_creator'],
+        adminUserProfiles: [],
+      })
+
+      // 4b. import-existing falls back to logged-in Open Platform email when application/v6 lacks creator_id
+      vi.spyOn(manager.platform, 'fetchOpenPlatformAppCredentials').mockResolvedValueOnce({
+        appId: 'cli_import_email_fallback',
+        appSecret: 'sec_import_2',
+        name: 'LegacyImportedBot',
+        description: 'Legacy bot',
+        avatarUrl: 'https://example.com/bot.png',
+        hasBotAbility: true,
+      })
+      const importFallbackRes = await invokeHandler(handler, {
+        method: 'POST',
+        url: '/api/lark-bridge/bots/import-existing',
+        body: { larkAppId: 'cli_import_email_fallback', defaultWorkingDir: validDir },
+      })
+      expect(importFallbackRes.status).toBe(201)
+      expect(importFallbackRes.json.bot).toMatchObject({
+        adminUsers: ['ou_importer_sam'],
+        adminUserProfiles: [
+          {
+            openId: 'ou_importer_sam',
+            name: 'Sam',
+            email: 'sam@example.com',
+          },
+        ],
+      })
+
+      // 5a. Auto-create SDK device_flow seeds creatorOpenId directly and hydrates profile
+      vi.spyOn(manager.platform, 'startAutoCreateBot').mockImplementationOnce((_req, onCreated) => {
+        void onCreated({
+          id: 'bot-device-flow',
+          name: 'DeviceFlowBot',
+          description: 'Personal bot',
+          larkAppId: 'cli_device_flow',
+          larkAppSecret: 'sec_device_1',
+          creatorOpenId: 'ou_device_creator',
+        })
+        return { jobId: 'job-device-1', status: 'working', stepMessage: 'working' }
+      })
+      await manager.startAutoCreateBot({
+        mode: 'device_flow',
+        name: 'DeviceFlowBot',
+        defaultWorkingDir: validDir,
+      })
+      await vi.waitFor(() => {
+        expect(store.getBot('bot-device-flow')?.adminUserProfiles).toHaveLength(1)
+      })
+      expect(store.getBot('bot-device-flow')).toMatchObject({
+        adminUsers: ['ou_device_creator'],
+        adminUserProfiles: [
+          {
+            openId: 'ou_device_creator',
+            name: 'Lin Xiao',
+            avatarUrl: 'https://example.com/lin.png',
+          },
+        ],
+      })
+
+      // 5b. Auto-create open_platform falls back to creatorEmail when application/v6 omits creator_id
+      vi.spyOn(manager.platform, 'startAutoCreateBot').mockImplementationOnce((_req, onCreated) => {
+        void onCreated({
+          id: 'bot-auto-op',
+          name: 'AutoOpBot',
+          description: 'Auto created bot',
+          larkAppId: 'cli_auto_op',
+          larkAppSecret: 'sec_auto_op',
+          creatorName: 'Alex Chen',
+          creatorEmail: 'alex@example.com',
+        })
+        return { jobId: 'job-op-1', status: 'working', stepMessage: 'working' }
+      })
+      await manager.startAutoCreateBot({
+        mode: 'open_platform',
+        name: 'AutoOpBot',
+        defaultWorkingDir: validDir,
+      })
+      await vi.waitFor(() => {
+        expect(store.getBot('bot-auto-op')?.adminUsers).toEqual(['ou_auto_alex'])
+      })
+      expect(store.getBot('bot-auto-op')?.adminUserProfiles).toEqual([
+        {
+          openId: 'ou_auto_alex',
+          name: 'Alex Chen',
+          email: 'alex@example.com',
+        },
+      ])
+    } finally {
+      fetchProfileSpy.mockRestore()
+      resolveEmailSpy.mockRestore()
+      resolveSummarySpy.mockRestore()
+      startSpy.mockRestore()
+      stopSpy.mockRestore()
+      await manager.stop()
+    }
   })
 })

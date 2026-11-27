@@ -37,6 +37,24 @@ function isReadableMemberLabel(name: string | undefined, openId?: string): boole
   return !RAW_FEISHU_ID_RE.test(clean)
 }
 
+function normalizeOpenId(value: string | undefined): string | undefined {
+  const clean = value?.trim()
+  return clean && clean.startsWith('ou_') ? clean : undefined
+}
+
+export interface SeedDefaultCreatorAdminOptions {
+  readonly creatorOpenId?: string
+  readonly creatorName?: string
+  readonly creatorEmail?: string
+  /**
+   * True only when `creatorName` / `creatorEmail` are guaranteed to belong to
+   * the Feishu app creator (e.g. Open Platform auto-create). When false (e.g.
+   * importing an existing app created by another member), those hints are only
+   * used if `creatorOpenId` itself was resolved from `creatorEmail`.
+   */
+  readonly creatorHintsMatchAppCreator?: boolean
+}
+
 export interface ManagedTransport {
   readonly config: LarkBotConfig
   readonly transport: LarkBotTransport
@@ -74,6 +92,8 @@ export class BotConnectionPool {
   private readonly botSyncQueues = new Map<string, Promise<void>>()
   private readonly preserveLocalDescriptionBots = new Set<string>()
   private readonly hydratedProfileBots = new Set<string>()
+  private readonly profileAttemptedBots = new Set<string>()
+  private readonly botCreatorOpenIds = new Map<string, string>()
   private readonly groupMemberSyncCache = new Map<
     string,
     {
@@ -212,10 +232,128 @@ export class BotConnectionPool {
       ...(remote.description || fallback?.description
         ? { description: remote.description || fallback?.description }
         : {}),
+      ...(remote.creatorOpenId ? { creatorOpenId: remote.creatorOpenId } : {}),
     }
     this.hydratedProfileBots.add(botId)
+    this.profileAttemptedBots.add(botId)
+    const creatorOpenId = normalizeOpenId(merged.creatorOpenId)
+    if (creatorOpenId) {
+      this.botCreatorOpenIds.set(botId, creatorOpenId)
+    }
     this.host.store.updateBotProfile(botId, merged)
     return merged
+  }
+
+  /**
+   * Seeds the Feishu app creator as the bot's default administrator on initial
+   * bot creation/import. Never overwrites existing `adminUsers` and never runs
+   * on subsequent edits, so explicitly clearing `adminUsers` stays respected.
+   */
+  async ensureDefaultCreatorAdmin(
+    botId: string,
+    options: SeedDefaultCreatorAdminOptions = {},
+  ): Promise<boolean> {
+    const bot = this.host.store.getBot(botId)
+    if (!bot || bot.adminUsers.length > 0) return false
+
+    const liveTransport = this.transports.get(botId)?.transport
+    let creatorOpenId: string | undefined
+    let source: 'explicit' | 'app_profile' | 'email_fallback' | undefined
+
+    const explicitOpenId = normalizeOpenId(options.creatorOpenId)
+    if (explicitOpenId) {
+      creatorOpenId = explicitOpenId
+      source = 'explicit'
+    }
+
+    if (!creatorOpenId) {
+      const cached = normalizeOpenId(
+        this.botCreatorOpenIds.get(botId) ?? liveTransport?.state.creatorOpenId,
+      )
+      if (cached) {
+        creatorOpenId = cached
+        source = 'app_profile'
+      }
+    }
+
+    if (!creatorOpenId && !this.profileAttemptedBots.has(botId)) {
+      this.profileAttemptedBots.add(botId)
+      const fetched = await this.transportFor(bot)
+        .fetchBotProfile()
+        .catch(() => undefined)
+      const fetchedCreator = normalizeOpenId(fetched?.creatorOpenId)
+      if (fetchedCreator) {
+        this.botCreatorOpenIds.set(botId, fetchedCreator)
+        creatorOpenId = fetchedCreator
+        source = 'app_profile'
+      }
+    }
+
+    if (!creatorOpenId && options.creatorEmail?.trim()) {
+      const emailOpenId = await this.transportFor(bot)
+        .resolveOpenIdByEmail(options.creatorEmail.trim())
+        .catch(() => undefined)
+      const normalized = normalizeOpenId(emailOpenId)
+      if (normalized) {
+        creatorOpenId = normalized
+        source = 'email_fallback'
+      }
+    }
+
+    if (!creatorOpenId) return false
+
+    const trustHints =
+      source === 'email_fallback' || options.creatorHintsMatchAppCreator === true
+    const fallbackName = trustHints ? options.creatorName?.trim() || undefined : undefined
+    const fallbackEmail = trustHints ? options.creatorEmail?.trim() || undefined : undefined
+    const resolved = await this.transportFor(bot)
+      .resolveUserSummary(creatorOpenId, fallbackName)
+      .catch(() => undefined)
+
+    const resolvedName =
+      resolved?.name && isReadableMemberLabel(resolved.name, creatorOpenId)
+        ? resolved.name.trim()
+        : fallbackName
+    const resolvedEmail = resolved?.email?.trim() || fallbackEmail
+    const resolvedAvatar = resolved?.avatarUrl?.trim() || undefined
+    const initialProfile: SubstituteTarget | undefined =
+      resolvedName || resolvedAvatar
+        ? {
+            openId: creatorOpenId,
+            name: resolvedName ?? creatorOpenId,
+            ...(resolvedEmail ? { email: resolvedEmail } : {}),
+            ...(resolvedAvatar ? { avatarUrl: resolvedAvatar } : {}),
+          }
+        : undefined
+
+    const latest = this.host.store.getBot(botId)
+    if (!latest || latest.adminUsers.length > 0) return false
+
+    const updated = this.host.store.upsertBot({
+      ...latest,
+      adminUsers: [creatorOpenId],
+      adminUserProfiles: initialProfile ? [initialProfile] : [],
+    })
+    if (
+      initialProfile &&
+      !initialProfile.avatarUrl &&
+      isReadableMemberLabel(initialProfile.name, creatorOpenId)
+    ) {
+      await this.hydrateAdminUserProfiles(updated).catch(() => undefined)
+    }
+
+    const finalBot = this.host.store.getBot(botId) ?? updated
+    const finalProfile = finalBot.adminUserProfiles.find((p) => p.openId === creatorOpenId)
+    const label =
+      finalProfile && isReadableMemberLabel(finalProfile.name, creatorOpenId)
+        ? finalProfile.name.trim()
+        : undefined
+    this.host.store.recordEvent({
+      botId,
+      kind: 'lifecycle',
+      summary: `已默认将应用创建人设为智能体管理员${label ? `（${label}）` : ''}`,
+    })
+    return true
   }
 
   async hydrateAllowedUserProfiles(bot: LarkBotConfig): Promise<SubstituteTarget[]> {
@@ -511,6 +649,7 @@ export class BotConnectionPool {
       },
       async (created) => {
         const finalId = this.allocateUniqueBotId(created.id, created.larkAppId)
+        const initialCreatorOpenId = normalizeOpenId(created.creatorOpenId)
         const saved = this.host.store.upsertBot({
           id: finalId,
           name: created.name,
@@ -518,6 +657,7 @@ export class BotConnectionPool {
           larkAppId: created.larkAppId,
           larkAppSecret: created.larkAppSecret,
           enabled: true,
+          ...(initialCreatorOpenId ? { adminUsers: [initialCreatorOpenId] } : {}),
           defaultWorkingDir: defaults.defaultWorkingDir,
           workspaceName: defaults.workspaceName,
           agentPreset: defaults.agentPreset,
@@ -525,7 +665,33 @@ export class BotConnectionPool {
           ...(defaults.model ? { model: defaults.model } : {}),
           ...(defaults.reasoningEffort ? { reasoningEffort: defaults.reasoningEffort } : {}),
         })
-        await this.syncBot(saved.id)
+        try {
+          await this.syncBot(saved.id)
+        } finally {
+          if (initialCreatorOpenId) {
+            const latest = this.host.store.getBot(saved.id) ?? saved
+            await this.hydrateAdminUserProfiles(latest).catch(() => undefined)
+            const hydrated = this.host.store.getBot(saved.id) ?? latest
+            const profile = hydrated.adminUserProfiles.find(
+              (p) => p.openId === initialCreatorOpenId,
+            )
+            const label =
+              profile && isReadableMemberLabel(profile.name, initialCreatorOpenId)
+                ? profile.name.trim()
+                : undefined
+            this.host.store.recordEvent({
+              botId: saved.id,
+              kind: 'lifecycle',
+              summary: `已默认将应用创建人设为智能体管理员${label ? `（${label}）` : ''}`,
+            })
+          } else {
+            await this.ensureDefaultCreatorAdmin(saved.id, {
+              ...(created.creatorName ? { creatorName: created.creatorName } : {}),
+              ...(created.creatorEmail ? { creatorEmail: created.creatorEmail } : {}),
+              creatorHintsMatchAppCreator: true,
+            }).catch(() => undefined)
+          }
+        }
       },
     )
   }
@@ -577,9 +743,18 @@ export class BotConnectionPool {
         summary: `接入时已补齐基线事件${eventSync.addedEvents.length > 0 ? `（新增 ${eventSync.addedEvents.length} 项）` : ''}${eventSync.version ? `并发布版本 ${eventSync.version}` : ''}`,
       })
     }
-    await this.syncBot(saved.id)
-    if (!saved.description.trim() || !saved.avatarUrl.trim()) {
-      await this.ensureBotProfileHydrated(saved.id)
+    const cachedIdentity = this.host.platform.getCachedIdentity?.()
+    try {
+      await this.syncBot(saved.id)
+      if (!saved.description.trim() || !saved.avatarUrl.trim()) {
+        await this.ensureBotProfileHydrated(saved.id)
+      }
+    } finally {
+      await this.ensureDefaultCreatorAdmin(saved.id, {
+        ...(cachedIdentity?.userName ? { creatorName: cachedIdentity.userName } : {}),
+        ...(cachedIdentity?.email ? { creatorEmail: cachedIdentity.email } : {}),
+        creatorHintsMatchAppCreator: false,
+      }).catch(() => undefined)
     }
     return {
       bot: this.host.store.getBot(saved.id) ?? saved,
@@ -597,7 +772,18 @@ export class BotConnectionPool {
       await existing.transport.stop().catch(() => {})
     }
     const bot = this.host.store.getBot(botId)
-    if (!bot || this.host.isDisposed()) return
+    if (!bot) {
+      this.botCreatorOpenIds.delete(botId)
+      this.hydratedProfileBots.delete(botId)
+      this.profileAttemptedBots.delete(botId)
+      return
+    }
+    if (existing && existing.config.larkAppId !== bot.larkAppId) {
+      this.botCreatorOpenIds.delete(botId)
+      this.hydratedProfileBots.delete(botId)
+      this.profileAttemptedBots.delete(botId)
+    }
+    if (this.host.isDisposed()) return
     await this.host.workspaces.syncBot(bot)
     await this.host.workspaces.reconcileBindings()
     if (bot.enabled && !this.host.isDisposed()) {
@@ -648,6 +834,11 @@ export class BotConnectionPool {
       },
       onBotProfile: (profile) => {
         this.hydratedProfileBots.add(bot.id)
+        this.profileAttemptedBots.add(bot.id)
+        const creatorOpenId = normalizeOpenId(profile.creatorOpenId)
+        if (creatorOpenId) {
+          this.botCreatorOpenIds.set(bot.id, creatorOpenId)
+        }
         this.host.store.updateBotProfile(bot.id, profile, {
           preserveNonEmptyDescription: this.preserveLocalDescriptionBots.has(bot.id),
         })
@@ -661,7 +852,9 @@ export class BotConnectionPool {
     this.transports.set(bot.id, { config: bot, transport })
     try {
       await transport.start()
+      this.profileAttemptedBots.add(bot.id)
     } catch (err) {
+      this.profileAttemptedBots.add(bot.id)
       if (this.transports.get(bot.id)?.transport === transport) {
         this.transports.delete(bot.id)
       }

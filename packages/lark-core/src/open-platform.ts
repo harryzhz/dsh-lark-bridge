@@ -137,6 +137,9 @@ export interface AutoCreatedBotCredentials {
   readonly description: string
   readonly larkAppId: string
   readonly larkAppSecret: string
+  readonly creatorOpenId?: string
+  readonly creatorName?: string
+  readonly creatorEmail?: string
 }
 
 export interface LarkOpenPlatformAppSummary {
@@ -667,6 +670,7 @@ export class LarkPlatformManager {
   private readonly oauthPath: string
   private readonly jobs = new Map<string, LarkQrJobView>()
   private readonly oauthTokens = new Map<string, LarkUserOAuthEntry>()
+  private cachedIdentity?: LarkOpenPlatformIdentity
 
   constructor(
     private readonly dataDir: string,
@@ -680,6 +684,10 @@ export class LarkPlatformManager {
 
   getJob(jobId: string): LarkQrJobView | undefined {
     return this.jobs.get(jobId)
+  }
+
+  getCachedIdentity(): LarkOpenPlatformIdentity | undefined {
+    return this.cachedIdentity
   }
 
   listUserAuthStatuses(botIds: readonly string[]): LarkUserAuthView[] {
@@ -718,6 +726,7 @@ export class LarkPlatformManager {
   }
 
   logoutOpenPlatform(): void {
+    this.cachedIdentity = undefined
     try {
       if (existsSync(this.sessionPath)) unlinkSync(this.sessionPath)
     } catch {
@@ -1227,12 +1236,16 @@ export class LarkPlatformManager {
     const localCookies = this.readCookieFile(this.sessionPath)
     if (localCookies.length > 0) {
       const client = await openConsoleClient(localCookies, this.fetcher).catch(() => undefined)
-      if (client) return { client, cookies: localCookies, source: 'local_cache' }
+      if (client) {
+        if (client.identity) this.cachedIdentity = client.identity
+        return { client, cookies: localCookies, source: 'local_cache' }
+      }
     }
     const cliCookies = this.readCookieFile(this.cliFallbackSessionPath)
     if (cliCookies.length > 0) {
       const client = await openConsoleClient(cliCookies, this.fetcher).catch(() => undefined)
       if (client) {
+        if (client.identity) this.cachedIdentity = client.identity
         writePrivateJson(this.sessionPath, { cookies: cliCookies })
         return { client, cookies: cliCookies, source: 'cli_cache' }
       }
@@ -1327,6 +1340,7 @@ export class LarkPlatformManager {
         if (!client) {
           throw new Error('扫码完成，但未能获取开放平台控制台凭证')
         }
+        if (client.identity) this.cachedIdentity = client.identity
         writePrivateJson(this.sessionPath, { cookies })
         return { cookies, client }
       }
@@ -1535,6 +1549,8 @@ export class LarkPlatformManager {
         description,
         larkAppId: appId,
         larkAppSecret: appSecret,
+        ...(client.identity.userName ? { creatorName: client.identity.userName } : {}),
+        ...(client.identity.email ? { creatorEmail: client.identity.email } : {}),
       })
 
       this.updateJob(jobId, {
@@ -1580,12 +1596,15 @@ export class LarkPlatformManager {
         throw new Error('扫码建应用未返回有效的凭证')
       }
 
+      const rawCreatorOpenId = result.user_info?.open_id?.trim()
+      const creatorOpenId = rawCreatorOpenId?.startsWith('ou_') ? rawCreatorOpenId : undefined
       await onCreated({
         id: botId,
         name,
         description,
         larkAppId: result.client_id,
         larkAppSecret: result.client_secret,
+        ...(creatorOpenId ? { creatorOpenId } : {}),
       })
 
       this.updateJob(jobId, {
