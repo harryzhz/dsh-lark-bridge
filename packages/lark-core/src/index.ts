@@ -39,8 +39,10 @@ export {
 } from './lark-transport.js'
 export {
   buildLarkPostPayload,
+  formatLarkEmotionToken,
   formatMarkdownForLarkCard,
   formatMarkdownForLarkPost,
+  resolveLarkEmojiType,
   type LarkPostPayloadOptions,
 } from './markdown.js'
 export {
@@ -209,6 +211,8 @@ export {
   DEFAULT_DREAMING_SCOPES,
   DEFAULT_GROUP_ROUTER_CONFIG,
   DEFAULT_LISTENER_TEMPLATES,
+  DEFAULT_LONG_TURN_NOTICE_DELAY_SECONDS,
+  DEFAULT_LONG_TURN_NOTICE_TEXT,
   DEFAULT_ROUTER_BYPASS_CONFIG,
   GroupListenerRuleSchema,
   GroupReplyModeSchema,

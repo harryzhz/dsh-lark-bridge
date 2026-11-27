@@ -81,6 +81,9 @@ export const DISCLOSURE_MODES: readonly Choice<'none' | 'subtle' | 'explicit'>[]
   },
 ]
 
+export const DEFAULT_LONG_TURN_NOTICE_DELAY_SECONDS = 60
+export const DEFAULT_LONG_TURN_NOTICE_TEXT = '深度求索中…[敲键盘]'
+
 export const DEFAULT_DREAMING_SCOPES: readonly string[] = [
   '个人偏好',
   '协作约定',

@@ -326,6 +326,9 @@ function migrateLegacyWorkspaceField(input: unknown): unknown {
   return rec
 }
 
+export const DEFAULT_LONG_TURN_NOTICE_DELAY_SECONDS = 60
+export const DEFAULT_LONG_TURN_NOTICE_TEXT = '深度求索中…[敲键盘]'
+
 export const LarkBotConfigSchema = z.preprocess(
   migrateLegacyWorkspaceField,
   z.object({
@@ -363,6 +366,13 @@ export const LarkBotConfigSchema = z.preprocess(
     // Card, signature & feedback
     sendIntermediateMessages: z.boolean().default(false),
     longTurnProgressNotice: z.boolean().default(true),
+    longTurnNoticeDelaySeconds: z
+      .number()
+      .int()
+      .min(0)
+      .max(3600)
+      .default(DEFAULT_LONG_TURN_NOTICE_DELAY_SECONDS),
+    longTurnNoticeText: z.string().max(300).default(DEFAULT_LONG_TURN_NOTICE_TEXT),
     useInteractiveCard: z.boolean().default(true),
     dshSessionLinkInCard: z.boolean().default(true),
     sessionLinkGuestReadOnly: z.boolean().default(true),
@@ -778,6 +788,8 @@ export type RoutingDecision =
       readonly useCard: boolean
       readonly sendIntermediateMessages: boolean
       readonly longTurnProgressNotice?: boolean
+      readonly longTurnNoticeDelaySeconds?: number
+      readonly longTurnNoticeText?: string
       readonly receivedReactionEmoji?: string
       readonly allowSilentEmptyReply: boolean
       readonly autoCloseAfterCompletion: boolean
