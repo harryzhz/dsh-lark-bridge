@@ -169,12 +169,19 @@ export {
 } from './inbound-pipeline.js'
 export {
   DEFAULT_MAX_CONCURRENT_TURNS_PER_RUNTIME,
+  MAX_CONCURRENT_TURNS_PER_RUNTIME,
+  MIN_CONCURRENT_TURNS_PER_RUNTIME,
+  RUNTIME_CONCURRENCY_KEY_SEP,
   RuntimeConcurrencyLimiter,
+  buildRuntimeConcurrencyKey,
   normalizeRuntimeConcurrencyKey,
+  parseRuntimeConcurrencyLimit,
+  sanitizeRuntimeConcurrencyLimits,
   type ConcurrencyAcquireOptions,
   type ConcurrencyLease,
   type ConcurrencyPriority,
   type RuntimeConcurrencyBucketStats,
+  type RuntimeConcurrencyConfigSnapshot,
   type RuntimeConcurrencyStats,
 } from './runtime-concurrency.js'
 export {

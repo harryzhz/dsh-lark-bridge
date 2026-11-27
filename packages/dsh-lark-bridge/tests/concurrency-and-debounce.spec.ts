@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
@@ -12,8 +12,13 @@ import {
 } from '@dsh-lark/lark-core'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { LarkBridgeManager } from '../src/bridge-manager.js'
+import { dispatchLarkApiRequest } from '../src/http-api.js'
 import { ListenerDebounceBuffer } from '../src/listener-debounce.js'
-import { RuntimeConcurrencyLimiter } from '../src/runtime-concurrency.js'
+import {
+  RuntimeConcurrencyLimiter,
+  buildRuntimeConcurrencyKey,
+} from '../src/runtime-concurrency.js'
+import { CONFIG_SNAPSHOT_FILENAME } from '../src/storage/database.js'
 import { LarkBridgeStore } from '../src/store.js'
 
 const tempDirs: string[] = []
@@ -151,6 +156,215 @@ describe('RuntimeConcurrencyLimiter', () => {
     b!.release()
     c!.release()
   })
+
+  it('supports per-runtime and per-profile overrides, inheritance, and hot limit updates', async () => {
+    const limiter = new RuntimeConcurrencyLimiter(1, { codex: 2 })
+    const proxyKey = buildRuntimeConcurrencyKey('codex', 'proxy-a')
+
+    // Profile inherits base runtime override (2) until explicitly overridden
+    expect(limiter.getLimit('standard')).toBe(1)
+    expect(limiter.getLimit('codex')).toBe(2)
+    expect(limiter.getLimit(proxyKey)).toBe(2)
+
+    // Profile pool is independent from base runtime pool
+    const base1 = await limiter.acquire({ runtimeKey: 'codex', priority: 'interactive' })
+    const base2 = await limiter.acquire({ runtimeKey: 'codex', priority: 'interactive' })
+    const proxy1 = await limiter.acquire({ runtimeKey: proxyKey, priority: 'interactive' })
+    expect(base1 && base2 && proxy1).toBeTruthy()
+
+    // Third turn on base codex queues
+    let base3Acquired = false
+    const base3Promise = limiter
+      .acquire({ runtimeKey: 'codex', priority: 'interactive' })
+      .then((lease) => {
+        base3Acquired = true
+        return lease
+      })
+    await Promise.resolve()
+    expect(base3Acquired).toBe(false)
+
+    // Raising codex limit hot-wakes queued base waiter without releasing active turns
+    limiter.setOverride('codex', 3)
+    const base3 = await base3Promise
+    expect(base3Acquired).toBe(true)
+    expect(base3).toBeDefined()
+
+    // Narrow profile override to 1 -> second proxy turn queues until limit raised or switched to unlimited (0)
+    limiter.setOverride(proxyKey, 1)
+    expect(limiter.getLimit(proxyKey)).toBe(1)
+    let proxy2Acquired = false
+    const proxy2Promise = limiter
+      .acquire({ runtimeKey: proxyKey, priority: 'interactive' })
+      .then((lease) => {
+        proxy2Acquired = true
+        return lease
+      })
+    await Promise.resolve()
+    expect(proxy2Acquired).toBe(false)
+
+    // Switching profile override to unlimited (0) wakes waiter immediately AND still tracks active count
+    limiter.setOverride(proxyKey, 0)
+    const proxy2 = await proxy2Promise
+    expect(proxy2Acquired).toBe(true)
+    expect(limiter.getStats().byRuntime[proxyKey]?.active).toBe(2)
+
+    // Tightening from unlimited (0) back to 1 blocks a third turn while 2 remain active
+    limiter.setOverride(proxyKey, 1)
+    let proxy3Acquired = false
+    const proxy3Promise = limiter
+      .acquire({ runtimeKey: proxyKey, priority: 'interactive' })
+      .then((lease) => {
+        proxy3Acquired = true
+        return lease
+      })
+    await Promise.resolve()
+    expect(proxy3Acquired).toBe(false)
+
+    // Removing profile override restores inheritance from codex (3) -> immediately wakes proxy3!
+    limiter.setOverride(proxyKey, null)
+    expect(limiter.getLimit(proxyKey)).toBe(3)
+    const proxy3 = await proxy3Promise
+    expect(proxy3Acquired).toBe(true)
+
+    base1!.release()
+    base2!.release()
+    base3!.release()
+    proxy1!.release()
+    proxy2!.release()
+    proxy3!.release()
+    expect(limiter.getStats().active).toBe(0)
+    expect(limiter.getStats().queued).toBe(0)
+  })
+
+  it('persists concurrency overrides in SQLite, reloads on restart, and enforces Owner-only HTTP API', async () => {
+    const dataDir = makeTempDir('dsh-lark-concurrency-api-')
+    const h = createBridgeHarness({
+      dataDir,
+      maxConcurrentTurnsPerRuntime: 3,
+    })
+
+    // Non-owner CLI / operator requests must be rejected with 403
+    const cliDenied = await dispatchLarkApiRequest(h.ctx, h.manager, {
+      method: 'PUT',
+      path: '/runtimes/concurrency',
+      body: { runtimeId: 'codex', maxConcurrent: 5 },
+      isCliAuthenticated: true,
+      principalKind: 'cli',
+    })
+    expect(cliDenied.status).toBe(403)
+
+    const operatorDenied = await dispatchLarkApiRequest(h.ctx, h.manager, {
+      method: 'PUT',
+      path: '/runtimes/concurrency',
+      body: { runtimeId: 'codex', maxConcurrent: 5 },
+      isCliAuthenticated: false,
+      isOperatorAuthenticated: true,
+      principalKind: 'operator',
+    })
+    expect(operatorDenied.status).toBe(403)
+
+    // Bounds & input validation
+    const invalidOutOfRange = await dispatchLarkApiRequest(h.ctx, h.manager, {
+      method: 'PUT',
+      path: '/runtimes/concurrency',
+      body: { runtimeId: 'codex', maxConcurrent: 64 },
+      isCliAuthenticated: false,
+      principalKind: 'owner',
+    })
+    expect(invalidOutOfRange.status).toBe(400)
+
+    const invalidFloat = await dispatchLarkApiRequest(h.ctx, h.manager, {
+      method: 'PUT',
+      path: '/runtimes/concurrency',
+      body: { runtimeId: 'codex', maxConcurrent: 2.5 },
+      isCliAuthenticated: false,
+      principalKind: 'owner',
+    })
+    expect(invalidFloat.status).toBe(400)
+
+    // Owner updates base runtime & profile limits
+    const setBase = await dispatchLarkApiRequest(h.ctx, h.manager, {
+      method: 'PUT',
+      path: '/runtimes/concurrency',
+      body: { runtimeId: 'codex', maxConcurrent: 6 },
+      isCliAuthenticated: false,
+      principalKind: 'owner',
+    })
+    expect(setBase.status).toBe(200)
+    expect(h.manager.runtimeLimiter.getLimit('codex')).toBe(6)
+
+    const setProfile = await dispatchLarkApiRequest(h.ctx, h.manager, {
+      method: 'PUT',
+      path: '/runtimes/concurrency',
+      body: { runtimeId: 'codex', profileId: 'proxy-a', maxConcurrent: 0 },
+      isCliAuthenticated: false,
+      principalKind: 'owner',
+    })
+    expect(setProfile.status).toBe(200)
+    expect(h.manager.runtimeLimiter.getLimit('codex::proxy-a')).toBe(0)
+
+    // GET /runtimes returns concurrency snapshot
+    const listRes = await dispatchLarkApiRequest(h.ctx, h.manager, {
+      method: 'GET',
+      path: '/runtimes',
+      isCliAuthenticated: false,
+      principalKind: 'owner',
+    })
+    expect(listRes.status).toBe(200)
+    const listPayload = listRes.payload as {
+      concurrency: { defaultLimit: number; maxLimit: number; limits: Record<string, number> }
+    }
+    expect(listPayload.concurrency.defaultLimit).toBe(3)
+    expect(listPayload.concurrency.maxLimit).toBe(32)
+    expect(listPayload.concurrency.limits).toEqual({
+      codex: 6,
+      'codex::proxy-a': 0,
+    })
+
+    // Snapshot & SQLite reload preserve persisted overrides across restart
+    h.store.flushConfigSnapshot()
+    const snapshot = JSON.parse(readFileSync(join(dataDir, CONFIG_SNAPSHOT_FILENAME), 'utf8')) as {
+      runtimeConcurrencyLimits?: Record<string, number>
+    }
+    expect(snapshot.runtimeConcurrencyLimits).toEqual({
+      codex: 6,
+      'codex::proxy-a': 0,
+    })
+    await h.manager.stop()
+    h.store.close()
+
+    const reloadedStore = new LarkBridgeStore(dataDir)
+    const reloadedManager = new LarkBridgeManager(
+      h.ctx,
+      {
+        dataDir,
+        publicBaseUrl: 'http://127.0.0.1:3880',
+        idleSweepIntervalMs: 0,
+        maxAuditEvents: 200,
+        autoInstallCliAndSkill: false,
+        enableInstanceLock: false,
+        maxConcurrentTurnsPerRuntime: 3,
+      },
+      reloadedStore,
+    )
+    expect(reloadedManager.runtimeLimiter.getLimit('codex')).toBe(6)
+    expect(reloadedManager.runtimeLimiter.getLimit('codex::proxy-a')).toBe(0)
+
+    // Resetting base override via null restores default limit (3)
+    const resetRes = await dispatchLarkApiRequest(h.ctx, reloadedManager, {
+      method: 'PUT',
+      path: '/runtimes/concurrency',
+      body: { runtimeId: 'codex', maxConcurrent: null },
+      isCliAuthenticated: false,
+      principalKind: 'owner',
+    })
+    expect(resetRes.status).toBe(200)
+    expect(reloadedManager.runtimeLimiter.getLimit('codex')).toBe(3)
+    expect(reloadedStore.getRuntimeConcurrencyLimits()).toEqual({ 'codex::proxy-a': 0 })
+
+    await reloadedManager.stop()
+    reloadedStore.close()
+  })
 })
 
 describe('ListenerDebounceBuffer', () => {
@@ -232,13 +446,14 @@ describe('ListenerDebounceBuffer', () => {
 })
 
 function createBridgeHarness(options: {
+  readonly dataDir?: string
   readonly maxConcurrentTurnsPerRuntime?: number
   readonly listenerDebounceOverrideMs?: number
   readonly reminderDispatchStaggerMs?: number
   readonly triageStream?: (opts: GenerateOptions) => AsyncIterable<StreamChunk>
   readonly manualTurnControl?: boolean
 }) {
-  const dir = makeTempDir()
+  const dir = options.dataDir ?? makeTempDir()
   const store = new LarkBridgeStore(dir)
   const listeners = new Set<(session: Session, event: SessionEvent) => void>()
   const agents = new Map<string, { session: Session; followup: (msg: unknown) => void }>()
@@ -452,6 +667,7 @@ function createBridgeHarness(options: {
 
   return {
     dir,
+    ctx,
     store,
     manager,
     bot,

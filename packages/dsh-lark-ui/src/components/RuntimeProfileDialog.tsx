@@ -13,6 +13,7 @@ import {
 import { bridgeApi } from '../api.js'
 import { parseCommandLineToProfileDraft } from '../command-import.js'
 import type {
+  RuntimeConcurrencyConfig,
   RuntimeOption,
   RuntimeProfileCapabilities,
   RuntimeProfileInput,
@@ -26,6 +27,10 @@ import {
   TextField,
   type SelectOption,
 } from './fields.js'
+import {
+  RuntimeConcurrencyField,
+  resolveRuntimeConcurrencyState,
+} from './RuntimeConcurrencyField.js'
 
 const SECRET_ENV_PATTERN = /(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)/i
 
@@ -56,6 +61,7 @@ interface ProfileFormDraft {
   readonly authMethodId: string
   readonly defaultModel: string
   readonly exposeAsPreset: boolean
+  readonly concurrencyLimit: number | null
 }
 
 let rowCounter = 1
@@ -82,10 +88,14 @@ function buildEmptyDraft(): ProfileFormDraft {
     authMethodId: '',
     defaultModel: '',
     exposeAsPreset: false,
+    concurrencyLimit: null,
   }
 }
 
-function draftFromProfile(profile: RuntimeProfileSummary): ProfileFormDraft {
+function draftFromProfile(
+  profile: RuntimeProfileSummary,
+  concurrencyLimit: number | null = null,
+): ProfileFormDraft {
   const secretSet = new Set(profile.secretEnvKeys ?? [])
   const envRows: EnvRow[] = Object.entries(profile.env ?? {}).map(([key, val]) => ({
     uid: nextRowUid(),
@@ -107,6 +117,7 @@ function draftFromProfile(profile: RuntimeProfileSummary): ProfileFormDraft {
     authMethodId: profile.authMethodId ?? '',
     defaultModel: profile.defaultModel ?? '',
     exposeAsPreset: Boolean(profile.exposeAsPreset),
+    concurrencyLimit,
   }
 }
 
@@ -167,6 +178,7 @@ function sourceTagLabel(source: RuntimeProfileSummary['source']): string | undef
 export function RuntimeProfilePanel({
   runtime,
   initialProfileId,
+  concurrency,
   backLabel,
   onBack,
   onClose,
@@ -174,6 +186,7 @@ export function RuntimeProfilePanel({
 }: {
   runtime: RuntimeOption
   initialProfileId?: string
+  concurrency?: RuntimeConcurrencyConfig
   backLabel?: string
   onBack?: () => void
   onClose: () => void
@@ -202,15 +215,22 @@ export function RuntimeProfilePanel({
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
 
+  const savedLimitFor = (profileId?: string): number | null => {
+    if (!concurrency || !profileId) return null
+    return resolveRuntimeConcurrencyState(concurrency, runtime.id, profileId).customLimit
+  }
+
   useEffect(() => {
     const target =
       (initialProfileId ? profiles.find((p) => p.id === initialProfileId) : undefined) ??
       profiles[0]
     if (target) {
       setSelectedId(target.id)
-      const next = draftFromProfile(target)
+      const next = draftFromProfile(target, savedLimitFor(target.id))
       setDraft(next)
-      setShowAdvanced(next.args.length > 0 || Boolean(next.defaultModel))
+      setShowAdvanced(
+        next.args.length > 0 || Boolean(next.defaultModel) || next.concurrencyLimit !== null,
+      )
     } else {
       setSelectedId('__new__')
       setDraft(buildEmptyDraft())
@@ -229,9 +249,11 @@ export function RuntimeProfilePanel({
 
   const selectExisting = (profile: RuntimeProfileSummary) => {
     setSelectedId(profile.id)
-    const next = draftFromProfile(profile)
+    const next = draftFromProfile(profile, savedLimitFor(profile.id))
     setDraft(next)
-    setShowAdvanced(next.args.length > 0 || Boolean(next.defaultModel))
+    setShowAdvanced(
+      next.args.length > 0 || Boolean(next.defaultModel) || next.concurrencyLimit !== null,
+    )
     setShowImport(false)
     setImportCmd('')
     setError('')
@@ -293,12 +315,21 @@ export function RuntimeProfilePanel({
       throw new Error('请填写配置名称')
     }
     const payload = buildProfilePayload(runtime.id, draft)
+    const prevSavedLimit =
+      draft.id && selectedId !== '__new__' ? savedLimitFor(draft.id) : null
     const saved =
       draft.id && selectedId !== '__new__'
         ? await bridgeApi.updateRuntimeProfile(runtime.id, draft.id, payload)
         : await bridgeApi.createRuntimeProfile(payload)
+    if (concurrency && draft.concurrencyLimit !== prevSavedLimit) {
+      await bridgeApi.setRuntimeConcurrency({
+        runtimeId: runtime.id,
+        profileId: saved.id,
+        maxConcurrent: draft.concurrencyLimit,
+      })
+    }
     setSelectedId(saved.id)
-    setDraft(draftFromProfile(saved))
+    setDraft(draftFromProfile(saved, draft.concurrencyLimit))
     return saved
   }
 
@@ -677,6 +708,24 @@ export function RuntimeProfilePanel({
                   mono
                 />
               </SettingRow>
+              {concurrency && (
+                <RuntimeConcurrencyField
+                  runtimeName={runtime.name}
+                  profileName={draft.name.trim() || draft.id || '新启动配置'}
+                  isProfile
+                  inheritedLimit={
+                    resolveRuntimeConcurrencyState(
+                      concurrency,
+                      runtime.id,
+                      draft.id || '__draft__',
+                    ).inheritedLimit
+                  }
+                  maxLimit={concurrency.maxLimit}
+                  value={draft.concurrencyLimit}
+                  disabled={busy}
+                  onChange={(concurrencyLimit) => patch({ concurrencyLimit })}
+                />
+              )}
             </>
           )}
         </div>
@@ -711,12 +760,14 @@ export function RuntimeProfileDialog({
   open,
   runtime,
   initialProfileId,
+  concurrency,
   onClose,
   onChanged,
 }: {
   open: boolean
   runtime: RuntimeOption
   initialProfileId?: string
+  concurrency?: RuntimeConcurrencyConfig
   onClose: () => void
   onChanged: (selectedProfileId?: string) => Promise<void>
 }) {
@@ -732,6 +783,7 @@ export function RuntimeProfileDialog({
       <RuntimeProfilePanel
         runtime={runtime}
         initialProfileId={initialProfileId}
+        concurrency={concurrency}
         onClose={onClose}
         onChanged={onChanged}
       />

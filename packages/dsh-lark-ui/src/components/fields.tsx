@@ -631,12 +631,14 @@ export function NumberField({
   onChange,
   suffix,
   min = 0,
+  max,
   disabled,
 }: {
   value: number
   onChange: (next: number) => void
   suffix: string
   min?: number
+  max?: number
   disabled?: boolean
 }) {
   return (
@@ -645,9 +647,14 @@ export function NumberField({
         className="fb-field fb-num"
         type="number"
         min={min}
+        max={max}
         value={value}
         disabled={disabled}
-        onChange={(e) => onChange(Math.max(min, Number(e.target.value) || 0))}
+        onChange={(e) => {
+          const parsed = Number(e.target.value)
+          const clampedMin = Math.max(min, Number.isFinite(parsed) ? parsed : min)
+          onChange(max !== undefined ? Math.min(max, clampedMin) : clampedMin)
+        }}
       />
       {suffix}
     </span>

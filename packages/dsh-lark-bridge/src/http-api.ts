@@ -1135,6 +1135,17 @@ export async function dispatchLarkApiRequest(
         }
         if (method === 'DELETE' && segments.length === 3) {
           const deleted = await manager.runtimes.deleteProfile(runtimeId, profileId)
+          if (deleted) {
+            try {
+              manager.setRuntimeConcurrencyLimit?.({
+                runtimeId,
+                profileId,
+                maxConcurrent: null,
+              })
+            } catch {
+              // Best-effort cleanup of orphaned concurrency override.
+            }
+          }
           return ok({ ok: deleted }, deleted ? 200 : 404)
         }
         if (method === 'POST' && segments[3] === 'probe' && segments.length === 4) {
@@ -1165,7 +1176,51 @@ export async function dispatchLarkApiRequest(
     if (method === 'GET' && pathname === 'runtimes') {
       const runtimes = await manager.runtimes.list()
       const exposedPresets = manager.runtimes.listExposedPresets()
-      return ok({ ok: true, runtimes, exposedPresets })
+      const concurrency =
+        typeof manager.getRuntimeConcurrencyConfig === 'function'
+          ? manager.getRuntimeConcurrencyConfig()
+          : undefined
+      return ok({
+        ok: true,
+        runtimes,
+        exposedPresets,
+        ...(concurrency ? { concurrency } : {}),
+      })
+    }
+
+    if (method === 'PUT' && pathname === 'runtimes/concurrency') {
+      if (!isOwnerWebSession) {
+        return ok({ ok: false, error: 'owner_web_session_required' }, 403)
+      }
+      const body = bodyRecord(request.body)
+      const runtimeId = typeof body.runtimeId === 'string' ? body.runtimeId.trim() : ''
+      if (!runtimeId || runtimeId.includes('::')) {
+        return ok({ ok: false, error: 'runtimeId is required' }, 400)
+      }
+      const profileId =
+        typeof body.profileId === 'string' && body.profileId.trim()
+          ? body.profileId.trim()
+          : undefined
+      if (profileId?.includes('::')) {
+        return ok({ ok: false, error: 'invalid profileId' }, 400)
+      }
+      const rawLimit = body.maxConcurrent
+      if (rawLimit !== null && rawLimit !== undefined && typeof rawLimit !== 'number') {
+        return ok({ ok: false, error: 'maxConcurrent must be an integer (0-32) or null' }, 400)
+      }
+      try {
+        const result = manager.setRuntimeConcurrencyLimit({
+          runtimeId,
+          ...(profileId ? { profileId } : {}),
+          maxConcurrent: rawLimit === undefined ? null : rawLimit,
+        })
+        return ok({ ok: true, ...result })
+      } catch (err) {
+        return ok(
+          { ok: false, error: err instanceof Error ? err.message : String(err) },
+          400,
+        )
+      }
     }
 
     if (method === 'GET' && pathname === 'models') {

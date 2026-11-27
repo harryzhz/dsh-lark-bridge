@@ -721,9 +721,16 @@ export interface ExposedRuntimePreset {
   defaultReasoningEffort?: string
 }
 
+export interface RuntimeConcurrencyConfig {
+  defaultLimit: number
+  maxLimit: number
+  limits: Record<string, number>
+}
+
 export interface RuntimeCatalogPayload {
   runtimes: RuntimeOption[]
   exposedPresets: ExposedRuntimePreset[]
+  concurrency?: RuntimeConcurrencyConfig
 }
 
 /** One agent runtime (DSH preset) the bridge can route a conversation to. */

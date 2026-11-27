@@ -12,6 +12,11 @@ import {
   type LarkGroupConfig,
   type ListenerTemplate,
 } from '@dsh-lark/lark-core'
+import {
+  normalizeRuntimeConcurrencyKey,
+  parseRuntimeConcurrencyLimit,
+  sanitizeRuntimeConcurrencyLimits,
+} from '../runtime-concurrency.js'
 import type {
   LarkScheduleBinding,
   LarkScheduleDeliveryMode,
@@ -25,6 +30,7 @@ import {
 } from './database.js'
 
 const SNAPSHOT_DEBOUNCE_MS = 500
+const RUNTIME_CONCURRENCY_LIMITS_META_KEY = 'runtime_concurrency_limits_json'
 
 export function parseScheduleBinding(raw: unknown): LarkScheduleBinding {
   if (!raw || typeof raw !== 'object') {
@@ -66,6 +72,7 @@ export class ConfigRepo {
   private snapshotTimer: ReturnType<typeof setTimeout> | null = null
   private snapshotDirty = false
   private viewerSecretCache: string | null = null
+  private runtimeConcurrencyLimitsCache: Record<string, number> | null = null
   private botsCache: { list: LarkBotConfig[]; byId: Map<string, LarkBotConfig> } | null = null
   private groupsCache: { list: LarkGroupConfig[]; byKey: Map<string, LarkGroupConfig> } | null = null
   private listenerTemplatesCache: ListenerTemplate[] | null = null
@@ -506,6 +513,42 @@ export class ConfigRepo {
     return existed
   }
 
+  getRuntimeConcurrencyLimits(): Record<string, number> {
+    if (this.runtimeConcurrencyLimitsCache) {
+      return { ...this.runtimeConcurrencyLimitsCache }
+    }
+    const raw = this.db.getMeta(RUNTIME_CONCURRENCY_LIMITS_META_KEY)
+    if (!raw) {
+      this.runtimeConcurrencyLimitsCache = {}
+      return {}
+    }
+    try {
+      this.runtimeConcurrencyLimitsCache = sanitizeRuntimeConcurrencyLimits(JSON.parse(raw))
+    } catch {
+      this.runtimeConcurrencyLimitsCache = {}
+    }
+    return { ...this.runtimeConcurrencyLimitsCache }
+  }
+
+  setRuntimeConcurrencyLimit(runtimeKey: string, limit: number | null): Record<string, number> {
+    const key = normalizeRuntimeConcurrencyKey(runtimeKey)
+    const parsed = parseRuntimeConcurrencyLimit(limit)
+    const next = this.getRuntimeConcurrencyLimits()
+    if (parsed === null) {
+      delete next[key]
+    } else {
+      next[key] = parsed
+    }
+    if (Object.keys(next).length === 0) {
+      this.db.deleteMeta(RUNTIME_CONCURRENCY_LIMITS_META_KEY)
+    } else {
+      this.db.setMeta(RUNTIME_CONCURRENCY_LIMITS_META_KEY, JSON.stringify(next))
+    }
+    this.runtimeConcurrencyLimitsCache = { ...next }
+    this.scheduleConfigSnapshot()
+    return { ...next }
+  }
+
   /**
    * Writes a read-only disaster recovery snapshot of low-frequency configuration tables.
    * Debounced on normal mutations so config backup stays off the hot path.
@@ -520,10 +563,12 @@ export class ConfigRepo {
     try {
       mkdirSync(this.dataDir, { recursive: true, mode: 0o700 })
       const secret = this.db.getMeta('viewer_ticket_secret')
+      const runtimeConcurrencyLimits = this.getRuntimeConcurrencyLimits()
       const payload = {
         version: 1,
         exportedAtMs: Date.now(),
         ...(secret ? { viewerTicketSecret: secret } : {}),
+        ...(Object.keys(runtimeConcurrencyLimits).length > 0 ? { runtimeConcurrencyLimits } : {}),
         bots: this.listBots(),
         groups: this.listGroups(),
         listenerTemplates: this.listListenerTemplates(),

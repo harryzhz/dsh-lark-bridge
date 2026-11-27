@@ -40,11 +40,13 @@ import type {
   ModelGroup,
   OpenPlatformAppItem,
   QrJobView,
+  RuntimeConcurrencyConfig,
   RuntimeOption,
   SubstituteTarget,
   TriageDefaultsPayload,
 } from '../types.js'
 import { AgentRuntimeFields } from './AgentRuntimeFields.js'
+import { resolveRuntimeConcurrencyState } from './RuntimeConcurrencyField.js'
 import { ConfigDialog, type ConfigSection } from './ConfigDialog.js'
 import { DirectoryField, DirectoryPickerPanel } from './DirectoryPickerModal.js'
 import { ExperimentalSection } from './ExperimentalSection.js'
@@ -226,6 +228,7 @@ export function BotConfigDialog({
   target,
   bots,
   runtimes,
+  runtimeConcurrency,
   models,
   triageDefaults,
   auth,
@@ -242,6 +245,7 @@ export function BotConfigDialog({
   target: BotRecord | 'new' | null
   bots: readonly BotRecord[]
   runtimes: readonly RuntimeOption[]
+  runtimeConcurrency?: RuntimeConcurrencyConfig
   models: readonly ModelGroup[]
   triageDefaults?: TriageDefaultsPayload
   auth: AuthStatusPayload | null
@@ -276,6 +280,7 @@ export function BotConfigDialog({
     <EditBotDialog
       target={target}
       runtimes={runtimes}
+      runtimeConcurrency={runtimeConcurrency}
       models={models}
       triageDefaults={triageDefaults}
       auth={auth}
@@ -867,6 +872,7 @@ function CreateBotDialog({
 function EditBotDialog({
   target,
   runtimes,
+  runtimeConcurrency,
   models,
   triageDefaults,
   auth,
@@ -879,6 +885,7 @@ function EditBotDialog({
 }: {
   target: BotRecord
   runtimes: readonly RuntimeOption[]
+  runtimeConcurrency?: RuntimeConcurrencyConfig
   models: readonly ModelGroup[]
   triageDefaults?: TriageDefaultsPayload
   auth: AuthStatusPayload | null
@@ -891,6 +898,7 @@ function EditBotDialog({
 }) {
   const [section, setSection] = useState<Section>('basic')
   const [draft, setDraft] = useState<BotConfig>(() => toBotConfig(target))
+  const [concurrencyDraft, setConcurrencyDraft] = useState<number | null | undefined>(undefined)
   const [localDreamState, setLocalDreamState] = useState<DreamRunState | undefined>(target.dreamState)
   const [saving, setSaving] = useState(false)
   const [syncingProfile, setSyncingProfile] = useState(false)
@@ -902,6 +910,7 @@ function EditBotDialog({
 
   useEffect(() => {
     setDraft(toBotConfig(target))
+    setConcurrencyDraft(undefined)
     setLocalDreamState(target.dreamState)
     setSection('basic')
     setProfileView(null)
@@ -960,10 +969,26 @@ function EditBotDialog({
         : normalizeModelAndEffort(runtime, models, draft.model, draft.reasoningEffort)
       const hasSignature = Boolean(draft.signature.trim())
       const showModel = Boolean(draft.replyFooterEnabled && draft.replyFooterModel)
+      const trimmedProfileId = draft.runtimeProfileId?.trim() || undefined
+      if (concurrencyDraft !== undefined && draft.agentPreset.trim()) {
+        const savedConcurrency = resolveRuntimeConcurrencyState(
+          runtimeConcurrency,
+          draft.agentPreset,
+          trimmedProfileId,
+        ).customLimit
+        if (concurrencyDraft !== savedConcurrency) {
+          await bridgeApi.setRuntimeConcurrency({
+            runtimeId: draft.agentPreset.trim(),
+            ...(trimmedProfileId ? { profileId: trimmedProfileId } : {}),
+            maxConcurrent: concurrencyDraft,
+          })
+          await onProfilesChanged?.()
+        }
+      }
       await onSave(
         {
           ...draft,
-          runtimeProfileId: draft.runtimeProfileId?.trim() || undefined,
+          runtimeProfileId: trimmedProfileId,
           model: norm.model || undefined,
           reasoningEffort: norm.reasoningEffort || undefined,
           replyFooterSignature: hasSignature,
@@ -1017,11 +1042,13 @@ function EditBotDialog({
                 <RuntimeProfilePanel
                   runtime={profileViewRuntime}
                   initialProfileId={profileView?.initialProfileId}
+                  concurrency={runtimeConcurrency}
                   backLabel="Agent 运行时"
                   onBack={() => setProfileView(null)}
                   onClose={onClose}
                   onChanged={async (nextProfileId) => {
                     setProfileRevision((v) => v + 1)
+                    setConcurrencyDraft(undefined)
                     await onProfilesChanged?.()
                     if (nextProfileId !== undefined) {
                       const changed = nextProfileId !== (draft.runtimeProfileId ?? '')
@@ -1124,19 +1151,29 @@ function EditBotDialog({
             }}
             runtimes={runtimes}
             models={models}
+            concurrency={runtimeConcurrency}
+            concurrencyDraft={concurrencyDraft}
+            onConcurrencyChange={setConcurrencyDraft}
             profileRevision={profileRevision}
             onProfilesChanged={onProfilesChanged}
             onManageProfiles={(rt, pid) =>
               setProfileView({ runtimeId: rt.id, ...(pid ? { initialProfileId: pid } : {}) })
             }
-            onChange={({ agentPreset, runtimeProfileId, model, reasoningEffort }) =>
+            onChange={({ agentPreset, runtimeProfileId, model, reasoningEffort }) => {
+              const nextProfileId = runtimeProfileId?.trim() || undefined
+              if (
+                agentPreset !== draft.agentPreset ||
+                nextProfileId !== (draft.runtimeProfileId?.trim() || undefined)
+              ) {
+                setConcurrencyDraft(undefined)
+              }
               patch({
                 agentPreset,
-                runtimeProfileId: runtimeProfileId?.trim() || undefined,
+                runtimeProfileId: nextProfileId,
                 model: model || undefined,
                 reasoningEffort: reasoningEffort || undefined,
               })
-            }
+            }}
           />
 
           <GroupTitle>智能分流</GroupTitle>

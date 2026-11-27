@@ -14,6 +14,7 @@ import type {
   ModelGroup,
   PluginUpdatesOverview,
   ReminderItem,
+  RuntimeConcurrencyConfig,
   RuntimeOption,
   ScheduleView,
   SessionBinding,
@@ -33,6 +34,7 @@ export interface BridgeData {
   triageSessions: TriageSession[]
   events: AuditEvent[]
   runtimes: RuntimeOption[]
+  runtimeConcurrency: RuntimeConcurrencyConfig
   models: ModelGroup[]
   listenerTemplates: ListenerTemplate[]
   triageDefaults: TriageDefaultsPayload
@@ -52,6 +54,7 @@ const EMPTY: BridgeData = {
   triageSessions: [],
   events: [],
   runtimes: [],
+  runtimeConcurrency: { defaultLimit: 3, maxLimit: 32, limits: {} },
   models: [],
   listenerTemplates: [...FALLBACK_LISTENER_TEMPLATES],
   triageDefaults: FALLBACK_TRIAGE_DEFAULTS,
@@ -105,6 +108,7 @@ export function useBridgeData(): BridgeData & {
       setData((prev) => ({
         ...prev,
         runtimes: catalog.runtimes,
+        ...(catalog.concurrency ? { runtimeConcurrency: catalog.concurrency } : {}),
         models,
       }))
     } catch {
