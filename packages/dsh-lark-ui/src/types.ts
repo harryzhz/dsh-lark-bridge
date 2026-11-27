@@ -365,9 +365,6 @@ export interface BotConfig {
   sendIntermediateMessages: boolean
   cotEnabled?: boolean
   cotToolResultEnabled?: boolean
-  longTurnProgressNotice?: boolean
-  longTurnNoticeDelaySeconds?: number
-  longTurnNoticeText?: string
   useInteractiveCard: boolean
   dshSessionLinkInCard: boolean
   sessionLinkGuestReadOnly: boolean

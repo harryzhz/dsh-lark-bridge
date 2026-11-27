@@ -104,23 +104,23 @@ describe('Profile-specific real model resolution & tier routing presets', () => 
         runtimeProfileId: 'custom-proxy',
         model: 'gemini-4-neon',
         reasoningEffort: 'low',
-        weight: 50,
+        weight: 70,
       }),
       expect.objectContaining({
         agentPreset: 'codex',
         runtimeProfileId: '',
         model: 'gpt-6.1-sol',
         reasoningEffort: 'low',
-        weight: 50,
+        weight: 30,
       }),
     ])
     expect(preset.tiers.standard.targets).toEqual([
-      expect.objectContaining({ agentPreset: 'agy', model: 'gemini-4-neon', reasoningEffort: 'xhigh' }),
-      expect.objectContaining({ agentPreset: 'codex', model: 'gpt-6.1-sol', reasoningEffort: 'xhigh' }),
+      expect.objectContaining({ agentPreset: 'agy', model: 'gemini-4-neon', reasoningEffort: 'xhigh', weight: 70 }),
+      expect.objectContaining({ agentPreset: 'codex', model: 'gpt-6.1-sol', reasoningEffort: 'xhigh', weight: 30 }),
     ])
     expect(preset.tiers.heavy.targets).toEqual([
-      expect.objectContaining({ agentPreset: 'agy', model: 'gemini-4-carbon', reasoningEffort: 'high' }),
-      expect.objectContaining({ agentPreset: 'codex', model: 'gpt-6-astra', reasoningEffort: 'xhigh' }),
+      expect.objectContaining({ agentPreset: 'agy', model: 'gemini-4-carbon', reasoningEffort: 'high', weight: 70 }),
+      expect.objectContaining({ agentPreset: 'codex', model: 'gpt-6-astra', reasoningEffort: 'xhigh', weight: 30 }),
     ])
   })
 })

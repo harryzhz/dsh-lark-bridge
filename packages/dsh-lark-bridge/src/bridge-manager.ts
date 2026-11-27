@@ -262,13 +262,6 @@ export class LarkBridgeManager {
       ...(config.listenerDebounceOverrideMs !== undefined
         ? { listenerDebounceOverrideMs: config.listenerDebounceOverrideMs }
         : {}),
-      queueWaitAnchorMs:
-        config.queueWaitAnchorMs ?? (config.idleSweepIntervalMs > 0 ? 10_000 : 0),
-      longTurnAnchorEnabled:
-        config.idleSweepIntervalMs > 0 || config.longTurnAnchorMs !== undefined,
-      ...(config.longTurnAnchorMs !== undefined
-        ? { longTurnAnchorMs: config.longTurnAnchorMs }
-        : {}),
       memory: this.memory,
       triage: this.triage,
       titleGuard: this.titleGuard,

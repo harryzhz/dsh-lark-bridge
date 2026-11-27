@@ -940,7 +940,7 @@ describe('Smart triage config, per-group overrides & protocol', () => {
     }
   })
 
-  it('tightens passive listener and delegation followup prompts while preserving business-screenshot handoff guardrails and longTurnProgressNotice default', () => {
+  it('tightens passive listener and delegation followup prompts while preserving business-screenshot handoff guardrails', () => {
     const listenerPrompt = buildTriageSystemPrompt({
       botName: 'TriageBot',
       hasActiveWorker: false,
@@ -970,57 +970,5 @@ describe('Smart triage config, per-group overrides & protocol', () => {
     })
     expect(mentionPrompt).toContain('纯表情包/梗图/生活趣图')
     expect(mentionPrompt).toContain('业务图表/报错截图')
-
-    const botDefault = makeBot()
-    expect(botDefault.longTurnProgressNotice).toBe(true)
-    expect(botDefault.longTurnNoticeDelaySeconds).toBe(300)
-    expect(botDefault.longTurnNoticeText).toBe('当前任务仍在深度求索中，请耐心等待…[敲键盘]')
-    const mentionDecision = decideLarkRouting(
-      botDefault,
-      makeMsg({
-        text: '@_user_1 查下日志',
-        mentions: [{ key: '@_user_1', openId: 'ou_bot', name: 'TriageBot' }],
-      }),
-      { hasActiveSessionForRoute: () => false },
-    )
-    expect(mentionDecision.action).toBe('agent')
-    if (mentionDecision.action === 'agent') {
-      expect(mentionDecision.longTurnProgressNotice).toBe(true)
-      expect(mentionDecision.longTurnNoticeDelaySeconds).toBe(300)
-      expect(mentionDecision.longTurnNoticeText).toBe('当前任务仍在深度求索中，请耐心等待…[敲键盘]')
-    }
-
-    const botCustom = makeBot({
-      longTurnProgressNotice: true,
-      longTurnNoticeDelaySeconds: 180,
-      longTurnNoticeText: '正在检索代码库…[思考]',
-    })
-    const customDecision = decideLarkRouting(
-      botCustom,
-      makeMsg({
-        text: '@_user_1 查下日志',
-        mentions: [{ key: '@_user_1', openId: 'ou_bot', name: 'TriageBot' }],
-      }),
-      { hasActiveSessionForRoute: () => false },
-    )
-    expect(customDecision.action).toBe('agent')
-    if (customDecision.action === 'agent') {
-      expect(customDecision.longTurnNoticeDelaySeconds).toBe(180)
-      expect(customDecision.longTurnNoticeText).toBe('正在检索代码库…[思考]')
-    }
-
-    const botDisabled = makeBot({ longTurnProgressNotice: false })
-    const offDecision = decideLarkRouting(
-      botDisabled,
-      makeMsg({
-        text: '@_user_1 查下日志',
-        mentions: [{ key: '@_user_1', openId: 'ou_bot', name: 'TriageBot' }],
-      }),
-      { hasActiveSessionForRoute: () => false },
-    )
-    expect(offDecision.action).toBe('agent')
-    if (offDecision.action === 'agent') {
-      expect(offDecision.longTurnProgressNotice).toBe(false)
-    }
   })
 })

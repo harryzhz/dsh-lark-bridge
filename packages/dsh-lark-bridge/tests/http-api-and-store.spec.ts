@@ -1041,10 +1041,9 @@ describe('LarkBridgeStore, RuntimeCatalog, CLI Auth & HTTP API', () => {
       idleCloseMinutes: 720,
       groupReplyMode: 'reply',
       receivedReactionEmoji: 'OnIt',
+      cotEnabled: true,
+      cotToolResultEnabled: true,
       sendIntermediateMessages: false,
-      longTurnProgressNotice: true,
-      longTurnNoticeDelaySeconds: 300,
-      longTurnNoticeText: '当前任务仍在深度求索中，请耐心等待…[敲键盘]',
       useInteractiveCard: true,
       dshSessionLinkInCard: true,
       sessionLinkGuestReadOnly: true,
@@ -1052,7 +1051,42 @@ describe('LarkBridgeStore, RuntimeCatalog, CLI Auth & HTTP API', () => {
       replyFooterModel: true,
       replyFooterSignature: true,
       signature: 'AI 可能出错，请谨慎判断结果~',
+      router: expect.objectContaining({
+        enabled: true,
+        scope: 'all_group',
+        timeoutMs: 15_000,
+        maxTriageImages: 5,
+        recentMessageCount: 6,
+        contextTtlMinutes: 30,
+        includeLastReply: true,
+        coalesceQueuedMessages: true,
+      }),
+      experimental: expect.objectContaining({
+        dreaming: expect.objectContaining({
+          enabled: true,
+          scheduleTime: '03:00',
+          minNewSessions: 2,
+          maxSessionsPerRun: 0,
+          maxCharsPerSession: 5000,
+          maxRemindersPerRun: 5,
+          maxDurationMinutes: 45,
+          deepConsolidation: true,
+          reasoningEffort: 'high',
+          cleanupAndCorrect: true,
+        }),
+        proactive: expect.objectContaining({
+          remindersEnabled: true,
+          reminderCreationMode: 'silent',
+          delegationFollowupEnabled: true,
+          quietHoursEnabled: true,
+          quietHoursStart: '00:00',
+          quietHoursEnd: '08:00',
+          autoCodeEnabled: true,
+          branchPrefix: 'agent/',
+        }),
+      }),
     })
+    expect('longTurnProgressNotice' in (createdBot.json.bot as Record<string, unknown>)).toBe(false)
 
     // 2. Discovered unconfigured group view starts disabled (configured_only) with new-group conversation defaults
     await invokeHandler(handler, { method: 'POST', url: '/api/lark-bridge/sync-chats' })

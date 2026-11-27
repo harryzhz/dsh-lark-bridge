@@ -10,6 +10,7 @@ import {
   MessageDeduplicator,
   REMINDER_SILENT_SENTINEL,
   SILENT_REPLY_SENTINEL,
+  buildDefaultNewBotSettings,
   buildGroupKey,
   buildLarkPostPayload,
   buildReminderConfirmCard,
@@ -817,13 +818,17 @@ describe('decideLarkRouting, <user_message> format, memberOverrides & title inte
     expect(followupDecision).toMatchObject({ action: 'agent', trigger: 'active-thread' })
   })
 
-  it('applies expected conversation & message defaults for newly created bots and blocks unconfigured groups by default', () => {
+  it('applies expected conversation & message defaults for bots, strips removed longTurn fields, and blocks unconfigured groups by default', () => {
     const freshBot = LarkBotConfigSchema.parse({
       id: 'bot-fresh',
       name: 'FreshBot',
       larkAppId: 'cli_fresh',
       larkAppSecret: 'sec_fresh',
       defaultWorkingDir: '~',
+      // Legacy removed fields must be stripped cleanly on load
+      longTurnProgressNotice: true,
+      longTurnNoticeDelaySeconds: 300,
+      longTurnNoticeText: 'legacy',
     })
     expect(freshBot).toMatchObject({
       groupAccessMode: 'configured_only',
@@ -833,9 +838,6 @@ describe('decideLarkRouting, <user_message> format, memberOverrides & title inte
       groupReplyMode: 'reply',
       receivedReactionEmoji: 'OnIt',
       sendIntermediateMessages: false,
-      longTurnProgressNotice: true,
-      longTurnNoticeDelaySeconds: 300,
-      longTurnNoticeText: '当前任务仍在深度求索中，请耐心等待…[敲键盘]',
       useInteractiveCard: true,
       dshSessionLinkInCard: true,
       sessionLinkGuestReadOnly: true,
@@ -844,6 +846,60 @@ describe('decideLarkRouting, <user_message> format, memberOverrides & title inte
       replyFooterSignature: true,
       signature: 'AI 可能出错，请谨慎判断结果~',
     })
+    expect('longTurnProgressNotice' in freshBot).toBe(false)
+    expect('longTurnNoticeDelaySeconds' in freshBot).toBe(false)
+    expect('longTurnNoticeText' in freshBot).toBe(false)
+
+    const newBotDefaults = buildDefaultNewBotSettings({
+      availableRuntimeIds: ['agy', 'codex'],
+      defaultAgentPreset: 'agy',
+      defaultProfileId: 'custom-profile',
+    })
+    expect(newBotDefaults).toMatchObject({
+      cotEnabled: true,
+      cotToolResultEnabled: true,
+      router: expect.objectContaining({
+        enabled: true,
+        scope: 'all_group',
+        timeoutMs: 15_000,
+        tierRouting: expect.objectContaining({
+          enabled: true,
+          presetKey: 'recommended',
+          bypassTier: 'default',
+        }),
+      }),
+      experimental: expect.objectContaining({
+        dreaming: expect.objectContaining({
+          enabled: true,
+          reasoningEffort: 'high',
+        }),
+        proactive: expect.objectContaining({
+          remindersEnabled: true,
+          delegationFollowupEnabled: true,
+          autoCodeEnabled: true,
+        }),
+      }),
+    })
+    expect(newBotDefaults.router.tierRouting.tiers.standard.targets).toEqual([
+      expect.objectContaining({
+        agentPreset: 'agy',
+        runtimeProfileId: 'custom-profile',
+        model: 'gemini-4-neon',
+        reasoningEffort: 'xhigh',
+        weight: 70,
+      }),
+      expect.objectContaining({
+        agentPreset: 'codex',
+        runtimeProfileId: '',
+        model: 'gpt-6.1-sol',
+        reasoningEffort: 'xhigh',
+        weight: 30,
+      }),
+    ])
+    const nativeOnlyDefaults = buildDefaultNewBotSettings({
+      availableRuntimeIds: ['standard'],
+    })
+    expect(nativeOnlyDefaults.router.tierRouting.enabled).toBe(false)
 
     const unconfiguredMention = decideLarkRouting(
       freshBot,

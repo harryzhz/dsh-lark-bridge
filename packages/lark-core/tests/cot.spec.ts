@@ -292,18 +292,16 @@ describe('CoT toggle resolution, routing propagation, and /cot slash command par
       hasActiveSessionForRoute: () => false,
     }
 
-    // Mention turn inherits bot cotEnabled=true and group cotToolResultEnabled=off,
-    // and suppresses longTurnProgressNotice whenever CoT is active.
+    // Mention turn inherits bot cotEnabled=true and group cotToolResultEnabled=off.
     const mentionDecision = decideLarkRouting(bot, createMessage(), runtime)
     expect(mentionDecision.action).toBe('agent')
     if (mentionDecision.action === 'agent') {
       expect(mentionDecision.cotEnabled).toBe(true)
       expect(mentionDecision.cotToolResultEnabled).toBe(false)
-      expect(mentionDecision.longTurnProgressNotice).toBe(false)
     }
 
-    // Group-level CoT override=on disables longTurnProgressNotice even if bot default CoT is off
-    const botCotOff = createBot({ cotEnabled: false, longTurnProgressNotice: true })
+    // Group-level CoT override=on enables CoT even if bot default CoT is off.
+    const botCotOff = createBot({ cotEnabled: false })
     const groupCotOn = LarkGroupConfigSchema.parse({
       key: buildGroupKey('cot-bot', 'oc_chat_on'),
       botId: 'cot-bot',
@@ -319,7 +317,6 @@ describe('CoT toggle resolution, routing propagation, and /cot slash command par
     expect(overrideOnDecision.action).toBe('agent')
     if (overrideOnDecision.action === 'agent') {
       expect(overrideOnDecision.cotEnabled).toBe(true)
-      expect(overrideOnDecision.longTurnProgressNotice).toBe(false)
     }
 
     // Passive listener with allowSilentEmptyReply suppresses CoT so silent turns never leak a bubble
