@@ -1,6 +1,6 @@
 {
   "name": "@dsh-lark/dsh-bundle",
-  "version": "0.4.32",
+  "version": "0.4.33",
   "private": true,
   "type": "module",
   "bin": {
