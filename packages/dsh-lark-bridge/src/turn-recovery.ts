@@ -3,7 +3,7 @@ import { brandString } from '@deepseek-ai/dsh-brand'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent, SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
-import { TurnFinalReplyTracker } from './turn-runner.js'
+import { TurnFinalReplyTracker, isSilenceCliToolCallEvent } from './turn-runner.js'
 import type { LarkPendingTurn } from './types.js'
 
 /** Maximum downtime / inactivity gap eligible for automatic post-restart recovery (15 minutes). */
@@ -26,11 +26,18 @@ export type PersistedTurnInspection =
   | {
       readonly state: 'completed'
       readonly replyText: string
+      readonly missedIntermediates: readonly string[]
       readonly silencedByTool: boolean
       readonly turn: number
     }
   | { readonly state: 'incomplete' }
   | { readonly state: 'unavailable' }
+
+export interface InspectPersistedTurnOptions {
+  readonly targetTurn?: number
+  readonly userMessageId?: string
+  readonly skipFirstIntermediates?: number
+}
 
 function extractUserMessageText(event: SessionEvent): string {
   if (event.type !== 'user/message') return ''
@@ -40,13 +47,6 @@ function extractUserMessageText(event: SessionEvent): string {
     .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text' && typeof b.text === 'string')
     .map((b) => b.text)
     .join('\n')
-}
-
-function isSilenceCliToolCall(event: SessionEvent): boolean {
-  if (event.type !== 'tool/call') return false
-  const data = event.data as { name?: unknown; arguments?: unknown }
-  const args = typeof data.arguments === 'string' ? data.arguments : ''
-  return /\blark-bridge\s+silence\b/.test(args)
 }
 
 async function loadSessionEventsForRecovery(
@@ -91,38 +91,66 @@ async function loadSessionEventsForRecovery(
 }
 
 /**
- * Inspects a persisted DSH session to determine whether the turn corresponding to
- * `messageId` already completed cleanly before shutdown/crash (e.g. process stopped
- * right before Feishu delivery). Matches strictly on `messageId` inside the turn's
- * `user/message` payload so an earlier completed turn in the same thread can never
- * be mistaken for the interrupted turn.
+ * Inspects a persisted (or live in-memory) DSH session to determine whether the turn
+ * corresponding to `messageId` (or `targetTurn` / `userMessageId`) already completed
+ * cleanly before shutdown/crash or during a hot-reload swap. Matches strictly so an
+ * earlier completed turn in the same thread can never be mistaken for the target turn.
  */
 export async function inspectPersistedTurnCompletion(
   ctx: Context,
   sessionId: string,
   messageId: string,
+  options: InspectPersistedTurnOptions = {},
 ): Promise<PersistedTurnInspection> {
-  if (!sessionId || !messageId) return { state: 'unavailable' }
+  if (!sessionId || (!messageId && options.targetTurn === undefined && !options.userMessageId)) {
+    return { state: 'unavailable' }
+  }
   const events = await loadSessionEventsForRecovery(ctx, sessionId)
   if (!events || events.length === 0) return { state: 'unavailable' }
 
-  // Find the latest turn whose user/message carries this exact Feishu messageId.
   let matchedTurn: number | undefined
   let matchedStartIndex = -1
-  let currentTurn: number | undefined
-  let currentStartIndex = -1
 
-  for (let i = 0; i < events.length; i += 1) {
-    const ev = events[i]!
-    if (ev.type === 'turn/start') {
-      currentTurn = ev.data.turn
-      currentStartIndex = i
-    } else if (ev.type === 'user/message' && currentTurn !== undefined) {
-      const text = extractUserMessageText(ev)
-      if (text.includes(messageId)) {
-        matchedTurn = currentTurn
-        matchedStartIndex = currentStartIndex
+  if (options.targetTurn !== undefined) {
+    for (let i = events.length - 1; i >= 0; i -= 1) {
+      const ev = events[i]!
+      if (ev.type === 'turn/start' && ev.data.turn === options.targetTurn) {
+        matchedTurn = options.targetTurn
+        matchedStartIndex = i
+        break
       }
+    }
+  }
+
+  if (matchedTurn === undefined) {
+    let currentTurn: number | undefined
+    let currentStartIndex = -1
+    let matchedByUserMsgId: { turn: number; startIndex: number } | undefined
+    let matchedByFeishuMsgId: { turn: number; startIndex: number } | undefined
+
+    for (let i = 0; i < events.length; i += 1) {
+      const ev = events[i]!
+      if (ev.type === 'turn/start') {
+        currentTurn = ev.data.turn
+        currentStartIndex = i
+      } else if (ev.type === 'user/message' && currentTurn !== undefined) {
+        const eventMsgId = (ev.data as { id?: string }).id
+        if (options.userMessageId && eventMsgId === options.userMessageId) {
+          matchedByUserMsgId = { turn: currentTurn, startIndex: currentStartIndex }
+        }
+        if (messageId) {
+          const text = extractUserMessageText(ev)
+          if (text.includes(messageId)) {
+            matchedByFeishuMsgId = { turn: currentTurn, startIndex: currentStartIndex }
+          }
+        }
+      }
+    }
+
+    const picked = matchedByUserMsgId ?? matchedByFeishuMsgId
+    if (picked) {
+      matchedTurn = picked.turn
+      matchedStartIndex = picked.startIndex
     }
   }
 
@@ -130,7 +158,15 @@ export async function inspectPersistedTurnCompletion(
     return { state: 'incomplete' }
   }
 
-  const tracker = new TurnFinalReplyTracker()
+  const missedIntermediates: string[] = []
+  const tracker = new TurnFinalReplyTracker({
+    ...(options.skipFirstIntermediates !== undefined
+      ? { skipFirstIntermediates: options.skipFirstIntermediates }
+      : {}),
+    onIntermediate: (text) => {
+      missedIntermediates.push(text)
+    },
+  })
   let silencedByTool = false
 
   for (let i = matchedStartIndex; i < events.length; i += 1) {
@@ -139,15 +175,17 @@ export async function inspectPersistedTurnCompletion(
       (ev.type === 'assistant/message' || ev.type === 'tool/call') &&
       ev.data.turn === matchedTurn
     ) {
-      if (isSilenceCliToolCall(ev)) {
+      if (isSilenceCliToolCallEvent(ev)) {
         silencedByTool = true
       }
       tracker.onEvent(ev)
     } else if (ev.type === 'turn/end' && ev.data.turn === matchedTurn) {
       if (ev.data.reason.kind === 'completed') {
+        await tracker.flush()
         return {
           state: 'completed',
           replyText: tracker.result(),
+          missedIntermediates,
           silencedByTool,
           turn: matchedTurn,
         }
@@ -195,7 +233,10 @@ export function canAutoResumePendingTurn(
   const crashAttempts = turn.recoveryAttempts ?? 0
   if (crashAttempts >= MAX_AUTO_RESUME_ATTEMPTS) return false
 
-  const isGraceful = phase === 'shutdown' || turn.interruptKind === 'graceful_shutdown'
+  const isGraceful =
+    phase === 'shutdown' ||
+    turn.interruptKind === 'graceful_shutdown' ||
+    turn.interruptKind === 'hot_reload'
   if (isGraceful) {
     const gracefulAttempts = turn.gracefulRecoveryAttempts ?? 0
     if (gracefulAttempts >= MAX_GRACEFUL_AUTO_RESUME_ATTEMPTS) return false

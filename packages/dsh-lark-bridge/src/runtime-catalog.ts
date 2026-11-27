@@ -3,6 +3,7 @@ import { installModelSelection } from '@deepseek-ai/dsh-agent'
 import { brandString } from '@deepseek-ai/dsh-brand'
 import type { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { appendPluginRecord, type Session } from '@deepseek-ai/dsh-session'
+import { resolveHostAgentPresets } from './hot-reload-handoff.js'
 
 /**
  * Session plugin record consumed by `dsh-external-agents` to bind a session
@@ -433,7 +434,7 @@ export class RuntimeCatalog {
         installModelSelection(agentCtx)
       }
       if (!presetId) return
-      const presets = this.ctx.get('agentPresets' as never) as AgentPresetRosterSource | undefined
+      const presets = resolveHostAgentPresets<AgentPresetRosterSource>(this.ctx)
       if (typeof presets?.mount !== 'function') return
       if (isExternal) {
         try {

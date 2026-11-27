@@ -66,7 +66,11 @@ import {
   composeRestartRecoveryReminder,
   inspectPersistedTurnCompletion,
 } from './turn-recovery.js'
-import { TurnAbortedError, runTurnAndCollectReply } from './turn-runner.js'
+import {
+  TurnAbortedError,
+  reattachTurnAndCollectReply,
+  runTurnAndCollectReply,
+} from './turn-runner.js'
 import {
   LARK_SENT_MESSAGE_RECORD_TYPE,
   type ActiveTurnSummary,
@@ -272,6 +276,9 @@ export interface ActiveTurnRecord {
   readonly cancelController?: AbortController
   handoffTurns?: readonly RouterHandoffTurn[]
   sessionId?: string
+  targetTurn?: number
+  userMessageId?: string
+  lastEventSeq?: number
   intermediateSentCount: number
   progressAnchorSent?: boolean
   queueAnchorSent?: boolean
@@ -1143,193 +1150,714 @@ export class InboundPipeline {
     })
     if (stale.length === 0) return 0
 
-    let recovered = 0
+    // Group coalesced messages that shared the exact same executing DSH turn so we attach
+    // only one listener and deliver a single reply while cleaning up every member's reaction.
+    const groups: Array<{ readonly lead: LarkPendingTurn; readonly members: LarkPendingTurn[] }> = []
+    const groupByTurnKey = new Map<string, { lead: LarkPendingTurn; members: LarkPendingTurn[] }>()
     for (const item of stale) {
-      if (this.activeTurns.has(item.id) || this.recoveringTurnIds.has(item.id)) continue
-      if (this.isMessageRecalled(item.botId, item.messageId)) {
-        this.host.store.deletePendingTurn(item.id)
-        this.host.store.recordEvent({
-          botId: item.botId,
-          chatId: item.chatId,
-          ...(item.chatName ? { chatName: item.chatName } : {}),
-          routeKey: item.routeKey,
-          ...(item.sessionId ? { sessionId: item.sessionId } : {}),
-          ...(item.traceId ? { traceId: item.traceId } : {}),
-          kind: 'lifecycle',
-          summary: '原消息已撤回，已跳过重启恢复',
-        })
-        recovered += 1
-        continue
+      const turnKey =
+        item.sessionId && item.targetTurn !== undefined
+          ? `${item.botId}|${item.sessionId}|turn:${item.targetTurn}`
+          : item.sessionId && item.userMessageId
+            ? `${item.botId}|${item.sessionId}|msg:${item.userMessageId}`
+            : undefined
+      if (turnKey) {
+        const existing = groupByTurnKey.get(turnKey)
+        if (existing) {
+          existing.members.push(item)
+          existing.lead = item
+          continue
+        }
+        const entry = { lead: item, members: [item] }
+        groupByTurnKey.set(turnKey, entry)
+        groups.push(entry)
+      } else {
+        groups.push({ lead: item, members: [item] })
       }
+    }
+
+    let recovered = 0
+    for (const group of groups) {
+      const members = group.members.filter(
+        (m) => !this.activeTurns.has(m.id) && !this.recoveringTurnIds.has(m.id),
+      )
+      if (members.length === 0) continue
+
+      const survivingMembers: LarkPendingTurn[] = []
+      for (const m of members) {
+        if (this.isMessageRecalled(m.botId, m.messageId)) {
+          this.host.store.deletePendingTurn(m.id)
+          this.host.store.recordEvent({
+            botId: m.botId,
+            chatId: m.chatId,
+            ...(m.chatName ? { chatName: m.chatName } : {}),
+            routeKey: m.routeKey,
+            ...(m.sessionId ? { sessionId: m.sessionId } : {}),
+            ...(m.traceId ? { traceId: m.traceId } : {}),
+            kind: 'lifecycle',
+            summary: '原消息已撤回，已跳过重启恢复',
+          })
+          recovered += 1
+        } else {
+          survivingMembers.push(m)
+        }
+      }
+      if (survivingMembers.length === 0) continue
+
+      const item = survivingMembers[survivingMembers.length - 1]!
+      const peerItems = survivingMembers.slice(0, -1)
       const transport = this.host.connections.getTransport(item.botId)
       if (!transport) {
         const bot = this.host.store.getBot(item.botId)
         const expired = nowMs - item.startedAtMs > STALE_PENDING_TURN_MAX_AGE_MS
         if (!bot?.enabled || expired) {
-          this.host.store.deletePendingTurn(item.id)
-          this.host.store.recordEvent({
-            botId: item.botId,
-            chatId: item.chatId,
-            ...(item.chatName ? { chatName: item.chatName } : {}),
-            routeKey: item.routeKey,
-            ...(item.sessionId ? { sessionId: item.sessionId } : {}),
-            ...(item.traceId ? { traceId: item.traceId } : {}),
-            kind: 'error',
-            summary: '本轮执行因服务重启中断',
-          })
-          recovered += 1
+          for (const member of survivingMembers) {
+            this.host.store.deletePendingTurn(member.id)
+            this.host.store.recordEvent({
+              botId: member.botId,
+              chatId: member.chatId,
+              ...(member.chatName ? { chatName: member.chatName } : {}),
+              routeKey: member.routeKey,
+              ...(member.sessionId ? { sessionId: member.sessionId } : {}),
+              ...(member.traceId ? { traceId: member.traceId } : {}),
+              kind: 'error',
+              summary: '本轮执行因服务重启中断',
+            })
+            recovered += 1
+          }
         }
         continue
       }
 
-      this.recoveringTurnIds.add(item.id)
+      for (const member of survivingMembers) {
+        this.recoveringTurnIds.add(member.id)
+      }
       this.host.onActivityChange?.()
       let handedOffToAsyncTask = false
+      const releaseRecoveringIds = () => {
+        for (const member of survivingMembers) {
+          this.recoveringTurnIds.delete(member.id)
+        }
+        this.host.onActivityChange?.()
+      }
+
       try {
         const bot = this.host.store.getBot(item.botId)
-        const groupConfig =
-          item.inboundMsg?.chatType === 'group'
-            ? this.host.store.getGroup(item.botId, item.chatId)
-            : this.host.store.getGroup(item.botId, item.chatId)
+        const groupConfig = this.host.store.getGroup(item.botId, item.chatId)
         const pendingChatType =
           item.inboundMsg?.chatType ?? (item.trigger === 'p2p' ? 'p2p' : 'group')
         const disabledScope = this.getDisabledScope(item.botId, pendingChatType, item.chatId)
         if (disabledScope) {
-          this.host.store.deletePendingTurn(item.id)
-          if (item.reactionId) {
-            await transport.removeReaction(item.messageId, item.reactionId).catch(() => {})
+          for (const member of survivingMembers) {
+            this.host.store.deletePendingTurn(member.id)
+            if (member.reactionId) {
+              await transport.removeReaction(member.messageId, member.reactionId).catch(() => {})
+            }
+            this.host.store.recordEvent({
+              botId: member.botId,
+              chatId: member.chatId,
+              ...(member.chatName ? { chatName: member.chatName } : {}),
+              routeKey: member.routeKey,
+              ...(member.sessionId ? { sessionId: member.sessionId } : {}),
+              ...(member.traceId ? { traceId: member.traceId } : {}),
+              kind: 'lifecycle',
+              summary: disabledCancelSummary(disabledScope, '已跳过重启恢复'),
+            })
+            recovered += 1
           }
-          this.host.store.recordEvent({
-            botId: item.botId,
-            chatId: item.chatId,
-            ...(item.chatName ? { chatName: item.chatName } : {}),
-            routeKey: item.routeKey,
-            ...(item.sessionId ? { sessionId: item.sessionId } : {}),
-            ...(item.traceId ? { traceId: item.traceId } : {}),
-            kind: 'lifecycle',
-            summary: disabledCancelSummary(disabledScope, '已跳过重启恢复'),
-          })
-          recovered += 1
           continue
         }
 
-        // 1. Check whether the interrupted session actually finished its turn right before shutdown.
+        const totalSentIntermediates = survivingMembers.reduce(
+          (sum, m) => sum + (m.intermediateSentCount ?? 0),
+          0,
+        )
+
+        // 0. Reclaim a surviving live host agent (from seamless `dsh-lark-bridge` hot-reload) if present.
+        const liveAgent = item.sessionId
+          ? this.host.sessions.reclaimLiveAgent(item.sessionId)
+          : undefined
+
+        // 1. Check whether the target turn already completed right before shutdown or during hot-reload swap.
         if (item.sessionId) {
           const inspection = await inspectPersistedTurnCompletion(
             this.host.ctx,
             item.sessionId,
             item.messageId,
+            {
+              ...(item.targetTurn !== undefined ? { targetTurn: item.targetTurn } : {}),
+              ...(item.userMessageId ? { userMessageId: item.userMessageId } : {}),
+              skipFirstIntermediates: totalSentIntermediates,
+            },
           )
           if (inspection.state === 'completed') {
-            this.host.store.deletePendingTurn(item.id)
+            for (const member of survivingMembers) {
+              this.host.store.deletePendingTurn(member.id)
+            }
             await this.deliverRecoveredCompletedTurn({
               bot,
               transport,
               turn: item,
+              peerTurns: peerItems,
               groupConfig,
               replyText: inspection.replyText,
+              missedIntermediates: inspection.missedIntermediates,
               silencedByTool: inspection.silencedByTool,
+              fromHotReload: item.interruptKind === 'hot_reload',
             })
-            recovered += 1
+            recovered += survivingMembers.length
             continue
           }
         }
 
-        // 2. Automatically resume eligible in-flight turns within the recovery window & retry budget.
-        if (bot?.enabled && canAutoResumePendingTurn(item, nowMs, { phase: 'startup' })) {
-          const replayMsg = item.inboundMsg!
+        // 2. Seamless live reattach: if the host agent survived hot-reload and is still executing this turn,
+        //    attach directly to its event stream without replaying or restarting the agent.
+        const canAttemptLiveReattach = Boolean(
+          liveAgent &&
+            bot?.enabled &&
+            item.sessionId &&
+            item.inboundMsg &&
+            (item.targetTurn !== undefined ||
+              Boolean(item.userMessageId) ||
+              item.interruptKind === 'hot_reload'),
+        )
+        if (canAttemptLiveReattach && liveAgent && bot && item.sessionId && item.inboundMsg) {
           const knownChatName =
             item.chatName ||
-            (replayMsg.chatType === 'group'
-              ? this.host.store.resolveChatName(bot.id, replayMsg.chatId)
+            (item.inboundMsg.chatType === 'group'
+              ? this.host.store.resolveChatName(bot.id, item.inboundMsg.chatId)
               : undefined)
-          const decision = this.resolveDecisionForMessage(bot, replayMsg, groupConfig, knownChatName)
+          const decision = this.resolveDecisionForMessage(
+            bot,
+            item.inboundMsg,
+            groupConfig,
+            knownChatName,
+          )
           if (decision.action === 'agent') {
-            const isGracefulShutdown = item.interruptKind === 'graceful_shutdown'
-            const nextCrashAttempts = isGracefulShutdown
-              ? (item.recoveryAttempts ?? 0)
-              : (item.recoveryAttempts ?? 0) + 1
-            const nextGracefulAttempts = isGracefulShutdown
-              ? (item.gracefulRecoveryAttempts ?? 0) + 1
-              : (item.gracefulRecoveryAttempts ?? 0)
-            const totalAttempts = nextCrashAttempts + nextGracefulAttempts
-            const traceId = item.traceId || createTraceId()
-            this.host.store.upsertPendingTurn({
-              ...item,
-              status: 'recovering',
-              recoveryAttempts: nextCrashAttempts,
-              gracefulRecoveryAttempts: nextGracefulAttempts,
-              lastActivityAtMs: nowMs,
-              updatedAtMs: nowMs,
-            })
-            this.host.store.recordEvent({
-              botId: bot.id,
-              chatId: item.chatId,
-              ...(knownChatName ? { chatName: knownChatName } : {}),
-              routeKey: decision.routeKey,
-              ...(item.sessionId ? { sessionId: item.sessionId } : {}),
-              traceId,
-              kind: 'lifecycle',
-              summary: `服务重启后自动恢复处理中消息（第 ${totalAttempts} 次恢复）`,
-            })
-
-            const task = this.runAgentTurn(bot, transport, replayMsg, decision, groupConfig, traceId, {
-              pendingTurnId: item.id,
-              ...(item.reactionId ? { existingReactionId: item.reactionId } : {}),
-              ...(item.sessionId ? { previousSessionId: item.sessionId } : {}),
-              recoveryAttempts: nextCrashAttempts,
-              gracefulRecoveryAttempts: nextGracefulAttempts,
-              totalRecoveryAttempts: totalAttempts,
-              previousIntermediateSentCount: item.intermediateSentCount ?? 0,
-              ...(item.handoffTurns ? { handoffTurns: item.handoffTurns } : {}),
-              startedAtMs: item.startedAtMs,
+            const task = this.reattachLiveTurn({
+              bot,
+              transport,
+              liveAgent,
+              sessionId: item.sessionId,
+              lead: item,
+              members: survivingMembers,
+              decision,
+              groupConfig,
+              ...(knownChatName ? { resolvedChatName: knownChatName } : {}),
+              skipFirstIntermediates: totalSentIntermediates,
+              nowMs,
             })
               .catch((err) => {
                 this.host.ctx.logger.warn(
-                  `[lark-bridge][bot=${bot.id}][msg=${item.messageId}] auto-resume failed: ${err instanceof Error ? err.message : String(err)}`,
+                  `[lark-bridge][bot=${bot.id}][msg=${item.messageId}] live hot-reload reattach failed: ${err instanceof Error ? err.message : String(err)}`,
                 )
               })
               .finally(() => {
-                this.recoveringTurnIds.delete(item.id)
                 this.recoveryTasks.delete(task)
-                this.host.onActivityChange?.()
+                releaseRecoveringIds()
               })
             this.recoveryTasks.add(task)
             handedOffToAsyncTask = true
-            recovered += 1
+            recovered += survivingMembers.length
             continue
           }
         }
 
-        // 3. Non-recoverable (legacy row without payload, expired window, retries exhausted, or disabled):
-        //    clean up stale reaction and notify interactive turns.
-        this.host.store.deletePendingTurn(item.id)
+        // 3. Fallback: automatically resume eligible interrupted turns by replaying into the existing session.
+        if (bot?.enabled && canAutoResumePendingTurn(item, nowMs, { phase: 'startup' })) {
+          const started = this.launchReplayRecoveryTask({
+            bot,
+            transport,
+            item,
+            peerItems,
+            groupConfig,
+            nowMs,
+            onDone: () => {
+              releaseRecoveringIds()
+            },
+          })
+          if (started) {
+            handedOffToAsyncTask = true
+            recovered += survivingMembers.length
+            continue
+          }
+        }
+
+        // 4. Non-recoverable (legacy row without payload, expired window, retries exhausted, or disabled):
+        //    clean up stale reactions and notify interactive turns.
+        for (const member of survivingMembers) {
+          this.host.store.deletePendingTurn(member.id)
+        }
+        for (const peer of peerItems) {
+          if (peer.reactionId) {
+            await transport.removeReaction(peer.messageId, peer.reactionId).catch(() => {})
+          }
+        }
         await this.deliverInterruptedTurnCleanup({
           transport,
           turn: item,
-          intermediateSentCount: item.intermediateSentCount ?? 0,
+          intermediateSentCount: totalSentIntermediates,
           auditSummary: '本轮执行因服务重启中断',
           replyText: '本轮执行因服务重启中断，可重新回复继续。',
         })
-        recovered += 1
+        recovered += survivingMembers.length
       } finally {
         if (!handedOffToAsyncTask) {
-          this.recoveringTurnIds.delete(item.id)
-          this.host.onActivityChange?.()
+          releaseRecoveringIds()
         }
       }
     }
     return recovered
   }
 
+  private launchReplayRecoveryTask(input: {
+    readonly bot: LarkBotConfig
+    readonly transport: LarkBotTransport
+    readonly item: LarkPendingTurn
+    readonly peerItems?: readonly LarkPendingTurn[]
+    readonly groupConfig: LarkGroupConfig | undefined
+    readonly nowMs: number
+    readonly onDone?: () => void
+  }): boolean {
+    const { bot, transport, item, peerItems = [], groupConfig, nowMs, onDone } = input
+    const replayMsg = item.inboundMsg
+    if (!replayMsg) return false
+    const knownChatName =
+      item.chatName ||
+      (replayMsg.chatType === 'group'
+        ? this.host.store.resolveChatName(bot.id, replayMsg.chatId)
+        : undefined)
+    const decision = this.resolveDecisionForMessage(bot, replayMsg, groupConfig, knownChatName)
+    if (decision.action !== 'agent') return false
+
+    const isGracefulShutdown =
+      item.interruptKind === 'graceful_shutdown' || item.interruptKind === 'hot_reload'
+    const nextCrashAttempts = isGracefulShutdown
+      ? (item.recoveryAttempts ?? 0)
+      : (item.recoveryAttempts ?? 0) + 1
+    const nextGracefulAttempts = isGracefulShutdown
+      ? (item.gracefulRecoveryAttempts ?? 0) + 1
+      : (item.gracefulRecoveryAttempts ?? 0)
+    const totalAttempts = nextCrashAttempts + nextGracefulAttempts
+    const traceId = item.traceId || createTraceId()
+
+    for (const peer of peerItems) {
+      this.host.store.deletePendingTurn(peer.id)
+      if (peer.reactionId) {
+        void transport.removeReaction(peer.messageId, peer.reactionId).catch(() => {})
+      }
+    }
+    this.host.store.upsertPendingTurn({
+      ...item,
+      status: 'recovering',
+      recoveryAttempts: nextCrashAttempts,
+      gracefulRecoveryAttempts: nextGracefulAttempts,
+      lastActivityAtMs: nowMs,
+      updatedAtMs: nowMs,
+    })
+    this.host.store.recordEvent({
+      botId: bot.id,
+      chatId: item.chatId,
+      ...(knownChatName ? { chatName: knownChatName } : {}),
+      routeKey: decision.routeKey,
+      ...(item.sessionId ? { sessionId: item.sessionId } : {}),
+      traceId,
+      kind: 'lifecycle',
+      summary: `服务重启后自动恢复处理中消息（第 ${totalAttempts} 次恢复）`,
+    })
+
+    const task = this.runAgentTurn(bot, transport, replayMsg, decision, groupConfig, traceId, {
+      pendingTurnId: item.id,
+      ...(item.reactionId ? { existingReactionId: item.reactionId } : {}),
+      ...(item.sessionId ? { previousSessionId: item.sessionId } : {}),
+      recoveryAttempts: nextCrashAttempts,
+      gracefulRecoveryAttempts: nextGracefulAttempts,
+      totalRecoveryAttempts: totalAttempts,
+      previousIntermediateSentCount: item.intermediateSentCount ?? 0,
+      ...(item.handoffTurns ? { handoffTurns: item.handoffTurns } : {}),
+      startedAtMs: item.startedAtMs,
+    })
+      .catch((err) => {
+        this.host.ctx.logger.warn(
+          `[lark-bridge][bot=${bot.id}][msg=${item.messageId}] auto-resume failed: ${err instanceof Error ? err.message : String(err)}`,
+        )
+      })
+      .finally(() => {
+        this.recoveryTasks.delete(task)
+        onDone?.()
+      })
+    this.recoveryTasks.add(task)
+    return true
+  }
+
+  /**
+   * Reattaches to an already-running turn on a live host agent after a seamless
+   * `dsh-lark-bridge` hot-reload swap without submitting a duplicate prompt.
+   * Synchronously claims the SessionActor slot and registers `activeTurns` /
+   * `executingTurnBySession` before its first `await` so concurrent inbound Feishu
+   * messages queue cleanly behind the surviving turn and agent CLI calls keep working.
+   */
+  private async reattachLiveTurn(input: {
+    readonly bot: LarkBotConfig
+    readonly transport: LarkBotTransport
+    readonly liveAgent: import('@deepseek-ai/dsh-agent').Agent
+    readonly sessionId: string
+    readonly lead: LarkPendingTurn
+    readonly members: readonly LarkPendingTurn[]
+    readonly decision: AgentDecision
+    readonly groupConfig: LarkGroupConfig | undefined
+    readonly resolvedChatName?: string
+    readonly skipFirstIntermediates: number
+    readonly nowMs: number
+  }): Promise<void> {
+    const {
+      bot,
+      transport,
+      liveAgent,
+      sessionId,
+      lead,
+      members,
+      decision,
+      groupConfig,
+      resolvedChatName,
+      skipFirstIntermediates,
+      nowMs,
+    } = input
+
+    const leadMsg = lead.inboundMsg!
+    const traceId = lead.traceId || createTraceId()
+    const boundDecision: AgentDecision = { ...decision, routeKey: lead.routeKey }
+    const acquired: AcquiredAgent = {
+      agent: liveAgent,
+      sessionId,
+      routeKey: lead.routeKey,
+      isNew: false,
+      disposeAfter: boundDecision.sessionMode === 'per_message',
+    }
+
+    const batchItems: QueuedWorkerTurnItem[] = members.map((member) => {
+      const mMsg = member.inboundMsg ?? leadMsg
+      const mCancelController = new AbortController()
+      const mDecision: AgentDecision = { ...boundDecision, routeKey: member.routeKey }
+      const mActiveTurn = this.registerActiveTurn({
+        id: member.id,
+        traceId: member.traceId || traceId,
+        botId: member.botId,
+        chatId: member.chatId,
+        ...(member.chatName || resolvedChatName ? { chatName: member.chatName || resolvedChatName } : {}),
+        messageId: member.messageId,
+        routeKey: member.routeKey,
+        replyMode: member.replyMode,
+        trigger: member.trigger,
+        allowSilentEmptyReply: member.allowSilentEmptyReply,
+        ...(boundDecision.silentOnly ? { silentOnly: true } : {}),
+        ...(member.reactionId ? { reactionId: member.reactionId } : {}),
+        startedAtMs: member.startedAtMs,
+        transport,
+        inboundMsg: mMsg,
+        ...(member.senderName ? { senderName: member.senderName } : {}),
+        cancelController: mCancelController,
+        ...(member.handoffTurns ? { handoffTurns: member.handoffTurns } : {}),
+        sessionId,
+        ...(member.targetTurn !== undefined ? { targetTurn: member.targetTurn } : {}),
+        ...(member.userMessageId ? { userMessageId: member.userMessageId } : {}),
+        ...(member.lastEventSeq !== undefined ? { lastEventSeq: member.lastEventSeq } : {}),
+        intermediateSentCount: member.intermediateSentCount ?? 0,
+        recoveryAttempts: member.recoveryAttempts ?? 0,
+        gracefulRecoveryAttempts: member.gracefulRecoveryAttempts ?? 0,
+      })
+      return {
+        msg: mMsg,
+        decision: mDecision,
+        activeTurn: mActiveTurn,
+        cancelController: mCancelController,
+        mediaCache: new InboundMediaCache(),
+        traceId: mActiveTurn.traceId,
+        ...(member.senderName ? { senderName: member.senderName } : {}),
+        ...(member.handoffTurns ? { handoffTurns: member.handoffTurns } : {}),
+      }
+    })
+    const latestItem = batchItems[batchItems.length - 1]!
+    const executingTurnCtx = buildExecutingTurnContext(
+      bot,
+      latestItem.msg,
+      boundDecision,
+      resolvedChatName,
+    )
+
+    // Synchronously reserve the session slot, active CLI context, and recall/disable tracking BEFORE any `await`.
+    this.host.sessions.markTurnRegistered(sessionId)
+    this.executingTurnBySession.set(sessionId, executingTurnCtx)
+    const untrackCallbacks = batchItems.map((bi) =>
+      this.trackInflightController(
+        bot.id,
+        bi.msg.chatId,
+        bi.msg.chatType,
+        bi.msg.messageId,
+        bi.cancelController,
+      ),
+    )
+    const untrackInflight = () => {
+      for (const fn of untrackCallbacks) fn()
+    }
+    const batchCancelController = new AbortController()
+    const cancelListeners: Array<{ readonly signal: AbortSignal; readonly fn: () => void }> = []
+    const evaluateCancel = (source: AbortSignal) => {
+      if (batchCancelController.signal.aborted) return
+      if (this.isSignalDisabled(source) || batchItems.every((i) => this.isTurnRecalled(bot.id, i))) {
+        batchCancelController.abort(source.reason)
+      }
+    }
+    for (const bi of batchItems) {
+      const sig = bi.cancelController.signal
+      if (sig.aborted) {
+        evaluateCancel(sig)
+      } else {
+        const fn = () => evaluateCancel(sig)
+        sig.addEventListener('abort', fn, { once: true })
+        cancelListeners.push({ signal: sig, fn })
+      }
+    }
+    const disposeCancelListeners = () => {
+      for (const entry of cancelListeners) {
+        entry.signal.removeEventListener('abort', entry.fn)
+      }
+      cancelListeners.length = 0
+    }
+
+    let releaseTurnSlot: (() => void) | undefined
+    let shouldDisposeEphemeral = false
+    let shouldArchiveEphemeral = false
+    let trackedRouteKey = lead.routeKey
+    let fellBackToReplay = false
+
+    try {
+      releaseTurnSlot = await this.host.sessions.acquireTurnSlot(
+        sessionId,
+        this.host.shutdownSignal,
+        () => this.host.isDisposed(),
+      )
+      if (!releaseTurnSlot) {
+        for (const bi of batchItems) {
+          this.suspendSingleTurnForRestart(bi.activeTurn, Date.now(), { preserveLiveAgents: true })
+        }
+        return
+      }
+
+      this.host.store.recordEvent({
+        botId: bot.id,
+        chatId: lead.chatId,
+        ...(resolvedChatName ? { chatName: resolvedChatName } : {}),
+        routeKey: trackedRouteKey,
+        sessionId,
+        traceId,
+        kind: 'lifecycle',
+        summary: '热更新重载完成，已无损续接后台运行中的会话',
+      })
+
+      const isSilenced = () => batchItems.some((i) => i.activeTurn.silencedByControl)
+      const isBatchCancelled = () =>
+        batchCancelController.signal.aborted ||
+        Boolean(this.getBatchDisabledScope(bot.id, batchItems)) ||
+        batchItems.every((i) => this.isTurnRecalled(bot.id, i))
+
+      const execStartedMs = Date.now()
+      const result = await reattachTurnAndCollectReply(this.host.ctx, liveAgent, {
+        ...(lead.targetTurn !== undefined ? { targetTurn: lead.targetTurn } : {}),
+        ...(lead.userMessageId ? { expectedUserMessageId: lead.userMessageId } : {}),
+        expectedFeishuMessageId: lead.messageId,
+        skipFirstIntermediates,
+        signal: this.host.shutdownSignal,
+        cancelSignal: batchCancelController.signal,
+        onActivity: (timestampMs) => {
+          for (const bi of batchItems) {
+            this.touchActiveTurnActivity(bi.activeTurn, timestampMs)
+          }
+        },
+        onTurnBound: ({ turn, userMessageId }) => {
+          for (const bi of batchItems) {
+            let changed = false
+            if (bi.activeTurn.targetTurn !== turn) {
+              bi.activeTurn.targetTurn = turn
+              changed = true
+            }
+            if (userMessageId && bi.activeTurn.userMessageId !== userMessageId) {
+              bi.activeTurn.userMessageId = userMessageId
+              changed = true
+            }
+            if (changed) this.persistActiveTurn(bi.activeTurn)
+          }
+        },
+        onEventSeq: (seq) => {
+          for (const bi of batchItems) {
+            if (bi.activeTurn.lastEventSeq === undefined || seq > bi.activeTurn.lastEventSeq) {
+              bi.activeTurn.lastEventSeq = seq
+            }
+          }
+        },
+        onSilencedByTool: () => {
+          latestItem.activeTurn.silencedByControl = true
+        },
+        ...(boundDecision.sendIntermediateMessages && !boundDecision.silentOnly
+          ? {
+              onIntermediate: async (stepText) => {
+                if (boundDecision.silentOnly || isSilenced() || isBatchCancelled()) return
+                const intermediate = await this.deliverIntermediateReply(
+                  bot,
+                  transport,
+                  latestItem.msg,
+                  boundDecision,
+                  stepText,
+                  liveAgent.session,
+                )
+                if (intermediate.sent) {
+                  const sentAtMs = Date.now()
+                  latestItem.activeTurn.intermediateSentCount += 1
+                  latestItem.activeTurn.lastActivityAtMs = sentAtMs
+                  latestItem.activeTurn.lastPersistedActivityAtMs = sentAtMs
+                  if (intermediate.routeKey !== boundDecision.routeKey) {
+                    latestItem.activeTurn.routeKey = intermediate.routeKey
+                    trackedRouteKey = intermediate.routeKey
+                    executingTurnCtx.routeKey = intermediate.routeKey
+                  }
+                  if (intermediate.threadId) {
+                    executingTurnCtx.threadId = intermediate.threadId
+                    executingTurnCtx.replyInThread = true
+                  }
+                  if (intermediate.rootId) {
+                    executingTurnCtx.rootId = intermediate.rootId
+                    if (executingTurnCtx.replyInThread) {
+                      executingTurnCtx.replyToMessageId = intermediate.rootId
+                    }
+                  }
+                  this.persistActiveTurn(latestItem.activeTurn)
+                  this.host.store.markBindingReplied(intermediate.routeKey)
+                }
+              },
+            }
+          : {}),
+      })
+
+      if (result.outcome === 'not_found') {
+        // The live agent no longer owns this turn (e.g. hot-reload happened before submission);
+        // release our active slots and fall back cleanly to replay recovery or interrupted cleanup.
+        fellBackToReplay = true
+        for (const bi of batchItems) {
+          bi.activeTurn.settled = true
+          bi.activeTurn.reactionRemoved = true
+          this.activeTurns.delete(bi.activeTurn.id)
+        }
+        this.host.onActivityChange?.()
+        if (this.executingTurnBySession.get(sessionId) === executingTurnCtx) {
+          this.executingTurnBySession.delete(sessionId)
+        }
+        disposeCancelListeners()
+        this.host.sessions.markTurnFinished(sessionId)
+        releaseTurnSlot()
+        releaseTurnSlot = undefined
+
+        if (canAutoResumePendingTurn(lead, Date.now(), { phase: 'startup' })) {
+          this.launchReplayRecoveryTask({
+            bot,
+            transport,
+            item: lead,
+            peerItems: members.slice(0, -1),
+            groupConfig,
+            nowMs: Date.now(),
+          })
+        } else {
+          for (const member of members) {
+            this.host.store.deletePendingTurn(member.id)
+          }
+          for (const peer of members.slice(0, -1)) {
+            if (peer.reactionId) {
+              await transport.removeReaction(peer.messageId, peer.reactionId).catch(() => {})
+            }
+          }
+          await this.deliverInterruptedTurnCleanup({
+            transport,
+            turn: lead,
+            intermediateSentCount: skipFirstIntermediates,
+            auditSummary: '本轮执行因服务重载中断',
+            replyText: '本轮执行因服务重载中断，可重新回复继续。',
+          })
+        }
+        return
+      }
+
+      if (result.silencedByTool) {
+        latestItem.activeTurn.silencedByControl = true
+      }
+      const execMs = Math.max(0, Date.now() - execStartedMs)
+      const settlement = await this.settleBatchReply({
+        bot,
+        transport,
+        groupConfig,
+        ...(resolvedChatName ? { resolvedChatName } : {}),
+        acquired,
+        batchItems,
+        effectiveDecision: { ...boundDecision, routeKey: trackedRouteKey },
+        replyText: result.replyText,
+        startedMs: lead.startedAtMs,
+        queueWaitMs: 0,
+        execMs,
+        reattachedFromHotReload: true,
+      })
+      shouldDisposeEphemeral = settlement.dispose
+      shouldArchiveEphemeral = settlement.archive
+    } catch (err) {
+      const failure = await this.handleBatchFailure({
+        bot,
+        transport,
+        msg: leadMsg,
+        decision: boundDecision,
+        ...(resolvedChatName ? { resolvedChatName } : {}),
+        activeTurn: latestItem.activeTurn,
+        batchItems,
+        acquiredRef: acquired,
+        trackedSessionId: sessionId,
+        err,
+      })
+      shouldDisposeEphemeral = failure.dispose
+      shouldArchiveEphemeral = failure.archive
+    } finally {
+      if (!fellBackToReplay) {
+        if (this.executingTurnBySession.get(sessionId) === executingTurnCtx) {
+          this.executingTurnBySession.delete(sessionId)
+        }
+        disposeCancelListeners()
+        for (const bi of batchItems) {
+          if (!bi.activeTurn.reactionRemoved && bi.activeTurn.reactionId) {
+            bi.activeTurn.reactionRemoved = true
+            await transport
+              .removeReaction(bi.msg.messageId, bi.activeTurn.reactionId)
+              .catch(() => {})
+          }
+        }
+        const otherTurnsInFlight = this.host.sessions.markTurnFinished(sessionId)
+        if (!otherTurnsInFlight && shouldDisposeEphemeral) {
+          await this.host.sessions
+            .disposeEphemeral(sessionId, trackedRouteKey, { archive: shouldArchiveEphemeral })
+            .catch(() => {})
+        }
+        releaseTurnSlot?.()
+      }
+      untrackInflight()
+    }
+  }
+
   /**
    * Preserves recoverable in-flight turns in SQLite (`status: 'interrupted'`) with their
    * Feishu reaction intact so the next process resumes them seamlessly without error spam.
-   * Only non-recoverable turns (missing payload or retries already exhausted) are cleaned up
-   * and reported as interrupted.
+   * When `preserveLiveAgents` is true (during `dsh-lark-bridge` HMR self-swap), marks turns
+   * with `interruptKind: 'hot_reload'` so the reloaded instance reattaches to live agents
+   * instead of replaying prompts.
    */
-  async suspendActiveTurnsForShutdown(): Promise<void> {
+  async suspendActiveTurnsForShutdown(
+    options: { readonly preserveLiveAgents?: boolean } = {},
+  ): Promise<void> {
     this.listenerDebounce.dispose()
+    const preserveLiveAgents = Boolean(options.preserveLiveAgents)
     const nowMs = Date.now()
     const recoverable: ActiveTurnRecord[] = []
     const nonRecoverable: ActiveTurnRecord[] = []
@@ -1338,7 +1866,12 @@ export class InboundPipeline {
       if (record.settled) continue
       record.settled = true
       record.reactionRemoved = true
-      if (canAutoResumePendingTurn(record, nowMs, { phase: 'shutdown' })) {
+      const canPreserveLive =
+        preserveLiveAgents &&
+        Boolean(record.sessionId) &&
+        Boolean(record.inboundMsg) &&
+        (record.targetTurn !== undefined || Boolean(record.userMessageId))
+      if (canPreserveLive || canAutoResumePendingTurn(record, nowMs, { phase: 'shutdown' })) {
         recoverable.push(record)
       } else {
         nonRecoverable.push(record)
@@ -1350,7 +1883,7 @@ export class InboundPipeline {
     for (const record of recoverable) {
       record.status = 'interrupted'
       record.interruptedAtMs = nowMs
-      record.interruptKind = 'graceful_shutdown'
+      record.interruptKind = preserveLiveAgents ? 'hot_reload' : 'graceful_shutdown'
       this.persistActiveTurn(record, { force: true })
       this.host.store.recordEvent({
         botId: record.botId,
@@ -1360,7 +1893,9 @@ export class InboundPipeline {
         ...(record.sessionId ? { sessionId: record.sessionId } : {}),
         traceId: record.traceId,
         kind: 'lifecycle',
-        summary: '服务重载或停机，已保存处理中任务待重启自动恢复',
+        summary: preserveLiveAgents
+          ? '飞书桥接热更新切包，已保持后台会话运行，重载后自动续传'
+          : '服务重载或停机，已保存处理中任务待重启自动恢复',
       })
     }
 
@@ -1401,11 +1936,24 @@ export class InboundPipeline {
     readonly bot: LarkBotConfig | undefined
     readonly transport: LarkBotTransport
     readonly turn: LarkPendingTurn
+    readonly peerTurns?: readonly LarkPendingTurn[]
     readonly groupConfig: LarkGroupConfig | undefined
     readonly replyText: string
+    readonly missedIntermediates?: readonly string[]
     readonly silencedByTool: boolean
+    readonly fromHotReload?: boolean
   }): Promise<void> {
-    const { bot, transport, turn, groupConfig, replyText, silencedByTool } = input
+    const {
+      bot,
+      transport,
+      turn,
+      peerTurns = [],
+      groupConfig,
+      replyText,
+      missedIntermediates = [],
+      silencedByTool,
+      fromHotReload = false,
+    } = input
     const effectiveSilencedByTool = silencedByTool && canSilenceTurnByControl(turn)
     const normalized = effectiveSilencedByTool
       ? ''
@@ -1413,6 +1961,11 @@ export class InboundPipeline {
     const isSilent = effectiveSilencedByTool || (turn.allowSilentEmptyReply && !normalized)
     if (turn.reactionId) {
       await transport.removeReaction(turn.messageId, turn.reactionId).catch(() => {})
+    }
+    for (const peer of peerTurns) {
+      if (peer.reactionId) {
+        await transport.removeReaction(peer.messageId, peer.reactionId).catch(() => {})
+      }
     }
     const recoveredSender = this.resolveTelemetrySender(
       turn.botId,
@@ -1438,31 +1991,69 @@ export class InboundPipeline {
         ...(turn.sessionId ? { sessionId: turn.sessionId } : {}),
         ...(turn.traceId ? { traceId: turn.traceId } : {}),
         kind: 'silent_skip',
-        summary: '服务重启后检测到原回合已静默完成',
+        summary: fromHotReload ? '热更新期间后台会话已静默完成' : '服务重启后检测到原回合已静默完成',
       })
       return
     }
 
-    const text = normalized || '（已完成，无文本输出）'
-    const useCard = bot
-      ? resolveEffectiveCardBot(bot, groupConfig).useInteractiveCard
-      : false
-    const card =
-      useCard && bot && turn.sessionId
-        ? buildReplyCard({
-            markdown: text,
-            bot: resolveEffectiveCardBot(bot, groupConfig),
-            sessionUrl: this.host.sessionWebUrl(turn.sessionId),
+    const sendIntermediateEnabled = Boolean(
+      bot &&
+        (groupConfig?.intermediateMessages === 'on'
+          ? true
+          : groupConfig?.intermediateMessages === 'off'
+            ? false
+            : bot.sendIntermediateMessages),
+    )
+    let sentMissedIntermediates = 0
+    if (sendIntermediateEnabled && missedIntermediates.length > 0 && bot) {
+      const cardBot = resolveEffectiveCardBot(bot, groupConfig)
+      for (const part of missedIntermediates) {
+        const cleanPart = normalizeReplyText(part, { allowSilentSentinel: true })
+        if (!cleanPart) continue
+        const card =
+          cardBot.useInteractiveCard && turn.sessionId
+            ? buildReplyCard({
+                markdown: cleanPart,
+                bot: cardBot,
+                sessionUrl: this.host.sessionWebUrl(turn.sessionId),
+              })
+            : undefined
+        await transport
+          .sendReply({
+            chatId: turn.chatId,
+            replyToMessageId: turn.messageId,
+            replyMode: turn.replyMode,
+            ...(card ? { card } : { text: cleanPart }),
           })
-        : undefined
-    await transport
-      .sendReply({
-        chatId: turn.chatId,
-        replyToMessageId: turn.messageId,
-        replyMode: turn.replyMode,
-        ...(card ? { card } : { text }),
-      })
-      .catch(() => {})
+          .then(() => {
+            sentMissedIntermediates += 1
+          })
+          .catch(() => {})
+      }
+    }
+
+    const text = normalized || (sentMissedIntermediates > 0 ? '' : '（已完成，无文本输出）')
+    if (text) {
+      const useCard = bot
+        ? resolveEffectiveCardBot(bot, groupConfig).useInteractiveCard
+        : false
+      const card =
+        useCard && bot && turn.sessionId
+          ? buildReplyCard({
+              markdown: text,
+              bot: resolveEffectiveCardBot(bot, groupConfig),
+              sessionUrl: this.host.sessionWebUrl(turn.sessionId),
+            })
+          : undefined
+      await transport
+        .sendReply({
+          chatId: turn.chatId,
+          replyToMessageId: turn.messageId,
+          replyMode: turn.replyMode,
+          ...(card ? { card } : { text }),
+        })
+        .catch(() => {})
+    }
     this.host.store.markBindingReplied(turn.routeKey)
     this.host.store.recordMetric({
       botId: turn.botId,
@@ -1475,6 +2066,9 @@ export class InboundPipeline {
       kind: 'replied',
       latencyMs: Date.now() - turn.startedAtMs,
     })
+    const prefix = fromHotReload
+      ? '热更新期间后台会话已完成，已无损续传补发'
+      : '服务重启后检测到原回合已完成，已补发回复'
     this.host.store.recordEvent({
       botId: turn.botId,
       chatId: turn.chatId,
@@ -1484,7 +2078,10 @@ export class InboundPipeline {
       ...(turn.traceId ? { traceId: turn.traceId } : {}),
       durationMs: Date.now() - turn.startedAtMs,
       kind: 'reply',
-      summary: `服务重启后检测到原回合已完成，已补发回复（${text.length} 字）`,
+      summary:
+        sentMissedIntermediates > 0
+          ? `${prefix}（${sentMissedIntermediates} 条过程消息${text ? ` + 最终回复 ${text.length} 字` : ''}）`
+          : `${prefix}（${text.length} 字）`,
     })
   }
 
@@ -2202,6 +2799,38 @@ export class InboundPipeline {
           replyText = await runTurnAndCollectReply(this.host.ctx, acquired.agent, content, {
             signal: this.host.shutdownSignal,
             cancelSignal: linkedCancel.signal,
+            onUserMessageSubmitted: (userMessageId) => {
+              for (const item of batchItems) {
+                item.activeTurn.sessionId = acquired.sessionId
+                item.activeTurn.userMessageId = userMessageId
+                this.persistActiveTurn(item.activeTurn)
+              }
+            },
+            onTurnBound: ({ turn, userMessageId }) => {
+              for (const item of batchItems) {
+                let changed = false
+                if (item.activeTurn.sessionId !== acquired.sessionId) {
+                  item.activeTurn.sessionId = acquired.sessionId
+                  changed = true
+                }
+                if (item.activeTurn.targetTurn !== turn) {
+                  item.activeTurn.targetTurn = turn
+                  changed = true
+                }
+                if (userMessageId && item.activeTurn.userMessageId !== userMessageId) {
+                  item.activeTurn.userMessageId = userMessageId
+                  changed = true
+                }
+                if (changed) this.persistActiveTurn(item.activeTurn)
+              }
+            },
+            onEventSeq: (seq) => {
+              for (const item of batchItems) {
+                if (item.activeTurn.lastEventSeq === undefined || seq > item.activeTurn.lastEventSeq) {
+                  item.activeTurn.lastEventSeq = seq
+                }
+              }
+            },
             onActivity: (timestampMs) => {
               for (const item of batchItems) {
                 this.touchActiveTurnActivity(item.activeTurn, timestampMs)
@@ -2330,6 +2959,7 @@ export class InboundPipeline {
     readonly startedMs: number
     readonly queueWaitMs?: number
     readonly execMs?: number
+    readonly reattachedFromHotReload?: boolean
   }): Promise<{ readonly dispose: boolean; readonly archive: boolean }> {
     const {
       bot,
@@ -2343,6 +2973,7 @@ export class InboundPipeline {
       startedMs,
       queueWaitMs = 0,
       execMs = 0,
+      reattachedFromHotReload = false,
     } = input
     const latestItem = batchItems[batchItems.length - 1]!
     const batchSize = batchItems.length
@@ -2553,6 +3184,7 @@ export class InboundPipeline {
         execMs: normalizedExecMs,
       })
       const replyTags = [
+        ...(reattachedFromHotReload ? ['热更无损续传'] : []),
         ...(batchSize > 1 ? [`合并 ${batchSize} 条消息`] : []),
         ...(normalizedQueueWaitMs >= 2_000
           ? [`含排队 ${Math.round(normalizedQueueWaitMs / 1000)}s`]
@@ -3446,13 +4078,18 @@ export class InboundPipeline {
     }
   }
 
-  private suspendSingleTurnForRestart(record: ActiveTurnRecord, nowMs = Date.now()): void {
+  private suspendSingleTurnForRestart(
+    record: ActiveTurnRecord,
+    nowMs = Date.now(),
+    options: { readonly preserveLiveAgents?: boolean } = {},
+  ): void {
     if (record.settled) return
+    const preserveLiveAgents = Boolean(options.preserveLiveAgents)
     record.settled = true
     record.reactionRemoved = true
     record.status = 'interrupted'
     record.interruptedAtMs = nowMs
-    record.interruptKind = 'graceful_shutdown'
+    record.interruptKind = preserveLiveAgents ? 'hot_reload' : 'graceful_shutdown'
     this.activeTurns.delete(record.id)
     this.persistActiveTurn(record, { force: true })
     this.host.store.recordEvent({
@@ -3463,7 +4100,9 @@ export class InboundPipeline {
       ...(record.sessionId ? { sessionId: record.sessionId } : {}),
       traceId: record.traceId,
       kind: 'lifecycle',
-      summary: '服务重载或停机，已保存处理中任务待重启自动恢复',
+      summary: preserveLiveAgents
+        ? '飞书桥接热更新切包，已保持后台会话运行，重载后自动续传'
+        : '服务重载或停机，已保存处理中任务待重启自动恢复',
     })
     this.host.onActivityChange?.()
   }
@@ -3621,6 +4260,9 @@ export class InboundPipeline {
       lastActivityAtMs: record.lastActivityAtMs,
       ...(record.interruptedAtMs !== undefined ? { interruptedAtMs: record.interruptedAtMs } : {}),
       ...(record.interruptKind ? { interruptKind: record.interruptKind } : {}),
+      ...(record.targetTurn !== undefined ? { targetTurn: record.targetTurn } : {}),
+      ...(record.userMessageId ? { userMessageId: record.userMessageId } : {}),
+      ...(record.lastEventSeq !== undefined ? { lastEventSeq: record.lastEventSeq } : {}),
       updatedAtMs: Date.now(),
     })
   }

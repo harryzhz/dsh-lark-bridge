@@ -888,6 +888,8 @@ export interface PluginUpdateOperation {
   items: PluginUpdateItemResult[]
   hotReloaded: boolean
   restartRequired: boolean
+  preservedTurns?: number
+  seamlessBridgeSwap?: boolean
   error?: string
 }
 
@@ -901,6 +903,7 @@ export interface PluginUpdatesOverview {
   checkedAtMs?: number
   inFlightTurns?: number
   activeExternalAgents?: number
+  bridgeSeamlessReload?: boolean
   updatableCount: number
   plugins: ManagedPluginStatus[]
   operation?: PluginUpdateOperation

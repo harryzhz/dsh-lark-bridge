@@ -370,6 +370,18 @@ export {
 } from './storage/legacy-migrator.js'
 export { runDbCliCommand, inspectInstanceLockFile, type ActiveLockSummary, type DbCliResult } from './storage/db-cli.js'
 export {
+  claimDetachedAgentHandle,
+  clearBridgeHotReloadSwap,
+  isBridgeHotReloadSwapping,
+  listDetachedSessionIds,
+  markBridgeHotReloadSwap,
+  resetGlobalHotReloadHandoffForTest,
+  resolveHostAgentPresets,
+  resolveHostAgents,
+  stashDetachedAgentHandle,
+  sweepUnclaimedDetachedHandles,
+} from './hot-reload-handoff.js'
+export {
   MAX_AUTO_RESUME_AGE_MS,
   MAX_AUTO_RESUME_ATTEMPTS,
   MAX_AUTO_RESUME_TOTAL_AGE_MS,
@@ -378,13 +390,18 @@ export {
   composeRestartRecoveryReminder,
   inspectPersistedTurnCompletion,
   type AutoResumeEligibilityOptions,
+  type InspectPersistedTurnOptions,
   type PersistedTurnInspection,
 } from './turn-recovery.js'
 export {
   TurnAbortedError,
   TurnFinalReplyTracker,
   detectRuntimeExecutorErrorBanner,
+  isSilenceCliToolCallEvent,
+  reattachTurnAndCollectReply,
   runTurnAndCollectReply,
+  type ReattachTurnOptions,
+  type ReattachTurnResult,
   type RunTurnOptions,
   type TurnAbortKind,
   type TurnReplyTrackerOptions,

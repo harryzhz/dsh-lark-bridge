@@ -289,6 +289,7 @@ export class ScheduleNotifier {
   private readonly originCache = new Map<string, LarkOriginRecord | null>()
   private readonly identityInjectedSessions = new Set<string>()
   private readonly instrumentedAgents = new WeakSet<object>()
+  private readonly instrumentRestorers: Array<() => void> = []
   private readonly disposers: Array<() => void> = []
 
   constructor(private readonly host: ScheduleDeliveryHost) {}
@@ -329,6 +330,15 @@ export class ScheduleNotifier {
     while (this.disposers.length > 0) {
       this.disposers.pop()?.()
     }
+    // Unwrap patched `agent.followup` hooks on surviving host agents so hot-reloaded
+    // agents never invoke stale closures backed by this instance's closed SQLite store.
+    while (this.instrumentRestorers.length > 0) {
+      try {
+        this.instrumentRestorers.pop()?.()
+      } catch {
+        // Ignore restore errors on already-disposed agents.
+      }
+    }
     this.activeTurns.clear()
     this.currentTurnBySession.clear()
     this.activeSessionContexts.clear()
@@ -353,11 +363,22 @@ export class ScheduleNotifier {
     if (this.instrumentedAgents.has(ref)) return
     this.instrumentedAgents.add(ref)
 
-    const origFollowup = agent.followup.bind(agent)
-    agent.followup = ((message: UserMessage) => {
+    const hadOwnFollowup = Object.prototype.hasOwnProperty.call(agent, 'followup')
+    const rawFollowup = agent.followup
+    const origFollowup = rawFollowup.bind(agent)
+    const wrapped = ((message: UserMessage) => {
       const enriched = this.enrichScheduleUserMessage(agent.session.id, message, agent.session)
       return origFollowup(enriched)
     }) as Agent['followup']
+    agent.followup = wrapped
+    this.instrumentRestorers.push(() => {
+      if (agent.followup !== wrapped) return
+      if (hadOwnFollowup) {
+        agent.followup = rawFollowup
+      } else {
+        delete (agent as { followup?: Agent['followup'] }).followup
+      }
+    })
   }
 
   enrichScheduleUserMessage(

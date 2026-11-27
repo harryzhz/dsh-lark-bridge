@@ -1075,6 +1075,7 @@ describe('Restart resilience, triage context persistence/backfill & graceful dra
     expect(result).toEqual({
       state: 'completed',
       replyText: '长会话末尾已完成回复',
+      missedIntermediates: [],
       silencedByTool: false,
       turn: 99,
     })

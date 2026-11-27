@@ -12,6 +12,7 @@ import { OBSERVABILITY_MIGRATION } from './007-observability.js'
 import { EXTERNAL_SESSION_LINKS_MIGRATION } from './008-external-session-links.js'
 import { TELEMETRY_SENDER_MIGRATION } from './009-telemetry-sender.js'
 import { TELEMETRY_LATENCY_SPLIT_MIGRATION } from './010-telemetry-latency-split.js'
+import { HOT_RELOAD_REATTACH_MIGRATION } from './011-hot-reload-reattach.js'
 
 export type { SqlMigration }
 export {
@@ -25,6 +26,7 @@ export {
   EXTERNAL_SESSION_LINKS_MIGRATION,
   TELEMETRY_SENDER_MIGRATION,
   TELEMETRY_LATENCY_SPLIT_MIGRATION,
+  HOT_RELOAD_REATTACH_MIGRATION,
 }
 
 export const ALL_MIGRATIONS: readonly SqlMigration[] = [
@@ -38,6 +40,7 @@ export const ALL_MIGRATIONS: readonly SqlMigration[] = [
   EXTERNAL_SESSION_LINKS_MIGRATION,
   TELEMETRY_SENDER_MIGRATION,
   TELEMETRY_LATENCY_SPLIT_MIGRATION,
+  HOT_RELOAD_REATTACH_MIGRATION,
 ]
 
 export const ENTITY_TABLE_NAMES = [
