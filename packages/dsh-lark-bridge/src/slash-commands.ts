@@ -223,7 +223,7 @@ async function handleCotCommand(
     })
     const label =
       normalized === 'on'
-        ? '已为本群开启原生思考过程展示'
+        ? '已为本群开启原生思考过程展示（本群长任务进度提示将自动关闭）'
         : normalized === 'off'
           ? '已为本群关闭原生思考过程展示'
           : `本群已恢复跟随智能体默认（当前为${bot.cotEnabled ? '开启' : '关闭'}）`
@@ -234,9 +234,12 @@ async function handleCotCommand(
   host.store.upsertBot({
     ...bot,
     cotEnabled: normalized === 'on',
+    ...(normalized === 'on' ? { longTurnProgressNotice: false } : {}),
   })
   await reply(
-    `${normalized === 'on' ? '已开启' : '已关闭'}智能体「${bot.name}」默认原生思考过程展示，从下一轮对话开始生效。`,
+    normalized === 'on'
+      ? `已开启智能体「${bot.name}」默认原生思考过程展示，并已自动关闭长任务进度提示，从下一轮对话开始生效。`
+      : `已关闭智能体「${bot.name}」默认原生思考过程展示，从下一轮对话开始生效。`,
   )
 }
 

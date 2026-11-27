@@ -171,11 +171,18 @@ export class ConfigRepo {
     const syncedAllowed = parsed.allowedUserProfiles.filter((p) => allowedSet.has(p.openId))
     const adminSet = new Set(parsed.adminUsers)
     const syncedAdmins = parsed.adminUserProfiles.filter((p) => adminSet.has(p.openId))
+    const normalizedLongTurnNotice = parsed.cotEnabled ? false : parsed.longTurnProgressNotice
     const finalBot: LarkBotConfig =
       syncedAllowed.length === parsed.allowedUserProfiles.length &&
-      syncedAdmins.length === parsed.adminUserProfiles.length
+      syncedAdmins.length === parsed.adminUserProfiles.length &&
+      normalizedLongTurnNotice === parsed.longTurnProgressNotice
         ? parsed
-        : { ...parsed, allowedUserProfiles: syncedAllowed, adminUserProfiles: syncedAdmins }
+        : {
+            ...parsed,
+            longTurnProgressNotice: normalizedLongTurnNotice,
+            allowedUserProfiles: syncedAllowed,
+            adminUserProfiles: syncedAdmins,
+          }
 
     this.db
       .prepare(

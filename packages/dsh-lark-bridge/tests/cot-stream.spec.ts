@@ -284,7 +284,8 @@ describe('/cot slash command, SQLite v12 migration, and turn-runner event forwar
         runTurn: vi.fn(async () => ''),
       }
 
-      // P2P: turn on bot default
+      // P2P: turn on bot default (also automatically turns off longTurnProgressNotice)
+      expect(store.getBot('cot-bot')?.longTurnProgressNotice).toBe(true)
       await handleSlashCommand(deps, {
         bot,
         chatType: 'p2p',
@@ -300,7 +301,17 @@ describe('/cot slash command, SQLite v12 migration, and turn-runner event forwar
         },
       })
       expect(store.getBot('cot-bot')?.cotEnabled).toBe(true)
+      expect(store.getBot('cot-bot')?.longTurnProgressNotice).toBe(false)
       expect(replies.at(-1)).toContain('已开启')
+      expect(replies.at(-1)).toContain('已自动关闭长任务进度提示')
+
+      // Direct store upsert with cotEnabled=true also normalizes longTurnProgressNotice=false
+      const normalizedBot = store.upsertBot({
+        ...store.getBot('cot-bot')!,
+        cotEnabled: true,
+        longTurnProgressNotice: true,
+      })
+      expect(normalizedBot.longTurnProgressNotice).toBe(false)
 
       // Group: non-admin cannot toggle
       const nonAdminReplies: string[] = []

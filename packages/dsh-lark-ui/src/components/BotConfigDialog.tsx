@@ -196,7 +196,7 @@ function toBotConfig(record: BotRecord): BotConfig {
     adminUserProfiles: cloned.adminUserProfiles ?? [],
     cotEnabled: cloned.cotEnabled ?? false,
     cotToolResultEnabled: cloned.cotToolResultEnabled ?? true,
-    longTurnProgressNotice: cloned.longTurnProgressNotice ?? true,
+    longTurnProgressNotice: cloned.cotEnabled ? false : (cloned.longTurnProgressNotice ?? true),
     longTurnNoticeDelaySeconds:
       cloned.longTurnNoticeDelaySeconds ?? DEFAULT_LONG_TURN_NOTICE_DELAY_SECONDS,
     longTurnNoticeText: cloned.longTurnNoticeText ?? DEFAULT_LONG_TURN_NOTICE_TEXT,
@@ -1312,7 +1312,13 @@ function BotConversationAndMessageSection({
         <Switch
           label="展示思考过程"
           checked={Boolean(draft.cotEnabled)}
-          onChange={(cotEnabled) => patch({ cotEnabled })}
+          onChange={(cotEnabled) =>
+            patch(
+              cotEnabled
+                ? { cotEnabled: true, longTurnProgressNotice: false }
+                : { cotEnabled: false },
+            )
+          }
         />
       </SettingRow>
       {Boolean(draft.cotEnabled) && (
@@ -1338,15 +1344,20 @@ function BotConversationAndMessageSection({
       </SettingRow>
       <SettingRow
         title="长任务进度提示"
-        desc="排队等待或处理耗时较长时自动补发一条简短提示，避免长时间无回应"
+        desc={
+          draft.cotEnabled
+            ? '开启展示思考过程后自动关闭，避免重复提示'
+            : '排队等待或处理耗时较长时自动补发一条简短提示，避免长时间无回应'
+        }
       >
         <Switch
           label="长任务进度提示"
-          checked={draft.longTurnProgressNotice !== false}
+          checked={!draft.cotEnabled && draft.longTurnProgressNotice !== false}
+          disabled={Boolean(draft.cotEnabled)}
           onChange={(longTurnProgressNotice) => patch({ longTurnProgressNotice })}
         />
       </SettingRow>
-      {draft.longTurnProgressNotice !== false && (
+      {!draft.cotEnabled && draft.longTurnProgressNotice !== false && (
         <NestedSettings>
           <SettingRow
             title="触发等待时长"
