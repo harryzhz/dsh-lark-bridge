@@ -45,7 +45,11 @@ import {
 import { assertExistingWorkingDirectory } from './fs-browser.js'
 import type { MemoryService } from './memory-service.js'
 import type { RuntimeCatalog } from './runtime-catalog.js'
-import type { ConcurrencyLease, RuntimeConcurrencyLimiter } from './runtime-concurrency.js'
+import {
+  buildRuntimeConcurrencyKey,
+  type ConcurrencyLease,
+  type RuntimeConcurrencyLimiter,
+} from './runtime-concurrency.js'
 import type { LarkBridgeStore } from './store.js'
 import { LARK_ORIGIN_RECORD_TYPE, type LarkOriginRecord } from './types.js'
 import type { WorkspaceGrouping } from './workspace-grouping.js'
@@ -866,12 +870,16 @@ export class ProactiveReminderService {
         summary: `提醒事项「${item.title}」开始执行`,
       })
 
+      const concurrencyKey =
+        typeof this.host.runtimes.resolveConcurrencyKey === 'function'
+          ? this.host.runtimes.resolveConcurrencyKey(runtime.agentPreset, runtime.runtimeProfileId)
+          : buildRuntimeConcurrencyKey(runtime.agentPreset, runtime.runtimeProfileId)
       const completion = this.finishReminderExecution({
         item: runningItem,
         bot,
         handle,
         sessionId,
-        runtimeKey: runtime.agentPreset,
+        runtimeKey: concurrencyKey,
         prompt,
         startedMs,
       })

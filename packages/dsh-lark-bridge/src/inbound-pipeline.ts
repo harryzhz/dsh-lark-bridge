@@ -50,7 +50,11 @@ import {
 } from './media-intake.js'
 import type { MemoryService } from './memory-service.js'
 import type { RuntimeCatalog } from './runtime-catalog.js'
-import type { ConcurrencyLease, RuntimeConcurrencyLimiter } from './runtime-concurrency.js'
+import {
+  buildRuntimeConcurrencyKey,
+  type ConcurrencyLease,
+  type RuntimeConcurrencyLimiter,
+} from './runtime-concurrency.js'
 import {
   bindingHasNativeThread,
   type AcquiredAgent,
@@ -2644,8 +2648,18 @@ export class InboundPipeline {
           queueWaitPhase = 'runtime'
           const limiterSignal = linkAbortSignals([this.host.shutdownSignal, linkedCancel.signal])
           try {
+            const concurrencyKey =
+              typeof this.host.runtimes.resolveConcurrencyKey === 'function'
+                ? this.host.runtimes.resolveConcurrencyKey(
+                    effectiveDecision.agentPreset,
+                    effectiveDecision.runtimeProfileId,
+                  )
+                : buildRuntimeConcurrencyKey(
+                    effectiveDecision.agentPreset,
+                    effectiveDecision.runtimeProfileId,
+                  )
             runtimeLease = await this.host.runtimeLimiter.acquire({
-              runtimeKey: effectiveDecision.agentPreset,
+              runtimeKey: concurrencyKey,
               priority: effectiveDecision.trigger === 'listener' ? 'background' : 'interactive',
               signal: limiterSignal.signal,
               isAborted: () => isBatchCancelled() || this.host.isDisposed(),

@@ -31,6 +31,7 @@ import type {
   QrJobView,
   ReminderItem,
   RuntimeCatalogPayload,
+  RuntimeConcurrencyConfig,
   RuntimeOption,
   RuntimeProfileInput,
   RuntimeProfileSummary,
@@ -139,12 +140,27 @@ export const bridgeApi = {
   events: async (limit = 120) => (await request<{ events: AuditEvent[] }>(`/events?limit=${limit}`)).events,
   runtimes: async () => (await request<{ runtimes: RuntimeOption[] }>('/runtimes')).runtimes,
   runtimeCatalog: async (): Promise<RuntimeCatalogPayload> => {
-    const res = await request<{ runtimes?: RuntimeOption[]; exposedPresets?: ExposedRuntimePreset[] }>('/runtimes')
+    const res = await request<{
+      runtimes?: RuntimeOption[]
+      exposedPresets?: ExposedRuntimePreset[]
+      concurrency?: RuntimeConcurrencyConfig
+    }>('/runtimes')
     return {
       runtimes: res.runtimes ?? [],
       exposedPresets: res.exposedPresets ?? [],
+      ...(res.concurrency ? { concurrency: res.concurrency } : {}),
     }
   },
+  setRuntimeConcurrency: async (input: {
+    runtimeId: string
+    profileId?: string
+    maxConcurrent: number | null
+  }) =>
+    put<{ runtimeKey: string; concurrency: RuntimeConcurrencyConfig }>('/runtimes/concurrency', {
+      runtimeId: input.runtimeId,
+      ...(input.profileId ? { profileId: input.profileId } : {}),
+      maxConcurrent: input.maxConcurrent,
+    }),
   models: async () => (await request<{ groups: ModelGroup[] }>('/models')).groups,
   profileModels: async (runtimeId: string, profileId?: string, refresh = false) => {
     const params = new URLSearchParams({ runtimeId })

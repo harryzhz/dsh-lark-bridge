@@ -4,6 +4,7 @@ import { brandString } from '@deepseek-ai/dsh-brand'
 import type { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { appendPluginRecord, type Session } from '@deepseek-ai/dsh-session'
 import { resolveHostAgentPresets } from './hot-reload-handoff.js'
+import { buildRuntimeConcurrencyKey } from './runtime-concurrency.js'
 
 /**
  * Session plugin record consumed by `dsh-external-agents` to bind a session
@@ -248,6 +249,26 @@ export class RuntimeCatalog {
   /** Provider id that owns a preset's model catalog; undefined for native presets. */
   providerFor(presetId: string): string | undefined {
     return this.directory()?.get(presetId)?.providerId
+  }
+
+  /**
+   * Resolve the canonical concurrency pool key for `(agentPreset, runtimeProfileId)`.
+   * Exposed external presets (e.g. a profile synced as a standalone DSH preset) map
+   * back to `<runtimeId>::<profileId>` so both selection paths share one pool and limit.
+   */
+  resolveConcurrencyKey(agentPreset?: string, runtimeProfileId?: string): string {
+    const cleanPreset = agentPreset?.trim() ?? ''
+    const cleanProfile = runtimeProfileId?.trim() ?? ''
+    if (cleanProfile) {
+      return buildRuntimeConcurrencyKey(cleanPreset, cleanProfile)
+    }
+    if (cleanPreset) {
+      const exposed = this.listExposedPresets().find((p) => p.presetId === cleanPreset)
+      if (exposed) {
+        return buildRuntimeConcurrencyKey(exposed.runtimeId, exposed.profileId)
+      }
+    }
+    return buildRuntimeConcurrencyKey(cleanPreset)
   }
 
   /** Whether a provider id belongs to an external CLI runtime rather than a native DSH LLM adapter. */

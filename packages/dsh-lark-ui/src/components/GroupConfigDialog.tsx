@@ -35,10 +35,12 @@ import type {
   GroupView,
   ListenerTemplate,
   ModelGroup,
+  RuntimeConcurrencyConfig,
   RuntimeOption,
   TriageDefaultsPayload,
 } from '../types.js'
 import { AgentRuntimeFields } from './AgentRuntimeFields.js'
+import { resolveRuntimeConcurrencyState } from './RuntimeConcurrencyField.js'
 import { ConfigDialog, type ConfigSection } from './ConfigDialog.js'
 import { DirectoryField, DirectoryPickerPanel } from './DirectoryPickerModal.js'
 import {
@@ -113,6 +115,7 @@ export function GroupConfigDialog({
   target,
   bots,
   runtimes,
+  runtimeConcurrency,
   models,
   listenerTemplates,
   triageDefaults,
@@ -123,6 +126,7 @@ export function GroupConfigDialog({
   target: GroupView | null
   bots: readonly BotRecord[]
   runtimes: readonly RuntimeOption[]
+  runtimeConcurrency?: RuntimeConcurrencyConfig
   models: readonly ModelGroup[]
   listenerTemplates: readonly ListenerTemplate[]
   triageDefaults?: TriageDefaultsPayload
@@ -132,6 +136,7 @@ export function GroupConfigDialog({
 }) {
   const [section, setSection] = useState<Section>('basic')
   const [draft, setDraft] = useState<GroupConfig | null>(null)
+  const [concurrencyDraft, setConcurrencyDraft] = useState<number | null | undefined>(undefined)
   const [members, setMembers] = useState<ChatMemberItem[]>([])
   const [loadingMembers, setLoadingMembers] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -143,6 +148,7 @@ export function GroupConfigDialog({
   useEffect(() => {
     if (!target) return
     setDraft(structuredClone(target.config))
+    setConcurrencyDraft(undefined)
     setSection('basic')
     setProfileView(null)
     setDirPickerOpen(false)
@@ -193,6 +199,7 @@ export function GroupConfigDialog({
     : '跟随智能体默认运行时'
 
   const switchRuntimeMode = (nextMode: 'inherit' | 'override') => {
+    setConcurrencyDraft(undefined)
     if (nextMode === 'inherit') {
       patch({
         runtimeMode: 'inherit',
@@ -264,6 +271,22 @@ export function GroupConfigDialog({
               model: '',
               reasoningEffort: '',
             }
+      if (runtimeMode === 'override' && concurrencyDraft !== undefined && overridePreset.trim()) {
+        const trimmedProfileId = draft.runtimeProfileId?.trim() || undefined
+        const savedConcurrency = resolveRuntimeConcurrencyState(
+          runtimeConcurrency,
+          overridePreset,
+          trimmedProfileId,
+        ).customLimit
+        if (concurrencyDraft !== savedConcurrency) {
+          await bridgeApi.setRuntimeConcurrency({
+            runtimeId: overridePreset.trim(),
+            ...(trimmedProfileId ? { profileId: trimmedProfileId } : {}),
+            maxConcurrent: concurrencyDraft,
+          })
+          await onProfilesChanged?.()
+        }
+      }
       await onSave(savedDraft)
       onClose()
     } catch (err) {
@@ -295,11 +318,13 @@ export function GroupConfigDialog({
                 <RuntimeProfilePanel
                   runtime={profileViewRuntime}
                   initialProfileId={profileView?.initialProfileId}
+                  concurrency={runtimeConcurrency}
                   backLabel="Agent 运行时"
                   onBack={() => setProfileView(null)}
                   onClose={onClose}
                   onChanged={async (nextProfileId) => {
                     setProfileRevision((v) => v + 1)
+                    setConcurrencyDraft(undefined)
                     await onProfilesChanged?.()
                     if (nextProfileId !== undefined) {
                       const changed = nextProfileId !== (draft.runtimeProfileId ?? '')
@@ -393,20 +418,30 @@ export function GroupConfigDialog({
               }}
               runtimes={runtimes}
               models={models}
+              concurrency={runtimeConcurrency}
+              concurrencyDraft={concurrencyDraft}
+              onConcurrencyChange={setConcurrencyDraft}
               profileRevision={profileRevision}
               onProfilesChanged={onProfilesChanged}
               onManageProfiles={(rt, pid) =>
                 setProfileView({ runtimeId: rt.id, ...(pid ? { initialProfileId: pid } : {}) })
               }
-              onChange={({ agentPreset, runtimeProfileId, model, reasoningEffort }) =>
+              onChange={({ agentPreset, runtimeProfileId, model, reasoningEffort }) => {
+                const nextProfileId = runtimeProfileId?.trim() ?? ''
+                if (
+                  agentPreset !== overridePreset ||
+                  nextProfileId !== (draft.runtimeProfileId?.trim() ?? '')
+                ) {
+                  setConcurrencyDraft(undefined)
+                }
                 patch({
                   runtimeMode: 'override',
                   agentPreset,
-                  runtimeProfileId: runtimeProfileId?.trim() ?? '',
+                  runtimeProfileId: nextProfileId,
                   model,
                   reasoningEffort,
                 })
-              }
+              }}
             />
           )}
 

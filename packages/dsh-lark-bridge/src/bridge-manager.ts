@@ -58,6 +58,8 @@ import { RuntimeCatalog } from './runtime-catalog.js'
 import {
   DEFAULT_MAX_CONCURRENT_TURNS_PER_RUNTIME,
   RuntimeConcurrencyLimiter,
+  parseRuntimeConcurrencyLimit,
+  type RuntimeConcurrencyConfigSnapshot,
 } from './runtime-concurrency.js'
 import { ScheduleNotifier, type ScheduleCreateInputLike } from './schedule-notifier.js'
 import { SessionCoordinator } from './session-coordinator.js'
@@ -207,8 +209,13 @@ export class LarkBridgeManager {
       disposeReminderHandle: (sessionId) => this.reminders.disposeSessionHandle(sessionId),
     })
 
+    const persistedConcurrencyLimits =
+      typeof store.getRuntimeConcurrencyLimits === 'function'
+        ? store.getRuntimeConcurrencyLimits()
+        : undefined
     this.runtimeLimiter = new RuntimeConcurrencyLimiter(
       config.maxConcurrentTurnsPerRuntime ?? DEFAULT_MAX_CONCURRENT_TURNS_PER_RUNTIME,
+      persistedConcurrencyLimits,
     )
 
     this.titleGuard = new SessionTitleGuard(ctx, store, this.workspaces, (sid) =>
@@ -718,6 +725,40 @@ export class LarkBridgeManager {
 
   recordApiTiming(route: string, durationMs: number): void {
     this.observability.recordApiTiming(route, durationMs)
+  }
+
+  getRuntimeConcurrencyConfig(): RuntimeConcurrencyConfigSnapshot {
+    return this.runtimeLimiter.getConfigSnapshot()
+  }
+
+  /**
+   * Persist and hot-apply a concurrency limit override for a runtime or launch profile.
+   * Passing `maxConcurrent: null` removes the override so it inherits parent/default.
+   */
+  setRuntimeConcurrencyLimit(input: {
+    readonly runtimeId: string
+    readonly profileId?: string
+    readonly maxConcurrent: number | null
+  }): { readonly runtimeKey: string; readonly concurrency: RuntimeConcurrencyConfigSnapshot } {
+    const cleanRuntimeId = input.runtimeId.trim()
+    if (!cleanRuntimeId) {
+      throw new Error('runtimeId is required')
+    }
+    if (cleanRuntimeId.includes('::')) {
+      throw new Error('runtimeId must not contain "::"')
+    }
+    const cleanProfileId = input.profileId?.trim() || undefined
+    if (cleanProfileId?.includes('::')) {
+      throw new Error('profileId must not contain "::"')
+    }
+    const parsedLimit = parseRuntimeConcurrencyLimit(input.maxConcurrent)
+    const runtimeKey = this.runtimes.resolveConcurrencyKey(cleanRuntimeId, cleanProfileId)
+    this.store.setRuntimeConcurrencyLimit?.(runtimeKey, parsedLimit)
+    this.runtimeLimiter.setOverride(runtimeKey, parsedLimit)
+    return {
+      runtimeKey,
+      concurrency: this.runtimeLimiter.getConfigSnapshot(),
+    }
   }
 
   clearSplitBrainAlert(botId: string): boolean {

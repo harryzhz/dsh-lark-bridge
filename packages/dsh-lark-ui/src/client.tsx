@@ -462,6 +462,7 @@ function LarkBridgePage() {
         target={editingBot}
         bots={data.bots}
         runtimes={data.runtimes}
+        runtimeConcurrency={data.runtimeConcurrency}
         models={data.models}
         triageDefaults={data.triageDefaults}
         auth={data.auth}
@@ -499,6 +500,7 @@ function LarkBridgePage() {
         target={editingGroup}
         bots={data.bots}
         runtimes={data.runtimes}
+        runtimeConcurrency={data.runtimeConcurrency}
         models={data.models}
         listenerTemplates={data.listenerTemplates}
         triageDefaults={data.triageDefaults}

@@ -253,6 +253,11 @@ describe('RuntimeCatalog, HTTP API, Slash Commands & ScheduleNotifier profile su
     expect(agyOpt?.profileCapabilities?.supportsConfigFile).toBe(true)
     expect(catalog.listExposedPresets().map((p) => p.presetId)).toEqual(['agy:demo-proxy'])
 
+    // Exposed presets and explicit (runtimeId, profileId) normalize to the same concurrency pool key
+    expect(catalog.resolveConcurrencyKey('agy', 'demo-proxy')).toBe('agy::demo-proxy')
+    expect(catalog.resolveConcurrencyKey('agy:demo-proxy')).toBe('agy::demo-proxy')
+    expect(catalog.resolveConcurrencyKey('codex')).toBe('codex')
+
     const launch = await catalog.resolveAgentLaunch({
       agentPreset: 'agy',
       runtimeProfileId: 'demo-proxy',

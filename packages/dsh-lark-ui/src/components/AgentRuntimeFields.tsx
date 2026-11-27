@@ -4,6 +4,7 @@ import { bridgeApi } from '../api.js'
 import type {
   CatalogModelItem,
   ModelGroup,
+  RuntimeConcurrencyConfig,
   RuntimeOption,
   RuntimeProfileSummary,
 } from '../types.js'
@@ -16,6 +17,10 @@ import {
   reasoningEffortOptions,
   runtimeOptions,
 } from './options.js'
+import {
+  RuntimeConcurrencyField,
+  resolveRuntimeConcurrencyState,
+} from './RuntimeConcurrencyField.js'
 import { RuntimeProfileDialog } from './RuntimeProfileDialog.js'
 
 export interface AgentRuntimeSelection {
@@ -76,9 +81,12 @@ export function AgentRuntimeFields({
   value,
   runtimes,
   models,
+  concurrency,
+  concurrencyDraft,
   disabled,
   profileRevision = 0,
   onChange,
+  onConcurrencyChange,
   onProfilesChanged,
   onManageProfiles,
 }: {
@@ -86,9 +94,13 @@ export function AgentRuntimeFields({
   value: AgentRuntimeSelection
   runtimes: readonly RuntimeOption[]
   models: readonly ModelGroup[]
+  concurrency?: RuntimeConcurrencyConfig
+  /** Pending draft override for the currently selected `(runtime, profile)`; `undefined` = untouched. */
+  concurrencyDraft?: number | null | undefined
   disabled?: boolean
   profileRevision?: number
   onChange: (next: AgentRuntimeSelection) => void
+  onConcurrencyChange?: (next: number | null) => void
   onProfilesChanged?: () => Promise<void>
   onManageProfiles?: (runtime: RuntimeOption, initialProfileId?: string) => void
 }) {
@@ -164,6 +176,14 @@ export function AgentRuntimeFields({
     effectiveModels,
     normalized.model,
     normalized.reasoningEffort,
+  )
+
+  const concurrencyState = useMemo(
+    () =>
+      concurrency && runtime
+        ? resolveRuntimeConcurrencyState(concurrency, runtime.id, activeProfileId || undefined)
+        : undefined,
+    [concurrency, runtime, activeProfileId],
   )
 
   return (
@@ -313,11 +333,25 @@ export function AgentRuntimeFields({
         />
       </SettingRow>
 
+      {concurrencyState && runtime && onConcurrencyChange && (
+        <RuntimeConcurrencyField
+          runtimeName={runtime.name}
+          profileName={activeProfile?.name || activeProfileId || undefined}
+          isProfile={concurrencyState.isProfile}
+          inheritedLimit={concurrencyState.inheritedLimit}
+          maxLimit={concurrencyState.maxLimit}
+          value={concurrencyDraft !== undefined ? concurrencyDraft : concurrencyState.customLimit}
+          disabled={disabled}
+          onChange={onConcurrencyChange}
+        />
+      )}
+
       {showProfileRow && runtime && !onManageProfiles && (
         <RuntimeProfileDialog
           open={manageOpen}
           runtime={runtime}
           initialProfileId={activeProfileId || undefined}
+          concurrency={concurrency}
           onClose={() => setManageOpen(false)}
           onChanged={async (nextProfileId) => {
             setProfileCatalogs((prev) => {

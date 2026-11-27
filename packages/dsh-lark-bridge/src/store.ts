@@ -256,6 +256,14 @@ export class LarkBridgeStore {
     return this.configRepo.deleteScheduleBinding(scheduleId)
   }
 
+  getRuntimeConcurrencyLimits(): Record<string, number> {
+    return this.configRepo.getRuntimeConcurrencyLimits()
+  }
+
+  setRuntimeConcurrencyLimit(runtimeKey: string, limit: number | null): Record<string, number> {
+    return this.configRepo.setRuntimeConcurrencyLimit(runtimeKey, limit)
+  }
+
   // ── Runtime State (Bindings, Sessions, Dreaming, Reminders, Pending) ─────
 
   listBindings(): LarkSessionBinding[] {
