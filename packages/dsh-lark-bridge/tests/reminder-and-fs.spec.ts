@@ -1382,4 +1382,121 @@ describe('Local directory picker HTTP API & lark-bridge worktree CLI', () => {
     expect(promptWithMemory).not.toContain('其他群专属机密流程')
     expect(promptWithMemory).not.toContain('温和')
   })
+
+  it('keeps in-flight reminders running for startup recovery when shutdownSignal aborts before reminders.stop()', async () => {
+    const dataDir = makeTempDir()
+    const workDir = makeTempDir()
+    const store = new LarkBridgeStore(dataDir)
+
+    store.upsertBot({
+      id: 'ops-bot',
+      name: 'OpsBot',
+      enabled: true,
+      larkAppId: 'cli_ops_1',
+      larkAppSecret: 'sec_test',
+      defaultWorkingDir: workDir,
+    })
+    store.upsertGroup({
+      botId: 'ops-bot',
+      chatId: 'oc_ops_shutdown',
+      chatName: '值班告警群',
+      enabled: true,
+    })
+
+    const shutdownController = new AbortController()
+    let turnStarted!: () => void
+    const turnStartedPromise = new Promise<void>((resolve) => {
+      turnStarted = resolve
+    })
+
+    const fakeCtx = {
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      agents: {
+        create: vi.fn(async ({ sessionId, setup }: { sessionId: string; setup?: (c: unknown, a: unknown) => void }) => {
+          const agent = { session: { id: sessionId, header: { cwd: workDir, agentPreset: 'codex' } } }
+          setup?.({}, agent)
+          return { agent, dispose: vi.fn().mockResolvedValue(undefined) }
+        }),
+      },
+      get: () => undefined,
+    } as unknown as Context
+
+    const runtimes = {
+      resolveAgentLaunch: vi.fn(async () => ({
+        provider: 'codex-cli',
+        model: 'gpt-6.1-sol',
+        mountPreset: vi.fn(async () => {}),
+      })),
+    } as unknown as RuntimeCatalog
+
+    const workspaces = {
+      resolveBotWorkspaceName: () => 'OpsBot',
+      resolveGroupWorkspaceName: () => 'OpsBot / 值班告警群',
+      attachSession: vi.fn(async () => {}),
+    } as unknown as WorkspaceGrouping
+
+    const reminders = new ProactiveReminderService({
+      ctx: fakeCtx,
+      store,
+      runtimes,
+      workspaces,
+      shutdownSignal: shutdownController.signal,
+      resolveMemberName: async () => undefined,
+      runTurn: () =>
+        new Promise<string>((_resolve, reject) => {
+          turnStarted()
+          shutdownController.signal.addEventListener(
+            'abort',
+            () => reject(new Error('本轮执行因服务重载或停机已中断')),
+            { once: true },
+          )
+        }),
+      sendOriginCard: vi.fn(async () => 'om_card'),
+      patchOriginCard: vi.fn(async () => {}),
+      deliverReminderOutput: vi.fn(async () => ({ messageIds: [] })),
+    })
+
+    const item = await reminders.create({
+      botId: 'ops-bot',
+      chatId: 'oc_ops_shutdown',
+      title: '热更新期间在途复查提醒',
+      prompt: '检查告警是否恢复',
+      mentions: [{ openId: 'ou_ops_1', name: 'Alex' }],
+      afterSeconds: 300,
+    })
+
+    // Start execution, wait until runTurn is in-flight, then abort shutdownSignal BEFORE stop()
+    const runPromise = reminders.runNow(item.id)
+    await turnStartedPromise
+    expect(store.getReminder(item.id)?.status).toBe('running')
+
+    reminders.prepareShutdown()
+    shutdownController.abort()
+    await runPromise
+    await reminders.stop()
+
+    // Reminder must remain `running` with no false error event so next instance retries it
+    expect(store.getReminder(item.id)?.status).toBe('running')
+    expect(store.getReminder(item.id)?.resolution).toBeUndefined()
+    expect(store.listEvents(20).some((e) => e.kind === 'error' && e.summary.includes('热更新期间在途复查提醒'))).toBe(false)
+
+    // Simulated restarted instance recovers the stale running reminder cleanly
+    const restarted = new ProactiveReminderService({
+      ctx: fakeCtx,
+      store,
+      runtimes,
+      workspaces,
+      resolveMemberName: async () => undefined,
+      runTurn: async () => REMINDER_SILENT_SENTINEL,
+      sendOriginCard: vi.fn(async () => 'om_card'),
+      patchOriginCard: vi.fn(async () => {}),
+      deliverReminderOutput: vi.fn(async () => ({ messageIds: [] })),
+    })
+    const recovered = await restarted.recoverStaleRunningReminders()
+    expect(recovered).toBe(1)
+    expect(store.getReminder(item.id)).toMatchObject({
+      status: 'scheduled',
+      retryCount: 1,
+    })
+  })
 })

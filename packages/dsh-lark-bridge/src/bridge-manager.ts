@@ -669,13 +669,17 @@ export class LarkBridgeManager {
     //    `dsh-lark-bridge` hot-reload swap, active host agents are kept alive for
     //    seamless event-stream reattachment by the reloaded instance.
     await this.inbound.suspendActiveTurnsForShutdown({ preserveLiveAgents })
+    // Mark background proactive services as stopping BEFORE aborting `shutdownController`
+    // so in-flight reminders interrupted by the abort stay `running` for startup recovery
+    // instead of racing into `archived/error` before `reminders.stop()` runs.
+    this.reminders.prepareShutdown()
+    this.dreaming.stop()
     this.runtimeLimiter.dispose()
     this.shutdownController.abort()
     this.sessionHandoff.dispose()
     this.consoleLogin.dispose()
     this.sessionViewer.dispose()
     this.schedules.stop()
-    this.dreaming.stop()
     while (this.disposers.length > 0) {
       this.disposers.pop()?.()
     }
