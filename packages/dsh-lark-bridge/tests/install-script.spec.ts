@@ -240,10 +240,16 @@ describe('one-click install scripts (install.sh & install.ps1)', () => {
       'harryzhz-dsh-external-agents-',
       'dsh-lark-bridge.tgz',
       'dsh-external-agents.tgz',
+      'DSH_WEB_HOST',
+      '@deepseek-ai/dsh-host-webserver',
+      'networkInterfaces',
+      '169.254.',
     ]) {
       expect(sh).toContain(token)
       expect(ps1).toContain(token)
     }
+    expect(sh).toContain('--web-host')
+    expect(ps1).toContain('$WebHost')
 
     expect(sh).toContain('https://download.deepseek.com/desktop/dsh-latest-macos-arm64.dmg')
     expect(sh).toContain('https://download.deepseek.com/desktop/dsh-latest-macos-x64.dmg')
@@ -256,6 +262,7 @@ describe('one-click install scripts (install.sh & install.ps1)', () => {
     const help = spawnSync('bash', [installShPath, '--help'], { encoding: 'utf8' })
     expect(help.status).toBe(0)
     expect(help.stdout).toContain('--mode <auto|web|app|both>')
+    expect(help.stdout).toContain('--web-host <auto|loopback|IP>')
     expect(help.stdout).toContain('--without-external-agents')
 
     const badMode = spawnSync('bash', [installShPath, '--mode', 'invalid'], { encoding: 'utf8' })
@@ -265,6 +272,14 @@ describe('one-click install scripts (install.sh & install.ps1)', () => {
     const badProfile = spawnSync('bash', [installShPath, '--profile', 'desktop'], { encoding: 'utf8' })
     expect(badProfile.status).not.toBe(0)
     expect(badProfile.stderr).toContain('desktop')
+
+    for (const invalidHost of ['0.0.0.0', '::', 'localhost', 'example.com', '192.0.2.10:3880', '999.1.1.1']) {
+      const badHost = spawnSync('bash', [installShPath, '--web-host', invalidHost, '--dry-run'], {
+        encoding: 'utf8',
+      })
+      expect(badHost.status, `expected ${invalidHost} to be rejected`).not.toBe(0)
+      expect(badHost.stderr).toContain('无效的 --web-host 值')
+    }
   })
 
   it('enforces SemVer 2.0.0 prerelease comparisons accurately', () => {
@@ -527,5 +542,249 @@ ensure_profile_pnpm_allow_builds ${JSON.stringify(p3)}
 
     const out3 = readFileSync(join(p3, 'pnpm-workspace.yaml'), 'utf8')
     expect(out3).toBe(orig3)
+  })
+
+  it(
+    'configures web profile cordis.patch.yml to bind local LAN IPv4 by default while preserving existing patches and desktop loopback',
+    { timeout: 20_000 },
+    () => {
+      const sb = createBaseSandbox({
+        unameS: 'Darwin',
+        unameM: 'arm64',
+        pnpmVer: '10.12.0',
+        dshVer: '0.2.2-rc.5',
+        appVer: '0.2.2-rc.5',
+        initDesktopProfile: true,
+      })
+
+      // Pre-seed web profile with DSH's default empty array template and desktop with untouched file
+      const webPatch = join(sb.dshHome, 'profiles/web/cordis.patch.yml')
+      const deskPatch = join(sb.dshHome, 'profiles/desktop/cordis.patch.yml')
+      mkdirSync(dirname(webPatch), { recursive: true })
+      writeFileSync(
+        webPatch,
+        '# Your patch layer for this dsh profile, applied after every bundle layer:\n[]\n',
+      )
+      writeFileSync(deskPatch, '# Desktop patch\n[]\n')
+
+      // 1. Dry-run must not modify cordis.patch.yml
+      const dry = spawnSync(
+        'bash',
+        [
+          installShPath,
+          '--mode',
+          'web',
+          '--yes',
+          '--dry-run',
+          '--bridge-version',
+          '0.4.16',
+          '--external-agents-version',
+          '0.4.3',
+        ],
+        { env: sb.env, encoding: 'utf8' },
+      )
+      expect(dry.status, dry.stderr + dry.stdout).toBe(0)
+      expect(dry.stdout).toContain('配置 Web 默认绑定本机局域网 IPv4')
+      expect(readFileSync(webPatch, 'utf8')).toContain('[]')
+
+      // 2. Real both-mode install configures web profile (replacing `[]`) and NEVER touches desktop profile
+      const first = spawnSync(
+        'bash',
+        [
+          installShPath,
+          '--mode',
+          'both',
+          '--yes',
+          '--no-launch',
+          '--bridge-version',
+          '0.4.16',
+          '--external-agents-version',
+          '0.4.3',
+        ],
+        { env: sb.env, encoding: 'utf8' },
+      )
+      expect(first.status, first.stderr + first.stdout).toBe(0)
+      expect(readFileSync(deskPatch, 'utf8')).toBe('# Desktop patch\n[]\n')
+
+      const patched1 = readFileSync(webPatch, 'utf8')
+      expect(patched1).not.toMatch(/^\[\]$/m)
+      expect(patched1).toContain('- id: webserver')
+      expect(patched1).toContain("name: '@deepseek-ai/dsh-host-webserver'")
+      expect(patched1).toContain('ctx.webStartup.host ?? (() => {')
+      expect(patched1).toContain('port: !!js ctx.webStartup.port ?? 3080')
+    },
+  )
+
+  it(
+    'preserves custom webserver patch on idempotent re-run and updates cleanly on explicit --web-host',
+    { timeout: 30_000 },
+    () => {
+      const sb = createBaseSandbox({
+        unameS: 'Linux',
+        unameM: 'x86_64',
+        pnpmVer: '10.12.0',
+        dshVer: '0.2.2-rc.5',
+      })
+      const webPatch = join(sb.dshHome, 'profiles/web/cordis.patch.yml')
+      mkdirSync(dirname(webPatch), { recursive: true })
+
+      // 1. User has custom webserver + sibling entries; idempotent re-run preserves all of them
+      writeFileSync(
+        webPatch,
+        [
+          '# User header',
+          '- id: agent-default-model',
+          '  config:',
+          '    model: custom-model',
+          '',
+          '# User custom webserver',
+          '- id: webserver',
+          "  name: '@deepseek-ai/dsh-host-webserver'",
+          '  config:',
+          "    host: !!js ctx.webStartup.host ?? '198.51.100.7'",
+          '    port: !!js ctx.webStartup.port ?? 3880',
+          '    tls: !!js ctx.webStartup.tls',
+          '',
+          '- id: ui-settings-general',
+          '  config:',
+          '    welcomeNoticeVersion: 2026-09-28.1',
+          '',
+        ].join('\n'),
+      )
+
+      const rerun = spawnSync(
+        'bash',
+        [
+          installShPath,
+          '--mode',
+          'web',
+          '--yes',
+          '--bridge-version',
+          '0.4.16',
+          '--external-agents-version',
+          '0.4.3',
+        ],
+        { env: sb.env, encoding: 'utf8' },
+      )
+      expect(rerun.status, rerun.stderr + rerun.stdout).toBe(0)
+      expect(rerun.stdout).toContain('保留现有设置')
+      expect(readFileSync(webPatch, 'utf8')).toContain('198.51.100.7')
+
+      // 2. Explicit --web-host replaces only the webserver entry and keeps sibling entries intact
+      const override = spawnSync(
+        'bash',
+        [
+          installShPath,
+          '--mode',
+          'web',
+          '--yes',
+          '--web-host',
+          '192.0.2.10',
+          '--bridge-version',
+          '0.4.16',
+          '--external-agents-version',
+          '0.4.3',
+        ],
+        { env: sb.env, encoding: 'utf8' },
+      )
+      expect(override.status, override.stderr + override.stdout).toBe(0)
+      const patchedOverride = readFileSync(webPatch, 'utf8')
+      expect(patchedOverride).toContain('- id: agent-default-model')
+      expect(patchedOverride).toContain('model: custom-model')
+      expect(patchedOverride).toContain('- id: ui-settings-general')
+      expect(patchedOverride).not.toContain('198.51.100.7')
+      expect(patchedOverride).toContain("host: !!js ctx.webStartup.host ?? '192.0.2.10'")
+      expect(patchedOverride.match(/^- id: webserver$/gm)).toHaveLength(1)
+
+      // 3. Explicit --web-host loopback switches cleanly to 127.0.0.1
+      const loopback = spawnSync(
+        'bash',
+        [
+          installShPath,
+          '--mode',
+          'web',
+          '--yes',
+          '--web-host',
+          'loopback',
+          '--bridge-version',
+          '0.4.16',
+          '--external-agents-version',
+          '0.4.3',
+        ],
+        { env: sb.env, encoding: 'utf8' },
+      )
+      expect(loopback.status, loopback.stderr + loopback.stdout).toBe(0)
+      const patchedLoopback = readFileSync(webPatch, 'utf8')
+      expect(patchedLoopback).toContain("host: !!js ctx.webStartup.host ?? '127.0.0.1'")
+      expect(patchedLoopback).toContain('- id: agent-default-model')
+      expect(patchedLoopback.match(/^- id: webserver$/gm)).toHaveLength(1)
+    },
+  )
+
+  it('generated auto web host !!js expression prioritizes physical LAN IPv4, respects --host, and falls back to 127.0.0.1', () => {
+    const sh = readFileSync(installShPath, 'utf8').replace(/\nmain "\$@"\s*$/, '\n')
+    const rendered = execFileSync('bash', ['-c', `${sh}\nrender_webserver_patch_block auto\n`], {
+      encoding: 'utf8',
+    })
+    const exprMatch = rendered.match(/host: !!js \|-\n((?:      .*\n)+)/)
+    expect(exprMatch, rendered).toBeTruthy()
+    const expr = exprMatch![1]
+      .split('\n')
+      .map((line) => line.replace(/^      /, ''))
+      .join('\n')
+      .trim()
+
+    const evalHost = (
+      cliHost: string | undefined,
+      ifaces: Record<string, Array<{ family: string | number; internal: boolean; address: string }>>,
+    ): string => {
+      const fakeProcess = {
+        getBuiltinModule: (id: string) =>
+          id === 'node:os' ? { networkInterfaces: () => ifaces } : undefined,
+      }
+      const fn = new Function('ctx', 'process', `return (${expr})`) as (
+        ctx: { webStartup: { host?: string } },
+        proc: typeof fakeProcess,
+      ) => string
+      return fn({ webStartup: { host: cliHost } }, fakeProcess)
+    }
+
+    // Explicit --host always wins
+    expect(
+      evalHost('127.0.0.1', {
+        en0: [{ family: 'IPv4', internal: false, address: '192.168.1.20' }],
+      }),
+    ).toBe('127.0.0.1')
+
+    // Prefers physical RFC1918 LAN over loopback, VPN utun, link-local, and Clash fake-IP
+    expect(
+      evalHost(undefined, {
+        lo0: [{ family: 'IPv4', internal: true, address: '127.0.0.1' }],
+        utun4: [{ family: 'IPv4', internal: false, address: '10.200.0.5' }],
+        utun9: [{ family: 'IPv4', internal: false, address: '198.18.0.1' }],
+        awdl0: [{ family: 'IPv4', internal: false, address: '169.254.10.20' }],
+        en1: [
+          { family: 'IPv6', internal: false, address: 'fe80::1' },
+          { family: 'IPv4', internal: false, address: '192.168.10.42' },
+        ],
+      }),
+    ).toBe('192.168.10.42')
+
+    // Uses physical public IPv4 on cloud VMs without RFC1918 LAN
+    expect(
+      evalHost(undefined, {
+        eth0: [{ family: 'IPv4', internal: false, address: '203.0.113.88' }],
+        docker0: [{ family: 'IPv4', internal: false, address: '172.17.0.1' }],
+      }),
+    ).toBe('203.0.113.88')
+
+    // Falls back to 127.0.0.1 when offline or only link-local / TUN fake-IP exist
+    expect(
+      evalHost(undefined, {
+        lo0: [{ family: 'IPv4', internal: true, address: '127.0.0.1' }],
+        en0: [{ family: 'IPv4', internal: false, address: '169.254.1.2' }],
+        utun0: [{ family: 'IPv4', internal: false, address: '198.18.0.1' }],
+      }),
+    ).toBe('127.0.0.1')
   })
 })

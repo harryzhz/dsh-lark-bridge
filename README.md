@@ -65,6 +65,7 @@ $env:DSH_INSTALL_MODE = 'both'; irm https://raw.githubusercontent.com/harryzhz/d
 | 参数（`install.sh` / `install.ps1`） | 环境变量 | 说明 |
 | --- | --- | --- |
 | `--mode <auto\|web\|app\|both>` / `-Mode` | `DSH_INSTALL_MODE` | 指定安装模式（`install.sh` 亦支持 `--web` / `--app` / `--both`） |
+| `--web-host <auto\|loopback\|IP>` / `-WebHost` | `DSH_WEB_HOST` | Web 版默认监听地址：默认 `auto`（启动时自动绑定本机局域网 IPv4，离线回退 `127.0.0.1`），也可设为 `loopback` 或具体本机 IP |
 | `--without-external-agents` / `-WithoutExternalAgents` | `DSH_WITHOUT_EXTERNAL_AGENTS=1` | 仅安装 `dsh-lark-bridge`，不安装 `dsh-external-agents` |
 | `--upgrade-dsh` / `-UpgradeDsh` | `DSH_UPGRADE=1` | 即使已存在兼容版 DSH，也重新下载/升级到最新版本 |
 | `--force` / `-Force` | `DSH_FORCE=1` | 即使插件已是目标版本也强制重新安装 |
@@ -72,7 +73,7 @@ $env:DSH_INSTALL_MODE = 'both'; irm https://raw.githubusercontent.com/harryzhz/d
 | `--dry-run` / `-DryRun` | `DSH_DRY_RUN=1` | 仅检测环境并打印将执行的安装计划，不做实际修改 |
 | `-y, --yes` / `-Yes` | `DSH_YES=1` | 非交互模式，自动确认所有提示 |
 
-> **说明**：Desktop App 版在安装插件前会自动优雅退出正在运行的应用（避免写锁冲突）；安装完成后重新打开 DeepSeek Harness，左侧边栏即出现 **飞书桥接**，外部 CLI 运行时同时就绪。
+> **说明**：Desktop App 版在安装插件前会自动优雅退出正在运行的应用（避免写锁冲突）；安装完成后重新打开 DeepSeek Harness，左侧边栏即出现 **飞书桥接**，外部 CLI 运行时同时就绪。Web 版安装时会自动在 `$DSH_HOME/profiles/web/cordis.patch.yml` 中配置默认绑定本机局域网 IPv4（启动时动态探测，离线自动回退 `127.0.0.1`，随时可用 `--host` 覆盖），让飞书卡片中的 DSH 接管链接直接使用本机 IP。
 
 ### 2.2 手动安装插件
 
@@ -131,11 +132,11 @@ allowBuilds:
 - **独立 DSH Web 服务**：安装插件后直接用标准 `dsh` 命令启动，需要后台保活时用 macOS LaunchAgent 或 systemd 托管即可（确保 `PATH` 包含 `~/.local/bin` 及所用外部 CLI 路径）。
 
 ```bash
-# 本机使用
+# 直接启动（通过一键脚本安装时已默认绑定本机局域网 IPv4，离线回退 127.0.0.1）
 dsh web
 
-# 局域网 / 服务器常驻（指定本机具体 IPv4 与端口）
-dsh --profile web --no-open --host <本机IPv4> --port 3880
+# 后台常驻（可按需指定端口，或追加 --host <本机IPv4|127.0.0.1> 显式覆盖）
+dsh --profile web --no-open --port 3880
 
 # 验证插件自动装配的 CLI 连通性
 lark-bridge context

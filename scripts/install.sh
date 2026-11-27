@@ -36,6 +36,11 @@ EXT_ALIAS_ASSET="dsh-external-agents.tgz"
 # ---------------------------------------------------------------------------
 MODE="${DSH_INSTALL_MODE:-auto}"
 WEB_PROFILE="${DSH_WEB_PROFILE:-web}"
+WEB_HOST="${DSH_WEB_HOST:-auto}"
+WEB_HOST_EXPLICIT=0
+if [ -n "${DSH_WEB_HOST:-}" ]; then
+  WEB_HOST_EXPLICIT=1
+fi
 INSTALL_EXTERNAL_AGENTS=1
 BRIDGE_VERSION="${DSH_BRIDGE_VERSION:-}"
 EXT_VERSION="${DSH_EXTERNAL_AGENTS_VERSION:-}"
@@ -62,6 +67,8 @@ DETECTED_DSH_IS_DESKTOP=0
 DETECTED_APP_PATH=""
 DETECTED_APP_VER=""
 DETECTED_APP_CLI=""
+DETECTED_LAN_IPV4=""
+DETECTED_LAN_IPV4_CHECKED=0
 
 # Cleanup tracking
 TMP_DIR=""
@@ -155,6 +162,7 @@ DeepSeek Harness (DSH) + 飞书桥接 & 外部 Agent 运行时 一键安装脚�
   --app                        等同于 --mode app（DSH Desktop 桌面客户端，仅 macOS）
   --both                       等同于 --mode both（同时安装 Desktop App 与 Web）
   --profile <name>             Web 版目标 profile 名称（默认: web）
+  --web-host <auto|loopback|IP> Web 版默认监听地址（默认: auto，启动时自动绑定本机局域网 IPv4，离线回退 127.0.0.1）
   --without-external-agents    仅安装 dsh-lark-bridge，不安装 dsh-external-agents
   --bridge-version <vX.Y.Z>    指定 dsh-lark-bridge 版本（默认最新 Release）
   --external-agents-version <v> 指定 dsh-external-agents 版本（默认最新 Release）
@@ -215,6 +223,17 @@ parse_args() {
         ;;
       --profile=*)
         WEB_PROFILE="${1#*=}"
+        shift
+        ;;
+      --web-host)
+        [ "$#" -ge 2 ] || die "--web-host 需要参数: auto | loopback | 具体本机 IPv4/IPv6 地址"
+        WEB_HOST="$2"
+        WEB_HOST_EXPLICIT=1
+        shift 2
+        ;;
+      --web-host=*)
+        WEB_HOST="${1#*=}"
+        WEB_HOST_EXPLICIT=1
         shift
         ;;
       --without-external-agents|--no-external-agents)
@@ -308,6 +327,82 @@ parse_args() {
   if [ -z "$WEB_PROFILE" ] || [ "$WEB_PROFILE" = "desktop" ]; then
     die "无效的 Web profile: ${WEB_PROFILE:-<empty>}（desktop profile 由 --mode app 托管）"
   fi
+
+  validate_web_host "$WEB_HOST"
+}
+
+is_valid_ipv4() {
+  local ip="$1"
+  [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  local o1="${BASH_REMATCH[1]}" o2="${BASH_REMATCH[2]}" o3="${BASH_REMATCH[3]}" o4="${BASH_REMATCH[4]}"
+  [ "$((10#$o1))" -le 255 ] && [ "$((10#$o2))" -le 255 ] && [ "$((10#$o3))" -le 255 ] && [ "$((10#$o4))" -le 255 ]
+}
+
+is_wildcard_ip() {
+  local lower
+  lower="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$lower" in
+    0.0.0.0|::|::0|0:0:0:0:0:0:0:0|::ffff:0.0.0.0|::ffff:0:0|0:0:0:0:0:ffff:0.0.0.0|0:0:0:0:0:ffff:0:0)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+is_valid_ip_literal() {
+  local ip="$1"
+  if is_valid_ipv4 "$ip"; then
+    return 0
+  fi
+  if command -v node >/dev/null 2>&1; then
+    node -e "process.exit(require('node:net').isIP(process.argv[1]) !== 0 ? 0 : 1)" "$ip" 2>/dev/null
+    return $?
+  fi
+  case "$ip" in
+    *:*:*)
+      [[ "$ip" =~ ^[0-9A-Fa-f:.]+$ ]] && return 0
+      ;;
+  esac
+  return 1
+}
+
+validate_web_host() {
+  local raw="${1:-}"
+  case "$raw" in
+    auto|loopback)
+      return 0
+      ;;
+  esac
+  if [ -z "$raw" ] || is_wildcard_ip "$raw" || ! is_valid_ip_literal "$raw"; then
+    die "无效的 --web-host 值: ${raw:-<empty>}（可选: auto | loopback | 具体本机 IPv4/IPv6 地址，不支持 0.0.0.0 / :: 或域名）"
+  fi
+}
+
+detect_local_lan_ipv4() {
+  if [ "$DETECTED_LAN_IPV4_CHECKED" -eq 1 ]; then
+    printf '%s' "$DETECTED_LAN_IPV4"
+    return 0
+  fi
+  DETECTED_LAN_IPV4_CHECKED=1
+  if command -v node >/dev/null 2>&1; then
+    DETECTED_LAN_IPV4="$(node -e '
+const ifaces = require("node:os").networkInterfaces();
+const virtRe = /^(lo|utun|tun|tap|wg|docker|br-|veth|virbr|tailscale|zt|awdl|llw|bridge|anpi|ap|gif|stf|ipsec|feth|vethernet|vmware|virtualbox|loopback|clash|mihomo|meta|wintun|openvpn|bluetooth)/i;
+const picks = [];
+for (const [name, list] of Object.entries(ifaces)) {
+  const virt = virtRe.test(name);
+  for (const a of list || []) {
+    if ((a.family !== "IPv4" && a.family !== 4) || a.internal) continue;
+    if (a.address.startsWith("169.254.") || /^198\.(18|19)\./.test(a.address)) continue;
+    const priv = /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(a.address);
+    picks.push({ ip: a.address, score: (virt ? 2 : 0) + (priv ? 0 : 1) });
+  }
+}
+picks.sort((a, b) => a.score - b.score);
+if (picks[0]) process.stdout.write(picks[0].ip);
+' 2>/dev/null || true)"
+  fi
+  printf '%s' "$DETECTED_LAN_IPV4"
 }
 
 # ---------------------------------------------------------------------------
@@ -1088,6 +1183,231 @@ install_web() {
   fi
 
   install_plugins_into_profile "$DETECTED_DSH_BIN" "$WEB_PROFILE" "Web"
+  configure_web_bind_host "$WEB_PROFILE"
+}
+
+has_webserver_patch_entry() {
+  local patch_file="$1"
+  [ -f "$patch_file" ] || return 1
+  awk '
+    function check_item(    k) {
+      if (!in_item) return
+      for (k = 1; k <= n; k++) {
+        if (buf[k] ~ /^-[[:space:]]+id:[[:space:]]*('\''|")?webserver('\''|")?[[:space:]]*(#.*)?$/ \
+          || buf[k] ~ /^[[:space:]]{2}id:[[:space:]]*('\''|")?webserver('\''|")?[[:space:]]*(#.*)?$/) {
+          found = 1
+          return
+        }
+      }
+    }
+    BEGIN { in_item = 0; n = 0; found = 0 }
+    {
+      sub(/\r$/, "")
+      if ($0 ~ /^-([[:space:]]|$)/) {
+        check_item()
+        in_item = 1
+        n = 1
+        buf[1] = $0
+      } else if (in_item) {
+        n++
+        buf[n] = $0
+      }
+    }
+    END {
+      check_item()
+      exit(found ? 0 : 1)
+    }
+  ' "$patch_file"
+}
+
+strip_webserver_patch_entry() {
+  local src_file="$1"
+  local dst_file="$2"
+  awk '
+    function is_managed_comment(line) {
+      return line ~ /^#[[:space:]]*Managed by dsh-lark-bridge installer:/
+    }
+    function is_webserver_item(    k) {
+      for (k = 1; k <= item_n; k++) {
+        if (item[k] ~ /^-[[:space:]]+id:[[:space:]]*('\''|")?webserver('\''|")?[[:space:]]*(#.*)?$/ \
+          || item[k] ~ /^[[:space:]]{2}id:[[:space:]]*('\''|")?webserver('\''|")?[[:space:]]*(#.*)?$/) {
+          return 1
+        }
+      }
+      return 0
+    }
+    function emit_line(line) {
+      out_n++
+      out[out_n] = line
+    }
+    function flush_item(    k, keep_lead_end) {
+      if (!in_item) return
+      if (is_webserver_item()) {
+        keep_lead_end = lead_n
+        while (keep_lead_end > 0 && (lead[keep_lead_end] ~ /^[[:space:]]*$/ || is_managed_comment(lead[keep_lead_end]))) {
+          keep_lead_end--
+        }
+        for (k = 1; k <= keep_lead_end; k++) emit_line(lead[k])
+      } else {
+        for (k = 1; k <= lead_n; k++) emit_line(lead[k])
+        for (k = 1; k <= item_n; k++) emit_line(item[k])
+      }
+      in_item = 0
+      item_n = 0
+      lead_n = 0
+      for (k = 1; k <= trail_n; k++) {
+        lead_n++
+        lead[lead_n] = trail[k]
+      }
+      trail_n = 0
+    }
+    BEGIN { in_item = 0; item_n = 0; lead_n = 0; trail_n = 0; out_n = 0 }
+    {
+      sub(/\r$/, "")
+      if (!in_item && $0 ~ /^[[:space:]]*\[\][[:space:]]*$/) {
+        next
+      }
+      if ($0 ~ /^-([[:space:]]|$)/) {
+        flush_item()
+        in_item = 1
+        item_n = 1
+        item[1] = $0
+        next
+      }
+      if (!in_item) {
+        lead_n++
+        lead[lead_n] = $0
+        next
+      }
+      if ($0 ~ /^[[:space:]]*$/ || $0 ~ /^#/) {
+        trail_n++
+        trail[trail_n] = $0
+      } else {
+        for (i = 1; i <= trail_n; i++) {
+          item_n++
+          item[item_n] = trail[i]
+        }
+        trail_n = 0
+        item_n++
+        item[item_n] = $0
+      }
+    }
+    END {
+      flush_item()
+      for (i = 1; i <= lead_n; i++) emit_line(lead[i])
+      while (out_n > 0 && out[out_n] ~ /^[[:space:]]*$/) out_n--
+      for (i = 1; i <= out_n; i++) print out[i]
+    }
+  ' "$src_file" > "$dst_file"
+}
+
+render_webserver_patch_block() {
+  local mode="$1"
+  if [ "$mode" = "auto" ]; then
+    cat <<'EOF'
+# Managed by dsh-lark-bridge installer: bind local LAN IPv4 by default (override with --host).
+- id: webserver
+  name: '@deepseek-ai/dsh-host-webserver'
+  config:
+    host: !!js |-
+      ctx.webStartup.host ?? (() => {
+        const ifaces = process.getBuiltinModule?.('node:os')?.networkInterfaces?.() ?? {};
+        const virtRe = /^(lo|utun|tun|tap|wg|docker|br-|veth|virbr|tailscale|zt|awdl|llw|bridge|anpi|ap|gif|stf|ipsec|feth|vethernet|vmware|virtualbox|loopback|clash|mihomo|meta|wintun|openvpn|bluetooth)/i;
+        const picks = [];
+        for (const [name, list] of Object.entries(ifaces)) {
+          const virt = virtRe.test(name);
+          for (const a of list ?? []) {
+            if ((a.family !== 'IPv4' && a.family !== 4) || a.internal) continue;
+            if (a.address.startsWith('169.254.') || /^198\.(18|19)\./.test(a.address)) continue;
+            const priv = /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(a.address);
+            picks.push({ ip: a.address, score: (virt ? 2 : 0) + (priv ? 0 : 1) });
+          }
+        }
+        picks.sort((a, b) => a.score - b.score);
+        return picks[0]?.ip ?? '127.0.0.1';
+      })()
+    port: !!js ctx.webStartup.port ?? 3080
+    tls: !!js ctx.webStartup.tls
+    compression: gzip
+    compressionLevel: 1
+    compressionThresholdBytes: 1024
+EOF
+    return 0
+  fi
+
+  local resolved_host="$mode"
+  if [ "$resolved_host" = "loopback" ]; then
+    resolved_host="127.0.0.1"
+  fi
+  cat <<EOF
+# Managed by dsh-lark-bridge installer: default Web bind host (override with --host).
+- id: webserver
+  name: '@deepseek-ai/dsh-host-webserver'
+  config:
+    host: !!js ctx.webStartup.host ?? '${resolved_host}'
+    port: !!js ctx.webStartup.port ?? 3080
+    tls: !!js ctx.webStartup.tls
+    compression: gzip
+    compressionLevel: 1
+    compressionThresholdBytes: 1024
+EOF
+}
+
+configure_web_bind_host() {
+  local profile_name="$1"
+  local profile_dir="$DSH_HOME_DIR/profiles/$profile_name"
+  local patch_file="$profile_dir/cordis.patch.yml"
+
+  if [ -f "$patch_file" ] && has_webserver_patch_entry "$patch_file"; then
+    if [ "$WEB_HOST_EXPLICIT" -eq 0 ] && [ "$FORCE_REINSTALL" -eq 0 ]; then
+      log_ok "[Web] cordis.patch.yml 已包含 webserver 监听配置，保留现有设置（如需修改请传 --web-host <auto|loopback|IP>）。"
+      return 0
+    fi
+  fi
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    if [ "$WEB_HOST" = "auto" ]; then
+      log_info "[DRY-RUN] 将在 $patch_file 配置 Web 默认绑定本机局域网 IPv4（离线回退 127.0.0.1，支持 --host 覆盖）"
+    else
+      local dry_host="$WEB_HOST"
+      [ "$dry_host" = "loopback" ] && dry_host="127.0.0.1"
+      log_info "[DRY-RUN] 将在 $patch_file 配置 Web 默认监听地址: ${dry_host}（支持 --host 覆盖）"
+    fi
+    return 0
+  fi
+
+  mkdir -p "$profile_dir"
+  local tmp_patch="${patch_file}.tmp.$$"
+
+  if [ -f "$patch_file" ]; then
+    strip_webserver_patch_entry "$patch_file" "$tmp_patch"
+    if [ -s "$tmp_patch" ]; then
+      printf '\n' >> "$tmp_patch"
+    fi
+  else
+    cat > "$tmp_patch" <<'EOF'
+# Your patch layer for this dsh profile, applied after every bundle layer:
+# a top-level YAML array of loader patch entries (id-targeted config
+# overrides, disables, and insert lists; `!!js` expressions allowed).
+
+EOF
+  fi
+
+  render_webserver_patch_block "$WEB_HOST" >> "$tmp_patch"
+  mv "$tmp_patch" "$patch_file"
+
+  if [ "$WEB_HOST" = "auto" ]; then
+    detect_local_lan_ipv4 >/dev/null
+    if [ -n "$DETECTED_LAN_IPV4" ]; then
+      log_ok "[Web] 已配置默认绑定本机局域网 IPv4（当前本机 IP: ${DETECTED_LAN_IPV4}，离线自动回退 127.0.0.1，启动时可用 --host 覆盖）-> $patch_file"
+    else
+      log_ok "[Web] 已配置默认绑定本机局域网 IPv4（离线自动回退 127.0.0.1，启动时可用 --host 覆盖）-> $patch_file"
+    fi
+  else
+    local final_host="$WEB_HOST"
+    [ "$final_host" = "loopback" ] && final_host="127.0.0.1"
+    log_ok "[Web] 已配置默认监听地址: ${final_host}（启动时可用 --host 覆盖）-> $patch_file"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -1320,11 +1640,24 @@ print_next_steps() {
       printf '  %s提示%s: 请将 %s 加入 PATH（例如写入 ~/.zshrc 或 ~/.bashrc）：\n' "$C_YELLOW" "$C_RESET" "$DSH_BIN_DIR"
       printf '    export PATH="%s:$PATH"\n' "$DSH_BIN_DIR"
     fi
-    if [ "$WEB_PROFILE" = "web" ]; then
-      printf '  1. 本机启动  : dsh web\n'
-      printf '  2. 局域网常驻: dsh --profile web --no-open --host <本机IPv4> --port 3880\n'
+    local bind_note=""
+    if [ "$WEB_HOST" = "auto" ]; then
+      detect_local_lan_ipv4 >/dev/null
+      if [ -n "$DETECTED_LAN_IPV4" ]; then
+        bind_note="（已默认绑定本机 IPv4，当前: ${DETECTED_LAN_IPV4}；离线自动回退 127.0.0.1）"
+      else
+        bind_note="（已默认绑定本机局域网 IPv4，离线自动回退 127.0.0.1）"
+      fi
     else
-      printf '  1. 启动命令  : dsh --profile %s\n' "$WEB_PROFILE"
+      local effective_host="$WEB_HOST"
+      [ "$effective_host" = "loopback" ] && effective_host="127.0.0.1"
+      bind_note="（已默认绑定 ${effective_host}）"
+    fi
+    if [ "$WEB_PROFILE" = "web" ]; then
+      printf '  1. 启动服务  : dsh web  %s\n' "$bind_note"
+      printf '  2. 后台常驻  : dsh --profile web --no-open --port 3880（如需指定或仅本机回环可追加 --host <IP>）\n'
+    else
+      printf '  1. 启动命令  : dsh --profile %s  %s\n' "$WEB_PROFILE" "$bind_note"
     fi
     printf '  3. 后续免重启热更新插件: lark-bridge plugin update all\n'
   fi
