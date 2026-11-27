@@ -44,11 +44,11 @@
 ## 产品演示
 
 <div align="center">
-  <a href="https://github.com/harryzhz/dsh-lark-bridge/releases/download/demo-video/dsh-lark-bridge-promo-v5.mp4">
+  <a href="https://drive.google.com/file/d/1pjdbF6pjJ9ZZGqx8MDeb8X0NV1D_XMmo/view?usp=drive_link">
     <img src="./docs/assets/demo-cover-v5.png" alt="点击观看 dsh-lark-bridge v5 产品实景演示视频" />
   </a>
   <p>
-    ▶️ <a href="https://github.com/harryzhz/dsh-lark-bridge/releases/download/demo-video/dsh-lark-bridge-promo-v5.mp4"><strong>点击观看完整产品演示视频（v5 · 1080p · 2 分 33 秒）</strong></a>
+    ▶️ <a href="https://drive.google.com/file/d/1pjdbF6pjJ9ZZGqx8MDeb8X0NV1D_XMmo/view?usp=drive_link"><strong>点击在线观看完整产品演示视频（v5 · 1080p · 2 分 33 秒）</strong></a>
   </p>
   <p><sub>涵盖：扫码一键建智能体 · 群内 <code>@</code> 排障与 DSH 接管 · 告警群免 <code>@</code> 主动值守 · 定时巡检图文卡片 · <code>A @ B</code> 委派跟进与夜间盘点 · 长期记忆关系图谱 · 驾驶舱可观测视图</sub></p>
 </div>

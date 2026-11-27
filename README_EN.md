@@ -44,11 +44,11 @@
 ## Demo
 
 <div align="center">
-  <a href="https://github.com/harryzhz/dsh-lark-bridge/releases/download/demo-video/dsh-lark-bridge-promo-v5.mp4">
+  <a href="https://drive.google.com/file/d/1pjdbF6pjJ9ZZGqx8MDeb8X0NV1D_XMmo/view?usp=drive_link">
     <img src="./docs/assets/demo-cover-v5.png" alt="Watch dsh-lark-bridge v5 Product Demo Video" />
   </a>
   <p>
-    ▶️ <a href="https://github.com/harryzhz/dsh-lark-bridge/releases/download/demo-video/dsh-lark-bridge-promo-v5.mp4"><strong>Watch Full Product Demo Video (v5 · 1080p · 2m 33s)</strong></a>
+    ▶️ <a href="https://drive.google.com/file/d/1pjdbF6pjJ9ZZGqx8MDeb8X0NV1D_XMmo/view?usp=drive_link"><strong>Watch Full Product Demo Video Online (v5 · 1080p · 2m 33s)</strong></a>
   </p>
   <p><sub>Covers: QR one-click bot setup · <code>@mention</code> repo debugging & DSH handoff · Zero-mention alert triage · Scheduled patrol cards · <code>A @ B</code> delegation & Auto-Dream audits · Memory Knowledge Graph · Observability Cockpit</sub></p>
 </div>
