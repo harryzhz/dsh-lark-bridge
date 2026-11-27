@@ -8,6 +8,7 @@ import {
   resolveEffectiveBotId,
 } from '../components/fields.js'
 import { resolveModelDisplayName, resolveRuntimeDisplayName } from '../components/options.js'
+import { cleanSummaryDetail } from '../components/ExperimentalSection.js'
 import { resolveNativeModelLabel } from '../components/TriageConfigFields.js'
 import { formatDuration, formatTime } from '../state.js'
 import type {
@@ -423,20 +424,25 @@ export function SessionsView({
                   s.memoryStats.archived > 0 ? `归档 ${s.memoryStats.archived}` : null,
                 ].filter(Boolean)
               : []
+            const ps = s.proactiveStats
             const statusProgress =
               s.status === 'running'
                 ? s.processedCount > 0
                   ? `正在整理 ${s.processedCount} 个会话`
                   : '正在核查记忆'
                 : s.status === 'succeeded'
-                  ? `已整理 ${s.processedCount} 个会话`
+                  ? ps && ps.batchesRun > 1
+                    ? `已整理 ${s.processedCount} 个会话（${ps.batchesRun} 批）`
+                    : `已整理 ${s.processedCount} 个会话`
                   : null
+            const cleanDreamSummary = s.summary ? cleanSummaryDetail(s.summary) : ''
             const metaText = [
               `${runtimeLabel}${modelLabel ? ` · ${modelLabel}` : ''}`,
               `工作区 ${s.workspaceName}`,
               statusProgress,
+              ps && ps.backlogRemaining > 0 ? `剩余积压 ${ps.backlogRemaining}` : null,
               s.durationMs ? formatDuration(s.durationMs) : null,
-              s.summary || null,
+              cleanDreamSummary || null,
             ]
               .filter(Boolean)
               .join(' · ')
@@ -453,8 +459,14 @@ export function SessionsView({
                     {s.status === 'succeeded' && memParts.length > 0 && (
                       <Tag tone="success">{memParts.join(' · ')}</Tag>
                     )}
+                    {s.status === 'succeeded' && ps && ps.remindersCreated > 0 && (
+                      <Tag tone="info">{`提醒 +${ps.remindersCreated}`}</Tag>
+                    )}
+                    {s.status === 'succeeded' && ps && ps.worktreesCreated > 0 && (
+                      <Tag tone="info">{`分支 +${ps.worktreesCreated}`}</Tag>
+                    )}
                     {s.status === 'succeeded' && s.outcome === 'no_change' && (
-                      <Tag tone="neutral">无新增记忆</Tag>
+                      <Tag tone="neutral">无新增变更</Tag>
                     )}
                   </div>
                   <div className="fb-item-meta" title={s.summary || metaText}>

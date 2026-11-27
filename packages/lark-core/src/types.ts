@@ -60,6 +60,12 @@ export const DEFAULT_DREAMING_SCOPES: readonly string[] = [
   '未完成待办',
 ]
 
+export const DEFAULT_DREAMING_SCHEDULE_TIME = '03:00'
+export const DEFAULT_DREAMING_MAX_SESSIONS_PER_RUN = 0
+export const DEFAULT_DREAMING_MAX_CHARS_PER_SESSION = 5000
+export const DEFAULT_DREAMING_MAX_REMINDERS_PER_RUN = 5
+export const DEFAULT_DREAMING_MAX_DURATION_MINUTES = 45
+
 function migrateLegacyDreamingInput(input: unknown): unknown {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return input
   const rec = { ...(input as Record<string, unknown>) }
@@ -85,9 +91,49 @@ export const BotDreamingConfigSchema = z.preprocess(
     enabled: z.boolean().default(false),
     scheduleTime: z
       .string()
-      .default('02:00')
-      .transform((v) => normalizeHHMM(v, '02:00')),
+      .default(DEFAULT_DREAMING_SCHEDULE_TIME)
+      .transform((v) => normalizeHHMM(v, DEFAULT_DREAMING_SCHEDULE_TIME)),
     minNewSessions: z.number().int().min(1).max(50).default(2),
+    /** Max sessions to consolidate per Dreaming run (`0` = all unprocessed sessions since last run). */
+    maxSessionsPerRun: z
+      .number()
+      .int()
+      .min(0)
+      .max(500)
+      .default(DEFAULT_DREAMING_MAX_SESSIONS_PER_RUN),
+    /** Per-session character budget for head+tail transcript sampling. */
+    maxCharsPerSession: z
+      .number()
+      .int()
+      .min(1000)
+      .max(20_000)
+      .default(DEFAULT_DREAMING_MAX_CHARS_PER_SESSION),
+    /** Hard cap on proactive reminders created during a single Dreaming run (`0` = disabled). */
+    maxRemindersPerRun: z
+      .number()
+      .int()
+      .min(0)
+      .max(20)
+      .default(DEFAULT_DREAMING_MAX_REMINDERS_PER_RUN),
+    /** Soft wall-clock budget (minutes) for multi-batch overnight Dreaming execution. */
+    maxDurationMinutes: z
+      .number()
+      .int()
+      .min(5)
+      .max(180)
+      .default(DEFAULT_DREAMING_MAX_DURATION_MINUTES),
+    /** Enable Stage 2 deep memory audit (codebase verification, cold-memory pruning & SOP synthesis). */
+    deepConsolidation: z.boolean().default(true),
+    /** Optional dedicated model for overnight Dreaming (empty string = inherit bot model). */
+    model: z
+      .string()
+      .default('')
+      .transform((v) => v.trim()),
+    /** Optional dedicated reasoning effort for overnight Dreaming (empty string = inherit bot effort). */
+    reasoningEffort: z
+      .string()
+      .default('')
+      .transform((v) => v.trim()),
     scopes: z
       .array(z.string().trim().min(1))
       .default([...DEFAULT_DREAMING_SCOPES]),
@@ -97,8 +143,15 @@ export const BotDreamingConfigSchema = z.preprocess(
 
 export const DEFAULT_BOT_DREAMING_CONFIG: z.output<typeof BotDreamingConfigSchema> = {
   enabled: false,
-  scheduleTime: '02:00',
+  scheduleTime: DEFAULT_DREAMING_SCHEDULE_TIME,
   minNewSessions: 2,
+  maxSessionsPerRun: DEFAULT_DREAMING_MAX_SESSIONS_PER_RUN,
+  maxCharsPerSession: DEFAULT_DREAMING_MAX_CHARS_PER_SESSION,
+  maxRemindersPerRun: DEFAULT_DREAMING_MAX_REMINDERS_PER_RUN,
+  maxDurationMinutes: DEFAULT_DREAMING_MAX_DURATION_MINUTES,
+  deepConsolidation: true,
+  model: '',
+  reasoningEffort: '',
   scopes: [...DEFAULT_DREAMING_SCOPES],
   cleanupAndCorrect: true,
 }
@@ -109,7 +162,7 @@ export const BotProactiveConfigSchema = z.object({
   remindersEnabled: z.boolean().default(false),
   reminderCreationMode: ReminderCreationModeSchema.default('silent'),
   delegationFollowupEnabled: z.boolean().default(false),
-  quietHoursEnabled: z.boolean().default(false),
+  quietHoursEnabled: z.boolean().default(true),
   quietHoursStart: z
     .string()
     .default('00:00')
@@ -129,7 +182,7 @@ export const DEFAULT_BOT_PROACTIVE_CONFIG: z.output<typeof BotProactiveConfigSch
   remindersEnabled: false,
   reminderCreationMode: 'silent',
   delegationFollowupEnabled: false,
-  quietHoursEnabled: false,
+  quietHoursEnabled: true,
   quietHoursStart: '00:00',
   quietHoursEnd: '08:00',
   autoCodeEnabled: false,

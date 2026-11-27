@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import {
   Button,
   IconChevronRightOutlineRegular,
@@ -15,6 +15,8 @@ import type {
   BotExperimentalConfig,
   BotProactiveConfig,
   DreamRunState,
+  ModelGroup,
+  RuntimeOption,
 } from '../types.js'
 import {
   EditableScopeList,
@@ -25,6 +27,11 @@ import {
   SettingRow,
   TextField,
 } from './fields.js'
+import {
+  catalogModelsForRuntime,
+  modelOptions,
+  reasoningEffortOptions,
+} from './options.js'
 
 export interface DreamStatusPresentation {
   readonly dot: StateDotState
@@ -33,8 +40,10 @@ export interface DreamStatusPresentation {
   readonly isError?: boolean
 }
 
-function cleanSummaryDetail(raw: string): string {
+export function cleanSummaryDetail(raw: string): string {
   return raw
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]*$/g, '$1')
     .replace(/\*\*(.*?)\*\*/g, '$1')
     .replace(/`([^`]+)`/g, '$1')
     .replace(/(?:^|\s)-\s+/g, ' ')
@@ -84,13 +93,23 @@ export function buildDreamStatusPresentation(
   }
 
   if (dreamState.status === 'succeeded') {
-    const countMatch = /^已整理\s+(\d+)\s+个会话(?:（([^）]+)）)?(?:\s*·\s*)?([\s\S]*)$/.exec(rawSummary)
+    const countMatch =
+      /^已整理\s+(\d+)\s+个会话(?:（\d+\s*批）)?(?:（([^）]+)）)?(?:\s*·\s*)?([\s\S]*)$/.exec(
+        rawSummary,
+      )
     const count = dreamState.lastProcessedCount ?? (countMatch ? Number(countMatch[1]) : undefined)
     const mutationTag = countMatch?.[2]?.trim() || ''
     const detail = cleanSummaryDetail(countMatch ? (countMatch[3] ?? '') : rawSummary)
+    const batchesRun = dreamState.proactiveStats?.batchesRun ?? 0
+    const countLabel =
+      count !== undefined
+        ? batchesRun > 1
+          ? `已整理 ${count} 个会话（${batchesRun} 批）`
+          : `已整理 ${count} 个会话`
+        : null
     const titleParts = [
       timeLabel ? `最近整理 ${timeLabel}` : '最近整理已完成',
-      count !== undefined ? `已整理 ${count} 个会话` : null,
+      countLabel,
       mutationTag || null,
     ].filter(Boolean)
     return {
@@ -107,6 +126,9 @@ export function ExperimentalSection({
   botId,
   experimental,
   dreamState,
+  runtime,
+  models = [],
+  botModel = '',
   onChange,
   onOpenSession,
   onStateUpdated,
@@ -114,6 +136,9 @@ export function ExperimentalSection({
   botId: string | null
   experimental: BotExperimentalConfig
   dreamState?: DreamRunState | undefined
+  runtime?: RuntimeOption | undefined
+  models?: readonly ModelGroup[]
+  botModel?: string | undefined
   onChange: (next: BotExperimentalConfig) => void
   onOpenSession?: ((sessionId: string) => void) | undefined
   onStateUpdated?: ((next: DreamRunState) => void) | undefined
@@ -144,6 +169,34 @@ export function ExperimentalSection({
   const isRunning = runningNow || dreamState?.status === 'running'
   const statusView = buildDreamStatusPresentation(dreamState, runError, isRunning)
 
+  const dreamModelValue = dreaming.model?.trim() ?? ''
+  const dreamEffortValue = dreaming.reasoningEffort?.trim() ?? ''
+  const runtimeCatalog = useMemo(
+    () => catalogModelsForRuntime(runtime, models),
+    [runtime, models],
+  )
+  const useModelDropdown = runtime?.kind === 'external' || runtimeCatalog.length > 0
+  const dreamModelChoices = useMemo(
+    () => [
+      { value: '', label: '跟随智能体默认' },
+      ...modelOptions(runtime, models, dreamModelValue),
+    ],
+    [runtime, models, dreamModelValue],
+  )
+  const effectiveModelForEffort = dreamModelValue || botModel?.trim() || ''
+  const effortMeta = useMemo(
+    () =>
+      reasoningEffortOptions(runtime, models, effectiveModelForEffort, dreamEffortValue),
+    [runtime, models, effectiveModelForEffort, dreamEffortValue],
+  )
+  const dreamEffortChoices = useMemo(
+    () => [
+      { value: '', label: '跟随智能体默认' },
+      ...effortMeta.options.filter((o) => o.value !== ''),
+    ],
+    [effortMeta.options],
+  )
+
   const defaultQuietWindowPatch = () => {
     const isUntouchedLegacy =
       !proactive.quietHoursEnabled &&
@@ -163,7 +216,7 @@ export function ExperimentalSection({
       <div className="fb-dream-card">
         <div className="fb-dream-head">
           <div className="fb-dream-desc">
-            定期回顾增量对话与代码变更，将结论沉淀至「记忆库」并纠偏过期内容。
+            夜间分批回顾增量对话与代码变更，完成记忆沉淀、存量验真、冷记忆治理与未闭环事项盘点。
           </div>
           {botId && (
             <div className="fb-dream-actions">
@@ -227,7 +280,7 @@ export function ExperimentalSection({
             <TextField
               value={dreaming.scheduleTime}
               onChange={(scheduleTime) => patchDreaming({ scheduleTime })}
-              placeholder="02:00"
+              placeholder="03:00"
               mono
             />
           </SettingRow>
@@ -235,17 +288,75 @@ export function ExperimentalSection({
             <NumberField
               value={dreaming.minNewSessions}
               min={1}
+              max={50}
               onChange={(minNewSessions) =>
                 patchDreaming({ minNewSessions: Math.min(50, Math.max(1, minNewSessions)) })
               }
               suffix="个会话"
             />
           </SettingRow>
-          <SettingRow title="提炼范围" desc="点击标签可直接修改文字" stack>
-            <EditableScopeList
-              values={dreaming.scopes}
-              presets={DEFAULT_DREAMING_SCOPES}
-              onChange={(scopes) => patchDreaming({ scopes })}
+          <SettingRow
+            title="每次整理上限"
+            desc="0 表示处理上次整理后的全部未处理会话，填正数则限制单次条数"
+          >
+            <NumberField
+              value={dreaming.maxSessionsPerRun ?? 0}
+              min={0}
+              max={500}
+              onChange={(maxSessionsPerRun) =>
+                patchDreaming({
+                  maxSessionsPerRun: Math.min(500, Math.max(0, Math.floor(maxSessionsPerRun))),
+                })
+              }
+              suffix="个会话"
+            />
+          </SettingRow>
+          <SettingRow
+            title="单会话字数预算"
+            desc="超长会话自动头尾采样，保留首轮诉求与收尾结论"
+          >
+            <NumberField
+              value={dreaming.maxCharsPerSession ?? 5000}
+              min={1000}
+              max={20000}
+              step={500}
+              onChange={(maxCharsPerSession) =>
+                patchDreaming({
+                  maxCharsPerSession: Math.min(
+                    20000,
+                    Math.max(1000, Math.floor(maxCharsPerSession)),
+                  ),
+                })
+              }
+              suffix="字"
+            />
+          </SettingRow>
+          <SettingRow
+            title="单次提醒上限"
+            desc="仅在开启主动创建提醒时生效，0 表示整理期间不自动建单"
+          >
+            <NumberField
+              value={dreaming.maxRemindersPerRun ?? 5}
+              min={0}
+              max={20}
+              onChange={(maxRemindersPerRun) =>
+                patchDreaming({
+                  maxRemindersPerRun: Math.min(20, Math.max(0, Math.floor(maxRemindersPerRun))),
+                })
+              }
+              suffix="条"
+            />
+          </SettingRow>
+
+          <GroupTitle>整理深度与模型</GroupTitle>
+          <SettingRow
+            title="深度验真与反思"
+            desc="对照代码库核验存量记忆、治理长期未召回条目并沉淀排障经验"
+          >
+            <Switch
+              label="深度验真与反思"
+              checked={dreaming.deepConsolidation !== false}
+              onChange={(deepConsolidation) => patchDreaming({ deepConsolidation })}
             />
           </SettingRow>
           <SettingRow
@@ -256,6 +367,38 @@ export function ExperimentalSection({
               label="清理过期与纠偏"
               checked={dreaming.cleanupAndCorrect}
               onChange={(cleanupAndCorrect) => patchDreaming({ cleanupAndCorrect })}
+            />
+          </SettingRow>
+          <SettingRow title="夜间整理模型" desc="可选为夜间整理指定更强推理模型">
+            {useModelDropdown ? (
+              <SelectMenu
+                value={dreamModelValue}
+                options={dreamModelChoices}
+                onChange={(model) => patchDreaming({ model, reasoningEffort: '' })}
+              />
+            ) : (
+              <TextField
+                value={dreamModelValue}
+                onChange={(model) => patchDreaming({ model })}
+                placeholder="跟随智能体默认"
+                mono
+              />
+            )}
+          </SettingRow>
+          {effortMeta.supported && (
+            <SettingRow title="夜间推理强度">
+              <SelectMenu
+                value={dreamEffortValue}
+                options={dreamEffortChoices}
+                onChange={(reasoningEffort) => patchDreaming({ reasoningEffort })}
+              />
+            </SettingRow>
+          )}
+          <SettingRow title="提炼范围" desc="点击标签可直接修改文字" stack>
+            <EditableScopeList
+              values={dreaming.scopes}
+              presets={DEFAULT_DREAMING_SCOPES}
+              onChange={(scopes) => patchDreaming({ scopes })}
             />
           </SettingRow>
         </>
@@ -275,7 +418,14 @@ export function ExperimentalSection({
         <Switch
           label="主动创建提醒事项"
           checked={proactive.remindersEnabled}
-          onChange={(remindersEnabled) => patchProactive({ remindersEnabled })}
+          onChange={(remindersEnabled) =>
+            patchProactive({
+              remindersEnabled,
+              ...(remindersEnabled && proactive.quietHoursEnabled === undefined
+                ? { quietHoursEnabled: true, ...defaultQuietWindowPatch() }
+                : {}),
+            })
+          }
         />
       </SettingRow>
 

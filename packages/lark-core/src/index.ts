@@ -93,8 +93,19 @@ export {
   type ScheduleTargetContextItem,
 } from './router.js'
 export {
+  LarkDreamProactiveStatsSchema,
+  composeDreamDeepConsolidationPrompt,
   composeDreamExecutionPrompt,
+  composeDreamProactivePrompt,
+  extractLarkContextMeta,
+  renderMemoryAuditReport,
+  truncateSessionTranscriptHeadTail,
+  type DreamDeepConsolidationPromptInput,
   type DreamExecutionPromptInput,
+  type DreamProactiveAuditPromptInput,
+  type ExtractedLarkContextMeta,
+  type LarkDreamProactiveStats,
+  type MemoryAuditReportInput,
 } from './dreaming.js'
 export {
   LarkMemoryConfidenceSchema,
@@ -211,6 +222,11 @@ export {
   DEFAULT_BOT_PROACTIVE_CONFIG,
   DEFAULT_BOT_ROUTER_CONFIG,
   DEFAULT_BOT_SIGNATURE,
+  DEFAULT_DREAMING_MAX_CHARS_PER_SESSION,
+  DEFAULT_DREAMING_MAX_DURATION_MINUTES,
+  DEFAULT_DREAMING_MAX_REMINDERS_PER_RUN,
+  DEFAULT_DREAMING_MAX_SESSIONS_PER_RUN,
+  DEFAULT_DREAMING_SCHEDULE_TIME,
   DEFAULT_DREAMING_SCOPES,
   DEFAULT_GROUP_ROUTER_CONFIG,
   DEFAULT_LISTENER_TEMPLATES,

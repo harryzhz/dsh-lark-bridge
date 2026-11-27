@@ -20,7 +20,8 @@ vi.mock('@deepseek-ai/dsh-client-ui-primitives', () => {
 })
 
 import { newBotConfig } from '../src/components/BotConfigDialog.js'
-import { buildDreamStatusPresentation } from '../src/components/ExperimentalSection.js'
+import { buildDreamStatusPresentation, cleanSummaryDetail } from '../src/components/ExperimentalSection.js'
+import { formatDuration } from '../src/state.js'
 import { mergeSessionRows } from '../src/views/SessionsView.js'
 import type { DreamRunState, DreamSession, SessionBinding, TriageSession } from '../src/types.js'
 
@@ -95,6 +96,40 @@ describe('Dreaming status presentation & unified SessionsView merging', () => {
     )
     expect(structured?.title).toContain('已整理 6 个会话 · 新增 2 · 纠偏 1')
     expect(structured?.detail).toBe('发布红线：统一检查 P95 延迟。')
+
+    const multiBatch = buildDreamStatusPresentation(
+      {
+        botId: 'bot-1',
+        status: 'succeeded',
+        lastDreamAtMs: Date.now(),
+        lastProcessedCount: 28,
+        lastSummary: '已整理 28 个会话（2 批）（新增 3 · 提醒 +2） · 已完成全库核验并创建白天提醒。',
+        processedSessionIds: ['s1'],
+        proactiveStats: {
+          batchesRun: 2,
+          backlogRemaining: 0,
+          remindersCreated: 2,
+          worktreesCreated: 0,
+          deepConsolidated: true,
+          openLoopsAudited: true,
+        },
+      },
+      '',
+      false,
+    )
+    expect(multiBatch?.title).toContain('已整理 28 个会话（2 批） · 新增 3 · 提醒 +2')
+    expect(multiBatch?.detail).toBe('已完成全库核验并创建白天提醒。')
+
+    expect(
+      cleanSummaryDetail('已核查 [open-loops-snapshot.md](/Users/demo/open-loops-snapshot.md) 与 **关键指标**'),
+    ).toBe('已核查 open-loops-snapshot.md 与 关键指标')
+    expect(cleanSummaryDetail('已核查 [open-loops-s…')).toBe('已核查 [open-loops-s…')
+    expect(cleanSummaryDetail('已核查 [open-loops-snapshot.md](/Users/demo/trunc')).toBe(
+      '已核查 open-loops-snapshot.md',
+    )
+    expect(formatDuration(244_000)).toBe('4m 4s')
+    expect(formatDuration(120_000)).toBe('2m')
+    expect(formatDuration(4500)).toBe('4.5s')
   })
 
   it('merges chat bindings and Dreaming sessions in reverse chronological order and respects filters', () => {
@@ -206,6 +241,21 @@ describe('Dreaming status presentation & unified SessionsView merging', () => {
       replyFooterModel: true,
       replyFooterSignature: true,
       signature: 'AI 可能出错，请谨慎判断结果~',
+      experimental: {
+        dreaming: expect.objectContaining({
+          scheduleTime: '03:00',
+          maxSessionsPerRun: 0,
+          maxCharsPerSession: 5000,
+          maxRemindersPerRun: 5,
+          deepConsolidation: true,
+        }),
+        proactive: expect.objectContaining({
+          reminderCreationMode: 'silent',
+          quietHoursEnabled: true,
+          quietHoursStart: '00:00',
+          quietHoursEnd: '08:00',
+        }),
+      },
     })
   })
 })

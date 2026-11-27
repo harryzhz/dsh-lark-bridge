@@ -307,8 +307,11 @@ export class LarkBridgeManager {
       dataDir: config.dataDir,
       store,
       memory: this.memory,
+      getReminders: () => this.reminders,
       runtimes: this.runtimes,
       workspaces: this.workspaces,
+      runtimeLimiter: this.runtimeLimiter,
+      shutdownSignal: this.shutdownController.signal,
       onActivityChange: notifyActivityChange,
       runTurn: (agent, content) =>
         runTurnAndCollectReply(this.ctx, agent, content, {

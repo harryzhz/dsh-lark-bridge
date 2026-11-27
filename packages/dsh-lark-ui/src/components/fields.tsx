@@ -632,6 +632,7 @@ export function NumberField({
   suffix,
   min = 0,
   max,
+  step,
   disabled,
 }: {
   value: number
@@ -639,6 +640,7 @@ export function NumberField({
   suffix: string
   min?: number
   max?: number
+  step?: number
   disabled?: boolean
 }) {
   return (
@@ -648,6 +650,7 @@ export function NumberField({
         type="number"
         min={min}
         max={max}
+        step={step}
         value={value}
         disabled={disabled}
         onChange={(e) => {

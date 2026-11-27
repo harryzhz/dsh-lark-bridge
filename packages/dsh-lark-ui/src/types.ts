@@ -42,6 +42,13 @@ export interface BotDreamingConfig {
   enabled: boolean
   scheduleTime: string
   minNewSessions: number
+  maxSessionsPerRun?: number
+  maxCharsPerSession?: number
+  maxRemindersPerRun?: number
+  maxDurationMinutes?: number
+  deepConsolidation?: boolean
+  model?: string
+  reasoningEffort?: string
   scopes: string[]
   cleanupAndCorrect: boolean
 }
@@ -114,6 +121,15 @@ export interface BotExperimentalConfig {
   proactive: BotProactiveConfig
 }
 
+export interface DreamProactiveStats {
+  batchesRun: number
+  backlogRemaining: number
+  remindersCreated: number
+  worktreesCreated: number
+  deepConsolidated: boolean
+  openLoopsAudited: boolean
+}
+
 export interface DreamRunState {
   botId: string
   status: 'idle' | 'running' | 'succeeded' | 'skipped' | 'failed'
@@ -123,6 +139,8 @@ export interface DreamRunState {
   lastProcessedCount?: number
   lastSummary?: string
   processedSessionIds: string[]
+  proactiveStats?: DreamProactiveStats
+  backlogRemaining?: number
 }
 
 export type MemoryType = 'feedback' | 'user' | 'project' | 'reference'
@@ -172,6 +190,7 @@ export interface DreamSession {
   status: 'running' | 'succeeded' | 'failed'
   outcome?: 'memory_updated' | 'no_change' | 'failed'
   memoryStats?: MemoryMutationStats
+  proactiveStats?: DreamProactiveStats
   dateKey: string
   processedCount: number
   summary?: string
