@@ -400,6 +400,7 @@ export interface GroupRoleConfig {
 }
 
 export type ListenerMsgType = 'text' | 'post' | 'interactive' | 'image' | 'merge_forward'
+export type ListenerMentionFilter = 'all' | 'exclude_peer' | 'exclude_all'
 export type ListenerSenderType = 'user' | 'bot'
 
 export interface ListenerTemplate {
@@ -425,6 +426,7 @@ export interface GroupListenerRule {
   allowSilentEmptyReply: boolean
   autoCloseAfterCompletion: boolean
   scope: 'top_level' | 'all'
+  mentionFilter?: ListenerMentionFilter
   msgTypes: ListenerMsgType[]
   senderTypes: ListenerSenderType[]
   senderFilterMode: 'all_except_excluded' | 'include_only'

@@ -117,7 +117,7 @@ flowchart TD
     B3 -- "否" --> B4{"分支 4: 代答模式命中?\nsubstituteMode.enabled\n消息为 text/post 且 @目标本人之外"}
     B4 -- "是" --> B4OUT["trigger=substitute\n注入 substitute 提示词\n话题内锁定 replyMode=new-topic"]
 
-    B4 -- "否" --> B5{"分支 5: 群主动监听命中?\nlistener.enabled 且通过 scope/msgTypes/sender/keywords"}
+    B4 -- "否" --> B5{"分支 5: 群主动监听命中?\nlistener.enabled 且通过 scope/mentionFilter/msgTypes/sender/keywords"}
     B5 -- "是" --> B5OUT["trigger=listener\n注入 listener 判断指令\n话题内锁定 replyMode=new-topic"]
     B5 -- "否" --> DROP2["忽略 (no_matching_rule / listener_*)"]
 ```

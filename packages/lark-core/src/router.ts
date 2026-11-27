@@ -510,6 +510,94 @@ export function isListenerSenderEnabled(
   return true
 }
 
+interface MessageMentionFlags {
+  readonly hasAllMention: boolean
+  readonly hasPeerMention: boolean
+}
+
+function collectPostAtUserIds(node: unknown, out: string[]): void {
+  if (!node) return
+  if (Array.isArray(node)) {
+    for (const item of node) collectPostAtUserIds(item, out)
+    return
+  }
+  if (typeof node !== 'object') return
+  const rec = node as Record<string, unknown>
+  if (rec.tag === 'at' && typeof rec.user_id === 'string') {
+    const uid = rec.user_id.trim()
+    if (uid) out.push(uid)
+    return
+  }
+  for (const val of Object.values(rec)) {
+    if (val && typeof val === 'object') {
+      collectPostAtUserIds(val, out)
+    }
+  }
+}
+
+function classifyListenerMentions(
+  msg: Pick<InboundLarkMessage, 'mentions' | 'text' | 'rawContent' | 'botOpenId' | 'msgType'>,
+): MessageMentionFlags {
+  let hasAllMention = false
+  let hasPeerMention = false
+
+  for (const m of msg.mentions) {
+    const id = m.openId?.trim()
+    const key = m.key?.trim()
+    if (key === '@_all' || id?.toLowerCase() === 'all') {
+      hasAllMention = true
+      continue
+    }
+    if (msg.botOpenId && id === msg.botOpenId) {
+      continue
+    }
+    if (id || key) {
+      hasPeerMention = true
+    }
+  }
+
+  // Real Feishu `post` messages omit `@all` (and some bot-authored `at` nodes) from
+  // `message.mentions`, keeping them only as `{ tag: "at", user_id: "..." }` in `rawContent`.
+  if (msg.msgType === 'post' && msg.rawContent && (!hasAllMention || !hasPeerMention)) {
+    try {
+      const parsed: unknown = JSON.parse(msg.rawContent)
+      const atIds: string[] = []
+      collectPostAtUserIds(parsed, atIds)
+      for (const uid of atIds) {
+        if (uid === '@_all' || uid.toLowerCase() === 'all') {
+          hasAllMention = true
+          continue
+        }
+        const resolved = msg.mentions.find((m) => m.key === uid)?.openId?.trim() ?? uid
+        if (msg.botOpenId && resolved === msg.botOpenId) {
+          continue
+        }
+        hasPeerMention = true
+      }
+    } catch {
+      // Ignore malformed rawContent; rely on structured `mentions`.
+    }
+  }
+
+  // Fallback for interactive cards that embed `<at id="...">` tags without populating
+  // `message.mentions`. Scoped to `interactive` so literal `<at ...>` code snippets in
+  // plain `text`/`post` messages never false-positive as mentions.
+  if (msg.msgType === 'interactive' && (!hasAllMention || !hasPeerMention)) {
+    const atTagRe = /<at\s+(?:user_id|id)\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))/gi
+    for (const match of msg.text.matchAll(atTagRe)) {
+      const id = (match[1] ?? match[2] ?? match[3] ?? '').trim()
+      if (!id) continue
+      if (id.toLowerCase() === 'all') {
+        hasAllMention = true
+      } else if (!msg.botOpenId || id !== msg.botOpenId) {
+        hasPeerMention = true
+      }
+    }
+  }
+
+  return { hasAllMention, hasPeerMention }
+}
+
 function matchesListenerRule(
   listener: GroupListenerRule,
   msg: InboundLarkMessage,
@@ -519,6 +607,17 @@ function matchesListenerRule(
 
   if (listener.scope === 'top_level' && (msg.rootId || msg.parentId)) {
     return { ok: false, reason: 'listener_not_top_level' }
+  }
+
+  const mentionFilter = listener.mentionFilter ?? 'all'
+  if (mentionFilter !== 'all') {
+    const mentionFlags = classifyListenerMentions(msg)
+    if (mentionFilter === 'exclude_all' && (mentionFlags.hasPeerMention || mentionFlags.hasAllMention)) {
+      return { ok: false, reason: 'listener_mention_excluded' }
+    }
+    if (mentionFilter === 'exclude_peer' && mentionFlags.hasPeerMention) {
+      return { ok: false, reason: 'listener_peer_mention_excluded' }
+    }
   }
 
   if (

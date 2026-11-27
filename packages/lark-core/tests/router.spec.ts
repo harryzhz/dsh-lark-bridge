@@ -2180,4 +2180,239 @@ describe('decideLarkRouting, <user_message> format, memberOverrides & title inte
       routeKey: rootKey,
     })
   })
+
+  it('filters @ messages in passive listeners according to listener.mentionFilter while preserving direct @bot and delegation fallback', () => {
+    const bot = createBot()
+    const makeGroup = (mentionFilter?: 'all' | 'exclude_peer' | 'exclude_all') =>
+      LarkGroupConfigSchema.parse({
+        key: `${bot.id}:oc_team_dev`,
+        botId: bot.id,
+        chatId: 'oc_team_dev',
+        enabled: true,
+        listener: {
+          enabled: true,
+          name: '工作日常',
+          prompt: '参与开放讨论，无需回复保持静默',
+          scope: 'top_level',
+          msgTypes: ['text', 'post', 'interactive'],
+          senderTypes: ['user', 'bot'],
+          ...(mentionFilter ? { mentionFilter } : {}),
+        },
+      })
+
+    const plainMsg = createMessage({
+      messageId: 'om_mf_plain',
+      text: '今天发布窗口是几点？联系 ops@example.com 或 @Controller，代码示例 `<at id="ou_peer">Sam</at>`',
+      mentions: [],
+    })
+    const peerMentionMsg = createMessage({
+      messageId: 'om_mf_peer',
+      text: '@_user_1 帮我看下这个接口报错',
+      mentions: [{ key: '@_user_1', openId: 'ou_peer', name: 'Sam' }],
+    })
+    const allMentionMsg = createMessage({
+      messageId: 'om_mf_all',
+      text: '@_all 下午三点同步发布进度',
+      mentions: [{ key: '@_all', openId: 'all', name: '所有人' }],
+    })
+    const allMentionWithoutOpenId = createMessage({
+      messageId: 'om_mf_all_no_id',
+      text: '@_all 大家看下文档',
+      mentions: [{ key: '@_all', name: '所有人' }],
+    })
+    const mixedMentionMsg = createMessage({
+      messageId: 'om_mf_mixed',
+      text: '@_all @_user_1 重点跟进下',
+      mentions: [
+        { key: '@_all', openId: 'all', name: '所有人' },
+        { key: '@_user_1', openId: 'ou_peer', name: 'Sam' },
+      ],
+    })
+    const cardPeerAtMsg = createMessage({
+      messageId: 'om_mf_card_peer',
+      msgType: 'interactive',
+      senderType: 'bot',
+      senderOpenId: 'ou_alert_bot',
+      text: '审批提醒：<at id="ou_peer">Sam</at> 请处理',
+      mentions: [],
+    })
+    const cardAllAtMsg = createMessage({
+      messageId: 'om_mf_card_all',
+      msgType: 'interactive',
+      senderType: 'bot',
+      senderOpenId: 'ou_alert_bot',
+      text: '版本通知：<at id=all>所有人</at> 已上线',
+      mentions: [],
+    })
+    const postAllAtMsg = createMessage({
+      messageId: 'om_mf_post_all',
+      msgType: 'post',
+      text: '@所有人 下午三点同步发布进度',
+      rawContent: JSON.stringify({
+        content: [[{ tag: 'at', user_id: 'all', user_name: '所有人' }, { tag: 'text', text: ' 下午三点同步发布进度' }]],
+      }),
+      mentions: [],
+    })
+    const postPeerAtMsg = createMessage({
+      messageId: 'om_mf_post_peer',
+      msgType: 'post',
+      text: '@Sam 麻烦看下这个变更',
+      rawContent: JSON.stringify({
+        content: [[{ tag: 'at', user_id: 'ou_peer', user_name: 'Sam' }, { tag: 'text', text: ' 麻烦看下这个变更' }]],
+      }),
+      mentions: [],
+    })
+    const directBotMentionMsg = createMessage({
+      messageId: 'om_mf_bot',
+      text: '@_bot_1 @_user_1 帮我看下日志',
+      mentions: [
+        { key: '@_bot_1', openId: 'ou_bot', name: 'DSH-Bot' },
+        { key: '@_user_1', openId: 'ou_peer', name: 'Sam' },
+      ],
+    })
+
+    // 1. Default (`all` / omitted): listens to all messages
+    const defaultGroup = makeGroup()
+    expect(defaultGroup.listener.mentionFilter).toBe('all')
+    for (const msg of [plainMsg, peerMentionMsg, allMentionMsg, cardPeerAtMsg, cardAllAtMsg]) {
+      const d = decideLarkRouting(bot, msg, {
+        groupConfig: defaultGroup,
+        hasActiveSessionForRoute: () => false,
+      })
+      expect(d).toMatchObject({ action: 'agent', trigger: 'listener' })
+    }
+
+    // 2. `exclude_peer`: skips @other member/app (and card <at id="ou_...">), keeps plain text & @all
+    const excludePeerGroup = makeGroup('exclude_peer')
+    expect(
+      decideLarkRouting(bot, plainMsg, {
+        groupConfig: excludePeerGroup,
+        hasActiveSessionForRoute: () => false,
+      }),
+    ).toMatchObject({ action: 'agent', trigger: 'listener' })
+    expect(
+      decideLarkRouting(bot, allMentionMsg, {
+        groupConfig: excludePeerGroup,
+        hasActiveSessionForRoute: () => false,
+      }),
+    ).toMatchObject({ action: 'agent', trigger: 'listener' })
+    expect(
+      decideLarkRouting(bot, allMentionWithoutOpenId, {
+        groupConfig: excludePeerGroup,
+        hasActiveSessionForRoute: () => false,
+      }),
+    ).toMatchObject({ action: 'agent', trigger: 'listener' })
+    expect(
+      decideLarkRouting(bot, cardAllAtMsg, {
+        groupConfig: excludePeerGroup,
+        hasActiveSessionForRoute: () => false,
+      }),
+    ).toMatchObject({ action: 'agent', trigger: 'listener' })
+    expect(
+      decideLarkRouting(bot, postAllAtMsg, {
+        groupConfig: excludePeerGroup,
+        hasActiveSessionForRoute: () => false,
+      }),
+    ).toMatchObject({ action: 'agent', trigger: 'listener' })
+    expect(
+      decideLarkRouting(bot, peerMentionMsg, {
+        groupConfig: excludePeerGroup,
+        hasActiveSessionForRoute: () => false,
+      }),
+    ).toEqual({ action: 'ignore', reason: 'listener_peer_mention_excluded' })
+    expect(
+      decideLarkRouting(bot, postPeerAtMsg, {
+        groupConfig: excludePeerGroup,
+        hasActiveSessionForRoute: () => false,
+      }),
+    ).toEqual({ action: 'ignore', reason: 'listener_peer_mention_excluded' })
+    expect(
+      decideLarkRouting(bot, mixedMentionMsg, {
+        groupConfig: excludePeerGroup,
+        hasActiveSessionForRoute: () => false,
+      }),
+    ).toEqual({ action: 'ignore', reason: 'listener_peer_mention_excluded' })
+    expect(
+      decideLarkRouting(bot, cardPeerAtMsg, {
+        groupConfig: excludePeerGroup,
+        hasActiveSessionForRoute: () => false,
+      }),
+    ).toEqual({ action: 'ignore', reason: 'listener_peer_mention_excluded' })
+
+    // 3. `exclude_all`: skips both @other and @all (and card <at ...>), keeps plain text
+    const excludeAllGroup = makeGroup('exclude_all')
+    expect(
+      decideLarkRouting(bot, plainMsg, {
+        groupConfig: excludeAllGroup,
+        hasActiveSessionForRoute: () => false,
+      }),
+    ).toMatchObject({ action: 'agent', trigger: 'listener' })
+    for (const msg of [
+      peerMentionMsg,
+      allMentionMsg,
+      allMentionWithoutOpenId,
+      mixedMentionMsg,
+      cardPeerAtMsg,
+      cardAllAtMsg,
+      postAllAtMsg,
+      postPeerAtMsg,
+    ]) {
+      expect(
+        decideLarkRouting(bot, msg, {
+          groupConfig: excludeAllGroup,
+          hasActiveSessionForRoute: () => false,
+        }),
+      ).toEqual({ action: 'ignore', reason: 'listener_mention_excluded' })
+    }
+
+    // 4. Direct @Bot is NEVER blocked by listener.mentionFilter
+    expect(
+      decideLarkRouting(bot, directBotMentionMsg, {
+        groupConfig: excludeAllGroup,
+        hasActiveSessionForRoute: () => false,
+      }),
+    ).toMatchObject({ action: 'agent', trigger: 'mention' })
+
+    // 5. Active-thread continuation is NOT affected by listener.mentionFilter
+    const activeThreadKey = 'cli_dsh_app:oc_team_dev:om_active_root'
+    expect(
+      decideLarkRouting(
+        bot,
+        createMessage({
+          messageId: 'om_mf_thread_peer',
+          rootId: 'om_active_root',
+          parentId: 'om_active_root',
+          threadId: 'omt_active_1',
+          text: '@_user_1 补充下上下文',
+          mentions: [{ key: '@_user_1', openId: 'ou_peer', name: 'Sam' }],
+        }),
+        {
+          groupConfig: excludeAllGroup,
+          hasActiveSessionForRoute: (k) => k === activeThreadKey,
+          getRouteTrigger: () => 'listener',
+          hasRouteReplied: () => true,
+        },
+      ),
+    ).toMatchObject({ action: 'agent', trigger: 'active-thread' })
+
+    // 6. Bot-level proactive delegation follow-up still catches A @ B when listener excludes @peer
+    const delegationBot = createBot({
+      experimental: {
+        proactive: {
+          remindersEnabled: true,
+          delegationFollowupEnabled: true,
+        },
+      },
+    })
+    const delegationDecision = decideLarkRouting(delegationBot, peerMentionMsg, {
+      groupConfig: excludePeerGroup,
+      hasActiveSessionForRoute: () => false,
+    })
+    expect(delegationDecision).toMatchObject({
+      action: 'agent',
+      trigger: 'listener',
+      silentOnly: true,
+      delegationFollowup: true,
+    })
+  })
 })
