@@ -1290,11 +1290,13 @@ function BotConversationAndMessageSection({
           <SettingRow
             title="提示文案"
             desc="支持 [敲键盘] 等飞书表情，留空走默认"
+            stack
           >
             <TextField
               value={draft.longTurnNoticeText ?? ''}
               onChange={(longTurnNoticeText) => patch({ longTurnNoticeText })}
               placeholder={DEFAULT_LONG_TURN_NOTICE_TEXT}
+              wide
             />
           </SettingRow>
         </NestedSettings>

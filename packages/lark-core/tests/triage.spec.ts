@@ -961,8 +961,8 @@ describe('Smart triage config, per-group overrides & protocol', () => {
 
     const botDefault = makeBot()
     expect(botDefault.longTurnProgressNotice).toBe(true)
-    expect(botDefault.longTurnNoticeDelaySeconds).toBe(60)
-    expect(botDefault.longTurnNoticeText).toBe('深度求索中…[敲键盘]')
+    expect(botDefault.longTurnNoticeDelaySeconds).toBe(300)
+    expect(botDefault.longTurnNoticeText).toBe('当前任务仍在深度求索中，请耐心等待…[敲键盘]')
     const mentionDecision = decideLarkRouting(
       botDefault,
       makeMsg({
@@ -974,8 +974,8 @@ describe('Smart triage config, per-group overrides & protocol', () => {
     expect(mentionDecision.action).toBe('agent')
     if (mentionDecision.action === 'agent') {
       expect(mentionDecision.longTurnProgressNotice).toBe(true)
-      expect(mentionDecision.longTurnNoticeDelaySeconds).toBe(60)
-      expect(mentionDecision.longTurnNoticeText).toBe('深度求索中…[敲键盘]')
+      expect(mentionDecision.longTurnNoticeDelaySeconds).toBe(300)
+      expect(mentionDecision.longTurnNoticeText).toBe('当前任务仍在深度求索中，请耐心等待…[敲键盘]')
     }
 
     const botCustom = makeBot({

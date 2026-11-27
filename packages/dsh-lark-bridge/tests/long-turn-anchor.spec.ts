@@ -379,7 +379,7 @@ describe('Long-turn & queue-wait automatic progress anchors (P2)', () => {
       await slow
       const slowReplies = h.sentReplies.filter((r) => r.replyToMessageId === 'om_slow')
       expect(slowReplies).toHaveLength(2)
-      expect(slowReplies[0]?.text).toBe('深度求索中…[敲键盘]')
+      expect(slowReplies[0]?.text).toBe('当前任务仍在深度求索中，请耐心等待…[敲键盘]')
       expect(slowReplies[1]?.text).toBe('深度分析报告')
     } finally {
       await h.manager.stop()
@@ -547,7 +547,7 @@ describe('Long-turn & queue-wait automatic progress anchors (P2)', () => {
       await pBlank
       expect(
         h.sentReplies.filter((r) => r.replyToMessageId === 'om_blank_1').map((r) => r.text),
-      ).toEqual(['深度求索中…[敲键盘]', '留空兜底结论'])
+      ).toEqual(['当前任务仍在深度求索中，请耐心等待…[敲键盘]', '留空兜底结论'])
 
       // delaySeconds=0 disables execution anchor while keeping queue-wait anchor available
       const pZero1 = h.manager.handleInbound(
