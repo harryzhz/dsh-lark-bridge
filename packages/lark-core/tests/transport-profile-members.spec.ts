@@ -203,6 +203,7 @@ describe('LarkBotTransport profile description sync & member/bot avatar resoluti
     let releaseMessageHandler!: () => void
     const onMessageStarted = vi.fn()
     const onChatMembershipChange = vi.fn()
+    const onBotAddedToChat = vi.fn()
 
     const transport = new LarkBotTransport(createBot(), {
       onMessage: async () => {
@@ -212,6 +213,7 @@ describe('LarkBotTransport profile description sync & member/bot avatar resoluti
         })
       },
       onChatMembershipChange,
+      onBotAddedToChat,
       logger: (_level, msg) => logs.push(msg),
     })
 
@@ -310,10 +312,27 @@ describe('LarkBotTransport profile description sync & member/bot avatar resoluti
         { needCheck: false },
       )
       await capturedDispatcher!.invoke(
-        { schema: '2.0', header: { event_type: 'im.chat.member.bot.added_v1' }, event: {} },
+        {
+          schema: '2.0',
+          header: { event_type: 'im.chat.member.bot.added_v1', event_id: 'ev_join_1' },
+          event: {
+            chat_id: 'oc_new_group',
+            name: '新协作群',
+            operator_id: { open_id: 'ou_inviter_1' },
+          },
+        },
         { needCheck: false },
       )
       expect(onChatMembershipChange).toHaveBeenCalledTimes(1)
+      await vi.waitFor(() => expect(onBotAddedToChat).toHaveBeenCalledTimes(1))
+      expect(onBotAddedToChat).toHaveBeenCalledWith(
+        expect.objectContaining({
+          botId: 'bot-alpha',
+          chatId: 'oc_new_group',
+          chatName: '新协作群',
+          operatorOpenId: 'ou_inviter_1',
+        }),
+      )
 
       await transport.stop()
       expect(closeSpy).toHaveBeenCalledTimes(1)

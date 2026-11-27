@@ -53,6 +53,11 @@ import { MemoryService } from './memory-service.js'
 import { ObservabilityService } from './observability-service.js'
 import type { ObservabilityPayload, ObservabilityWindow } from './observability-types.js'
 import { PluginUpdateService } from './plugin-updater.js'
+import {
+  PromptGeneratorService,
+  type GeneratePromptInput,
+  type GeneratePromptOutput,
+} from './prompt-generator-service.js'
 import { ProactiveReminderService } from './reminder-service.js'
 import { RuntimeCatalog } from './runtime-catalog.js'
 import {
@@ -136,6 +141,7 @@ export class LarkBridgeManager {
   readonly titleGuard: SessionTitleGuard
   readonly splitBrain: SplitBrainDetector
   readonly pluginUpdater: PluginUpdateService
+  readonly promptGenerator: PromptGeneratorService
   readonly observability: ObservabilityService
 
   private readonly instanceLock: InstanceLock
@@ -178,6 +184,7 @@ export class LarkBridgeManager {
       platform: this.platform,
       directoryEnricher: this.directoryEnricher,
       isDisposed: () => this.disposed,
+      isDraining: () => this.phase === 'draining' || this.phase === 'stopping',
       onInboundMessage: (botId, transport, msg) =>
         this.inbound.handleInbound(botId, transport, msg),
       onMessageRecalled: (botId, transport, event) =>
@@ -390,6 +397,15 @@ export class LarkBridgeManager {
           }
         },
       },
+    })
+
+    this.promptGenerator = new PromptGeneratorService({
+      ctx,
+      store,
+      runtimes: this.runtimes,
+      workspaces: this.workspaces,
+      runtimeLimiter: this.runtimeLimiter,
+      shutdownSignal: this.shutdownController.signal,
     })
 
     this.observability = new ObservabilityService({
@@ -826,6 +842,10 @@ export class LarkBridgeManager {
     rawBody: Record<string, unknown>,
   ): Promise<{ readonly bot: LarkBotConfig; readonly eventSync?: LarkBaselineEventSyncResult }> {
     return this.connections.importExistingOpenPlatformBot(rawBody)
+  }
+
+  generatePrompt(input: GeneratePromptInput): Promise<GeneratePromptOutput> {
+    return this.promptGenerator.generate(input)
   }
 
   async syncGroupWorkspace(botId: string, chatId: string): Promise<void> {
