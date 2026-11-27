@@ -23,6 +23,7 @@ import type {
   RouterBypassConfig,
   RouterScopeMode,
   RuntimeOption,
+  TierRoutingConfig,
   TriageDefaultsPayload,
   TriageToolSchema,
 } from '../types.js'
@@ -35,6 +36,7 @@ import {
   TagInput,
   type SelectOption,
 } from './fields.js'
+import { TierRoutingFields } from './TierRoutingFields.js'
 
 export interface TriageFieldsValue {
   readonly provider: string
@@ -48,6 +50,7 @@ export interface TriageFieldsValue {
   readonly contextTtlMinutes: number
   readonly includeLastReply: boolean
   readonly coalesceQueuedMessages: boolean
+  readonly tierRouting?: TierRoutingConfig
 }
 
 function listNativeModelGroups(
@@ -88,7 +91,8 @@ export function formatTriageSummary(
   const modelLabel =
     resolveNativeModelLabel(router.provider, router.model, models) || 'DSH 默认原生模型'
   const scopeLabel = choiceLabel(ROUTER_SCOPE_MODES, router.scope)
-  return `已开启 · ${modelLabel} · ${scopeLabel}`
+  const tierSuffix = router.tierRouting?.enabled ? ' · 按难度路由' : ''
+  return `已开启 · ${modelLabel} · ${scopeLabel}${tierSuffix}`
 }
 
 interface ParsedSchemaProp {
@@ -216,7 +220,26 @@ function TriagePromptSection({
   const effectivePromptText = value.systemPrompt.trim() ? value.systemPrompt : defaultPrompt
   const isPromptCustomized =
     Boolean(value.systemPrompt.trim()) && value.systemPrompt.trim() !== defaultPrompt.trim()
-  const toolSchema = triageDefaults.toolSchema ?? FALLBACK_TRIAGE_DEFAULTS.toolSchema!
+  const baseToolSchema = triageDefaults.toolSchema ?? FALLBACK_TRIAGE_DEFAULTS.toolSchema!
+  const toolSchema = useMemo<TriageToolSchema>(() => {
+    if (!value.tierRouting?.enabled) return baseToolSchema
+    const baseProps = (baseToolSchema.parameters.properties ?? {}) as Record<string, unknown>
+    return {
+      ...baseToolSchema,
+      parameters: {
+        ...baseToolSchema.parameters,
+        properties: {
+          ...baseProps,
+          tier: {
+            type: 'string',
+            enum: ['lite', 'standard', 'heavy'],
+            description:
+              '新建会话且 action="handoff" 时的任务复杂度档位：lite（轻量）/ standard（标准）/ heavy（深度）。',
+          },
+        },
+      },
+    }
+  }, [baseToolSchema, value.tierRouting?.enabled])
 
   const updatePrompt = (nextText: string) => {
     if (!nextText.trim() || nextText.trim() === defaultPrompt.trim()) {
@@ -340,6 +363,9 @@ export function TriageConfigFields({
   models,
   triageDefaults = FALLBACK_TRIAGE_DEFAULTS,
   emptyModelLabel = '跟随 DSH 默认原生模型',
+  defaultAgentPreset,
+  defaultProfileId,
+  defaultModel,
   onChange,
 }: {
   value: TriageFieldsValue
@@ -347,6 +373,9 @@ export function TriageConfigFields({
   models: readonly ModelGroup[]
   triageDefaults?: TriageDefaultsPayload
   emptyModelLabel?: string
+  defaultAgentPreset?: string
+  defaultProfileId?: string
+  defaultModel?: string
   onChange: (patch: Partial<TriageFieldsValue>) => void
 }) {
   const nativeGroups = listNativeModelGroups(models, runtimes)
@@ -444,6 +473,16 @@ export function TriageConfigFields({
           onChange={(coalesceQueuedMessages) => onChange({ coalesceQueuedMessages })}
         />
       </SettingRow>
+
+      <TierRoutingFields
+        value={value.tierRouting}
+        runtimes={runtimes}
+        models={models}
+        {...(defaultAgentPreset ? { defaultAgentPreset } : {})}
+        {...(defaultProfileId ? { defaultProfileId } : {})}
+        {...(defaultModel ? { defaultModel } : {})}
+        onChange={(tierRouting) => onChange({ tierRouting })}
+      />
 
       <GroupTitle>直通规则</GroupTitle>
       <SettingRow

@@ -497,6 +497,11 @@ export function GroupConfigDialog({
                               base?.includeLastReply ?? currentRouter.includeLastReply,
                             coalesceQueuedMessages:
                               base?.coalesceQueuedMessages ?? currentRouter.coalesceQueuedMessages,
+                            ...(base?.tierRouting
+                              ? { tierRouting: base.tierRouting }
+                              : currentRouter.tierRouting
+                                ? { tierRouting: currentRouter.tierRouting }
+                                : {}),
                           },
                         })
                         return
@@ -512,6 +517,21 @@ export function GroupConfigDialog({
                     models={models}
                     triageDefaults={triageDefaults}
                     emptyModelLabel={emptyGroupModelLabel}
+                    defaultAgentPreset={
+                      draft.runtimeMode === 'override' && draft.agentPreset
+                        ? draft.agentPreset
+                        : bot?.agentPreset
+                    }
+                    defaultProfileId={
+                      draft.runtimeMode === 'override'
+                        ? draft.runtimeProfileId || undefined
+                        : bot?.runtimeProfileId
+                    }
+                    defaultModel={
+                      draft.runtimeMode === 'override' && draft.model
+                        ? draft.model
+                        : bot?.model
+                    }
                     onChange={(next) =>
                       patch({ router: { ...currentRouter, mode: 'override', ...next } })
                     }

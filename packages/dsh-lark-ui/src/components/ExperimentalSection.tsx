@@ -32,6 +32,11 @@ import {
   modelOptions,
   reasoningEffortOptions,
 } from './options.js'
+import {
+  buildEffectiveModelsForProfile,
+  profileCatalogCacheKey,
+  useProfileModelCatalogs,
+} from './profile-models.js'
 
 export interface DreamStatusPresentation {
   readonly dot: StateDotState
@@ -127,6 +132,7 @@ export function ExperimentalSection({
   experimental,
   dreamState,
   runtime,
+  runtimeProfileId,
   models = [],
   botModel = '',
   onChange,
@@ -137,6 +143,7 @@ export function ExperimentalSection({
   experimental: BotExperimentalConfig
   dreamState?: DreamRunState | undefined
   runtime?: RuntimeOption | undefined
+  runtimeProfileId?: string | undefined
   models?: readonly ModelGroup[]
   botModel?: string | undefined
   onChange: (next: BotExperimentalConfig) => void
@@ -171,23 +178,44 @@ export function ExperimentalSection({
 
   const dreamModelValue = dreaming.model?.trim() ?? ''
   const dreamEffortValue = dreaming.reasoningEffort?.trim() ?? ''
+  const activeProfileId = runtimeProfileId?.trim() ?? ''
+  const dreamRuntimes = useMemo(() => (runtime ? [runtime] : []), [runtime])
+  const dreamProfilePairs = useMemo(
+    () => (runtime && activeProfileId ? [{ runtimeId: runtime.id, profileId: activeProfileId }] : []),
+    [runtime, activeProfileId],
+  )
+  const { catalogs: profileCatalogs, loadingKeys } = useProfileModelCatalogs(
+    dreamProfilePairs,
+    dreamRuntimes,
+    models,
+  )
+  const profileLoading = Boolean(
+    runtime && activeProfileId && loadingKeys.has(profileCatalogCacheKey(runtime.id, activeProfileId)),
+  )
+  const effectiveModels = useMemo(
+    () =>
+      buildEffectiveModelsForProfile(runtime, activeProfileId, models, profileCatalogs, {
+        loading: profileLoading,
+      }),
+    [runtime, activeProfileId, models, profileCatalogs, profileLoading],
+  )
   const runtimeCatalog = useMemo(
-    () => catalogModelsForRuntime(runtime, models),
-    [runtime, models],
+    () => catalogModelsForRuntime(runtime, effectiveModels),
+    [runtime, effectiveModels],
   )
   const useModelDropdown = runtime?.kind === 'external' || runtimeCatalog.length > 0
   const dreamModelChoices = useMemo(
     () => [
       { value: '', label: '跟随智能体默认' },
-      ...modelOptions(runtime, models, dreamModelValue),
+      ...modelOptions(runtime, effectiveModels, dreamModelValue),
     ],
-    [runtime, models, dreamModelValue],
+    [runtime, effectiveModels, dreamModelValue],
   )
   const effectiveModelForEffort = dreamModelValue || botModel?.trim() || ''
   const effortMeta = useMemo(
     () =>
-      reasoningEffortOptions(runtime, models, effectiveModelForEffort, dreamEffortValue),
-    [runtime, models, effectiveModelForEffort, dreamEffortValue],
+      reasoningEffortOptions(runtime, effectiveModels, effectiveModelForEffort, dreamEffortValue),
+    [runtime, effectiveModels, effectiveModelForEffort, dreamEffortValue],
   )
   const dreamEffortChoices = useMemo(
     () => [

@@ -334,8 +334,8 @@ sequenceDiagram
 | `/status` | 无变更 | 无 | 立即返回当前会话 ID、工作区、运行时、模型、目录与 DSH 接管链接 |
 | `/new` 或 `/close` | 删除主绑定与全部别名，按 `sessionId` 释放句柄 | 立即归档原会话 | 下一条消息创建新会话 |
 | `/cancel` | 保持绑定不变 | 无 | 向运行中 Agent 发送 `cancel({ kind: 'user' })` 中断当前回合 |
-| `/model <id>` | 保持绑定不变 | 无 | 运行中会话直接 `agent.model.select()` 立即生效，并同步更新群独立模型或 Bot 默认模型 |
-| `/agent <id>` | 更新群独立运行时或 Bot 默认运行时，删除主绑定与全部别名 | 立即归档原会话 | 下一条消息以新运行时创建会话 |
+| `/model [id] [effort]` | 保持绑定不变，标记 `runtimePinned = true` | 无 | 无参列出当前会话所属运行时（含自定义启动配置/代理）的真实可用模型与思考强度；带参热切当前会话模型（群聊与活跃会话仅修改本会话，不改动群/智能体默认配置） |
+| `/agent <id>` | 更新群独立运行时或 Bot 默认运行时（群聊禁用），删除主绑定与全部别名 | 立即归档原会话 | 下一条消息以新运行时创建会话 |
 | 控制台「会话 → 结束并归档」 | 删除主绑定与全部别名，按 `sessionId` 释放句柄 | 立即归档 | 立即生效 |
 | 控制台修改群 `model` / `reasoningEffort` | 保持原绑定（含别名）与会话 | 无 | 下一条消息进入 `resumeAgent` 时热切换 |
 | 控制台修改群 `agentPreset` / `workingDir` | 下一条消息到达时解绑旧路由（含别名）并新建会话 | 旧会话待空闲超时归档 | 下一条消息生效 |
@@ -348,7 +348,7 @@ sequenceDiagram
 
 - **可定制 System Prompt 与固定工具契约**：
   - 支持在配置页编辑完整 System Prompt，并通过 `{{bot_name}}`、`{{bot_role}}`、`{{chat_name}}`、`{{trigger}}`、`{{trigger_guide}}`、`{{active_session_rule}}`、`{{listener_name}}`、`{{listener_prompt}}` 占位注入运行时上下文（空变量自动折叠多余空行；留空回退内置默认模板；存量旧版 `customPrompt` 读取时自动合并迁移）；
-  - `route_message` 工具定义（`silent` / `quick_reply` / `handoff`）固定下发，不可被用户修改；
+  - `route_message` 工具定义（`silent` / `quick_reply` / `handoff`）固定下发，不可被用户修改；开启「按难度路由（`tierRouting`）」且当前为新建会话时，自动附加 `tier`（`lite` / `standard` / `heavy`）判档参数与三档说明，按各档配置的 `Agent + Profile + Model + 思考强度` 权重池（优先选择有空闲并发槽位且未处于短期故障冷却的组合）一次性选定新会话的运行时与模型，并在 `session_bindings` 标记 `runtimePinned = true` 与 `routedTier` 锁定全生命周期（续聊与重启恢复不被群默认配置覆写；显式 `@Bot` 新会话即使在 `passive_only` 模式下也会完成轻量定档且保持禁静默）；
   - `UserMessage` 与监听/角色规则**全文透传不截断**，近期群聊或话题消息条数由 `recentMessageCount`（0–50，默认 6）、有效时间窗由 `contextTtlMinutes`（1–1440 分钟，默认 30）、是否附带上一轮主回复全文由 `includeLastReply`（默认开启）控制；
   - **跨重启持久化与冷启动回填**：分流滑窗、上一轮主回复与轻回复临时话题（含别名）均增量持久化至 SQLite `triage_context_scopes`，同时启用群聊内被规则 `ignore` 的非自发消息与 Bot 自身回复也会同步写入群级滑窗；冷启动或停机空窗期若本地滑窗条数不足，首次分流会自动通过 `transport.listMessages`（`1.2s` 短超时兜底）懒回填真实群/话题历史并按 `messageId` 去重，确保重启后第一条消息依然具备完整上下文。
 - **轻量分流闸门与可查看特殊会话（`LlmTriageService` + `TriageSessionRecorder`）**：

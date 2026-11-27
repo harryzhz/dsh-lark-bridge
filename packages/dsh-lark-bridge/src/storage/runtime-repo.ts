@@ -39,6 +39,8 @@ interface BindingRow {
   runtime_profile_id: string | null
   model: string | null
   reasoning_effort: string | null
+  runtime_pinned?: number | null
+  routed_tier?: string | null
   working_dir: string
   trigger: string
   listener_name: string | null
@@ -173,9 +175,9 @@ export class RuntimeRepo {
           `INSERT INTO session_bindings (
              route_key, session_id, bot_id, bot_name, lark_app_id, chat_type, chat_id, chat_name,
              user_open_id, user_name, workspace_name, agent_preset, runtime_profile_id, model,
-             reasoning_effort, working_dir, trigger, listener_name, has_replied, created_at_ms,
-             last_activity_ms, idle_close_ms
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             reasoning_effort, runtime_pinned, routed_tier, working_dir, trigger, listener_name,
+             has_replied, created_at_ms, last_activity_ms, idle_close_ms
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(route_key) DO UPDATE SET
              session_id = excluded.session_id,
              bot_id = excluded.bot_id,
@@ -191,6 +193,8 @@ export class RuntimeRepo {
              runtime_profile_id = excluded.runtime_profile_id,
              model = excluded.model,
              reasoning_effort = excluded.reasoning_effort,
+             runtime_pinned = excluded.runtime_pinned,
+             routed_tier = excluded.routed_tier,
              working_dir = excluded.working_dir,
              trigger = excluded.trigger,
              listener_name = excluded.listener_name,
@@ -215,6 +219,8 @@ export class RuntimeRepo {
           binding.runtimeProfileId ?? null,
           binding.model ?? null,
           binding.reasoningEffort ?? null,
+          binding.runtimePinned ? 1 : null,
+          binding.routedTier ?? null,
           binding.workingDir ?? '',
           binding.trigger ?? 'mention',
           binding.listenerName ?? null,
@@ -1263,6 +1269,10 @@ export class RuntimeRepo {
       ...(row.runtime_profile_id ? { runtimeProfileId: row.runtime_profile_id } : {}),
       ...(row.model ? { model: row.model } : {}),
       ...(row.reasoning_effort ? { reasoningEffort: row.reasoning_effort } : {}),
+      ...(row.runtime_pinned === 1 ? { runtimePinned: true } : {}),
+      ...(row.routed_tier === 'lite' || row.routed_tier === 'standard' || row.routed_tier === 'heavy'
+        ? { routedTier: row.routed_tier }
+        : {}),
       workingDir: row.working_dir,
       trigger: row.trigger,
       ...(row.listener_name ? { listenerName: row.listener_name } : {}),

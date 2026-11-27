@@ -1,8 +1,6 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { IconSettingsOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
-import { bridgeApi } from '../api.js'
 import type {
-  CatalogModelItem,
   ModelGroup,
   RuntimeConcurrencyConfig,
   RuntimeOption,
@@ -17,6 +15,12 @@ import {
   reasoningEffortOptions,
   runtimeOptions,
 } from './options.js'
+import {
+  buildEffectiveModelsForProfile,
+  profileCatalogCacheKey,
+  resolveProfileCatalogModels,
+  useProfileModelCatalogs,
+} from './profile-models.js'
 import {
   RuntimeConcurrencyField,
   resolveRuntimeConcurrencyState,
@@ -113,49 +117,28 @@ export function AgentRuntimeFields({
   const showProfileRow = Boolean(runtime?.kind === 'external' && runtime.supportsProfiles)
 
   const [manageOpen, setManageOpen] = useState(false)
-  const [profileCatalogs, setProfileCatalogs] = useState<Record<string, CatalogModelItem[]>>({})
-  const [loadingProfileModels, setLoadingProfileModels] = useState(false)
   const [catalogRevision, setCatalogRevision] = useState(0)
 
-  const cacheKey = runtime && activeProfileId ? `${runtime.id}::${activeProfileId}` : ''
+  const cacheKey = runtime && activeProfileId ? profileCatalogCacheKey(runtime.id, activeProfileId) : ''
   const effectiveRevision = catalogRevision + profileRevision
+  const requestedPairs = useMemo(
+    () => (runtime && activeProfileId ? [{ runtimeId: runtime.id, profileId: activeProfileId }] : []),
+    [runtime, activeProfileId],
+  )
+  const {
+    catalogs: profileCatalogs,
+    loadingKeys,
+    invalidateRuntime,
+  } = useProfileModelCatalogs(requestedPairs, runtimes, models, effectiveRevision)
+  const loadingProfileModels = Boolean(cacheKey && loadingKeys.has(cacheKey))
 
-  useEffect(() => {
-    if (!runtime || runtime.kind !== 'external' || !activeProfileId) {
-      setLoadingProfileModels(false)
-      return
-    }
-    let cancelled = false
-    setLoadingProfileModels(true)
-    void bridgeApi
-      .profileModels(runtime.id, activeProfileId)
-      .then((items) => {
-        if (cancelled) return
-        setProfileCatalogs((prev) => ({ ...prev, [cacheKey]: items }))
-      })
-      .catch(() => {
-        // Keep base runtime model catalog as fallback if live probe fails.
-      })
-      .finally(() => {
-        if (!cancelled) setLoadingProfileModels(false)
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [runtime?.id, runtime?.kind, activeProfileId, cacheKey, effectiveRevision])
-
-  const effectiveModels = useMemo<readonly ModelGroup[]>(() => {
-    if (!runtime?.providerId || !cacheKey) return models
-    const override = profileCatalogs[cacheKey]
-    if (!override || override.length === 0) return models
-    const exists = models.some((g) => g.provider === runtime.providerId)
-    if (!exists) {
-      return [...models, { provider: runtime.providerId, name: runtime.name, models: override }]
-    }
-    return models.map((g) =>
-      g.provider === runtime.providerId ? { ...g, models: override } : g,
-    )
-  }, [models, runtime, cacheKey, profileCatalogs])
+  const effectiveModels = useMemo<readonly ModelGroup[]>(
+    () =>
+      buildEffectiveModelsForProfile(runtime, activeProfileId, models, profileCatalogs, {
+        loading: loadingProfileModels,
+      }),
+    [models, runtime, activeProfileId, profileCatalogs, loadingProfileModels],
+  )
 
   const effectiveRuntime = useMemo<RuntimeOption | undefined>(() => {
     if (!runtime) return undefined
@@ -238,14 +221,18 @@ export function AgentRuntimeFields({
               const nextProfile = nextProfileId
                 ? profiles.find((p) => p.id === nextProfileId)
                 : undefined
-              const nextKey = nextProfileId ? `${runtime.id}::${nextProfileId}` : ''
-              const cachedList = nextKey ? profileCatalogs[nextKey] : undefined
-              const nextModels =
-                cachedList && cachedList.length > 0 && runtime.providerId
-                  ? models.map((g) =>
-                      g.provider === runtime.providerId ? { ...g, models: cachedList } : g,
-                    )
-                  : models
+              const cachedList = resolveProfileCatalogModels(
+                runtime,
+                nextProfileId,
+                models,
+                profileCatalogs,
+              )
+              const nextModels = buildEffectiveModelsForProfile(
+                runtime,
+                nextProfileId,
+                models,
+                profileCatalogs,
+              )
               const nextRt = nextProfile?.defaultModel
                 ? { ...runtime, defaultModel: nextProfile.defaultModel }
                 : runtime
@@ -354,13 +341,7 @@ export function AgentRuntimeFields({
           concurrency={concurrency}
           onClose={() => setManageOpen(false)}
           onChanged={async (nextProfileId) => {
-            setProfileCatalogs((prev) => {
-              const next: Record<string, CatalogModelItem[]> = {}
-              for (const [k, v] of Object.entries(prev)) {
-                if (!k.startsWith(`${runtime.id}::`)) next[k] = v
-              }
-              return next
-            })
+            invalidateRuntime(runtime.id)
             setCatalogRevision((v) => v + 1)
             await onProfilesChanged?.()
             if (nextProfileId !== undefined) {

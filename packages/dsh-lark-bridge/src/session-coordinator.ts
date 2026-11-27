@@ -654,16 +654,31 @@ export class SessionCoordinator {
       const existingActor = this.actors.get(existing.sessionId)
       const targetCwd = expandWorkingDir(decision.workingDir) || decision.workingDir
       const existingCwd = expandWorkingDir(existing.workingDir) || existing.workingDir
+      const pinned = Boolean(existing.runtimePinned)
       const profileChanged = (existing.runtimeProfileId ?? '') !== (decision.runtimeProfileId ?? '')
       if (
         existingActor?.isTerminated ||
-        existing.agentPreset !== decision.agentPreset ||
-        profileChanged ||
-        existingCwd !== targetCwd
+        existingCwd !== targetCwd ||
+        (!pinned && (existing.agentPreset !== decision.agentPreset || profileChanged))
       ) {
         await this.unbindRoute(existing.routeKey, { archive: false })
       } else {
-        const resumed = await this.resumeAgent(bot, existing, decision)
+        const resumeDecision: AgentDecision = pinned
+          ? {
+              ...decision,
+              agentPreset: existing.agentPreset,
+              ...(existing.runtimeProfileId
+                ? { runtimeProfileId: existing.runtimeProfileId }
+                : { runtimeProfileId: undefined }),
+              ...(existing.model ? { model: existing.model } : { model: undefined }),
+              ...(existing.reasoningEffort
+                ? { reasoningEffort: existing.reasoningEffort }
+                : { reasoningEffort: undefined }),
+              runtimePinned: true,
+              ...(existing.routedTier ? { routedTier: existing.routedTier } : {}),
+            }
+          : decision
+        const resumed = await this.resumeAgent(bot, existing, resumeDecision)
         if (resumed) return resumed
       }
     }
@@ -886,6 +901,8 @@ export class SessionCoordinator {
       ...(decision.runtimeProfileId ? { runtimeProfileId: decision.runtimeProfileId } : {}),
       ...(decision.model ? { model: decision.model } : {}),
       ...(decision.reasoningEffort ? { reasoningEffort: decision.reasoningEffort } : {}),
+      ...(decision.runtimePinned ? { runtimePinned: true } : {}),
+      ...(decision.routedTier ? { routedTier: decision.routedTier } : {}),
       workingDir,
       trigger: decision.trigger,
       ...(decision.listenerName ? { listenerName: decision.listenerName } : {}),

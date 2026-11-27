@@ -184,6 +184,15 @@ export class RuntimeConcurrencyLimiter {
     return this.defaultLimit
   }
 
+  /** Whether the runtime bucket currently has an immediate free execution slot. */
+  hasCapacity(rawRuntimeKey: string): boolean {
+    const runtimeKey = normalizeRuntimeConcurrencyKey(rawRuntimeKey)
+    const effectiveLimit = this.getLimit(runtimeKey)
+    if (effectiveLimit === 0) return true
+    const bucket = this.buckets.get(runtimeKey)
+    return !bucket || bucket.active < effectiveLimit
+  }
+
   /**
    * Hot-update a single runtime or profile limit without restarting the service.
    * Passing `null` removes the custom override so the bucket inherits parent/default.

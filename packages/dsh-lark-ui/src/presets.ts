@@ -10,8 +10,13 @@ import type {
   RouterBypassConfig,
   RouterBypassMsgType,
   RouterScopeMode,
+  RuntimeOption,
   ScheduleDeliveryMode,
   ScheduleNotifyOn,
+  TaskDifficultyTier,
+  TierRoutingBypassTier,
+  TierRoutingConfig,
+  TierRoutingTarget,
   TriageDefaultsPayload,
 } from './types.js'
 
@@ -139,6 +144,245 @@ export function cloneRouterBypass(bypass?: Partial<RouterBypassConfig>): RouterB
   }
 }
 
+export const TASK_DIFFICULTY_TIERS: readonly TaskDifficultyTier[] = ['lite', 'standard', 'heavy']
+
+export const TIER_LABELS: Readonly<Record<TaskDifficultyTier, string>> = {
+  lite: '轻量',
+  standard: '标准',
+  heavy: '深度',
+}
+
+export const DEFAULT_TIER_DESCRIPTIONS: Readonly<Record<TaskDifficultyTier, string>> = {
+  lite: '轻量任务：查资料、查飞书消息/文档、读单个文件、简单配置查询、内容总结整理或单步工具操作',
+  standard: '常规研发与协作：常规代码修改、定位常见 Bug、补写单测、常规 PR Review、多工具信息检索与方案整理',
+  heavy: '深度攻坚任务：跨模块架构设计、疑难并发/性能/线上复杂故障根因排查、大规模重构、高风险安全/代码深度审查或复杂长上下文深推',
+}
+
+export const TIER_ROUTING_BYPASS_OPTIONS: readonly Choice<TierRoutingBypassTier>[] = [
+  { value: 'default', label: '跟随默认运行时' },
+  { value: 'lite', label: '轻量档' },
+  { value: 'standard', label: '标准档' },
+  { value: 'heavy', label: '深度档' },
+]
+
+export const TIER_ROUTING_PRESET_OPTIONS: readonly Choice<string>[] = [
+  { value: 'recommended', label: '推荐三档（Agy + Codex）' },
+  { value: 'single_agent', label: '单运行时分档（跟随当前主运行时）' },
+  { value: 'custom', label: '自定义' },
+]
+
+export const DEFAULT_TIER_ROUTING: TierRoutingConfig = {
+  enabled: false,
+  presetKey: '',
+  bypassTier: 'default',
+  tiers: {
+    lite: { prompt: '', targets: [] },
+    standard: { prompt: '', targets: [] },
+    heavy: { prompt: '', targets: [] },
+  },
+}
+
+export function cloneTierRouting(raw?: Partial<TierRoutingConfig>): TierRoutingConfig {
+  const cloneTargets = (list?: readonly TierRoutingTarget[]): TierRoutingTarget[] =>
+    (list ?? []).map((t) => ({
+      id: t.id,
+      agentPreset: t.agentPreset,
+      runtimeProfileId: t.runtimeProfileId ?? '',
+      model: t.model ?? '',
+      reasoningEffort: t.reasoningEffort ?? '',
+      weight: typeof t.weight === 'number' && Number.isFinite(t.weight) ? t.weight : 50,
+      enabled: t.enabled !== false,
+    }))
+  return {
+    enabled: Boolean(raw?.enabled),
+    presetKey: raw?.presetKey ?? '',
+    bypassTier: raw?.bypassTier ?? 'default',
+    tiers: {
+      lite: {
+        prompt: raw?.tiers?.lite?.prompt ?? '',
+        targets: cloneTargets(raw?.tiers?.lite?.targets),
+      },
+      standard: {
+        prompt: raw?.tiers?.standard?.prompt ?? '',
+        targets: cloneTargets(raw?.tiers?.standard?.targets),
+      },
+      heavy: {
+        prompt: raw?.tiers?.heavy?.prompt ?? '',
+        targets: cloneTargets(raw?.tiers?.heavy?.targets),
+      },
+    },
+  }
+}
+
+export function buildPresetTierRouting(
+  presetKey: string,
+  options: {
+    readonly runtimes: readonly RuntimeOption[]
+    readonly defaultAgentPreset?: string
+    readonly defaultProfileId?: string
+    readonly defaultModel?: string
+  },
+): TierRoutingConfig {
+  const findRuntime = (id: string) => options.runtimes.find((r) => r.id === id && !r.broken)
+  const resolveProfileFor = (runtimeId: string): string => {
+    if (options.defaultAgentPreset === runtimeId && options.defaultProfileId) {
+      return options.defaultProfileId
+    }
+    return ''
+  }
+
+  if (presetKey === 'single_agent') {
+    const rtId = options.defaultAgentPreset?.trim() || options.runtimes[0]?.id || 'agy'
+    const profileId = options.defaultProfileId?.trim() || ''
+    const model = options.defaultModel?.trim() || findRuntime(rtId)?.defaultModel || ''
+    return {
+      enabled: true,
+      presetKey: 'single_agent',
+      bypassTier: 'default',
+      tiers: {
+        lite: {
+          prompt: '',
+          targets: [
+            {
+              id: 'lite-1',
+              agentPreset: rtId,
+              runtimeProfileId: profileId,
+              model,
+              reasoningEffort: 'low',
+              weight: 100,
+              enabled: true,
+            },
+          ],
+        },
+        standard: {
+          prompt: '',
+          targets: [
+            {
+              id: 'std-1',
+              agentPreset: rtId,
+              runtimeProfileId: profileId,
+              model,
+              reasoningEffort: 'high',
+              weight: 100,
+              enabled: true,
+            },
+          ],
+        },
+        heavy: {
+          prompt: '',
+          targets: [
+            {
+              id: 'heavy-1',
+              agentPreset: rtId,
+              runtimeProfileId: profileId,
+              model,
+              reasoningEffort: 'xhigh',
+              weight: 100,
+              enabled: true,
+            },
+          ],
+        },
+      },
+    }
+  }
+
+  // Recommended 3-tier preset: Agy + Codex across lite / standard / heavy.
+  const hasAgy = options.runtimes.length === 0 || Boolean(findRuntime('agy'))
+  const hasCodex = options.runtimes.length === 0 || Boolean(findRuntime('codex'))
+  const agyProfile = resolveProfileFor('agy')
+  const codexProfile = resolveProfileFor('codex')
+
+  const pickPair = (
+    agyTarget: TierRoutingTarget,
+    codexTarget: TierRoutingTarget,
+  ): TierRoutingTarget[] => {
+    const out: TierRoutingTarget[] = []
+    if (hasAgy) out.push(agyTarget)
+    if (hasCodex) out.push(codexTarget)
+    if (out.length === 0) {
+      out.push(agyTarget, codexTarget)
+    }
+    return out
+  }
+
+  return {
+    enabled: true,
+    presetKey: 'recommended',
+    bypassTier: 'default',
+    tiers: {
+      lite: {
+        prompt: '',
+        targets: pickPair(
+          {
+            id: 'lite-agy',
+            agentPreset: 'agy',
+            runtimeProfileId: agyProfile,
+            model: 'gemini-4-neon',
+            reasoningEffort: 'low',
+            weight: 50,
+            enabled: true,
+          },
+          {
+            id: 'lite-codex',
+            agentPreset: 'codex',
+            runtimeProfileId: codexProfile,
+            model: 'gpt-6.1-sol',
+            reasoningEffort: 'low',
+            weight: 50,
+            enabled: true,
+          },
+        ),
+      },
+      standard: {
+        prompt: '',
+        targets: pickPair(
+          {
+            id: 'std-agy',
+            agentPreset: 'agy',
+            runtimeProfileId: agyProfile,
+            model: 'gemini-4-neon',
+            reasoningEffort: 'xhigh',
+            weight: 50,
+            enabled: true,
+          },
+          {
+            id: 'std-codex',
+            agentPreset: 'codex',
+            runtimeProfileId: codexProfile,
+            model: 'gpt-6.1-sol',
+            reasoningEffort: 'xhigh',
+            weight: 50,
+            enabled: true,
+          },
+        ),
+      },
+      heavy: {
+        prompt: '',
+        targets: pickPair(
+          {
+            id: 'heavy-agy',
+            agentPreset: 'agy',
+            runtimeProfileId: agyProfile,
+            model: 'gemini-4-carbon',
+            reasoningEffort: 'high',
+            weight: 50,
+            enabled: true,
+          },
+          {
+            id: 'heavy-codex',
+            agentPreset: 'codex',
+            runtimeProfileId: codexProfile,
+            model: 'gpt-6-astra',
+            reasoningEffort: 'xhigh',
+            weight: 50,
+            enabled: true,
+          },
+        ),
+      },
+    },
+  }
+}
+
 export const FALLBACK_TRIAGE_DEFAULTS: TriageDefaultsPayload = {
   toolName: 'route_message',
   toolSchema: {
@@ -177,6 +421,7 @@ export const FALLBACK_TRIAGE_DEFAULTS: TriageDefaultsPayload = {
     { key: 'active_session_rule', token: '{{active_session_rule}}', label: '活跃会话约束', desc: '根据是否存在活跃主会话决定是否允许 quick_reply' },
     { key: 'listener_name', token: '{{listener_name}}', label: '监听规则名', desc: '命中主动监听时的规则名称（非监听为空）' },
     { key: 'listener_prompt', token: '{{listener_prompt}}', label: '监听指令全文', desc: '群主动监听配置的完整判断指令（非监听为空）' },
+    { key: 'tier_routing_guide', token: '{{tier_routing_guide}}', label: '难度分档规则', desc: '开启按难度路由且新建会话时自动生成的三档判定说明' },
   ],
   defaultSystemPrompt: [
     '你是飞书群聊智能体「{{bot_name}}」的前置智能分流助手。你的唯一职责是在极短时间内判断当前入站消息的处理去向，并调用 `route_message` 工具（或直接输出严格 JSON）。',
