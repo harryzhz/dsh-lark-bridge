@@ -1,8 +1,8 @@
 {
   "name": "@harryzhz/dsh-lark-bridge",
   "version": "0.4.42",
-  "description": "Lark (Feishu) multi-agent bridge, group governance, Dreaming offline memory & proactive assistant plugin for DeepSeek Harness (Desktop & Web)",
-  "license": "SEE LICENSE IN LICENSE",
+  "description": "Turn Claude Code, Codex, TRAE & DeepSeek Harness into a 24/7 Feishu/Lark team member — zero public server, smart triage, auto-memory & proactive follow-up.",
+  "license": "MIT",
   "homepage": "https://github.com/harryzhz/dsh-lark-bridge#readme",
   "repository": {
     "type": "git",
@@ -14,11 +14,20 @@
   "icon": "./icon.svg",
   "keywords": [
     "deepseek-harness",
+    "deepseek-harness-plugin",
     "dsh",
     "dsh-plugin",
     "lark",
     "feishu",
-    "agent"
+    "lark-bot",
+    "feishu-bot",
+    "claude-code",
+    "codex",
+    "trae",
+    "ai-agent",
+    "coding-agent",
+    "agent",
+    "mcp"
   ],
   "publishConfig": {
     "access": "public"
