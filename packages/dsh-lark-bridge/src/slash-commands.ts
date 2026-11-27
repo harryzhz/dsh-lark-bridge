@@ -531,7 +531,7 @@ async function switchModel(
       [
         ...header,
         '',
-        `真实可用模型（共 ${availableModels.length} 个）：`,
+        `可用模型（共 ${availableModels.length} 个）：`,
         ...lines,
         '',
         isGroupChat
@@ -550,7 +550,7 @@ async function switchModel(
   if (availableModels.length > 0 && !matchedEntry) {
     const preview = availableModels.map((m) => m.id).join('、')
     await input.reply(
-      `运行时 ${runtimeLabel} 下未找到模型 "${modelQuery}"。\n当前真实可用模型：${preview}\n发送 /model 可查看完整列表与支持的思考强度。`,
+      `运行时 ${runtimeLabel} 下未找到模型 "${modelQuery}"。\n当前可用模型：${preview}\n发送 /model 可查看完整列表与支持的思考强度。`,
     )
     return
   }
