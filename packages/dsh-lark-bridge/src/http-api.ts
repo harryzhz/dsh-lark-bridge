@@ -1,7 +1,11 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Context } from '@deepseek-ai/cordis'
 import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
-import { resolveEffectiveWorkspaceName, toPublicBotView } from '@dsh-lark/lark-core'
+import {
+  buildDefaultNewBotSettings,
+  resolveEffectiveWorkspaceName,
+  toPublicBotView,
+} from '@dsh-lark/lark-core'
 import {
   SessionIdentityError,
   type AgentCliSendInput,
@@ -695,7 +699,63 @@ export async function dispatchLarkApiRequest(
       )
       const requestedId = typeof body.id === 'string' ? body.id.trim() : ''
       const existedBefore = Boolean(requestedId && manager.store.getBot(requestedId))
-      const saved = manager.store.upsertBot(body)
+      let createPayload: Record<string, unknown> = body
+      if (!existedBefore) {
+        const availableRuntimes = await manager.runtimes.list().catch(() => [])
+        const availableRuntimeIds = availableRuntimes.filter((r) => !r.broken).map((r) => r.id)
+        const preset = typeof body.agentPreset === 'string' ? body.agentPreset.trim() : undefined
+        const profileId =
+          typeof body.runtimeProfileId === 'string' ? body.runtimeProfileId.trim() : undefined
+        const defaults = buildDefaultNewBotSettings({
+          availableRuntimeIds,
+          ...(preset ? { defaultAgentPreset: preset } : {}),
+          ...(profileId ? { defaultProfileId: profileId } : {}),
+        })
+        createPayload = {
+          ...defaults,
+          ...body,
+          ...(body.router && typeof body.router === 'object' && !Array.isArray(body.router)
+            ? { router: { ...defaults.router, ...(body.router as Record<string, unknown>) } }
+            : {}),
+          ...(body.experimental &&
+          typeof body.experimental === 'object' &&
+          !Array.isArray(body.experimental)
+            ? {
+                experimental: {
+                  ...defaults.experimental,
+                  ...(body.experimental as Record<string, unknown>),
+                  ...(typeof (body.experimental as Record<string, unknown>).dreaming === 'object' &&
+                  (body.experimental as Record<string, unknown>).dreaming !== null &&
+                  !Array.isArray((body.experimental as Record<string, unknown>).dreaming)
+                    ? {
+                        dreaming: {
+                          ...defaults.experimental.dreaming,
+                          ...((body.experimental as Record<string, unknown>).dreaming as Record<
+                            string,
+                            unknown
+                          >),
+                        },
+                      }
+                    : {}),
+                  ...(typeof (body.experimental as Record<string, unknown>).proactive === 'object' &&
+                  (body.experimental as Record<string, unknown>).proactive !== null &&
+                  !Array.isArray((body.experimental as Record<string, unknown>).proactive)
+                    ? {
+                        proactive: {
+                          ...defaults.experimental.proactive,
+                          ...((body.experimental as Record<string, unknown>).proactive as Record<
+                            string,
+                            unknown
+                          >),
+                        },
+                      }
+                    : {}),
+                },
+              }
+            : {}),
+        }
+      }
+      const saved = manager.store.upsertBot(createPayload)
       const hasManualDescription = Boolean(saved.description.trim())
       const platformSync = hasManualDescription
         ? await manager.platform.syncBotBaseInfo(saved.larkAppId, {

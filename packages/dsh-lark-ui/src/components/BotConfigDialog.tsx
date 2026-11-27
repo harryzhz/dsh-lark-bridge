@@ -16,12 +16,11 @@ import {
 import { bridgeApi } from '../api.js'
 import {
   ACCESS_MODES,
+  buildPresetTierRouting,
   cloneRouterBypass,
   cloneTierRouting,
   DEFAULT_BOT_SIGNATURE,
   DEFAULT_DREAMING_SCOPES,
-  DEFAULT_LONG_TURN_NOTICE_DELAY_SECONDS,
-  DEFAULT_LONG_TURN_NOTICE_TEXT,
   DEFAULT_ROUTER_BYPASS,
   DISCLOSURE_MODES,
   P2P_SESSION_MODES,
@@ -125,10 +124,83 @@ export const DEFAULT_ROUTER_CONFIG: BotRouterConfig = {
   coalesceQueuedMessages: true,
 }
 
+const PREFERRED_NEW_BOT_RUNTIME_ID = 'agy'
+const PREFERRED_NEW_BOT_MODEL = 'gemini-4-neon'
+const PREFERRED_NEW_BOT_EFFORT = 'xhigh'
+
+function pickDefaultNewBotRuntime(
+  runtimes: readonly RuntimeOption[],
+  models: readonly ModelGroup[],
+): {
+  readonly runtime: RuntimeOption | undefined
+  readonly model: string
+  readonly reasoningEffort: string
+} {
+  const healthy = runtimes.filter((r) => !r.broken)
+  const preferred = healthy.find((r) => r.id === PREFERRED_NEW_BOT_RUNTIME_ID)
+  if (preferred) {
+    const providerModels = preferred.providerId
+      ? models.find((g) => g.provider === preferred.providerId)?.models
+      : undefined
+    const hasPreferredModel =
+      !providerModels?.length || providerModels.some((m) => m.id === PREFERRED_NEW_BOT_MODEL)
+    const rawModel = hasPreferredModel
+      ? PREFERRED_NEW_BOT_MODEL
+      : effectiveDefaultModel(preferred, models)
+    const norm = normalizeModelAndEffort(preferred, models, rawModel, PREFERRED_NEW_BOT_EFFORT)
+    return {
+      runtime: preferred,
+      model: norm.model || rawModel,
+      reasoningEffort: norm.reasoningEffort || PREFERRED_NEW_BOT_EFFORT,
+    }
+  }
+  const fallback =
+    healthy.find((r) => r.isDefault) ??
+    healthy[0] ??
+    runtimes.find((r) => r.isDefault) ??
+    runtimes[0]
+  return {
+    runtime: fallback,
+    model: effectiveDefaultModel(fallback, models),
+    reasoningEffort: '',
+  }
+}
+
+function buildDefaultNewBotTierRoutingConfig(
+  runtimes: readonly RuntimeOption[],
+  defaultAgentPreset: string,
+  defaultProfileId: string,
+  defaultModel: string,
+) {
+  const healthy = runtimes.filter((r) => !r.broken)
+  if (
+    runtimes.length > 0 &&
+    !healthy.some((r) => r.id === 'agy' || r.id === 'codex')
+  ) {
+    return cloneTierRouting()
+  }
+  return buildPresetTierRouting('recommended', {
+    runtimes,
+    ...(defaultAgentPreset ? { defaultAgentPreset } : {}),
+    ...(defaultProfileId ? { defaultProfileId } : {}),
+    ...(defaultModel ? { defaultModel } : {}),
+  })
+}
+
 export function newBotConfig(
   defaultRuntime: RuntimeOption | undefined,
   models: readonly ModelGroup[] = [],
+  runtimes: readonly RuntimeOption[] = [],
 ): BotConfig {
+  const picked =
+    runtimes.length > 0
+      ? pickDefaultNewBotRuntime(runtimes, models)
+      : {
+          runtime: defaultRuntime,
+          model: effectiveDefaultModel(defaultRuntime, models),
+          reasoningEffort: defaultRuntime?.id === PREFERRED_NEW_BOT_RUNTIME_ID ? PREFERRED_NEW_BOT_EFFORT : '',
+        }
+  const agentPreset = picked.runtime?.id ?? defaultRuntime?.id ?? 'standard'
   return {
     id: '',
     name: '',
@@ -137,10 +209,10 @@ export function newBotConfig(
     larkAppSecret: '',
     avatarUrl: '',
     description: '',
-    agentPreset: defaultRuntime?.id ?? 'standard',
+    agentPreset,
     runtimeProfileId: '',
-    model: effectiveDefaultModel(defaultRuntime, models),
-    reasoningEffort: '',
+    model: picked.model,
+    reasoningEffort: picked.reasoningEffort,
     defaultWorkingDir: '~',
     workspaceName: '',
     groupReplyMode: 'reply',
@@ -154,11 +226,8 @@ export function newBotConfig(
     adminUsers: [],
     adminUserProfiles: [],
     sendIntermediateMessages: false,
-    cotEnabled: false,
+    cotEnabled: true,
     cotToolResultEnabled: true,
-    longTurnProgressNotice: true,
-    longTurnNoticeDelaySeconds: DEFAULT_LONG_TURN_NOTICE_DELAY_SECONDS,
-    longTurnNoticeText: DEFAULT_LONG_TURN_NOTICE_TEXT,
     useInteractiveCard: true,
     dshSessionLinkInCard: true,
     sessionLinkGuestReadOnly: true,
@@ -172,12 +241,25 @@ export function newBotConfig(
     substituteMode: { enabled: false, targets: [], disclosure: 'none', activeThreadFollowup: true },
     router: {
       ...DEFAULT_ROUTER_CONFIG,
+      enabled: true,
+      scope: 'all_group',
+      timeoutMs: 15_000,
       bypass: cloneRouterBypass(DEFAULT_ROUTER_BYPASS),
-      tierRouting: cloneTierRouting(),
+      tierRouting: buildDefaultNewBotTierRoutingConfig(runtimes, agentPreset, '', picked.model),
     },
     experimental: {
-      dreaming: { ...DEFAULT_DREAMING_CONFIG, scopes: [...DEFAULT_DREAMING_CONFIG.scopes] },
-      proactive: { ...DEFAULT_PROACTIVE_CONFIG },
+      dreaming: {
+        ...DEFAULT_DREAMING_CONFIG,
+        enabled: true,
+        reasoningEffort: 'high',
+        scopes: [...DEFAULT_DREAMING_CONFIG.scopes],
+      },
+      proactive: {
+        ...DEFAULT_PROACTIVE_CONFIG,
+        remindersEnabled: true,
+        delegationFollowupEnabled: true,
+        autoCodeEnabled: true,
+      },
     },
   }
 }
@@ -201,10 +283,6 @@ function toBotConfig(record: BotRecord): BotConfig {
     adminUserProfiles: cloned.adminUserProfiles ?? [],
     cotEnabled: cloned.cotEnabled ?? false,
     cotToolResultEnabled: cloned.cotToolResultEnabled ?? true,
-    longTurnProgressNotice: cloned.cotEnabled ? false : (cloned.longTurnProgressNotice ?? true),
-    longTurnNoticeDelaySeconds:
-      cloned.longTurnNoticeDelaySeconds ?? DEFAULT_LONG_TURN_NOTICE_DELAY_SECONDS,
-    longTurnNoticeText: cloned.longTurnNoticeText ?? DEFAULT_LONG_TURN_NOTICE_TEXT,
     sessionLinkGuestReadOnly: cloned.sessionLinkGuestReadOnly ?? true,
     router: {
       ...DEFAULT_ROUTER_CONFIG,
@@ -428,7 +506,7 @@ function CreateBotDialog({
   const [existingSource, setExistingSource] = useState<'open_platform' | 'manual'>('open_platform')
   const [syncBaselineEvents, setSyncBaselineEvents] = useState(false)
   const [draft, setDraft] = useState<BotConfig>(() =>
-    newBotConfig(runtimes.find((r) => r.isDefault) ?? runtimes[0], models),
+    newBotConfig(runtimes.find((r) => r.isDefault) ?? runtimes[0], models, runtimes),
   )
   const runtimeTouchedRef = useRef(false)
   const [autoJob, setAutoJob] = useState<QrJobView | null>(null)
@@ -447,18 +525,30 @@ function CreateBotDialog({
 
   useEffect(() => {
     if (runtimeTouchedRef.current || runtimes.length === 0) return
-    const defaultRuntime = runtimes.find((r) => r.isDefault) ?? runtimes[0]
-    if (!defaultRuntime) return
+    const picked = pickDefaultNewBotRuntime(runtimes, models)
+    if (!picked.runtime) return
     setDraft((prev) => {
-      const nextModel = effectiveDefaultModel(defaultRuntime, models)
-      if (prev.agentPreset === defaultRuntime.id && (prev.model ?? '') === (nextModel ?? '')) {
+      if (
+        prev.agentPreset === picked.runtime!.id &&
+        (prev.model ?? '') === (picked.model ?? '') &&
+        (prev.reasoningEffort ?? '') === (picked.reasoningEffort ?? '')
+      ) {
         return prev
       }
       return {
         ...prev,
-        agentPreset: defaultRuntime.id,
-        model: nextModel,
-        reasoningEffort: '',
+        agentPreset: picked.runtime!.id,
+        model: picked.model,
+        reasoningEffort: picked.reasoningEffort,
+        router: {
+          ...prev.router,
+          tierRouting: buildDefaultNewBotTierRoutingConfig(
+            runtimes,
+            picked.runtime!.id,
+            prev.runtimeProfileId ?? '',
+            picked.model,
+          ),
+        },
       }
     })
   }, [runtimes, models])
@@ -579,13 +669,23 @@ function CreateBotDialog({
     setSaving(true)
     try {
       const resolvedId = draft.id.trim() || generateFallbackBotId(draft.name, draft.larkAppId)
+      const cleanProfileId = draft.runtimeProfileId?.trim() ?? ''
       await onSave(
         {
           ...draft,
           id: resolvedId,
-          runtimeProfileId: draft.runtimeProfileId?.trim() || undefined,
+          runtimeProfileId: cleanProfileId || undefined,
           model: norm.model || undefined,
           reasoningEffort: norm.reasoningEffort || undefined,
+          router: {
+            ...draft.router,
+            tierRouting: buildDefaultNewBotTierRoutingConfig(
+              runtimes,
+              draft.agentPreset,
+              cleanProfileId,
+              norm.model || '',
+            ),
+          },
         },
         null,
       )
@@ -1322,13 +1422,7 @@ function BotConversationAndMessageSection({
         <Switch
           label="展示思考过程"
           checked={Boolean(draft.cotEnabled)}
-          onChange={(cotEnabled) =>
-            patch(
-              cotEnabled
-                ? { cotEnabled: true, longTurnProgressNotice: false }
-                : { cotEnabled: false },
-            )
-          }
+          onChange={(cotEnabled) => patch({ cotEnabled })}
         />
       </SettingRow>
       {Boolean(draft.cotEnabled) && (
@@ -1352,52 +1446,6 @@ function BotConversationAndMessageSection({
           onChange={(sendIntermediateMessages) => patch({ sendIntermediateMessages })}
         />
       </SettingRow>
-      <SettingRow
-        title="长任务进度提示"
-        desc={
-          draft.cotEnabled
-            ? '开启展示思考过程后自动关闭，避免重复提示'
-            : '排队等待或处理耗时较长时自动补发一条简短提示，避免长时间无回应'
-        }
-      >
-        <Switch
-          label="长任务进度提示"
-          checked={!draft.cotEnabled && draft.longTurnProgressNotice !== false}
-          disabled={Boolean(draft.cotEnabled)}
-          onChange={(longTurnProgressNotice) => patch({ longTurnProgressNotice })}
-        />
-      </SettingRow>
-      {!draft.cotEnabled && draft.longTurnProgressNotice !== false && (
-        <NestedSettings>
-          <SettingRow
-            title="触发等待时长"
-            desc="处理超过该时长且无中间输出时发送（0 表示仅排队时提示）"
-          >
-            <NumberField
-              value={draft.longTurnNoticeDelaySeconds ?? DEFAULT_LONG_TURN_NOTICE_DELAY_SECONDS}
-              min={0}
-              onChange={(secs) =>
-                patch({
-                  longTurnNoticeDelaySeconds: Math.min(3600, Math.max(0, Math.round(secs))),
-                })
-              }
-              suffix="秒"
-            />
-          </SettingRow>
-          <SettingRow
-            title="提示文案"
-            desc="支持 [敲键盘] 等飞书表情，留空走默认"
-            stack
-          >
-            <TextField
-              value={draft.longTurnNoticeText ?? ''}
-              onChange={(longTurnNoticeText) => patch({ longTurnNoticeText })}
-              placeholder={DEFAULT_LONG_TURN_NOTICE_TEXT}
-              wide
-            />
-          </SettingRow>
-        </NestedSettings>
-      )}
 
       <GroupTitle>消息卡片</GroupTitle>
       <SettingRow title="使用消息卡片" desc="关闭后以纯文本发送回复">

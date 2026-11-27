@@ -221,19 +221,26 @@ describe('Dreaming status presentation & unified SessionsView merging', () => {
     expect(dreamOnly.map(rowId)).toEqual(['sess-dream-new', 'sess-dream-old'])
   })
 
-  it('initializes newBotConfig with Citlalin-aligned conversation & message defaults', () => {
-    const draft = newBotConfig(undefined, [])
+  it('initializes newBotConfig with Citlalin-aligned defaults across conversation, triage, tier routing, dreaming & proactive', () => {
+    const runtimes = [
+      { id: 'standard', name: '标准模式', kind: 'native' as const, isDefault: true, defaultModel: 'deepseek-chat' },
+      { id: 'agy', name: 'Antigravity', kind: 'external' as const, isDefault: false, providerId: 'agy-cli', defaultModel: 'gemini-4-neon' },
+      { id: 'codex', name: 'Codex', kind: 'external' as const, isDefault: false, providerId: 'codex-cli', defaultModel: 'gpt-6.1-sol' },
+    ]
+    const draft = newBotConfig(runtimes[0], [], runtimes)
     expect(draft).toMatchObject({
+      agentPreset: 'agy',
+      model: 'gemini-4-neon',
+      reasoningEffort: 'xhigh',
       groupAccessMode: 'configured_only',
       mentionTriggerMode: 'mention_and_active_thread',
       groupSessionMode: 'thread',
       idleCloseMinutes: 720,
       groupReplyMode: 'reply',
       receivedReactionEmoji: 'OnIt',
+      cotEnabled: true,
+      cotToolResultEnabled: true,
       sendIntermediateMessages: false,
-      longTurnProgressNotice: true,
-      longTurnNoticeDelaySeconds: 300,
-      longTurnNoticeText: '当前任务仍在深度求索中，请耐心等待…[敲键盘]',
       useInteractiveCard: true,
       dshSessionLinkInCard: true,
       sessionLinkGuestReadOnly: true,
@@ -241,21 +248,42 @@ describe('Dreaming status presentation & unified SessionsView merging', () => {
       replyFooterModel: true,
       replyFooterSignature: true,
       signature: 'AI 可能出错，请谨慎判断结果~',
+      router: expect.objectContaining({
+        enabled: true,
+        scope: 'all_group',
+        timeoutMs: 15_000,
+        tierRouting: expect.objectContaining({
+          enabled: true,
+          presetKey: 'recommended',
+          bypassTier: 'default',
+        }),
+      }),
       experimental: {
         dreaming: expect.objectContaining({
+          enabled: true,
           scheduleTime: '03:00',
           maxSessionsPerRun: 0,
           maxCharsPerSession: 5000,
           maxRemindersPerRun: 5,
           deepConsolidation: true,
+          reasoningEffort: 'high',
         }),
         proactive: expect.objectContaining({
+          remindersEnabled: true,
           reminderCreationMode: 'silent',
+          delegationFollowupEnabled: true,
           quietHoursEnabled: true,
           quietHoursStart: '00:00',
           quietHoursEnd: '08:00',
+          autoCodeEnabled: true,
+          branchPrefix: 'agent/',
         }),
       },
     })
+    expect('longTurnProgressNotice' in draft).toBe(false)
+    expect(draft.router.tierRouting?.tiers.standard.targets).toEqual([
+      expect.objectContaining({ agentPreset: 'agy', model: 'gemini-4-neon', reasoningEffort: 'xhigh', weight: 70 }),
+      expect.objectContaining({ agentPreset: 'codex', model: 'gpt-6.1-sol', reasoningEffort: 'xhigh', weight: 30 }),
+    ])
   })
 })

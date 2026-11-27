@@ -88,8 +88,6 @@ export const DISCLOSURE_MODES: readonly Choice<'none' | 'subtle' | 'explicit'>[]
 ]
 
 export const DEFAULT_BOT_SIGNATURE = 'AI 可能出错，请谨慎判断结果~'
-export const DEFAULT_LONG_TURN_NOTICE_DELAY_SECONDS = 300
-export const DEFAULT_LONG_TURN_NOTICE_TEXT = '当前任务仍在深度求索中，请耐心等待…[敲键盘]'
 
 export const DEFAULT_DREAMING_SCOPES: readonly string[] = [
   '个人偏好',
@@ -320,7 +318,7 @@ export function buildPresetTierRouting(
             runtimeProfileId: agyProfile,
             model: 'gemini-4-neon',
             reasoningEffort: 'low',
-            weight: 50,
+            weight: 70,
             enabled: true,
           },
           {
@@ -329,7 +327,7 @@ export function buildPresetTierRouting(
             runtimeProfileId: codexProfile,
             model: 'gpt-6.1-sol',
             reasoningEffort: 'low',
-            weight: 50,
+            weight: 30,
             enabled: true,
           },
         ),
@@ -343,7 +341,7 @@ export function buildPresetTierRouting(
             runtimeProfileId: agyProfile,
             model: 'gemini-4-neon',
             reasoningEffort: 'xhigh',
-            weight: 50,
+            weight: 70,
             enabled: true,
           },
           {
@@ -352,7 +350,7 @@ export function buildPresetTierRouting(
             runtimeProfileId: codexProfile,
             model: 'gpt-6.1-sol',
             reasoningEffort: 'xhigh',
-            weight: 50,
+            weight: 30,
             enabled: true,
           },
         ),
@@ -366,7 +364,7 @@ export function buildPresetTierRouting(
             runtimeProfileId: agyProfile,
             model: 'gemini-4-carbon',
             reasoningEffort: 'high',
-            weight: 50,
+            weight: 70,
             enabled: true,
           },
           {
@@ -375,7 +373,7 @@ export function buildPresetTierRouting(
             runtimeProfileId: codexProfile,
             model: 'gpt-6-astra',
             reasoningEffort: 'xhigh',
-            weight: 50,
+            weight: 30,
             enabled: true,
           },
         ),

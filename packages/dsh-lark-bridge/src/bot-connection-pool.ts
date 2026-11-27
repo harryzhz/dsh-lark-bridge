@@ -1,6 +1,8 @@
 import type { Context } from '@deepseek-ai/cordis'
 import {
+  DEFAULT_NEW_BOT_PREFERRED_RUNTIME,
   LarkBotTransport,
+  buildDefaultNewBotSettings,
   slugifyBotId,
   type CardActionEvent,
   type DiscoveredLarkChat,
@@ -651,6 +653,11 @@ export class BotConnectionPool {
         const finalId = this.allocateUniqueBotId(created.id, created.larkAppId)
         const initialCreatorOpenId = normalizeOpenId(created.creatorOpenId)
         const saved = this.host.store.upsertBot({
+          ...buildDefaultNewBotSettings({
+            availableRuntimeIds: defaults.availableRuntimeIds,
+            defaultAgentPreset: defaults.agentPreset,
+            ...(defaults.runtimeProfileId ? { defaultProfileId: defaults.runtimeProfileId } : {}),
+          }),
           id: finalId,
           name: created.name,
           description: created.description,
@@ -722,6 +729,11 @@ export class BotConnectionPool {
       : undefined
 
     const saved = this.host.store.upsertBot({
+      ...buildDefaultNewBotSettings({
+        availableRuntimeIds: defaults.availableRuntimeIds,
+        defaultAgentPreset: defaults.agentPreset,
+        ...(defaults.runtimeProfileId ? { defaultProfileId: defaults.runtimeProfileId } : {}),
+      }),
       id: finalId,
       name,
       description,
@@ -954,25 +966,45 @@ export class BotConnectionPool {
     const defaultWorkingDir =
       (typeof rawBody.defaultWorkingDir === 'string' && rawBody.defaultWorkingDir.trim()) || '~'
     assertExistingWorkingDirectory(defaultWorkingDir)
+    const availableRuntimes = await this.host.runtimes.list().catch(() => [])
+    const healthyRuntimes = availableRuntimes.filter((r) => !r.broken)
+    const availableRuntimeIds = healthyRuntimes.map((r) => r.id)
     const requestedPreset =
       typeof rawBody.agentPreset === 'string' ? rawBody.agentPreset.trim() : ''
+    const preferredRuntime = healthyRuntimes.find(
+      (r) => r.id === DEFAULT_NEW_BOT_PREFERRED_RUNTIME.agentPreset,
+    )
     let agentPreset = requestedPreset
     if (!agentPreset) {
-      const availableRuntimes = await this.host.runtimes.list().catch(() => [])
       agentPreset =
-        availableRuntimes.find((r) => r.isDefault)?.id ?? availableRuntimes[0]?.id ?? 'standard'
+        preferredRuntime?.id ??
+        healthyRuntimes.find((r) => r.isDefault)?.id ??
+        healthyRuntimes[0]?.id ??
+        availableRuntimes.find((r) => r.isDefault)?.id ??
+        availableRuntimes[0]?.id ??
+        'standard'
     }
     const runtimeProfileId =
       typeof rawBody.runtimeProfileId === 'string' && rawBody.runtimeProfileId.trim()
         ? rawBody.runtimeProfileId.trim()
         : undefined
-    const model =
+    const requestedModel =
       typeof rawBody.model === 'string' && rawBody.model.trim() ? rawBody.model.trim() : undefined
-    const reasoningEffort =
+    const requestedEffort =
       typeof rawBody.reasoningEffort === 'string' && rawBody.reasoningEffort.trim()
         ? rawBody.reasoningEffort.trim()
         : undefined
+    const usePreferredDefaults =
+      !requestedPreset &&
+      agentPreset === DEFAULT_NEW_BOT_PREFERRED_RUNTIME.agentPreset
+    const model =
+      requestedModel ??
+      (usePreferredDefaults ? DEFAULT_NEW_BOT_PREFERRED_RUNTIME.model : undefined)
+    const reasoningEffort =
+      requestedEffort ??
+      (usePreferredDefaults ? DEFAULT_NEW_BOT_PREFERRED_RUNTIME.reasoningEffort : undefined)
     return {
+      availableRuntimeIds,
       defaultWorkingDir,
       workspaceName,
       agentPreset,

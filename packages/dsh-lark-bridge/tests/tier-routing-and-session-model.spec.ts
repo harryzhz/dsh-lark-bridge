@@ -57,16 +57,16 @@ function makeRecommendedTierRouting(): TierRoutingConfig {
 describe('Tier routing core & weighted pool scheduling', () => {
   it('defines the exact 3-tier Agy + Codex recommended preset', () => {
     expect(RECOMMENDED_TIER_ROUTING_TARGETS.lite).toEqual([
-      expect.objectContaining({ agentPreset: 'agy', model: 'gemini-4-neon', reasoningEffort: 'low', weight: 50 }),
-      expect.objectContaining({ agentPreset: 'codex', model: 'gpt-6.1-sol', reasoningEffort: 'low', weight: 50 }),
+      expect.objectContaining({ agentPreset: 'agy', model: 'gemini-4-neon', reasoningEffort: 'low', weight: 70 }),
+      expect.objectContaining({ agentPreset: 'codex', model: 'gpt-6.1-sol', reasoningEffort: 'low', weight: 30 }),
     ])
     expect(RECOMMENDED_TIER_ROUTING_TARGETS.standard).toEqual([
-      expect.objectContaining({ agentPreset: 'agy', model: 'gemini-4-neon', reasoningEffort: 'xhigh', weight: 50 }),
-      expect.objectContaining({ agentPreset: 'codex', model: 'gpt-6.1-sol', reasoningEffort: 'xhigh', weight: 50 }),
+      expect.objectContaining({ agentPreset: 'agy', model: 'gemini-4-neon', reasoningEffort: 'xhigh', weight: 70 }),
+      expect.objectContaining({ agentPreset: 'codex', model: 'gpt-6.1-sol', reasoningEffort: 'xhigh', weight: 30 }),
     ])
     expect(RECOMMENDED_TIER_ROUTING_TARGETS.heavy).toEqual([
-      expect.objectContaining({ agentPreset: 'agy', model: 'gemini-4-carbon', reasoningEffort: 'high', weight: 50 }),
-      expect.objectContaining({ agentPreset: 'codex', model: 'gpt-6-astra', reasoningEffort: 'xhigh', weight: 50 }),
+      expect.objectContaining({ agentPreset: 'agy', model: 'gemini-4-carbon', reasoningEffort: 'high', weight: 70 }),
+      expect.objectContaining({ agentPreset: 'codex', model: 'gpt-6-astra', reasoningEffort: 'xhigh', weight: 30 }),
     ])
   })
 

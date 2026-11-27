@@ -1,7 +1,7 @@
 import { homedir } from 'node:os'
 import { basename, join, parse, resolve } from 'node:path'
 import { z } from 'zod'
-import { DEFAULT_TRIAGE_SYSTEM_PROMPT } from './triage.js'
+import { DEFAULT_TRIAGE_SYSTEM_PROMPT, RECOMMENDED_TIER_ROUTING_TARGETS } from './triage.js'
 
 export function expandWorkingDir(rawDir: string): string {
   const trimmed = rawDir.trim()
@@ -477,8 +477,163 @@ function migrateLegacyWorkspaceField(input: unknown): unknown {
 export const DEFAULT_BOT_GROUP_ACCESS_MODE = 'configured_only' as const
 export const DEFAULT_BOT_GROUP_REPLY_MODE = 'reply' as const
 export const DEFAULT_BOT_SIGNATURE = 'AI 可能出错，请谨慎判断结果~'
-export const DEFAULT_LONG_TURN_NOTICE_DELAY_SECONDS = 300
-export const DEFAULT_LONG_TURN_NOTICE_TEXT = '当前任务仍在深度求索中，请耐心等待…[敲键盘]'
+
+/** Preferred default runtime selection when creating a new bot (falls back if unavailable). */
+export const DEFAULT_NEW_BOT_PREFERRED_RUNTIME = {
+  agentPreset: 'agy',
+  model: 'gemini-4-neon',
+  reasoningEffort: 'xhigh',
+} as const
+
+export interface DefaultNewBotTierRoutingOptions {
+  /** Available non-broken runtime IDs in the current host (when non-empty, filters targets to installed runtimes). */
+  readonly availableRuntimeIds?: readonly string[]
+  /** Main runtime preset chosen for the new bot. */
+  readonly defaultAgentPreset?: string
+  /** Optional launch profile chosen on the main runtime; synced onto matching tier targets. */
+  readonly defaultProfileId?: string
+}
+
+/**
+ * Build the recommended 3-tier difficulty routing preset (Agy 70% + Codex 30%
+ * across lite / standard / heavy) for newly created bots.
+ */
+export function buildDefaultNewBotTierRouting(
+  options: DefaultNewBotTierRoutingOptions = {},
+): z.output<typeof TierRoutingConfigSchema> {
+  const available =
+    options.availableRuntimeIds && options.availableRuntimeIds.length > 0
+      ? new Set(options.availableRuntimeIds.map((id) => id.trim()).filter(Boolean))
+      : undefined
+  const hasAgy = !available || available.has('agy')
+  const hasCodex = !available || available.has('codex')
+  if (available && !hasAgy && !hasCodex) {
+    return {
+      enabled: false,
+      presetKey: '',
+      bypassTier: 'default',
+      tiers: {
+        lite: { prompt: '', targets: [] },
+        standard: { prompt: '', targets: [] },
+        heavy: { prompt: '', targets: [] },
+      },
+    }
+  }
+
+  const agyProfile =
+    options.defaultAgentPreset === 'agy' && options.defaultProfileId?.trim()
+      ? options.defaultProfileId.trim()
+      : ''
+  const codexProfile =
+    options.defaultAgentPreset === 'codex' && options.defaultProfileId?.trim()
+      ? options.defaultProfileId.trim()
+      : ''
+
+  const buildTierTargets = (
+    tier: 'lite' | 'standard' | 'heavy',
+  ): z.output<typeof TierRoutingTargetSchema>[] =>
+    RECOMMENDED_TIER_ROUTING_TARGETS[tier]
+      .filter((t) => !available || available.has(t.agentPreset))
+      .map((t) => ({
+        ...t,
+        runtimeProfileId:
+          t.agentPreset === 'agy'
+            ? agyProfile
+            : t.agentPreset === 'codex'
+              ? codexProfile
+              : t.runtimeProfileId,
+      }))
+
+  return {
+    enabled: true,
+    presetKey: 'recommended',
+    bypassTier: 'default',
+    tiers: {
+      lite: { prompt: '', targets: buildTierTargets('lite') },
+      standard: { prompt: '', targets: buildTierTargets('standard') },
+      heavy: { prompt: '', targets: buildTierTargets('heavy') },
+    },
+  }
+}
+
+/**
+ * Default behavioral configuration applied to newly created bots across all creation
+ * flows (auto-create, open-platform import, manual UI form, and POST /bots).
+ * Existing bots keep their stored values and conservative schema defaults on load.
+ */
+export function buildDefaultNewBotSettings(
+  options: DefaultNewBotTierRoutingOptions = {},
+): {
+  readonly groupAccessMode: typeof DEFAULT_BOT_GROUP_ACCESS_MODE
+  readonly mentionTriggerMode: 'mention_and_active_thread'
+  readonly groupSessionMode: 'thread'
+  readonly idleCloseMinutes: number
+  readonly groupReplyMode: typeof DEFAULT_BOT_GROUP_REPLY_MODE
+  readonly p2pEnabled: boolean
+  readonly p2pSessionMode: 'chat'
+  readonly receivedReactionEmoji: string
+  readonly cotEnabled: boolean
+  readonly cotToolResultEnabled: boolean
+  readonly sendIntermediateMessages: boolean
+  readonly useInteractiveCard: boolean
+  readonly dshSessionLinkInCard: boolean
+  readonly sessionLinkGuestReadOnly: boolean
+  readonly replyFooterEnabled: boolean
+  readonly replyFooterModel: boolean
+  readonly replyFooterSignature: boolean
+  readonly signature: string
+  readonly router: z.output<typeof BotRouterConfigSchema>
+  readonly experimental: z.output<typeof BotExperimentalConfigSchema>
+} {
+  return {
+    groupAccessMode: DEFAULT_BOT_GROUP_ACCESS_MODE,
+    mentionTriggerMode: 'mention_and_active_thread',
+    groupSessionMode: 'thread',
+    idleCloseMinutes: 720,
+    groupReplyMode: DEFAULT_BOT_GROUP_REPLY_MODE,
+    p2pEnabled: true,
+    p2pSessionMode: 'chat',
+    receivedReactionEmoji: 'OnIt',
+    cotEnabled: true,
+    cotToolResultEnabled: true,
+    sendIntermediateMessages: false,
+    useInteractiveCard: true,
+    dshSessionLinkInCard: true,
+    sessionLinkGuestReadOnly: true,
+    replyFooterEnabled: true,
+    replyFooterModel: true,
+    replyFooterSignature: true,
+    signature: DEFAULT_BOT_SIGNATURE,
+    router: {
+      ...DEFAULT_BOT_ROUTER_CONFIG,
+      enabled: true,
+      provider: '',
+      model: '',
+      scope: 'all_group',
+      bypass: {
+        senderTypes: [...DEFAULT_ROUTER_BYPASS_CONFIG.senderTypes],
+        msgTypes: [],
+        keywords: [],
+      },
+      timeoutMs: 15_000,
+      tierRouting: buildDefaultNewBotTierRouting(options),
+    },
+    experimental: {
+      dreaming: {
+        ...DEFAULT_BOT_DREAMING_CONFIG,
+        enabled: true,
+        reasoningEffort: 'high',
+        scopes: [...DEFAULT_DREAMING_SCOPES],
+      },
+      proactive: {
+        ...DEFAULT_BOT_PROACTIVE_CONFIG,
+        remindersEnabled: true,
+        delegationFollowupEnabled: true,
+        autoCodeEnabled: true,
+      },
+    },
+  }
+}
 
 /** Default conversation & message overrides applied when configuring a new group. */
 export const DEFAULT_NEW_GROUP_CONVERSATION_CONFIG = {
@@ -525,14 +680,6 @@ export const LarkBotConfigSchema = z.preprocess(
     cotEnabled: z.boolean().default(false),
     cotToolResultEnabled: z.boolean().default(true),
     sendIntermediateMessages: z.boolean().default(false),
-    longTurnProgressNotice: z.boolean().default(true),
-    longTurnNoticeDelaySeconds: z
-      .number()
-      .int()
-      .min(0)
-      .max(3600)
-      .default(DEFAULT_LONG_TURN_NOTICE_DELAY_SECONDS),
-    longTurnNoticeText: z.string().max(300).default(DEFAULT_LONG_TURN_NOTICE_TEXT),
     useInteractiveCard: z.boolean().default(true),
     dshSessionLinkInCard: z.boolean().default(true),
     sessionLinkGuestReadOnly: z.boolean().default(true),
@@ -963,9 +1110,6 @@ export type RoutingDecision =
       readonly cotEnabled?: boolean
       readonly cotToolResultEnabled?: boolean
       readonly sendIntermediateMessages: boolean
-      readonly longTurnProgressNotice?: boolean
-      readonly longTurnNoticeDelaySeconds?: number
-      readonly longTurnNoticeText?: string
       readonly receivedReactionEmoji?: string
       readonly allowSilentEmptyReply: boolean
       readonly autoCloseAfterCompletion: boolean
