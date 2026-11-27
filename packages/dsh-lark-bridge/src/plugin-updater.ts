@@ -6,6 +6,7 @@ import {
   readFileSync,
   realpathSync,
   renameSync,
+  rmSync,
   writeFileSync,
 } from 'node:fs'
 import * as nodeModule from 'node:module'
@@ -202,6 +203,7 @@ export interface HostPluginManagerLike {
       expected?: { readonly name: string; readonly version: string }
     },
   ): Promise<HostChangeResultLike>
+  setBundleEnabled?(name: string, enabled: boolean): Promise<HostChangeResultLike>
 }
 
 export interface HostHmrLike {
@@ -605,22 +607,184 @@ function summarizeReleaseNotes(raw: string | undefined): string | undefined {
   return joined.length > 420 ? `${joined.slice(0, 417)}...` : joined
 }
 
+function atomicWriteText(filePath: string, content: string): void {
+  mkdirSync(dirname(filePath), { recursive: true })
+  const tmp = `${filePath}.tmp.${process.pid}.${Date.now()}`
+  writeFileSync(tmp, content, { encoding: 'utf8', mode: 0o600 })
+  if (process.platform !== 'win32') {
+    try {
+      chmodSync(tmp, 0o600)
+    } catch {
+      // Ignore chmod failure on restricted filesystems.
+    }
+  }
+  renameSync(tmp, filePath)
+}
+
 function atomicWriteJson(filePath: string, value: unknown): void {
   try {
-    mkdirSync(dirname(filePath), { recursive: true })
-    const tmp = `${filePath}.tmp.${process.pid}.${Date.now()}`
-    writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
-    if (process.platform !== 'win32') {
-      try {
-        chmodSync(tmp, 0o600)
-      } catch {
-        // Ignore chmod failure on restricted filesystems.
-      }
-    }
-    renameSync(tmp, filePath)
+    atomicWriteText(filePath, `${JSON.stringify(value, null, 2)}\n`)
   } catch {
     // Non-fatal persistence failure.
   }
+}
+
+const MISSING_TARBALL_INTEGRITY_RE =
+  /ERR_PNPM_(?:MISSING_TARBALL_INTEGRITY|LOCKFILE_MISSING_INTEGRITY)|lockfile entry has no ["']?integrity["']? field|has no ["']?integrity["']? field,?\s+so\s+(?:its\s+downloaded\s+tarball|pnpm\s+cannot\s+verify)/i
+
+export function isMissingTarballIntegrityError(result: HostChangeResultLike | undefined): boolean {
+  if (!result) return false
+  const haystack = [result.error?.code, result.error?.diagnostic, result.packageResult?.output]
+    .filter((part): part is string => typeof part === 'string' && part.length > 0)
+    .join('\n')
+  return haystack.length > 0 && MISSING_TARBALL_INTEGRITY_RE.test(haystack)
+}
+
+function isRemoteTarballUrl(url: string): boolean {
+  return /^https:\/\/\S+/i.test(url) || LOOPBACK_MIRROR_RE.test(url)
+}
+
+function extractTarballUrlFromInlineBody(body: string): string | undefined {
+  if (/\bintegrity\s*:/i.test(body)) return undefined
+  const match = /\btarball\s*:\s*(?:'([^']+)'|"([^"]+)"|([^,\s}]+))/i.exec(body)
+  const url = (match?.[1] ?? match?.[2] ?? match?.[3])?.trim()
+  return url && isRemoteTarballUrl(url) ? url : undefined
+}
+
+/**
+ * Scan a pnpm lockfile for remote tarball `resolution:` entries that omit an `integrity:` field.
+ * pnpm >=10.34 / >=11.4 fails closed with `ERR_PNPM_MISSING_TARBALL_INTEGRITY` on such entries.
+ */
+export function findLockfileEntriesMissingTarballIntegrity(lockfileContent: string): string[] {
+  const missing = new Set<string>()
+  const lines = lockfileContent.split(/\r?\n/)
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i]!
+    const inlineMatch = /^(\s*resolution:\s*\{)([^}]*)(\}\s*)$/.exec(line)
+    if (inlineMatch) {
+      const url = extractTarballUrlFromInlineBody(inlineMatch[2]!)
+      if (url) missing.add(url)
+      continue
+    }
+    const blockMatch = /^(\s*)resolution:\s*$/.exec(line)
+    if (blockMatch) {
+      const baseIndent = blockMatch[1]!.length
+      let hasIntegrity = false
+      let blockUrl: string | undefined
+      let j = i + 1
+      for (; j < lines.length; j += 1) {
+        const sub = lines[j]!
+        if (!sub.trim()) break
+        const indentMatch = /^(\s*)/.exec(sub)
+        const subIndent = indentMatch ? indentMatch[1]!.length : 0
+        if (subIndent <= baseIndent) break
+        if (/^\s+integrity\s*:/i.test(sub)) {
+          hasIntegrity = true
+        } else {
+          const urlMatch = /^\s+tarball\s*:\s*(?:'([^']+)'|"([^"]+)"|([^\s#]+))\s*$/i.exec(sub)
+          if (urlMatch) {
+            const candidate = (urlMatch[1] ?? urlMatch[2] ?? urlMatch[3])?.trim()
+            if (candidate && isRemoteTarballUrl(candidate)) {
+              blockUrl = candidate
+            }
+          }
+        }
+      }
+      if (!hasIntegrity && blockUrl) {
+        missing.add(blockUrl)
+      }
+      i = j - 1
+    }
+  }
+  return [...missing]
+}
+
+/**
+ * Backfill `integrity: sha512-...` into matching remote tarball `resolution:` entries in a pnpm
+ * lockfile while preserving surrounding YAML structure and existing integrity fields untouched.
+ */
+export function patchLockfileTarballIntegrities(
+  lockfileContent: string,
+  urlToIntegrity: ReadonlyMap<string, string>,
+): { readonly content: string; readonly patchedCount: number } {
+  if (urlToIntegrity.size === 0) {
+    return { content: lockfileContent, patchedCount: 0 }
+  }
+  const eol = lockfileContent.includes('\r\n') ? '\r\n' : '\n'
+  const lines = lockfileContent.split(/\r?\n/)
+  const out: string[] = []
+  let patchedCount = 0
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i]!
+    const inlineMatch = /^(\s*resolution:\s*\{)([^}]*)(\}\s*)$/.exec(line)
+    if (inlineMatch) {
+      const url = extractTarballUrlFromInlineBody(inlineMatch[2]!)
+      const integrity = url ? urlToIntegrity.get(url) : undefined
+      if (integrity) {
+        out.push(`${inlineMatch[1]}integrity: ${integrity}, ${inlineMatch[2]!.trim()}${inlineMatch[3]}`)
+        patchedCount += 1
+        continue
+      }
+      out.push(line)
+      continue
+    }
+
+    const blockMatch = /^(\s*)resolution:\s*$/.exec(line)
+    if (blockMatch) {
+      const baseIndent = blockMatch[1]!.length
+      const blockLines: string[] = []
+      let hasIntegrity = false
+      let tarballLineIdx = -1
+      let tarballIndent = ''
+      let blockUrl: string | undefined
+      let j = i + 1
+      for (; j < lines.length; j += 1) {
+        const sub = lines[j]!
+        if (!sub.trim()) break
+        const indentMatch = /^(\s*)/.exec(sub)
+        const subIndent = indentMatch ? indentMatch[1]!.length : 0
+        if (subIndent <= baseIndent) break
+        blockLines.push(sub)
+        if (/^\s+integrity\s*:/i.test(sub)) {
+          hasIntegrity = true
+        } else {
+          const urlMatch = /^(\s+)tarball\s*:\s*(?:'([^']+)'|"([^"]+)"|([^\s#]+))\s*$/i.exec(sub)
+          if (urlMatch) {
+            const candidate = (urlMatch[2] ?? urlMatch[3] ?? urlMatch[4])?.trim()
+            if (candidate && isRemoteTarballUrl(candidate)) {
+              blockUrl = candidate
+              tarballLineIdx = blockLines.length - 1
+              tarballIndent = urlMatch[1]!
+            }
+          }
+        }
+      }
+      out.push(line)
+      const integrity = !hasIntegrity && blockUrl ? urlToIntegrity.get(blockUrl) : undefined
+      if (integrity && tarballLineIdx >= 0) {
+        for (let k = 0; k < blockLines.length; k += 1) {
+          if (k === tarballLineIdx) {
+            out.push(`${tarballIndent}integrity: ${integrity}`)
+          }
+          out.push(blockLines[k]!)
+        }
+        patchedCount += 1
+      } else {
+        out.push(...blockLines)
+      }
+      i = j - 1
+      continue
+    }
+
+    out.push(line)
+  }
+
+  return { content: out.join(eol), patchedCount }
+}
+
+function formatMissingIntegrityHint(rawMessage: string): string {
+  return `${rawMessage}（pnpm-lock.yaml 缺少远端安装包 integrity 校验字段；若宿主机使用 pnpm 10.34.x 存在已知复现缺陷，请升级 pnpm 至 11.x 并清理 profile 锁文件后重试）`
 }
 
 function readPersistedOperation(filePath: string): PluginUpdateOperation | undefined {
@@ -1116,6 +1280,146 @@ export class PluginUpdateService {
     return { bytes, sha256 }
   }
 
+  private resolveManagedTarballChecksum(tarballUrl: string): {
+    readonly checksumUrl: string
+    readonly assetName: string
+  } | undefined {
+    for (const spec of this.plugins) {
+      const escapedRepo = spec.githubRepo.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      const match = new RegExp(
+        `^https://github\\.com/${escapedRepo}/releases/download/([^/]+)/([^/?#]+\\.tgz)(?:[?#].*)?$`,
+        'i',
+      ).exec(tarballUrl)
+      if (match) {
+        const tagName = match[1]!
+        const assetName = match[2]!
+        return {
+          checksumUrl: `https://github.com/${spec.githubRepo}/releases/download/${tagName}/SHA256SUMS.txt`,
+          assetName,
+        }
+      }
+    }
+    return undefined
+  }
+
+  /**
+   * Compute verified `sha512-<base64>` SRI integrity for a remote tarball URL declared in the
+   * profile manifest. For managed GitHub Release URLs, cross-checks SHA256 against `SHA256SUMS.txt`
+   * when available and fails closed on mismatch.
+   */
+  private async computeVerifiedTarballIntegrity(tarballUrl: string): Promise<string | undefined> {
+    let expectedSha256: string | undefined
+    const managedChecksum = this.resolveManagedTarballChecksum(tarballUrl)
+    if (managedChecksum) {
+      try {
+        const sumRes = await this.fetchImpl(managedChecksum.checksumUrl, {
+          headers: { 'user-agent': 'dsh-lark-bridge-updater' },
+          signal: AbortSignal.timeout(RELEASE_FETCH_TIMEOUT_MS),
+        })
+        if (sumRes.ok) {
+          const sums = parseSha256Sums(await sumRes.text())
+          expectedSha256 = sums.get(managedChecksum.assetName)
+        }
+      } catch {
+        // Optional checksum lookup; continue and still verify download & bounds.
+      }
+    }
+
+    const res = await this.fetchImpl(tarballUrl, {
+      headers: { 'user-agent': 'dsh-lark-bridge-updater' },
+      signal: AbortSignal.timeout(TARBALL_VERIFY_TIMEOUT_MS),
+    })
+    if (!res.ok) return undefined
+    const contentLength = Number(res.headers.get('content-length') ?? '0')
+    if (Number.isFinite(contentLength) && contentLength > MAX_TARBALL_VERIFY_BYTES) {
+      return undefined
+    }
+
+    const sha256Hash = createHash('sha256')
+    const sha512Hash = createHash('sha512')
+    let bytes = 0
+    if (res.body && typeof res.body.getReader === 'function') {
+      const reader = res.body.getReader()
+      while (true) {
+        const chunk = await reader.read()
+        if (chunk.done) break
+        bytes += chunk.value.byteLength
+        if (bytes > MAX_TARBALL_VERIFY_BYTES) {
+          await reader.cancel().catch(() => {})
+          return undefined
+        }
+        sha256Hash.update(chunk.value)
+        sha512Hash.update(chunk.value)
+      }
+    } else {
+      const buf = Buffer.from(await res.arrayBuffer())
+      bytes = buf.byteLength
+      if (bytes > MAX_TARBALL_VERIFY_BYTES) return undefined
+      sha256Hash.update(buf)
+      sha512Hash.update(buf)
+    }
+
+    if (bytes === 0) return undefined
+    if (expectedSha256 && sha256Hash.digest('hex') !== expectedSha256) {
+      return undefined
+    }
+    return `sha512-${sha512Hash.digest('base64')}`
+  }
+
+  /**
+   * Inspect the profile's `pnpm-lock.yaml` for direct remote tarball dependencies missing an
+   * `integrity` field (stripped by older pnpm <=10.33 and rejected by pnpm >=10.34 / >=11.4 with
+   * `ERR_PNPM_MISSING_TARBALL_INTEGRITY`) and backfill verified `sha512-...` hashes in-place.
+   */
+  async repairProfileLockfileIntegrity(profileDir: string): Promise<{
+    readonly repairedCount: number
+    readonly remainingMissing: number
+  }> {
+    const lockfilePath = join(profileDir, 'pnpm-lock.yaml')
+    if (!existsSync(lockfilePath)) {
+      return { repairedCount: 0, remainingMissing: 0 }
+    }
+    let lockContent: string
+    try {
+      lockContent = readFileSync(lockfilePath, 'utf8')
+    } catch {
+      return { repairedCount: 0, remainingMissing: 0 }
+    }
+    const missingUrls = findLockfileEntriesMissingTarballIntegrity(lockContent)
+    if (missingUrls.length === 0) {
+      return { repairedCount: 0, remainingMissing: 0 }
+    }
+
+    // Fail-closed allowlist: only fetch and backfill URLs explicitly declared in profile `package.json`.
+    const manifest = this.readProfileManifest(profileDir)
+    const declaredUrls = new Set(
+      Object.values(manifest.dependencies)
+        .filter((spec): spec is string => typeof spec === 'string')
+        .map((spec) => spec.trim()),
+    )
+
+    const urlToIntegrity = new Map<string, string>()
+    for (const url of missingUrls) {
+      if (!declaredUrls.has(url)) continue
+      try {
+        const integrity = await this.computeVerifiedTarballIntegrity(url)
+        if (integrity) urlToIntegrity.set(url, integrity)
+      } catch {
+        // Leave unverified entries untouched so fallback retry can handle them cleanly.
+      }
+    }
+
+    if (urlToIntegrity.size === 0) {
+      return { repairedCount: 0, remainingMissing: missingUrls.length }
+    }
+    const patched = patchLockfileTarballIntegrities(lockContent, urlToIntegrity)
+    if (patched.patchedCount > 0) {
+      atomicWriteText(lockfilePath, patched.content)
+    }
+    const remaining = findLockfileEntriesMissingTarballIntegrity(patched.content).length
+    return { repairedCount: patched.patchedCount, remainingMissing: remaining }
+  }
+
   getOperation(operationId?: string): PluginUpdateOperation | undefined {
     const state = getGlobalUpdateState()
     if (operationId) {
@@ -1402,6 +1706,8 @@ export class PluginUpdateService {
     const drainTimeoutMs = options.drainTimeoutMs ?? 90_000
     const force = Boolean(options.force)
     const verifyFn = (rel: ReleaseInfo) => this.verifyReleaseAsset(rel)
+    const repairLockfileFn = (dir: string) => this.repairProfileLockfileIntegrity(dir)
+    const readManifestFn = (dir: string) => this.readProfileManifest(dir)
 
     const runDetachedPipeline = async (): Promise<void> => {
       let current = initialOp
@@ -1518,6 +1824,12 @@ export class PluginUpdateService {
         )
 
         // Stage 3: Execute removeBundle -> installBundle via host-owned `pluginManager` (survives bridge unload!).
+        // Pre-flight repair missing tarball integrity fields in `pnpm-lock.yaml` before unloading any
+        // bundle so pnpm >=10.34 / >=11.4 does not abort mid-swap with ERR_PNPM_MISSING_TARBALL_INTEGRITY.
+        if (profileDir) {
+          await repairLockfileFn(profileDir).catch(() => {})
+        }
+
         let anyRestartRequired = false
         let allHotReloaded = true
         let markedHotReloadSwap = false
@@ -1542,6 +1854,17 @@ export class PluginUpdateService {
             recordManagedPackageMove(profileDir, target.installedKey, target.spec.packageName)
           }
 
+          const lockfilePath = profileDir ? join(profileDir, 'pnpm-lock.yaml') : undefined
+          let lockfileBackup: string | undefined
+          if (lockfilePath && existsSync(lockfilePath)) {
+            try {
+              lockfileBackup = readFileSync(lockfilePath, 'utf8')
+            } catch {
+              lockfileBackup = undefined
+            }
+          }
+          let lockfileClearedForRetry = false
+
           // When self-updating bridge:
           // 1) Signal `LarkBridgeManager.stop()` to preserve live host agents for seamless reattach.
           // 2) Hold intermediate client-module deletion broadcasts so the browser keeps the UI &
@@ -1555,15 +1878,115 @@ export class PluginUpdateService {
             ])
           }
 
-          const removeRes = await pm.removeBundle(target.installedKey)
+          let removeRes = await pm.removeBundle(target.installedKey)
+          if (
+            (removeRes.application === 'failed' || removeRes.application === 'cancelled') &&
+            isMissingTarballIntegrityError(removeRes) &&
+            lockfilePath &&
+            existsSync(lockfilePath)
+          ) {
+            try {
+              rmSync(lockfilePath, { force: true })
+              lockfileClearedForRetry = true
+            } catch {
+              // Ignore unlink failure and proceed to rollback path.
+            }
+            if (lockfileClearedForRetry) {
+              removeRes = await pm.removeBundle(target.installedKey)
+            }
+          }
+
           if (removeRes.application === 'failed' || removeRes.application === 'cancelled') {
+            const missingIntegrity = isMissingTarballIntegrityError(removeRes)
+            const rawErrMsg = formatChangeError(removeRes, `卸载旧版 ${target.spec.displayName} 失败`)
+            const errMsg = missingIntegrity ? formatMissingIntegrityHint(rawErrMsg) : rawErrMsg
+
+            // DSH `PluginManager.removeBundle` deselects and HMR-unloads the bundle BEFORE running
+            // `pnpm remove`, and does NOT re-enable it when `pnpm remove` fails. Re-enable (or
+            // reinstall) automatically so the bridge never stays stranded at HTTP 404.
+            const stillInstalled = profileDir
+              ? Object.prototype.hasOwnProperty.call(
+                  readManifestFn(profileDir).dependencies,
+                  target.installedKey,
+                )
+              : true
+            if (stillInstalled && lockfilePath && lockfileBackup !== undefined) {
+              try {
+                atomicWriteText(lockfilePath, lockfileBackup)
+              } catch {
+                // Non-fatal lockfile backup restore.
+              }
+            }
+
+            let restored = false
+            if (target.wasEnabled) {
+              updateOp({
+                status: 'restoring',
+                currentTarget: target.spec.id,
+                message: `卸载旧版失败，正在自动恢复启用 ${target.spec.displayName}…`,
+              })
+              if (stillInstalled && typeof pm.setBundleEnabled === 'function') {
+                const enableRes = await pm
+                  .setBundleEnabled(target.installedKey, true)
+                  .catch(() => undefined)
+                restored = Boolean(
+                  enableRes &&
+                    enableRes.application !== 'failed' &&
+                    enableRes.application !== 'cancelled',
+                )
+              }
+              if (!restored && !stillInstalled && target.previousSpec) {
+                let reinstallRes = await pm
+                  .installBundle(target.previousSpec, { enabled: true })
+                  .catch(() => undefined)
+                if (
+                  (!reinstallRes ||
+                    reinstallRes.application === 'failed' ||
+                    reinstallRes.application === 'cancelled') &&
+                  isMissingTarballIntegrityError(reinstallRes) &&
+                  lockfilePath &&
+                  existsSync(lockfilePath)
+                ) {
+                  try {
+                    rmSync(lockfilePath, { force: true })
+                    reinstallRes = await pm
+                      .installBundle(target.previousSpec, { enabled: true })
+                      .catch(() => undefined)
+                  } catch {
+                    // Ignore unlink error.
+                  }
+                }
+                restored = Boolean(
+                  reinstallRes &&
+                    reinstallRes.application !== 'failed' &&
+                    reinstallRes.application !== 'cancelled',
+                )
+              }
+            }
+
             if (markedHotReloadSwap) {
-              lifecycle.finishHotReloadSwap?.(operationId, { disposeDetached: false })
+              lifecycle.finishHotReloadSwap?.(operationId, { disposeDetached: !restored })
               markedHotReloadSwap = false
             }
-            const errMsg = formatChangeError(removeRes, `卸载旧版 ${target.spec.displayName} 失败`)
-            updateItem(i, { status: 'failed', error: errMsg })
-            throw new TaggedUpdateError(errMsg, 'install_failed')
+            if (drainedByUs) {
+              await lifecycle.cancelDrain().catch(() => {})
+              drainedByUs = false
+            }
+            updateItem(i, {
+              status: restored ? 'rolled_back' : 'failed',
+              error: errMsg,
+              rolledBack: restored,
+            })
+            updateOp({
+              status: restored ? 'rolled_back' : 'failed',
+              failureCode: 'install_failed',
+              error: errMsg,
+              message: restored ? `${errMsg}（已自动恢复原版本并重新启用）` : errMsg,
+              finishedAtMs: Date.now(),
+              hotReloaded: false,
+              restartRequired: false,
+            })
+            return
           }
 
           updateOp({
@@ -1572,7 +1995,7 @@ export class PluginUpdateService {
             message: `正在安装并热重载 ${target.spec.displayName} v${target.release.version}${preserveSuffix}…`,
           })
 
-          const installRes = await pm.installBundle(target.release.tarballUrl, {
+          let installRes = await pm.installBundle(target.release.tarballUrl, {
             enabled: target.wasEnabled,
             expected: {
               name: target.spec.packageName,
@@ -1580,11 +2003,37 @@ export class PluginUpdateService {
             },
           })
 
+          if (
+            (installRes.application === 'failed' || installRes.application === 'cancelled') &&
+            isMissingTarballIntegrityError(installRes) &&
+            lockfilePath &&
+            existsSync(lockfilePath) &&
+            !lockfileClearedForRetry
+          ) {
+            try {
+              rmSync(lockfilePath, { force: true })
+              lockfileClearedForRetry = true
+            } catch {
+              // Ignore unlink failure.
+            }
+            if (lockfileClearedForRetry) {
+              installRes = await pm.installBundle(target.release.tarballUrl, {
+                enabled: target.wasEnabled,
+                expected: {
+                  name: target.spec.packageName,
+                  version: target.release.version,
+                },
+              })
+            }
+          }
+
           if (installRes.application === 'failed' || installRes.application === 'cancelled') {
-            const errMsg = formatChangeError(
+            const missingIntegrity = isMissingTarballIntegrityError(installRes)
+            const rawErrMsg = formatChangeError(
               installRes,
               `安装新版 ${target.spec.displayName} v${target.release.version} 失败`,
             )
+            const errMsg = missingIntegrity ? formatMissingIntegrityHint(rawErrMsg) : rawErrMsg
             let rolledBack = false
             if (target.previousSpec) {
               updateOp({
@@ -1595,9 +2044,26 @@ export class PluginUpdateService {
               if (installRes.stage === 'enable') {
                 await pm.removeBundle(target.spec.packageName).catch(() => {})
               }
-              const restoreRes = await pm
+              let restoreRes = await pm
                 .installBundle(target.previousSpec, { enabled: target.wasEnabled })
                 .catch(() => undefined)
+              if (
+                (!restoreRes ||
+                  restoreRes.application === 'failed' ||
+                  restoreRes.application === 'cancelled') &&
+                isMissingTarballIntegrityError(restoreRes) &&
+                lockfilePath &&
+                existsSync(lockfilePath)
+              ) {
+                try {
+                  rmSync(lockfilePath, { force: true })
+                  restoreRes = await pm
+                    .installBundle(target.previousSpec, { enabled: target.wasEnabled })
+                    .catch(() => undefined)
+                } catch {
+                  // Ignore unlink error.
+                }
+              }
               rolledBack = Boolean(
                 restoreRes &&
                   restoreRes.application !== 'failed' &&
@@ -1607,6 +2073,10 @@ export class PluginUpdateService {
             if (markedHotReloadSwap) {
               lifecycle.finishHotReloadSwap?.(operationId, { disposeDetached: !rolledBack })
               markedHotReloadSwap = false
+            }
+            if (drainedByUs) {
+              await lifecycle.cancelDrain().catch(() => {})
+              drainedByUs = false
             }
             updateItem(i, {
               status: rolledBack ? 'rolled_back' : 'failed',

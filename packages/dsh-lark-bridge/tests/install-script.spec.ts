@@ -787,4 +787,43 @@ ensure_profile_pnpm_allow_builds ${JSON.stringify(p3)}
       }),
     ).toBe('127.0.0.1')
   })
+
+  it('detects legacy pnpm-lock.yaml missing tarball integrity and defaults auto-installed pnpm to v11', () => {
+    const dir = makeTempDir('dsh-lock-integrity-')
+    const sh = readFileSync(installShPath, 'utf8')
+    const ps1 = readFileSync(installPs1Path, 'utf8')
+
+    expect(sh).toContain('pnpm@11')
+    expect(sh).not.toContain('pnpm@10')
+    expect(ps1).toContain('pnpm@11')
+    expect(ps1).not.toContain('pnpm@10')
+
+    const shLib = sh.replace(/\nmain "\$@"\s*$/, '\n')
+    const badProf = join(dir, 'bad')
+    const okProf = join(dir, 'ok')
+    mkdirSync(badProf, { recursive: true })
+    mkdirSync(okProf, { recursive: true })
+    writeFileSync(
+      join(badProf, 'pnpm-lock.yaml'),
+      "lockfileVersion: '9.0'\npackages:\n  '@harryzhz/dsh-external-agents@https://example.com/a.tgz':\n    resolution: {tarball: https://example.com/a.tgz}\n",
+    )
+    writeFileSync(
+      join(okProf, 'pnpm-lock.yaml'),
+      "lockfileVersion: '9.0'\npackages:\n  '@harryzhz/dsh-external-agents@https://example.com/a.tgz':\n    resolution: {integrity: sha512-abc==, tarball: https://example.com/a.tgz}\n",
+    )
+
+    const out = execFileSync(
+      'bash',
+      [
+        '-c',
+        `${shLib}
+profile_lockfile_missing_tarball_integrity ${JSON.stringify(badProf)} && echo BAD_DETECTED || echo BAD_MISSED
+profile_lockfile_missing_tarball_integrity ${JSON.stringify(okProf)} && echo OK_FALSE_POS || echo OK_CLEAN
+`,
+      ],
+      { encoding: 'utf8' },
+    )
+    expect(out).toContain('BAD_DETECTED')
+    expect(out).toContain('OK_CLEAN')
+  })
 })

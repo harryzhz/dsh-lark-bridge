@@ -921,6 +921,21 @@ ensure_profile_pnpm_allow_builds() {
   fi
 }
 
+profile_lockfile_missing_tarball_integrity() {
+  local profile_dir="$1"
+  local lock_file="$profile_dir/pnpm-lock.yaml"
+  [ -f "$lock_file" ] || return 1
+  awk '
+    /^[[:space:]]*resolution:[[:space:]]*\{/ {
+      if ($0 ~ /tarball:[[:space:]]*['\''"]?https?:\/\// && $0 !~ /integrity[[:space:]]*:/) {
+        found = 1
+        exit 0
+      }
+    }
+    END { exit (found ? 0 : 1) }
+  ' "$lock_file"
+}
+
 install_plugins_into_profile() {
   local dsh_bin="$1"
   local profile_name="$2"
@@ -982,13 +997,23 @@ install_plugins_into_profile() {
 
   log_info "[${label}] 正在向 profile '${profile_name}' 安装插件..."
   if ! DSH_HOME="$DSH_HOME_DIR" "$dsh_bin" plugin --profile "$profile_name" add "${specs[@]}"; then
-    # If the profile was just initialized by `dsh plugin`, ensure pnpm-workspace.yaml
-    # marks protobufjs build scripts as explicitly disabled (required by pnpm 11) and retry once.
+    # Retry once if (1) the profile was just initialized without protobufjs allowBuilds (pnpm 11),
+    # or (2) a legacy pnpm-lock.yaml has remote tarball entries missing `integrity` (pnpm >=10.34/11.4).
     local ws_file="$profile_dir/pnpm-workspace.yaml"
+    local retried=0
     if [ -f "$ws_file" ] && ! grep -Eq "protobufjs" "$ws_file"; then
       log_info "[${label}] 为 pnpm 11 补充 protobufjs 构建脚本豁免声明后重试一次..."
       ensure_profile_pnpm_allow_builds "$profile_dir"
-      DSH_HOME="$DSH_HOME_DIR" "$dsh_bin" plugin --profile "$profile_name" add "${specs[@]}"
+      retried=1
+    fi
+    if profile_lockfile_missing_tarball_integrity "$profile_dir"; then
+      log_warn "[${label}] 检测到旧版 pnpm-lock.yaml 缺少远端安装包 integrity 校验字段，正在重建锁文件后重试..."
+      rm -f "$profile_dir/pnpm-lock.yaml"
+      retried=1
+    fi
+    if [ "$retried" -eq 1 ]; then
+      DSH_HOME="$DSH_HOME_DIR" "$dsh_bin" plugin --profile "$profile_name" add "${specs[@]}" \
+        || die "[${label}] 向 profile '${profile_name}' 安装插件失败。"
     else
       die "[${label}] 向 profile '${profile_name}' 安装插件失败。"
     fi
@@ -1053,6 +1078,11 @@ ensure_pnpm_for_web() {
     if ! command -v pnpm >/dev/null 2>&1 && [ -x "$DSH_BIN_DIR/pnpm" ]; then
       export PATH="$DSH_BIN_DIR:$PATH"
     fi
+    case "$DETECTED_PNPM_VER" in
+      10.34.*)
+        log_warn "检测到 pnpm v${DETECTED_PNPM_VER}：该版本在复装远端 .tgz 插件时存在 ERR_PNPM_MISSING_TARBALL_INTEGRITY 已知缺陷，如遇安装/热更新失败请升级至 pnpm 11（pnpm@11）。"
+        ;;
+    esac
     return 0
   fi
 
@@ -1063,7 +1093,7 @@ ensure_pnpm_for_web() {
 
   log_info "未检测到 pnpm，正在自动准备 pnpm..."
   if command -v corepack >/dev/null 2>&1; then
-    if corepack enable >/dev/null 2>&1 && corepack prepare pnpm@10 --activate >/dev/null 2>&1; then
+    if corepack enable >/dev/null 2>&1 && corepack prepare pnpm@11 --activate >/dev/null 2>&1; then
       detect_pnpm
       if [ -n "$DETECTED_PNPM_VER" ]; then
         log_ok "已通过 corepack 启用 pnpm v${DETECTED_PNPM_VER}"
@@ -1079,7 +1109,7 @@ ensure_pnpm_for_web() {
   if [ ! -f "$pnpm_home/package.json" ]; then
     printf '{"name":"dsh-pnpm-runtime","private":true}\n' > "$pnpm_home/package.json"
   fi
-  npm --prefix "$pnpm_home" install --no-audit --no-fund pnpm@10
+  npm --prefix "$pnpm_home" install --no-audit --no-fund pnpm@11
   cat > "$DSH_BIN_DIR/pnpm" <<EOF
 #!/bin/sh
 exec "${pnpm_home}/node_modules/.bin/pnpm" "\$@"
