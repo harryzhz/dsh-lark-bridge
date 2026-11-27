@@ -18,6 +18,8 @@ import {
   ACCESS_MODES,
   cloneRouterBypass,
   DEFAULT_DREAMING_SCOPES,
+  DEFAULT_LONG_TURN_NOTICE_DELAY_SECONDS,
+  DEFAULT_LONG_TURN_NOTICE_TEXT,
   DEFAULT_ROUTER_BYPASS,
   DISCLOSURE_MODES,
   P2P_SESSION_MODES,
@@ -142,6 +144,8 @@ export function newBotConfig(
     adminUserProfiles: [],
     sendIntermediateMessages: false,
     longTurnProgressNotice: true,
+    longTurnNoticeDelaySeconds: DEFAULT_LONG_TURN_NOTICE_DELAY_SECONDS,
+    longTurnNoticeText: DEFAULT_LONG_TURN_NOTICE_TEXT,
     useInteractiveCard: true,
     dshSessionLinkInCard: true,
     sessionLinkGuestReadOnly: true,
@@ -179,6 +183,9 @@ function toBotConfig(record: BotRecord): BotConfig {
     adminUsers: cloned.adminUsers ?? [],
     adminUserProfiles: cloned.adminUserProfiles ?? [],
     longTurnProgressNotice: cloned.longTurnProgressNotice ?? true,
+    longTurnNoticeDelaySeconds:
+      cloned.longTurnNoticeDelaySeconds ?? DEFAULT_LONG_TURN_NOTICE_DELAY_SECONDS,
+    longTurnNoticeText: cloned.longTurnNoticeText ?? DEFAULT_LONG_TURN_NOTICE_TEXT,
     sessionLinkGuestReadOnly: cloned.sessionLinkGuestReadOnly ?? true,
     router: {
       ...DEFAULT_ROUTER_CONFIG,
@@ -1255,7 +1262,7 @@ function BotConversationAndMessageSection({
       </SettingRow>
       <SettingRow
         title="长任务进度提示"
-        desc="排队等待或深度处理耗时较长时自动补发一条简短提示，避免长时间无回应"
+        desc="排队等待或处理耗时较长时自动补发一条简短提示，避免长时间无回应"
       >
         <Switch
           label="长任务进度提示"
@@ -1263,6 +1270,35 @@ function BotConversationAndMessageSection({
           onChange={(longTurnProgressNotice) => patch({ longTurnProgressNotice })}
         />
       </SettingRow>
+      {draft.longTurnProgressNotice !== false && (
+        <NestedSettings>
+          <SettingRow
+            title="触发等待时长"
+            desc="处理超过该时长且无中间输出时发送（0 表示仅排队时提示）"
+          >
+            <NumberField
+              value={draft.longTurnNoticeDelaySeconds ?? DEFAULT_LONG_TURN_NOTICE_DELAY_SECONDS}
+              min={0}
+              onChange={(secs) =>
+                patch({
+                  longTurnNoticeDelaySeconds: Math.min(3600, Math.max(0, Math.round(secs))),
+                })
+              }
+              suffix="秒"
+            />
+          </SettingRow>
+          <SettingRow
+            title="提示文案"
+            desc="支持飞书表情简码如 [敲键盘]，留空使用默认文案"
+          >
+            <TextField
+              value={draft.longTurnNoticeText ?? ''}
+              onChange={(longTurnNoticeText) => patch({ longTurnNoticeText })}
+              placeholder={DEFAULT_LONG_TURN_NOTICE_TEXT}
+            />
+          </SettingRow>
+        </NestedSettings>
+      )}
 
       <GroupTitle>消息卡片</GroupTitle>
       <SettingRow title="使用消息卡片" desc="关闭后以纯文本发送回复">

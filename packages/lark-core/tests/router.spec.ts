@@ -1271,6 +1271,43 @@ describe('decideLarkRouting, <user_message> format, memberOverrides & title inte
     expect(formatMarkdownForLarkPost('**A** 和 **B**')).toBe('**A** 和 **B**')
   })
 
+  it('converts known Feishu emoji tokens in plain post text into native emotion nodes and preserves Markdown untouched', () => {
+    const noticePayload = buildLarkPostPayload('深度求索中…[敲键盘]') as {
+      zh_cn: { content: Array<Array<{ tag: string; text?: string; emoji_type?: string }>> }
+    }
+    expect(noticePayload.zh_cn.content).toEqual([
+      [
+        { tag: 'text', text: '深度求索中…' },
+        { tag: 'emotion', emoji_type: 'Typing' },
+      ],
+    ])
+    // Inbound parser round-trips native emotion nodes back into `[敲键盘]`
+    expect(parseLarkMessageContent('post', JSON.stringify(noticePayload)).text).toBe(
+      '深度求索中…[敲键盘]',
+    )
+
+    // Mixed known/unknown brackets and direct emoji_type tokens
+    const mixedPayload = buildLarkPostPayload('状态[未知标签] 马上来 [OnIt]\n第二行[思考]') as {
+      zh_cn: { content: Array<Array<{ tag: string; text?: string; emoji_type?: string }>> }
+    }
+    expect(mixedPayload.zh_cn.content).toEqual([
+      [
+        { tag: 'text', text: '状态[未知标签] 马上来 ' },
+        { tag: 'emotion', emoji_type: 'OnIt' },
+      ],
+      [
+        { tag: 'text', text: '第二行' },
+        { tag: 'emotion', emoji_type: 'THINKING' },
+      ],
+    ])
+
+    // Rich Markdown containing brackets or links keeps `{ tag: "md" }` untouched
+    const mdWithBracket = buildLarkPostPayload('**进度**：[敲键盘](https://example.com)') as {
+      zh_cn: { content: Array<Array<{ tag: string; text?: string }>> }
+    }
+    expect(mdWithBracket.zh_cn.content[0]![0]!.tag).toBe('md')
+  })
+
   it('guards listener threads from premature active-thread hijacking and preserves silent reply semantics after replying', () => {
     const bot = createBot({ mentionTriggerMode: 'mention_and_active_thread' })
     const dailyGroup = LarkGroupConfigSchema.parse({

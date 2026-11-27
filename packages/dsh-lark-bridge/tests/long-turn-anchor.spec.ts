@@ -41,6 +41,7 @@ interface PendingTurnHandle {
 }
 
 function createAnchorHarness(options: {
+  readonly idleSweepIntervalMs?: number
   readonly queueWaitAnchorMs?: number
   readonly longTurnAnchorMs?: number
   readonly maxConcurrentTurnsPerRuntime?: number
@@ -182,7 +183,7 @@ function createAnchorHarness(options: {
     {
       dataDir: dir,
       publicBaseUrl: 'http://127.0.0.1:3880',
-      idleSweepIntervalMs: 0,
+      idleSweepIntervalMs: options.idleSweepIntervalMs ?? 0,
       maxAuditEvents: 200,
       autoInstallCliAndSkill: false,
       syncGlobalCliAndSkill: false,
@@ -312,7 +313,7 @@ describe('Long-turn & queue-wait automatic progress anchors (P2)', () => {
       // Hold Turn 2 past longTurnAnchorMs (60ms): MUST NOT send a second execution anchor since queue anchor was already sent
       await sleep(90)
       const execAnchorsOnTurn2 = h.sentReplies.filter(
-        (r) => r.replyToMessageId === 'om_2' && r.text?.includes('正在深入处理中'),
+        (r) => r.replyToMessageId === 'om_2' && r.text?.includes('深度求索中'),
       )
       expect(execAnchorsOnTurn2).toHaveLength(0)
 
@@ -378,7 +379,7 @@ describe('Long-turn & queue-wait automatic progress anchors (P2)', () => {
       await slow
       const slowReplies = h.sentReplies.filter((r) => r.replyToMessageId === 'om_slow')
       expect(slowReplies).toHaveLength(2)
-      expect(slowReplies[0]?.text).toContain('正在深入处理中')
+      expect(slowReplies[0]?.text).toBe('深度求索中…[敲键盘]')
       expect(slowReplies[1]?.text).toBe('深度分析报告')
     } finally {
       await h.manager.stop()
@@ -463,6 +464,176 @@ describe('Long-turn & queue-wait automatic progress anchors (P2)', () => {
       expect(h.sentReplies.filter((r) => r.replyToMessageId === 'om_off_1').map((r) => r.text)).toEqual([
         '已完成',
       ])
+    } finally {
+      await h.manager.stop()
+      h.store.close()
+    }
+  })
+
+  it('respects custom longTurnNoticeText, falls back to default when blank, and honors per-bot longTurnNoticeDelaySeconds including 0=disabled', async () => {
+    const h = createAnchorHarness({ queueWaitAnchorMs: 40, longTurnAnchorMs: 50 })
+    const botCustom = makeBot(h.dir, {
+      id: 'bot-custom',
+      name: 'CustomBot',
+      larkAppId: 'cli_custom',
+      longTurnProgressNotice: true,
+      longTurnNoticeDelaySeconds: 120,
+      longTurnNoticeText: '全力排查中，请稍候 [思考]',
+    })
+    const botBlank = makeBot(h.dir, {
+      id: 'bot-blank',
+      name: 'BlankBot',
+      larkAppId: 'cli_blank',
+      longTurnProgressNotice: true,
+      longTurnNoticeDelaySeconds: 60,
+      longTurnNoticeText: '   ',
+    })
+    const botDelayZero = makeBot(h.dir, {
+      id: 'bot-zero',
+      name: 'ZeroDelayBot',
+      larkAppId: 'cli_zero',
+      longTurnProgressNotice: true,
+      longTurnNoticeDelaySeconds: 0,
+      longTurnNoticeText: '不会发送',
+    })
+    h.store.upsertBot(botCustom)
+    h.store.upsertBot(botBlank)
+    h.store.upsertBot(botDelayZero)
+    for (const [botId, chatId] of [
+      ['bot-custom', 'oc_custom'],
+      ['bot-blank', 'oc_blank'],
+      ['bot-zero', 'oc_zero'],
+    ] as const) {
+      h.store.upsertGroup(
+        LarkGroupConfigSchema.parse({
+          key: `${botId}:${chatId}`,
+          botId,
+          chatId,
+          enabled: true,
+        }),
+      )
+    }
+
+    try {
+      const pCustom = h.manager.handleInbound(
+        botCustom.id,
+        h.transport,
+        makeMentionMsg('om_custom_1', '查一下', {
+          botId: botCustom.id,
+          larkAppId: botCustom.larkAppId,
+          chatId: 'oc_custom',
+        }),
+      )
+      await vi.waitFor(() => expect(h.pendingTurns).toHaveLength(1))
+      await sleep(80)
+      h.pendingTurns[0]!.finish('自定义结论')
+      await pCustom
+      expect(
+        h.sentReplies.filter((r) => r.replyToMessageId === 'om_custom_1').map((r) => r.text),
+      ).toEqual(['全力排查中，请稍候 [思考]', '自定义结论'])
+
+      const pBlank = h.manager.handleInbound(
+        botBlank.id,
+        h.transport,
+        makeMentionMsg('om_blank_1', '查一下', {
+          botId: botBlank.id,
+          larkAppId: botBlank.larkAppId,
+          chatId: 'oc_blank',
+        }),
+      )
+      await vi.waitFor(() => expect(h.pendingTurns).toHaveLength(2))
+      await sleep(80)
+      h.pendingTurns[1]!.finish('留空兜底结论')
+      await pBlank
+      expect(
+        h.sentReplies.filter((r) => r.replyToMessageId === 'om_blank_1').map((r) => r.text),
+      ).toEqual(['深度求索中…[敲键盘]', '留空兜底结论'])
+
+      // delaySeconds=0 disables execution anchor while keeping queue-wait anchor available
+      const pZero1 = h.manager.handleInbound(
+        botDelayZero.id,
+        h.transport,
+        makeMentionMsg('om_zero_1', '长任务一', {
+          botId: botDelayZero.id,
+          larkAppId: botDelayZero.larkAppId,
+          chatId: 'oc_zero',
+        }),
+      )
+      await vi.waitFor(() => expect(h.pendingTurns).toHaveLength(3))
+      const pZero2 = h.manager.handleInbound(
+        botDelayZero.id,
+        h.transport,
+        makeMentionMsg('om_zero_2', '排队追问', {
+          botId: botDelayZero.id,
+          larkAppId: botDelayZero.larkAppId,
+          chatId: 'oc_zero',
+          rootId: 'om_zero_1',
+          threadId: 'omt_om_zero_1',
+        }),
+      )
+      await sleep(80)
+      h.pendingTurns[2]!.finish('任务一结论')
+      await pZero1
+      await vi.waitFor(() => expect(h.pendingTurns).toHaveLength(4))
+      h.pendingTurns[3]!.finish('任务二结论')
+      await pZero2
+      expect(
+        h.sentReplies.filter((r) => r.replyToMessageId === 'om_zero_1').map((r) => r.text),
+      ).toEqual(['任务一结论'])
+      expect(
+        h.sentReplies.filter((r) => r.replyToMessageId === 'om_zero_2').map((r) => r.text),
+      ).toEqual(['前序任务仍在处理中，已加入队列，完成后会继续处理。', '任务二结论'])
+    } finally {
+      await h.manager.stop()
+      h.store.close()
+    }
+  })
+
+  it('uses per-bot longTurnNoticeDelaySeconds in production mode when no host override is set', async () => {
+    const h = createAnchorHarness({ idleSweepIntervalMs: 60_000, queueWaitAnchorMs: 0 })
+    const botOneSec = makeBot(h.dir, {
+      id: 'bot-1s',
+      name: 'FastNoticeBot',
+      larkAppId: 'cli_1s',
+      longTurnProgressNotice: true,
+      longTurnNoticeDelaySeconds: 1,
+      longTurnNoticeText: '1秒后提示…[敲键盘]',
+    })
+    h.store.upsertBot(botOneSec)
+    h.store.upsertGroup(
+      LarkGroupConfigSchema.parse({
+        key: 'bot-1s:oc_1s',
+        botId: 'bot-1s',
+        chatId: 'oc_1s',
+        enabled: true,
+      }),
+    )
+
+    try {
+      const p = h.manager.handleInbound(
+        botOneSec.id,
+        h.transport,
+        makeMentionMsg('om_1s_1', '测1秒阈值', {
+          botId: botOneSec.id,
+          larkAppId: botOneSec.larkAppId,
+          chatId: 'oc_1s',
+        }),
+      )
+      await vi.waitFor(() => expect(h.pendingTurns).toHaveLength(1))
+      await sleep(400)
+      expect(h.sentReplies.filter((r) => r.replyToMessageId === 'om_1s_1')).toHaveLength(0)
+      await vi.waitFor(
+        () =>
+          expect(
+            h.sentReplies.filter((r) => r.replyToMessageId === 'om_1s_1').map((r) => r.text),
+          ).toEqual(['1秒后提示…[敲键盘]']),
+        { timeout: 1_500 },
+      )
+      h.pendingTurns[0]!.finish('完成')
+      await p
+      expect(
+        h.sentReplies.filter((r) => r.replyToMessageId === 'om_1s_1').map((r) => r.text),
+      ).toEqual(['1秒后提示…[敲键盘]', '完成'])
     } finally {
       await h.manager.stop()
       h.store.close()

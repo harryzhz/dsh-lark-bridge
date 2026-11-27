@@ -9,6 +9,112 @@ export interface LarkPostPayloadOptions {
   readonly title?: string
 }
 
+const LARK_EMOJI_ZH_LABEL_TO_TYPE: Readonly<Record<string, string>> = {
+  敲键盘: 'Typing',
+  处理中: 'OnIt',
+  稍等: 'OneSecond',
+  完成: 'DONE',
+  赞: 'THUMBSUP',
+  敬礼: 'SALUTE',
+  加油: 'MUSCLE',
+  思考: 'THINKING',
+  瞄: 'GLANCE',
+  对勾: 'CheckMark',
+  碰拳: 'FISTBUMP',
+  微笑: 'SMILE',
+  大笑: 'LAUGH',
+  哈哈: 'LOL',
+  鼓掌: 'APPLAUSE',
+  拍手: 'CLAP',
+  感谢: 'THANKS',
+  比心: 'FINGERHEART',
+  加一: 'JIAYI',
+  捂脸: 'FACEPALM',
+  爱心: 'HEART',
+  撒花: 'PARTY',
+  咖啡: 'Coffee',
+  火: 'Fire',
+  挥手: 'WAVE',
+  玫瑰: 'ROSE',
+  奋斗: 'STRIVE',
+  冲: 'GoGoGo',
+  机智: 'SMART',
+  汗: 'SWEAT',
+  害羞: 'SHY',
+  抱抱: 'HUG',
+  灵光一闪: 'StatusFlashOfInspiration',
+}
+
+const LARK_EMOJI_TYPE_TO_ZH_LABEL: ReadonlyMap<string, string> = new Map(
+  Object.entries(LARK_EMOJI_ZH_LABEL_TO_TYPE).map(([label, type]) => [type, label]),
+)
+
+const LARK_EMOJI_DIRECT_TYPES: ReadonlySet<string> = new Set([
+  ...Object.values(LARK_EMOJI_ZH_LABEL_TO_TYPE),
+  'Get',
+  'OK',
+  'LGTM',
+])
+
+const LARK_EMOJI_TOKEN_RE = /\[([^\[\]\n]+)\](?!\()/g
+const PLAIN_TEXT_MARKDOWN_SYNTAX_RE =
+  /(?:```|~~~|`|!\[|\]\(|^\s*#{1,6}\s|^\s*>\s|^\s*(?:[-*+]|\d+\.)\s|\*\*|__|~~|<at\b|<link\b|<font\b|<https?:\/\/|https?:\/\/)/m
+
+/** Resolve a Feishu bracket emoji token (e.g. `敲键盘` or `Typing`) to its official `emoji_type`. */
+export function resolveLarkEmojiType(token: string): string | undefined {
+  const key = token.trim()
+  if (!key) return undefined
+  if (Object.prototype.hasOwnProperty.call(LARK_EMOJI_ZH_LABEL_TO_TYPE, key)) {
+    return LARK_EMOJI_ZH_LABEL_TO_TYPE[key]
+  }
+  if (LARK_EMOJI_DIRECT_TYPES.has(key)) {
+    return key
+  }
+  return undefined
+}
+
+/** Format an official Feishu `emoji_type` back into bracket notation (e.g. `Typing` -> `[敲键盘]`). */
+export function formatLarkEmotionToken(emojiType: string): string {
+  const key = emojiType.trim()
+  if (!key) return ''
+  return `[${LARK_EMOJI_TYPE_TO_ZH_LABEL.get(key) ?? key}]`
+}
+
+type LarkPostInlineNode =
+  | { readonly tag: 'text'; readonly text: string }
+  | { readonly tag: 'emotion'; readonly emoji_type: string }
+
+function buildEmotionAwarePostParagraphs(text: string): LarkPostInlineNode[][] | undefined {
+  if (!text || PLAIN_TEXT_MARKDOWN_SYNTAX_RE.test(text)) return undefined
+  let hasEmotion = false
+  const paragraphs: LarkPostInlineNode[][] = []
+  for (const line of text.split('\n')) {
+    const nodes: LarkPostInlineNode[] = []
+    let textBuf = ''
+    let cursor = 0
+    LARK_EMOJI_TOKEN_RE.lastIndex = 0
+    let match: RegExpExecArray | null
+    while ((match = LARK_EMOJI_TOKEN_RE.exec(line)) !== null) {
+      const emojiType = resolveLarkEmojiType(match[1] ?? '')
+      if (!emojiType) continue
+      hasEmotion = true
+      textBuf += line.slice(cursor, match.index)
+      if (textBuf.length > 0) {
+        nodes.push({ tag: 'text', text: textBuf })
+        textBuf = ''
+      }
+      nodes.push({ tag: 'emotion', emoji_type: emojiType })
+      cursor = match.index + match[0].length
+    }
+    textBuf += line.slice(cursor)
+    if (textBuf.length > 0 || nodes.length === 0) {
+      nodes.push({ tag: 'text', text: textBuf })
+    }
+    paragraphs.push(nodes)
+  }
+  return hasEmotion ? paragraphs : undefined
+}
+
 function normalizeLineEndings(raw: string): string {
   return raw.replace(/\r\n?/g, '\n')
 }
@@ -229,8 +335,18 @@ export function buildLarkPostPayload(
   markdown: string,
   options: LarkPostPayloadOptions = {},
 ): Record<string, unknown> {
-  const formatted = formatMarkdownForLarkPost(markdown)
   const title = trimInvisibleText(options.title ?? '')
+  const normalized = trimInvisibleText(normalizeLineEndings(markdown))
+  const emotionParagraphs = buildEmotionAwarePostParagraphs(normalized)
+  if (emotionParagraphs) {
+    return {
+      zh_cn: {
+        ...(title ? { title } : {}),
+        content: emotionParagraphs,
+      },
+    }
+  }
+  const formatted = formatMarkdownForLarkPost(markdown)
   return {
     zh_cn: {
       ...(title ? { title } : {}),

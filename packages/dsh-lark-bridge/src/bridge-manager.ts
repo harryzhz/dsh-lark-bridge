@@ -250,8 +250,11 @@ export class LarkBridgeManager {
         : {}),
       queueWaitAnchorMs:
         config.queueWaitAnchorMs ?? (config.idleSweepIntervalMs > 0 ? 10_000 : 0),
-      longTurnAnchorMs:
-        config.longTurnAnchorMs ?? (config.idleSweepIntervalMs > 0 ? 60_000 : 0),
+      longTurnAnchorEnabled:
+        config.idleSweepIntervalMs > 0 || config.longTurnAnchorMs !== undefined,
+      ...(config.longTurnAnchorMs !== undefined
+        ? { longTurnAnchorMs: config.longTurnAnchorMs }
+        : {}),
       memory: this.memory,
       triage: this.triage,
       titleGuard: this.titleGuard,

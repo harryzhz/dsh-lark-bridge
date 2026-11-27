@@ -315,6 +315,8 @@ export interface BotConfig {
   adminUserProfiles?: SubstituteTarget[]
   sendIntermediateMessages: boolean
   longTurnProgressNotice?: boolean
+  longTurnNoticeDelaySeconds?: number
+  longTurnNoticeText?: string
   useInteractiveCard: boolean
   dshSessionLinkInCard: boolean
   sessionLinkGuestReadOnly: boolean

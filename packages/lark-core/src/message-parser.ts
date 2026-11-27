@@ -1,3 +1,4 @@
+import { formatLarkEmotionToken } from './markdown.js'
 import type { LarkMention, ParsedSlashCommand } from './types.js'
 
 const SLASH_COMMANDS = new Set([
@@ -52,6 +53,11 @@ function collectPostText(node: unknown, texts: string[], imageKeys: string[]): v
     } else if (userId.startsWith('@_user_')) {
       texts.push(userId)
     }
+    return
+  }
+  if (rec.tag === 'emotion' && typeof rec.emoji_type === 'string' && rec.emoji_type.trim()) {
+    const token = formatLarkEmotionToken(rec.emoji_type)
+    if (token) texts.push(token)
     return
   }
   if (rec.tag === 'img' && typeof rec.image_key === 'string') {

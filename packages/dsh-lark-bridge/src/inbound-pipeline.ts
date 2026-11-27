@@ -3,6 +3,8 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import { appendPluginRecord, type Session } from '@deepseek-ai/dsh-session'
 import {
+  DEFAULT_LONG_TURN_NOTICE_DELAY_SECONDS,
+  DEFAULT_LONG_TURN_NOTICE_TEXT,
   MessageDeduplicator,
   buildReplyCard,
   buildRouteKey,
@@ -298,6 +300,7 @@ export interface InboundPipelineHost {
   readonly listenerDebounceEnabled?: boolean
   readonly listenerDebounceOverrideMs?: number
   readonly queueWaitAnchorMs?: number
+  readonly longTurnAnchorEnabled?: boolean
   readonly longTurnAnchorMs?: number
   readonly memory?: MemoryService
   readonly triage?: LlmTriageService
@@ -2144,7 +2147,9 @@ export class InboundPipeline {
           resolvedChatName,
         )
         this.executingTurnBySession.set(acquired.sessionId, executingTurnCtx)
-        const execAnchorMs = this.host.longTurnAnchorMs ?? 0
+        const execAnchorMs = this.resolveExecAnchorMs(effectiveDecision)
+        const execNoticeText =
+          effectiveDecision.longTurnNoticeText?.trim() || DEFAULT_LONG_TURN_NOTICE_TEXT
         let execAnchorTimer: ReturnType<typeof setTimeout> | null = null
         const clearExecAnchorTimer = () => {
           if (execAnchorTimer) {
@@ -2181,7 +2186,7 @@ export class InboundPipeline {
               sessionId: acquired.sessionId,
               ...(resolvedChatName ? { resolvedChatName } : {}),
               executingTurnCtx,
-              text: '正在深入处理中，完成后会直接回复结论。',
+              text: execNoticeText,
               auditSummary: '主引擎执行耗时较长，已发送进度提示',
               onRouteUpdated: (nextRouteKey) => {
                 trackedRouteKey = nextRouteKey
@@ -4004,6 +4009,19 @@ export class InboundPipeline {
       }
     }
     return false
+  }
+
+  private resolveExecAnchorMs(decision: AgentDecision): number {
+    const delaySeconds =
+      decision.longTurnNoticeDelaySeconds ?? DEFAULT_LONG_TURN_NOTICE_DELAY_SECONDS
+    if (delaySeconds <= 0) return 0
+    if (this.host.longTurnAnchorMs !== undefined) {
+      return Math.max(0, this.host.longTurnAnchorMs)
+    }
+    if (this.host.longTurnAnchorEnabled === false) {
+      return 0
+    }
+    return delaySeconds * 1000
   }
 
   private async sendProgressAnchor(input: {
