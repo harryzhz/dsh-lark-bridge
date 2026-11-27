@@ -25,7 +25,7 @@ import {
   type AgentCliSendInput,
   type ResolvedCliSessionIdentity,
 } from './agent-tool-facade.js'
-import { BotConnectionPool } from './bot-connection-pool.js'
+import { BotConnectionPool, type SeedDefaultCreatorAdminOptions } from './bot-connection-pool.js'
 import {
   ensureCliAuthEndpoint,
   ensureOperatorAuth,
@@ -792,6 +792,13 @@ export class LarkBridgeManager {
 
   syncBotProfile(botId: string): Promise<LarkBotProfile | undefined> {
     return this.connections.syncBotProfile(botId)
+  }
+
+  ensureDefaultCreatorAdmin(
+    botId: string,
+    options?: SeedDefaultCreatorAdminOptions,
+  ): Promise<boolean> {
+    return this.connections.ensureDefaultCreatorAdmin(botId, options)
   }
 
   hydrateAllowedUserProfiles(bot: LarkBotConfig): Promise<SubstituteTarget[]> {

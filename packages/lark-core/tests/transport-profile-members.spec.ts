@@ -684,4 +684,108 @@ describe('LarkBotTransport profile description sync & member/bot avatar resoluti
       name: '林晓',
     })
   })
+
+  it('extracts app creator open_id via application/v6 with user_id_type=open_id and resolves open_id by email', async () => {
+    const observedProfiles: LarkBotProfile[] = []
+    const transport = new LarkBotTransport(createBot(), {
+      onMessage: () => {},
+      onBotProfile: (profile) => observedProfiles.push(profile),
+    })
+    const client = (transport as unknown as { client: { request: ReturnType<typeof vi.fn> } }).client
+
+    // 1. Primary creator_id (ou_*) with explicit user_id_type=open_id
+    const seenParams: Array<Record<string, unknown> | undefined> = []
+    client.request = vi.fn(async (req: { url: string; params?: Record<string, unknown> }) => {
+      if (req.url === '/open-apis/bot/v3/info/') {
+        return { bot: { open_id: 'ou_bot_self', app_name: 'AlphaBot' } }
+      }
+      if (req.url.startsWith('/open-apis/application/v6/applications/')) {
+        seenParams.push(req.params)
+        return {
+          data: {
+            app: {
+              app_name: 'AlphaBot',
+              creator_id: 'ou_creator_primary',
+              owner: { type: 2, owner_id: 'ou_owner_secondary' },
+            },
+          },
+        }
+      }
+      return {}
+    })
+
+    const primaryProfile = await transport.fetchBotProfile()
+    expect(seenParams[0]).toEqual({ lang: 'zh_cn', user_id_type: 'open_id' })
+    expect(primaryProfile.creatorOpenId).toBe('ou_creator_primary')
+    expect(transport.state.creatorOpenId).toBe('ou_creator_primary')
+    expect(observedProfiles.at(-1)?.creatorOpenId).toBe('ou_creator_primary')
+
+    // 2. Falls back to owner.owner_id when creator_id is absent and owner.type === 2; ignores non-ou_ IDs
+    const transportOwnerFallback = new LarkBotTransport(createBot(), { onMessage: () => {} })
+    const fallbackClient = (
+      transportOwnerFallback as unknown as { client: { request: ReturnType<typeof vi.fn> } }
+    ).client
+    fallbackClient.request = vi.fn(async (req: { url: string }) => {
+      if (req.url === '/open-apis/bot/v3/info/') {
+        return { bot: { open_id: 'ou_bot_self', app_name: 'AlphaBot' } }
+      }
+      if (req.url.startsWith('/open-apis/application/v6/applications/')) {
+        return {
+          data: {
+            app: {
+              app_name: 'AlphaBot',
+              owner: { type: 2, owner_id: 'ou_self_built_owner' },
+            },
+          },
+        }
+      }
+      return {}
+    })
+    const ownerProfile = await transportOwnerFallback.fetchBotProfile()
+    expect(ownerProfile.creatorOpenId).toBe('ou_self_built_owner')
+
+    // Non-ou_ creator_id or non-type-2 owner_id is ignored
+    const transportNonOpenId = new LarkBotTransport(createBot(), { onMessage: () => {} })
+    const nonOpenIdClient = (
+      transportNonOpenId as unknown as { client: { request: ReturnType<typeof vi.fn> } }
+    ).client
+    nonOpenIdClient.request = vi.fn(async (req: { url: string }) => {
+      if (req.url === '/open-apis/bot/v3/info/') {
+        return { bot: { open_id: 'ou_bot_self', app_name: 'AlphaBot' } }
+      }
+      if (req.url.startsWith('/open-apis/application/v6/applications/')) {
+        return {
+          data: {
+            app: {
+              app_name: 'AlphaBot',
+              creator_id: 'emp_raw_user_id',
+              owner: { type: 1, owner_id: 'ou_isv_owner' },
+            },
+          },
+        }
+      }
+      return {}
+    })
+    const ignoredProfile = await transportNonOpenId.fetchBotProfile()
+    expect(ignoredProfile.creatorOpenId).toBeUndefined()
+
+    // 3. resolveOpenIdByEmail resolves ou_* and degrades cleanly on failure or non-ou_ IDs
+    client.request = vi.fn(async (req: { url: string; data?: { emails?: string[] } }) => {
+      if (req.url === '/open-apis/contact/v3/users/batch_get_id') {
+        const email = req.data?.emails?.[0]
+        if (email === 'alex@example.com') {
+          return { data: { user_list: [{ email, user_id: 'ou_alex_email' }] } }
+        }
+        if (email === 'invalid@example.com') {
+          return { data: { user_list: [{ email, user_id: 'not_an_open_id' }] } }
+        }
+        throw new Error('permission denied')
+      }
+      return {}
+    })
+    expect(await transport.resolveOpenIdByEmail('alex@example.com')).toBe('ou_alex_email')
+    expect(await transport.resolveOpenIdByEmail('invalid@example.com')).toBeUndefined()
+    expect(await transport.resolveOpenIdByEmail('blocked@example.com')).toBeUndefined()
+    expect(await transport.resolveOpenIdByEmail('not-an-email')).toBeUndefined()
+  })
 })

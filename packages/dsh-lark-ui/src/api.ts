@@ -212,7 +212,7 @@ export const bridgeApi = {
   reconnectBot: (id: string) => post(`/bots/${seg(id)}/reconnect`),
   syncBotProfile: (id: string) =>
     post<{
-      profile: { openId?: string; name?: string; avatarUrl?: string; description?: string }
+      profile: { openId?: string; name?: string; avatarUrl?: string; description?: string; creatorOpenId?: string }
     }>(`/bots/${seg(id)}/sync-profile`),
   deleteBot: (id: string) => del(`/bots/${seg(id)}`),
   syncBotChats: async (id: string) => (await post<{ count: number }>(`/bots/${seg(id)}/sync-chats`)).count,
