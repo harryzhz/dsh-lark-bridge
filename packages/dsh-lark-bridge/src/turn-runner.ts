@@ -1,8 +1,9 @@
 import type { Context } from '@deepseek-ai/cordis'
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { Agent, AssistantStreamFrame } from '@deepseek-ai/dsh-agent'
 import { createUserMessage, type ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent, TurnEndReason } from '@deepseek-ai/dsh-session'
 import { hasVisibleText, trimInvisibleText } from '@dsh-lark/lark-core'
+import type { TurnCotInputEvent } from './cot-stream-controller.js'
 
 export type TurnAbortKind =
   | 'disposed'
@@ -76,6 +77,159 @@ function extractUserMessageText(event: SessionEvent): string {
 function eventSeqOf(event: SessionEvent): number | undefined {
   const seq = (event as { readonly seq?: unknown }).seq
   return typeof seq === 'number' && Number.isFinite(seq) ? seq : undefined
+}
+
+function extractToolResultText(message: unknown): string {
+  if (!message || typeof message !== 'object') return ''
+  const content = (message as { content?: unknown }).content
+  if (!Array.isArray(content)) return ''
+  const parts: string[] = []
+  for (const block of content) {
+    if (!block || typeof block !== 'object') continue
+    const rec = block as Record<string, unknown>
+    if (rec.type === 'text' && typeof rec.text === 'string') {
+      parts.push(rec.text)
+    } else if (rec.type === 'tool-result' && Array.isArray(rec.content)) {
+      for (const nested of rec.content) {
+        if (nested && typeof nested === 'object') {
+          const nRec = nested as Record<string, unknown>
+          if (nRec.type === 'text' && typeof nRec.text === 'string') {
+            parts.push(nRec.text)
+          }
+        }
+      }
+    }
+  }
+  return parts.join('\n')
+}
+
+function emitSessionEventForCot(
+  event: SessionEvent,
+  onCotEvent: ((ev: TurnCotInputEvent) => void) | undefined,
+): void {
+  if (!onCotEvent) return
+  if (event.type === 'assistant/message') {
+    const data = event.data as {
+      readonly turn: number
+      readonly step?: number
+      readonly interrupted?: boolean
+      readonly message: { readonly content: readonly ContentBlock[] }
+    }
+    if (data.interrupted) return
+    const content = data.message.content
+    const hasToolCall = content.some((b) => b.type === 'tool-call')
+    const stepKey =
+      typeof data.step === 'number' ? `turn:${data.turn}:step:${data.step}` : undefined
+    for (const block of content) {
+      if (block.type === 'reasoning' && typeof block.text === 'string' && block.text.trim()) {
+        onCotEvent({
+          type: 'reasoning-message',
+          ...(stepKey ? { stepKey } : {}),
+          text: block.text,
+        })
+      } else if (
+        hasToolCall &&
+        block.type === 'text' &&
+        typeof block.text === 'string' &&
+        hasVisibleText(block.text)
+      ) {
+        onCotEvent({
+          type: 'commentary-text',
+          text: trimInvisibleText(block.text),
+        })
+      }
+    }
+    return
+  }
+  if (event.type === 'tool/call') {
+    if (isSilenceCliToolCallEvent(event)) return
+    const data = event.data as { callId?: unknown; name?: unknown; arguments?: unknown }
+    const callId = typeof data.callId === 'string' ? data.callId.trim() : ''
+    if (!callId) return
+    const name = typeof data.name === 'string' && data.name.trim() ? data.name.trim() : 'tool'
+    const args =
+      typeof data.arguments === 'string'
+        ? data.arguments
+        : data.arguments !== undefined
+          ? JSON.stringify(data.arguments)
+          : ''
+    onCotEvent({ type: 'tool-call', callId, name, arguments: args })
+    return
+  }
+  if (event.type === 'tool/result') {
+    const data = event.data as {
+      message?: {
+        toolCallId?: unknown
+        source?: { callId?: unknown }
+        isError?: unknown
+        content?: unknown
+      }
+      error?: unknown
+    }
+    const msg = data.message
+    const rawId = msg?.toolCallId ?? msg?.source?.callId
+    const callId = typeof rawId === 'string' ? rawId.trim() : ''
+    if (!callId) return
+    onCotEvent({
+      type: 'tool-result',
+      callId,
+      output: extractToolResultText(msg),
+      isError: Boolean(msg?.isError || data.error),
+    })
+  }
+}
+
+function subscribeAssistantStreamForCot(
+  ctx: Context,
+  sessionId: string,
+  getTargetTurn: () => number | undefined,
+  canEmit: () => boolean,
+  onCotEvent: ((ev: TurnCotInputEvent) => void) | undefined,
+): (() => void) | undefined {
+  if (!onCotEvent) return undefined
+  const attempts = new Map<string, { readonly turn: number; readonly step: number }>()
+  return (
+    ctx.on as (
+      name: string,
+      listener: (payload: { readonly agent?: Agent; readonly frame?: AssistantStreamFrame }) => void,
+      options?: { readonly global?: boolean },
+    ) => () => void
+  )(
+    'agent/assistant-stream',
+    (payload) => {
+      if (!canEmit()) return
+      const streamAgent = payload?.agent
+      const frame = payload?.frame
+      if (!streamAgent || !frame || String(streamAgent.session.id) !== sessionId) return
+      if (frame.type === 'start') {
+        attempts.set(String(frame.attemptId), { turn: frame.turn, step: frame.step })
+        return
+      }
+      const meta = attempts.get(String(frame.attemptId))
+      if (frame.type === 'end') {
+        attempts.delete(String(frame.attemptId))
+        return
+      }
+      if (!meta) return
+      const targetTurn = getTargetTurn()
+      if (targetTurn === undefined || meta.turn !== targetTurn) return
+      const chunk = frame.chunk
+      if (chunk.type === 'reasoning-delta' && chunk.text) {
+        onCotEvent({
+          type: 'reasoning-delta',
+          blockKey: `${String(frame.attemptId)}:${chunk.index}`,
+          stepKey: `turn:${meta.turn}:step:${meta.step}`,
+          text: chunk.text,
+        })
+      } else if (chunk.type === 'block-end' && chunk.block.type === 'reasoning') {
+        onCotEvent({
+          type: 'reasoning-block-end',
+          blockKey: `${String(frame.attemptId)}:${chunk.index}`,
+        })
+      }
+    },
+    { global: true },
+  )
 }
 
 export interface TurnReplyTrackerOptions {
@@ -227,6 +381,7 @@ function releaseSessionTurn(sessionId: string, turn: number | undefined): void {
 
 export interface RunTurnOptions {
   readonly onIntermediate?: (text: string) => void | Promise<void>
+  readonly onCotEvent?: (event: TurnCotInputEvent) => void
   readonly onActivity?: (timestampMs: number) => void
   readonly onUserMessageSubmitted?: (userMessageId: string) => void
   readonly onTurnBound?: (info: { readonly turn: number; readonly userMessageId?: string }) => void
@@ -317,6 +472,7 @@ export function runTurnAndCollectReply(
     let lastAssistantMessageAtMs: number | undefined
     let phase: 'running' | 'flushing' | 'settled' = 'running'
     let offEvent: (() => void) | undefined
+    let offStream: (() => void) | undefined
     let offDispose: (() => void) | undefined
 
     const notifyTurnBound = (turn: number) => {
@@ -375,6 +531,15 @@ export function runTurnAndCollectReply(
       if (offEvent) {
         const fn = offEvent
         offEvent = undefined
+        try {
+          fn()
+        } catch {
+          // Listener may already be detached by Cordis fiber disposal.
+        }
+      }
+      if (offStream) {
+        const fn = offStream
+        offStream = undefined
         try {
           fn()
         } catch {
@@ -469,6 +634,7 @@ export function runTurnAndCollectReply(
               lastAssistantMessageAtMs = nowMs
             }
             options.onActivity?.(nowMs)
+            emitSessionEventForCot(event, options.onCotEvent)
             tracker.onEvent(event)
             return
           }
@@ -480,6 +646,9 @@ export function runTurnAndCollectReply(
             notifyTurnBound(targetTurn)
             if (seq !== undefined) options.onEventSeq?.(seq)
             options.onActivity?.(Date.now())
+            if (event.type === 'tool/result' && !cancelError && !options.cancelSignal?.aborted) {
+              emitSessionEventForCot(event, options.onCotEvent)
+            }
             return
           }
           if (event.type === 'step/end' && event.data.turn === targetTurn) {
@@ -533,6 +702,14 @@ export function runTurnAndCollectReply(
           }
         },
         { global: true },
+      )
+
+      offStream = subscribeAssistantStreamForCot(
+        ctx,
+        sessionId,
+        () => (targetTurnConfirmed ? targetTurn : undefined),
+        () => phase === 'running' && !cancelError && !options.cancelSignal?.aborted,
+        options.onCotEvent,
       )
 
       // Guard against Cordis LIFO fiber disposal detaching `ctx.on` before `turn/end`
@@ -651,6 +828,7 @@ export function reattachTurnAndCollectReply(
     let silencedByTool = false
     let phase: 'running' | 'flushing' | 'settled' = 'running'
     let offEvent: (() => void) | undefined
+    let offStream: (() => void) | undefined
     let offDispose: (() => void) | undefined
     let buffering = true
     const bufferedLiveEvents: SessionEvent[] = []
@@ -681,6 +859,15 @@ export function reattachTurnAndCollectReply(
       if (offEvent) {
         const fn = offEvent
         offEvent = undefined
+        try {
+          fn()
+        } catch {
+          // Listener may already be detached by Cordis fiber disposal.
+        }
+      }
+      if (offStream) {
+        const fn = offStream
+        offStream = undefined
         try {
           fn()
         } catch {
@@ -830,7 +1017,10 @@ export function reattachTurnAndCollectReply(
           options.onSilencedByTool?.()
         }
         if (cancelError || options.cancelSignal?.aborted) return
-        if (!fromSnapshot) options.onActivity?.(Date.now())
+        if (!fromSnapshot) {
+          options.onActivity?.(Date.now())
+          emitSessionEventForCot(event, options.onCotEvent)
+        }
         tracker.onEvent(event)
         return
       }
@@ -842,7 +1032,12 @@ export function reattachTurnAndCollectReply(
         targetTurnConfirmed = true
         notifyTurnBound(targetTurn)
         if (seq !== undefined) options.onEventSeq?.(seq)
-        if (!fromSnapshot) options.onActivity?.(Date.now())
+        if (!fromSnapshot) {
+          options.onActivity?.(Date.now())
+          if (event.type === 'tool/result' && !cancelError && !options.cancelSignal?.aborted) {
+            emitSessionEventForCot(event, options.onCotEvent)
+          }
+        }
         return
       }
 
@@ -910,6 +1105,14 @@ export function reattachTurnAndCollectReply(
           processEvent(event, false)
         },
         { global: true },
+      )
+
+      offStream = subscribeAssistantStreamForCot(
+        ctx,
+        sessionId,
+        () => (targetTurnConfirmed ? targetTurn : undefined),
+        () => phase === 'running' && !buffering && !cancelError && !options.cancelSignal?.aborted,
+        options.onCotEvent,
       )
 
       if (typeof ctx.effect === 'function') {

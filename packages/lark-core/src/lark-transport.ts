@@ -1,6 +1,14 @@
 import { extname } from 'node:path'
 import { Readable } from 'node:stream'
 import * as lark from '@larksuiteoapi/node-sdk'
+import {
+  COT_MAX_EVENTS_PER_BATCH,
+  COT_REQUEST_TIMEOUT_MS,
+  isCotAlreadyTerminalResponse,
+  type CotEventPayload,
+  type CreateCotMessageOptions,
+  type CreateCotMessageResult,
+} from './cot.js'
 import { createLarkSdkLogger, type LarkSdkErrorRecord } from './lark-logger.js'
 import { buildLarkPostPayload } from './markdown.js'
 import { parseLarkMessageContent } from './message-parser.js'
@@ -990,6 +998,110 @@ export class LarkBotTransport {
         `patchMessageCard(${messageId}) failed: ${err instanceof Error ? err.message : String(err)}`,
       )
     }
+  }
+
+  private async requestWithTimeout<T>(
+    run: () => Promise<T>,
+    timeoutMs = COT_REQUEST_TIMEOUT_MS,
+  ): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      return await Promise.race([
+        run(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            reject(new Error(`Lark CoT request timed out after ${timeoutMs}ms`))
+          }, timeoutMs)
+          timer.unref?.()
+        }),
+      ])
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
+  }
+
+  async createCotMessage(options: CreateCotMessageOptions): Promise<CreateCotMessageResult> {
+    const data: Record<string, unknown> = {
+      receive_id: options.chatId,
+    }
+    if (options.originMessageId && options.originMessageId.startsWith('om_')) {
+      data.origin_message_id = options.originMessageId
+      if (options.replyInThread) {
+        data.reply_in_thread = true
+      }
+    }
+    const res = (await this.requestWithTimeout(() =>
+      this.client.request({
+        method: 'POST',
+        url: '/open-apis/im/v1/message_cot',
+        params: { receive_id_type: 'chat_id' },
+        data,
+      }),
+    )) as {
+      code?: number
+      msg?: string
+      data?: { cot_id?: string; message_id?: string }
+    }
+    if (typeof res?.code === 'number' && res.code !== 0) {
+      throw new Error(`createCotMessage rejected (${res.code}): ${res.msg || 'unknown error'}`)
+    }
+    const cotId = res?.data?.cot_id?.trim()
+    const messageId = res?.data?.message_id?.trim()
+    if (!cotId || !messageId) {
+      throw new Error('createCotMessage returned empty cot_id or message_id')
+    }
+    this.recordSentMessageId(messageId)
+    return { cotId, messageId }
+  }
+
+  async appendCotEvents(
+    cotId: string,
+    messageId: string,
+    events: readonly CotEventPayload[],
+  ): Promise<{ readonly alreadyTerminal: boolean }> {
+    if (events.length === 0) return { alreadyTerminal: false }
+    for (let i = 0; i < events.length; i += COT_MAX_EVENTS_PER_BATCH) {
+      const slice = events.slice(i, i + COT_MAX_EVENTS_PER_BATCH)
+      const res = (await this.requestWithTimeout(() =>
+        this.client.request({
+          method: 'PUT',
+          url: '/open-apis/im/v1/message_cot',
+          data: {
+            cot_id: cotId,
+            message_id: messageId,
+            events: slice,
+          },
+        }),
+      )) as { code?: number; msg?: string }
+      if (isCotAlreadyTerminalResponse(res)) {
+        return { alreadyTerminal: true }
+      }
+      if (typeof res?.code === 'number' && res.code !== 0) {
+        throw new Error(`appendCotEvents rejected (${res.code}): ${res.msg || 'unknown error'}`)
+      }
+    }
+    return { alreadyTerminal: false }
+  }
+
+  async completeCotMessage(
+    cotId: string,
+    messageId: string,
+    reason: 'done' | 'error',
+  ): Promise<{ readonly alreadyTerminal: boolean }> {
+    const res = (await this.requestWithTimeout(() =>
+      this.client.request({
+        method: 'POST',
+        url: `/open-apis/im/v1/message_cot/complete/${encodeURIComponent(cotId)}`,
+        params: { message_id: messageId, reason },
+      }),
+    )) as { code?: number; msg?: string }
+    if (isCotAlreadyTerminalResponse(res)) {
+      return { alreadyTerminal: true }
+    }
+    if (typeof res?.code === 'number' && res.code !== 0) {
+      throw new Error(`completeCotMessage rejected (${res.code}): ${res.msg || 'unknown error'}`)
+    }
+    return { alreadyTerminal: false }
   }
 
   async listJoinedChats(): Promise<DiscoveredLarkChat[]> {

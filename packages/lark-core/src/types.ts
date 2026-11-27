@@ -427,6 +427,8 @@ export const LarkBotConfigSchema = z.preprocess(
     adminUserProfiles: z.array(SubstituteTargetSchema).default([]),
 
     // Card, signature & feedback
+    cotEnabled: z.boolean().default(false),
+    cotToolResultEnabled: z.boolean().default(true),
     sendIntermediateMessages: z.boolean().default(false),
     longTurnProgressNotice: z.boolean().default(true),
     longTurnNoticeDelaySeconds: z
@@ -548,6 +550,8 @@ export const LarkGroupConfigSchema = z.preprocess(
 
     // Message & card overrides
     receivedReactionEmoji: z.string().default('inherit'),
+    cotEnabled: z.enum(['inherit', 'on', 'off']).default('inherit'),
+    cotToolResultEnabled: z.enum(['inherit', 'on', 'off']).default('inherit'),
     intermediateMessages: z.enum(['inherit', 'on', 'off']).default('inherit'),
     replyFormat: z.enum(['inherit', 'card', 'text']).default('inherit'),
     dshSessionLinkInCard: z.enum(['inherit', 'on', 'off']).default('inherit'),
@@ -820,7 +824,7 @@ export interface RecalledLarkMessageEvent {
 }
 
 export interface ParsedSlashCommand {
-  readonly name: 'new' | 'close' | 'cancel' | 'status' | 'model' | 'agent' | 'console' | 'help'
+  readonly name: 'new' | 'close' | 'cancel' | 'status' | 'model' | 'agent' | 'console' | 'cot' | 'help'
   readonly args: string
 }
 
@@ -849,6 +853,8 @@ export type RoutingDecision =
       readonly sessionMode: 'thread' | 'per_message' | 'chat'
       readonly replyMode: GroupReplyMode
       readonly useCard: boolean
+      readonly cotEnabled?: boolean
+      readonly cotToolResultEnabled?: boolean
       readonly sendIntermediateMessages: boolean
       readonly longTurnProgressNotice?: boolean
       readonly longTurnNoticeDelaySeconds?: number
@@ -1128,6 +1134,36 @@ export function resolveEffectiveRouterConfig(
     contextTtlMinutes: groupRouter.contextTtlMinutes,
     includeLastReply: groupRouter.includeLastReply,
     coalesceQueuedMessages: groupRouter.coalesceQueuedMessages,
+  }
+}
+
+export interface EffectiveCotConfig {
+  readonly enabled: boolean
+  readonly toolResultEnabled: boolean
+  readonly source: 'bot' | 'group'
+}
+
+export function resolveEffectiveCotConfig(
+  bot: Pick<LarkBotConfig, 'cotEnabled' | 'cotToolResultEnabled'>,
+  group?: Pick<LarkGroupConfig, 'cotEnabled' | 'cotToolResultEnabled'>,
+): EffectiveCotConfig {
+  const groupOverride = group?.cotEnabled === 'on' || group?.cotEnabled === 'off'
+  const enabled =
+    group?.cotEnabled === 'on'
+      ? true
+      : group?.cotEnabled === 'off'
+        ? false
+        : Boolean(bot.cotEnabled)
+  const toolResultEnabled =
+    group?.cotToolResultEnabled === 'on'
+      ? true
+      : group?.cotToolResultEnabled === 'off'
+        ? false
+        : bot.cotToolResultEnabled !== false
+  return {
+    enabled,
+    toolResultEnabled,
+    source: groupOverride ? 'group' : 'bot',
   }
 }
 

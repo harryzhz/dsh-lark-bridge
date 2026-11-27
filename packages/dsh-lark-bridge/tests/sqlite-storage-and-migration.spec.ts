@@ -655,13 +655,15 @@ describe('SQLite WAL storage, atomic auto-migration & db CLI', () => {
     const dir = makeTempDir('dsh-lark-v6-')
     const store = new LarkBridgeStore(dir)
     try {
-      expect(store.getStorageStats().schemaVersion).toBe(11)
+      expect(store.getStorageStats().schemaVersion).toBe(12)
       const pendingCols = (
         store.db.prepare('PRAGMA table_info(pending_turns)').all() as Array<{ name: string }>
       ).map((c) => c.name)
       expect(pendingCols).toContain('target_turn')
       expect(pendingCols).toContain('user_message_id')
       expect(pendingCols).toContain('last_event_seq')
+      expect(pendingCols).toContain('cot_id')
+      expect(pendingCols).toContain('cot_message_id')
       const cols = (
         store.db.prepare('PRAGMA table_info(telemetry_usage_events)').all() as Array<{ name: string }>
       ).map((c) => c.name)

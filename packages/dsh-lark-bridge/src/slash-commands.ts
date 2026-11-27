@@ -5,6 +5,7 @@ import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import {
   resolveEffectiveAgentRuntime,
+  resolveEffectiveCotConfig,
   type LarkBotConfig,
   type LarkGroupConfig,
   type ParsedSlashCommand,
@@ -31,6 +32,7 @@ export interface SlashCommandHost {
 export interface SlashCommandInput {
   readonly bot: LarkBotConfig
   readonly group?: LarkGroupConfig
+  readonly chatId?: string
   readonly chatType?: 'p2p' | 'group' | string
   readonly senderOpenId?: string
   readonly senderType?: 'user' | 'bot'
@@ -45,6 +47,7 @@ export interface SlashCommandInput {
 const P2P_HELP_TEXT = [
   '可用命令：',
   '/status - 查看当前会话、工作区与接管链接',
+  '/cot [on|off|status] - 查看或开关原生思考过程展示',
   '/console - 获取 DSH 管理面一次性登录链接（仅限管理员）',
   '/new - 归档当前会话并开启新会话',
   '/close - 关闭并归档当前会话',
@@ -56,6 +59,7 @@ const P2P_HELP_TEXT = [
 const GROUP_HELP_TEXT = [
   '可用命令：',
   '/status - 查看当前会话、工作区与会话链接',
+  '/cot [on|off|inherit|status] - 查看或开关本群思考过程展示（修改仅限管理员）',
   '/console - 私聊获取 DSH 管理面一次性登录链接（仅限管理员）',
   '/new - 归档当前会话并开启新会话',
   '/close - 关闭并归档当前会话',
@@ -123,6 +127,9 @@ export async function handleSlashCommand(host: SlashCommandHost, input: SlashCom
     case 'console':
       await handleConsoleCommand(host, input, isGroupChat)
       return
+    case 'cot':
+      await handleCotCommand(host, input, isGroupChat)
+      return
     case 'agent':
       if (isGroupChat) {
         await reply(GROUP_CONFIG_COMMAND_DENIED_TEXT)
@@ -138,6 +145,99 @@ export async function handleSlashCommand(host: SlashCommandHost, input: SlashCom
       await switchModel(host, input, liveAgent)
       return
   }
+}
+
+async function handleCotCommand(
+  host: SlashCommandHost,
+  input: SlashCommandInput,
+  isGroupChat: boolean,
+): Promise<void> {
+  const { bot, group, command, reply } = input
+  const rawArg = command.args.trim().toLowerCase()
+  const effective = resolveEffectiveCotConfig(bot, isGroupChat ? group : undefined)
+
+  if (!rawArg || rawArg === 'status') {
+    const scopeDesc = isGroupChat
+      ? group?.cotEnabled === 'on'
+        ? '本群单独开启'
+        : group?.cotEnabled === 'off'
+          ? '本群单独关闭'
+          : `跟随智能体默认（${bot.cotEnabled ? '开启' : '关闭'}）`
+      : `智能体默认（${bot.cotEnabled ? '开启' : '关闭'}）`
+    const toolDesc = effective.toolResultEnabled ? '附带工具输出' : '仅展示工具标题'
+    await reply(
+      [
+        `原生思考过程：${effective.enabled ? '已开启' : '已关闭'}（${scopeDesc}）`,
+        ...(effective.enabled ? [`工具节点展示：${toolDesc}`] : []),
+        isGroupChat
+          ? '用法：/cot on | off | inherit | status（修改仅限管理员）'
+          : '用法：/cot on | off | status',
+      ].join('\n'),
+    )
+    return
+  }
+
+  const normalized =
+    rawArg === 'on' || rawArg === 'true' || rawArg === '1'
+      ? 'on'
+      : rawArg === 'off' || rawArg === 'false' || rawArg === '0'
+        ? 'off'
+        : rawArg === 'inherit' || rawArg === 'default'
+          ? 'inherit'
+          : undefined
+  if (!normalized || (!isGroupChat && normalized === 'inherit')) {
+    await reply(
+      isGroupChat
+        ? '用法：/cot on | off | inherit | status'
+        : '用法：/cot on | off | status',
+    )
+    return
+  }
+
+  if (isGroupChat) {
+    const senderOpenId = input.senderOpenId?.trim() || ''
+    const admins = bot.adminUsers ?? []
+    if ((input.senderType && input.senderType !== 'user') || !senderOpenId) {
+      await reply('安全限制：群聊中仅人类管理员可修改 /cot 开关。')
+      return
+    }
+    if (admins.length === 0) {
+      await reply(
+        `安全限制：尚未为智能体「${bot.name}」配置管理员，请在 DSH 控制台修改本群思考过程开关或先添加管理员。`,
+      )
+      return
+    }
+    if (!admins.includes(senderOpenId)) {
+      await reply(`安全限制：仅智能体「${bot.name}」配置的管理员可在群聊中修改 /cot 开关。`)
+      return
+    }
+    const targetChatId = input.chatId?.trim() || group?.chatId?.trim() || ''
+    if (!targetChatId) {
+      await reply('无法识别当前群聊 ID，请在 DSH 控制台修改思考过程开关。')
+      return
+    }
+    const existingGroup = host.store.getGroup(bot.id, targetChatId) ?? group
+    host.store.upsertGroup({
+      ...(existingGroup ?? { botId: bot.id, chatId: targetChatId, enabled: true }),
+      cotEnabled: normalized,
+    })
+    const label =
+      normalized === 'on'
+        ? '已为本群开启原生思考过程展示'
+        : normalized === 'off'
+          ? '已为本群关闭原生思考过程展示'
+          : `本群已恢复跟随智能体默认（当前为${bot.cotEnabled ? '开启' : '关闭'}）`
+    await reply(`${label}，从下一轮对话开始生效。`)
+    return
+  }
+
+  host.store.upsertBot({
+    ...bot,
+    cotEnabled: normalized === 'on',
+  })
+  await reply(
+    `${normalized === 'on' ? '已开启' : '已关闭'}智能体「${bot.name}」默认原生思考过程展示，从下一轮对话开始生效。`,
+  )
 }
 
 async function handleConsoleCommand(

@@ -153,6 +153,8 @@ export function newBotConfig(
     adminUsers: [],
     adminUserProfiles: [],
     sendIntermediateMessages: false,
+    cotEnabled: false,
+    cotToolResultEnabled: true,
     longTurnProgressNotice: true,
     longTurnNoticeDelaySeconds: DEFAULT_LONG_TURN_NOTICE_DELAY_SECONDS,
     longTurnNoticeText: DEFAULT_LONG_TURN_NOTICE_TEXT,
@@ -192,6 +194,8 @@ function toBotConfig(record: BotRecord): BotConfig {
     larkAppSecret: '',
     adminUsers: cloned.adminUsers ?? [],
     adminUserProfiles: cloned.adminUserProfiles ?? [],
+    cotEnabled: cloned.cotEnabled ?? false,
+    cotToolResultEnabled: cloned.cotToolResultEnabled ?? true,
     longTurnProgressNotice: cloned.longTurnProgressNotice ?? true,
     longTurnNoticeDelaySeconds:
       cloned.longTurnNoticeDelaySeconds ?? DEFAULT_LONG_TURN_NOTICE_DELAY_SECONDS,
@@ -1301,6 +1305,30 @@ function BotConversationAndMessageSection({
       <SettingRow title="收到消息时的表情" desc="处理期间贴在原消息上，回复完成后自动移除">
         <SelectMenu value={draft.receivedReactionEmoji} options={reactionOptions()} onChange={(receivedReactionEmoji) => patch({ receivedReactionEmoji })} />
       </SettingRow>
+      <SettingRow
+        title="展示思考过程"
+        desc="以飞书原生思考气泡实时展示推理与工具调用（需新版飞书客户端）"
+      >
+        <Switch
+          label="展示思考过程"
+          checked={Boolean(draft.cotEnabled)}
+          onChange={(cotEnabled) => patch({ cotEnabled })}
+        />
+      </SettingRow>
+      {Boolean(draft.cotEnabled) && (
+        <NestedSettings>
+          <SettingRow
+            title="附带工具输出"
+            desc="在思考气泡的工具节点内附带截断后的工具执行结果"
+          >
+            <Switch
+              label="附带工具输出"
+              checked={draft.cotToolResultEnabled !== false}
+              onChange={(cotToolResultEnabled) => patch({ cotToolResultEnabled })}
+            />
+          </SettingRow>
+        </NestedSettings>
+      )}
       <SettingRow title="发送中间过程消息" desc="执行过程中的阶段说明实时发出，不与最终回复合并">
         <Switch
           label="发送中间过程消息"

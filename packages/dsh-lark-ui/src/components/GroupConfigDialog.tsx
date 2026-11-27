@@ -770,6 +770,10 @@ function GroupConversationAndMessageSection({
     (draft.dshSessionLinkInCard ?? 'inherit') === 'inherit'
       ? bot.dshSessionLinkInCard
       : draft.dshSessionLinkInCard === 'on'
+  const effectiveCotEnabled =
+    (draft.cotEnabled ?? 'inherit') === 'inherit'
+      ? Boolean(bot.cotEnabled)
+      : draft.cotEnabled === 'on'
   const botSignature =
     bot.replyFooterEnabled && bot.replyFooterSignature ? bot.signature.trim() : ''
   const signatureMode = draft.signatureMode ?? 'inherit'
@@ -834,6 +838,27 @@ function GroupConversationAndMessageSection({
           onChange={(receivedReactionEmoji) => patch({ receivedReactionEmoji })}
         />
       </SettingRow>
+      <SettingRow title="展示思考过程">
+        <SelectMenu
+          value={draft.cotEnabled ?? 'inherit'}
+          options={withInherit(BINARY_SWITCH_MODES, bot.cotEnabled ? 'on' : 'off')}
+          onChange={(cotEnabled) => patch({ cotEnabled })}
+        />
+      </SettingRow>
+      {effectiveCotEnabled && (
+        <NestedSettings>
+          <SettingRow title="附带工具输出">
+            <SelectMenu
+              value={draft.cotToolResultEnabled ?? 'inherit'}
+              options={withInherit(
+                BINARY_SWITCH_MODES,
+                bot.cotToolResultEnabled !== false ? 'on' : 'off',
+              )}
+              onChange={(cotToolResultEnabled) => patch({ cotToolResultEnabled })}
+            />
+          </SettingRow>
+        </NestedSettings>
+      )}
       <SettingRow title="发送中间过程消息">
         <SelectMenu
           value={draft.intermediateMessages ?? 'inherit'}
