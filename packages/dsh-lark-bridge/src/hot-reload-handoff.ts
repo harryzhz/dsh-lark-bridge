@@ -3,8 +3,36 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { AgentHandle } from '@deepseek-ai/dsh-agent'
 
 const GLOBAL_HANDOFF_KEY = Symbol.for('dsh-lark-bridge.hot-reload-handoff')
+const CORDIS_ROOT_SYMBOL = Symbol.for('cordis.root')
 const DEFAULT_SWAP_TTL_MS = 3 * 60_000
 const DEFAULT_ORPHAN_HANDLE_TTL_MS = 3 * 60_000
+
+interface HostRootContextLike {
+  readonly get?: (name: string) => unknown
+}
+
+/**
+ * Resolve the Cordis root context across both Cordis >=4.2 (`ctx[Context.root]`,
+ * keyed by `Symbol.for('cordis.root')`) and Cordis <=4.1 (`ctx.root`).
+ *
+ * Reading the symbol key first avoids triggering Cordis 4.2's strict inject proxy
+ * (`cannot get property "root" without inject`), while guarding the legacy fallback
+ * with `'root' in ctx` keeps it safe even when a strict proxy omits the symbol.
+ */
+function resolveHostRootContext(ctx: Context): HostRootContextLike | undefined {
+  if (!ctx || typeof ctx !== 'object') return undefined
+  const symbolRoot = (ctx as unknown as Record<PropertyKey, unknown>)[CORDIS_ROOT_SYMBOL]
+  if (symbolRoot && typeof (symbolRoot as HostRootContextLike).get === 'function') {
+    return symbolRoot as HostRootContextLike
+  }
+  if ('root' in (ctx as object)) {
+    const legacyRoot = (ctx as unknown as { readonly root?: unknown }).root
+    if (legacyRoot && typeof (legacyRoot as HostRootContextLike).get === 'function') {
+      return legacyRoot as HostRootContextLike
+    }
+  }
+  return undefined
+}
 
 interface SwapMarker {
   readonly operationId: string
@@ -52,11 +80,11 @@ function handleEntryKey(dataDir: string, sessionId: string): string {
  * `dsh-lark-bridge` are owned by the host root fiber rather than this plugin's
  * HMR-disposable fiber. When `dsh-lark-bridge` hot-reloads, live agents keep
  * running uninterrupted in the host process; when the host process shuts down,
- * `ctx.root` still disposes them cleanly.
+ * the host root context still disposes them cleanly.
  */
 export function resolveHostAgents(ctx: Context): Context['agents'] {
-  const root = (ctx as { readonly root?: { readonly get?: (name: string) => unknown } }).root
-  if (typeof root?.get === 'function') {
+  const root = resolveHostRootContext(ctx)
+  if (root && typeof root.get === 'function') {
     const rootAgents = root.get('agents') as Context['agents'] | undefined
     if (rootAgents && typeof rootAgents.create === 'function') {
       return rootAgents
@@ -66,12 +94,13 @@ export function resolveHostAgents(ctx: Context): Context['agents'] {
 }
 
 /**
- * Resolve the host `agentPresets` service through `ctx.root` when available so
- * preset mounting does not bind its service tracer to this plugin's short-lived fiber.
+ * Resolve the host `agentPresets` service through the Cordis root context when
+ * available so preset mounting does not bind its service tracer to this plugin's
+ * short-lived fiber.
  */
 export function resolveHostAgentPresets<T>(ctx: Context): T | undefined {
-  const root = (ctx as { readonly root?: { readonly get?: (name: string) => unknown } }).root
-  if (typeof root?.get === 'function') {
+  const root = resolveHostRootContext(ctx)
+  if (root && typeof root.get === 'function') {
     const rootPresets = root.get('agentPresets') as T | undefined
     if (rootPresets) return rootPresets
   }
