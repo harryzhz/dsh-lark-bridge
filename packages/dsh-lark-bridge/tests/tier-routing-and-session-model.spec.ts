@@ -462,6 +462,8 @@ describe('Session pinning & session-level /model with profile-specific real mode
     await sendCmd('')
     expect(listAvailableModelsForPreset).toHaveBeenCalledWith('agy', 'custom-proxy')
     expect(replies.at(-1)).toContain('agy (custom-proxy)')
+    expect(replies.at(-1)).toContain('可用模型（共 2 个）：')
+    expect(replies.at(-1)).not.toContain('真实可用模型')
     expect(replies.at(-1)).toContain('gemini-4-neon')
     expect(replies.at(-1)).toContain('gemini-4-carbon')
     expect(replies.at(-1)).not.toContain('claude-opus-5-5')
@@ -469,6 +471,8 @@ describe('Session pinning & session-level /model with profile-specific real mode
     // 2. Rejects model unavailable on this proxy profile.
     await sendCmd('claude-opus-5-5')
     expect(replies.at(-1)).toContain('未找到模型')
+    expect(replies.at(-1)).toContain('当前可用模型：')
+    expect(replies.at(-1)).not.toContain('真实可用模型')
     expect(selectSpy).not.toHaveBeenCalled()
 
     // 3. Rejects unsupported reasoning effort on target model.
