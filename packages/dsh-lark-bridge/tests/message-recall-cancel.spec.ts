@@ -266,6 +266,7 @@ describe('Feishu message recall cancellation', () => {
       larkAppSecret: 'mock-secret-value',
       defaultWorkingDir: dir,
       agentPreset: 'standard',
+      groupAccessMode: 'all_joined',
       receivedReactionEmoji: 'THUMBSUP',
       sendIntermediateMessages: true,
     })
@@ -380,6 +381,7 @@ describe('Feishu message recall cancellation', () => {
       larkAppSecret: 'mock-secret-value',
       defaultWorkingDir: dir,
       agentPreset: 'standard',
+      groupAccessMode: 'all_joined',
       receivedReactionEmoji: 'NONE',
     })
 
@@ -451,6 +453,7 @@ describe('Feishu message recall cancellation', () => {
       larkAppSecret: 'mock-secret-value',
       defaultWorkingDir: dir,
       agentPreset: 'standard',
+      groupAccessMode: 'all_joined',
       receivedReactionEmoji: 'NONE',
       router: {
         enabled: false,
@@ -591,6 +594,7 @@ describe('Feishu message recall cancellation', () => {
       larkAppSecret: 'mock-secret-value',
       defaultWorkingDir: dir,
       agentPreset: 'standard',
+      groupAccessMode: 'all_joined',
       receivedReactionEmoji: 'NONE',
       router: {
         enabled: true,
@@ -698,6 +702,7 @@ describe('Feishu message recall cancellation', () => {
       larkAppSecret: 'mock-secret-value',
       defaultWorkingDir: dir,
       agentPreset: 'standard',
+      groupAccessMode: 'all_joined',
       receivedReactionEmoji: 'NONE',
     })
 
@@ -773,6 +778,7 @@ describe('Feishu message recall cancellation', () => {
       larkAppSecret: 'mock-secret-value',
       defaultWorkingDir: dir,
       agentPreset: 'standard',
+      groupAccessMode: 'all_joined',
       receivedReactionEmoji: 'NONE',
       router: {
         enabled: true,
@@ -857,6 +863,7 @@ describe('Feishu message recall cancellation', () => {
       larkAppSecret: 'mock-secret-value',
       defaultWorkingDir: dir,
       agentPreset: 'standard',
+      groupAccessMode: 'all_joined',
       receivedReactionEmoji: 'NONE',
       router: {
         enabled: true,

@@ -445,6 +445,7 @@ describe('Smart Triage Gate, Per-Group Overrides & Busy-Queue Coalescing', () =>
       larkAppSecret: 'sec_demo',
       defaultWorkingDir: h.dir,
       agentPreset: 'standard',
+      groupAccessMode: 'all_joined',
       receivedReactionEmoji: 'OnIt',
       useInteractiveCard: true,
       router: {
@@ -536,6 +537,8 @@ describe('Smart Triage Gate, Per-Group Overrides & Busy-Queue Coalescing', () =>
       larkAppSecret: 'sec_demo',
       defaultWorkingDir: h.dir,
       agentPreset: 'standard',
+      groupAccessMode: 'all_joined',
+      groupReplyMode: 'new-topic',
       receivedReactionEmoji: 'OnIt',
       router: {
         enabled: true,
@@ -605,6 +608,7 @@ describe('Smart Triage Gate, Per-Group Overrides & Busy-Queue Coalescing', () =>
       larkAppSecret: 'sec_demo',
       defaultWorkingDir: h.dir,
       agentPreset: 'standard',
+      groupAccessMode: 'all_joined',
       receivedReactionEmoji: 'OnIt',
       router: {
         enabled: true,
@@ -728,6 +732,7 @@ describe('Smart Triage Gate, Per-Group Overrides & Busy-Queue Coalescing', () =>
       larkAppSecret: 'sec_demo',
       defaultWorkingDir: h.dir,
       agentPreset: 'standard',
+      groupAccessMode: 'all_joined',
       router: {
         enabled: true,
         provider: 'deepseek',
@@ -1121,6 +1126,7 @@ describe('Smart Triage Gate, Per-Group Overrides & Busy-Queue Coalescing', () =>
       larkAppSecret: 'sec_demo',
       defaultWorkingDir: h.dir,
       agentPreset: 'standard',
+      groupAccessMode: 'all_joined',
       router: {
         enabled: true,
         provider: 'deepseek',

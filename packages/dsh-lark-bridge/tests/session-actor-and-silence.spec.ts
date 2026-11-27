@@ -160,6 +160,7 @@ describe('SessionActor invariants, structured silence control & SessionTitleGuar
       larkAppSecret: 'mock-secret-value',
       defaultWorkingDir: dir,
       agentPreset: 'standard',
+      groupAccessMode: 'all_joined',
       idleCloseMinutes: 1,
       receivedReactionEmoji: 'NONE',
     })

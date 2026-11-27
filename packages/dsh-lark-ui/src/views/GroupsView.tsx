@@ -67,13 +67,14 @@ export function GroupsView({
           const modelLabel = effectivePreset
             ? resolveModelDisplayName(effectivePreset, effectiveModel, runtimes, models)
             : ''
-          const reply = cfg.replyMode === 'inherit' ? null : choiceLabel(REPLY_MODES, cfg.replyMode)
+          const reply =
+            !g.configured || cfg.replyMode === 'inherit' ? null : choiceLabel(REPLY_MODES, cfg.replyMode)
           const trigger =
-            !cfg.mentionTriggerMode || cfg.mentionTriggerMode === 'inherit'
+            !g.configured || !cfg.mentionTriggerMode || cfg.mentionTriggerMode === 'inherit'
               ? null
               : choiceLabel(TRIGGER_MODES, cfg.mentionTriggerMode)
           const cardOverride =
-            !cfg.replyFormat || cfg.replyFormat === 'inherit'
+            !g.configured || !cfg.replyFormat || cfg.replyFormat === 'inherit'
               ? null
               : cfg.replyFormat === 'card'
                 ? '消息卡片'

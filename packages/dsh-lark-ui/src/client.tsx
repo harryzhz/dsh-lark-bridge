@@ -349,13 +349,18 @@ function LarkBridgePage() {
             actions={{
               edit: setEditingGroup,
               setEnabled: (g, enabled) => void act(() => bridgeApi.saveGroup({ ...g.config, enabled })),
-              reset: (g) =>
+              reset: (g) => {
+                const bot = data.bots.find((b) => b.id === g.botId)
                 setConfirm({
                   title: `恢复「${g.chatName}」的默认配置？`,
-                  description: '本群的单独设置会被清除，之后跟随智能体配置。',
+                  description:
+                    bot?.groupAccessMode === 'configured_only'
+                      ? '本群的单独设置会被清除并停用，重新启用或配置时将使用新群默认设置。'
+                      : '本群的单独设置会被清除，之后跟随智能体配置。',
                   confirmLabel: '恢复默认',
                   run: () => act(() => bridgeApi.resetGroup(g.botId, g.chatId), '已恢复默认'),
-                }),
+                })
+              },
             }}
           />
         )}

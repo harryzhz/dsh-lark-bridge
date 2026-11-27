@@ -19,6 +19,7 @@ function makeBot(overrides: Record<string, unknown> = {}) {
     model: 'gemini-4-carbon',
     reasoningEffort: 'medium',
     defaultWorkingDir: '~',
+    groupAccessMode: 'all_joined',
     allowedUsers: ['ou_owner'],
     substituteMode: {
       enabled: true,

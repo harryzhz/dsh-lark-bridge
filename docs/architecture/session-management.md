@@ -81,9 +81,9 @@ flowchart LR
 | 配置项 | 智能体默认 | 群聊覆盖 | 主动监听（`listener`）命中时 | 活跃话题续聊（`active-thread`）命中时 |
 |---|---|---|---|---|
 | **会话策略 (`sessionMode`)** | `groupSessionMode`（默认 `thread`） | `inherit` / `thread` / `per_message` / `chat` | **强制用 `listener.sessionMode`**（默认 `per_message`） | **强制为 `thread`** |
-| **回复方式 (`replyMode`)** | `groupReplyMode`（默认 `new-topic`，UI 称「话题内回复」） | `inherit` / `new-topic` / `reply` / `chat` | **未在话题中时**用 `listener.replyMode`；**已在话题中时锁定 `new-topic`** | 若原为 `listener` 且无 `threadId` 则用 `listener.replyMode`，其余锁定 `new-topic` |
+| **回复方式 (`replyMode`)** | `groupReplyMode`（默认 `reply`，UI 称「引用回复」） | `inherit` / `new-topic` / `reply` / `chat`（新群默认 `new-topic`） | **未在话题中时**用 `listener.replyMode`；**已在话题中时锁定 `new-topic`** | 若原为 `listener` 且无 `threadId` 则用 `listener.replyMode`，其余锁定 `new-topic` |
 | **触发方式 (`mentionTriggerMode`)** | `mention_and_active_thread` / `mention_only` | `inherit` / 覆盖 | 不受此项控制，由监听过滤规则决定 | 决定是否允许 `mention` / `listener` / `schedule` / `reminder` 话题免 `@` 续聊 |
-| **空闲归档 (`idleCloseMinutes`)** | 默认 `720`（12 小时，0 为关闭） | 可选覆盖 | 继承群 / 智能体生效值 | 继承群 / 智能体生效值 |
+| **空闲归档 (`idleCloseMinutes`)** | 默认 `720`（12 小时，0 为关闭） | 可选覆盖（新群默认 `360` 分钟） | 继承群 / 智能体生效值 | 继承群 / 智能体生效值 |
 | **允许空输出静默 (`allowSilentEmptyReply`)** | 固定 `false` | 固定 `false` | 由 `listener.allowSilentEmptyReply` 决定（默认 `true`） | 原为 `listener` 话题时继承 `listener.allowSilentEmptyReply`，否则 `false` |
 | **完成后自动关闭 (`autoCloseAfterCompletion`)** | 仅 `per_message` 时为 `true` | 仅 `per_message` 时为 `true` | `listener.autoCloseAfterCompletion \|\| listener.sessionMode === 'per_message'` | 固定 `false` |
 | **运行时与工作目录** | `agentPreset` / `model` / `reasoningEffort` / `defaultWorkingDir` | `runtimeMode: override` 与 `workingDir` 可独立覆盖 | 继承群 / 智能体生效值 | 继承群 / 智能体生效值 |

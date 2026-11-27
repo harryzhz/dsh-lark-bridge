@@ -971,4 +971,156 @@ describe('LarkBridgeStore, RuntimeCatalog, CLI Auth & HTTP API', () => {
     expect(manager.memory.get(mem.entry.id, { recordRecall: false })?.id).toBe(mem.entry.id)
     await manager.stop()
   })
+
+  it('initializes new bots and newly configured groups with expected conversation & message defaults without overriding existing inherited groups', async () => {
+    const dir = makeTempDir()
+    const validDir = makeTempDir()
+    const store = new LarkBridgeStore(dir)
+    const fakeCtx = {
+      logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn() },
+      get: () => undefined,
+      llm: { listProviders: () => [], listModels: async () => [] },
+      agents: { get: () => undefined },
+    } as unknown as Context
+    const runtimes = new RuntimeCatalog(fakeCtx)
+    const manager = {
+      ctx: fakeCtx,
+      store,
+      runtimes,
+      listBotStatuses: () => [],
+      hydrateAllowedUserProfiles: vi.fn(async () => []),
+      syncBot: vi.fn().mockResolvedValue(undefined),
+      removeBot: vi.fn().mockResolvedValue(undefined),
+      syncGroupWorkspace: vi.fn().mockResolvedValue(undefined),
+      syncJoinedChats: vi.fn().mockImplementation(async (botId?: string) => {
+        const chats = [
+          {
+            botId: botId ?? 'bot-defaults',
+            chatId: 'oc_new_group',
+            name: '新接入协作群',
+            description: '',
+          },
+        ]
+        store.mergeDiscoveredChats(botId ?? 'bot-defaults', chats)
+        return chats
+      }),
+      listGroupMembers: vi.fn().mockResolvedValue([]),
+      searchUsers: vi.fn().mockResolvedValue([]),
+      unbindRoute: vi.fn().mockResolvedValue(true),
+      sessionWebUrl: (sid: string) => `http://127.0.0.1:3880/sessions/${sid}`,
+      platform: {
+        getAuthStatus: vi.fn().mockResolvedValue({
+          openPlatform: { authenticated: false },
+          userAuth: [],
+        }),
+      },
+    } as unknown as LarkBridgeManager
+
+    const fakeConnection: ConnectionAdmitter = {
+      admit: () => ({ peer: { principal: { kind: 'owner' } } }),
+    }
+    const handler = createLarkHttpHandler(fakeCtx, fakeConnection, manager)
+
+    // 1. Minimal POST /bots gets Citlalin-aligned conversation & message defaults
+    const createdBot = await invokeHandler(handler, {
+      method: 'POST',
+      url: '/api/lark-bridge/bots',
+      body: {
+        id: 'bot-defaults',
+        name: 'DefaultBot',
+        larkAppId: 'cli_defaults',
+        larkAppSecret: 'sec_defaults',
+        defaultWorkingDir: validDir,
+      },
+    })
+    expect(createdBot.status).toBe(201)
+    expect(createdBot.json.bot).toMatchObject({
+      groupAccessMode: 'configured_only',
+      mentionTriggerMode: 'mention_and_active_thread',
+      groupSessionMode: 'thread',
+      idleCloseMinutes: 720,
+      groupReplyMode: 'reply',
+      receivedReactionEmoji: 'OnIt',
+      sendIntermediateMessages: false,
+      longTurnProgressNotice: true,
+      longTurnNoticeDelaySeconds: 300,
+      longTurnNoticeText: '当前任务仍在深度求索中，请耐心等待…[敲键盘]',
+      useInteractiveCard: true,
+      dshSessionLinkInCard: true,
+      sessionLinkGuestReadOnly: true,
+      replyFooterEnabled: true,
+      replyFooterModel: true,
+      replyFooterSignature: true,
+      signature: 'AI 可能出错，请谨慎判断结果~',
+    })
+
+    // 2. Discovered unconfigured group view starts disabled (configured_only) with new-group conversation defaults
+    await invokeHandler(handler, { method: 'POST', url: '/api/lark-bridge/sync-chats' })
+    const unconfiguredViews = await invokeHandler(handler, { url: '/api/lark-bridge/groups' })
+    const unconfigured = (unconfiguredViews.json.groups as Array<Record<string, unknown>>)[0]!
+    expect(unconfigured.configured).toBe(false)
+    expect(unconfigured.config).toMatchObject({
+      enabled: false,
+      mentionTriggerMode: 'inherit',
+      sessionMode: 'inherit',
+      idleCloseMinutes: 360,
+      replyMode: 'new-topic',
+      receivedReactionEmoji: 'inherit',
+      intermediateMessages: 'inherit',
+      replyFormat: 'text',
+      dshSessionLinkInCard: 'inherit',
+      sessionLinkGuestReadOnly: 'inherit',
+      replyFooterModel: 'inherit',
+      signatureMode: 'inherit',
+      signature: '',
+    })
+
+    // 3. First PUT /groups with minimal payload persists new-group conversation defaults
+    const enabledRes = await invokeHandler(handler, {
+      method: 'PUT',
+      url: '/api/lark-bridge/groups/bot-defaults/oc_new_group',
+      body: { enabled: true },
+    })
+    expect(enabledRes.status).toBe(200)
+    expect(enabledRes.json.group).toMatchObject({
+      enabled: true,
+      idleCloseMinutes: 360,
+      replyMode: 'new-topic',
+      replyFormat: 'text',
+      mentionTriggerMode: 'inherit',
+      sessionMode: 'inherit',
+    })
+
+    // 4. Switching idleCloseMinutes back to inherit (null) is preserved across subsequent partial updates
+    const inheritIdleRes = await invokeHandler(handler, {
+      method: 'PUT',
+      url: '/api/lark-bridge/groups/bot-defaults/oc_new_group',
+      body: {
+        idleCloseMinutes: null,
+        replyMode: 'inherit',
+        replyFormat: 'inherit',
+      },
+    })
+    expect(inheritIdleRes.status).toBe(200)
+    expect((inheritIdleRes.json.group as Record<string, unknown>).idleCloseMinutes).toBeUndefined()
+    expect(inheritIdleRes.json.group).toMatchObject({
+      replyMode: 'inherit',
+      replyFormat: 'inherit',
+    })
+
+    const subsequentPartialRes = await invokeHandler(handler, {
+      method: 'PUT',
+      url: '/api/lark-bridge/groups/bot-defaults/oc_new_group',
+      body: { workspaceName: '自定义工作区' },
+    })
+    expect(subsequentPartialRes.status).toBe(200)
+    expect((subsequentPartialRes.json.group as Record<string, unknown>).idleCloseMinutes).toBeUndefined()
+    expect(subsequentPartialRes.json.group).toMatchObject({
+      workspaceName: '自定义工作区',
+      replyMode: 'inherit',
+      replyFormat: 'inherit',
+    })
+
+    store.close()
+  })
 })
