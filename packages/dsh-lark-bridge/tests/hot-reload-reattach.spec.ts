@@ -15,6 +15,7 @@ import {
   LarkBridgeStore,
   markBridgeHotReloadSwap,
   resetGlobalHotReloadHandoffForTest,
+  resolveHostAgentPresets,
   resolveHostAgents,
   stashDetachedAgentHandle,
   sweepUnclaimedDetachedHandles,
@@ -430,6 +431,101 @@ describe('Seamless hot-reload agent preservation & live turn reattach', () => {
     // Host process shutdown still cleans up root-owned handles automatically.
     await root.fiber.dispose()
     expect(rootOwnedHandle.isDisposed()).toBe(true)
+  })
+
+  it('binds agentPresets resolved via resolveHostAgentPresets() to Cordis root fiber across plugin disposal', async () => {
+    class MockAgentPresetsService extends Service {
+      constructor(ctx: Context) {
+        super(ctx, 'agentPresets')
+      }
+      mount() {
+        let disposed = false
+        this.ctx.effect(() => () => {
+          disposed = true
+        })
+        return { isDisposed: () => disposed }
+      }
+    }
+
+    const root = new Context()
+    await root.plugin(MockAgentPresetsService).await()
+
+    let rootMountedPreset!: { isDisposed: () => boolean }
+    const pluginFork = root.plugin({
+      name: 'bridge-presets-hmr-sim',
+      apply(ctx) {
+        const presets = resolveHostAgentPresets<MockAgentPresetsService>(ctx)
+        expect(presets).toBeDefined()
+        rootMountedPreset = presets!.mount()
+      },
+    })
+    await pluginFork.await()
+
+    await pluginFork.dispose()
+    expect(rootMountedPreset.isDisposed()).toBe(false)
+
+    await root.fiber.dispose()
+    expect(rootMountedPreset.isDisposed()).toBe(true)
+  })
+
+  it('resolves root context via Symbol.for("cordis.root") on Cordis 4.2 without touching strict-injected ctx.root', () => {
+    const CORDIS_ROOT_SYMBOL = Symbol.for('cordis.root')
+    const rootAgents = { create: vi.fn(), get: vi.fn() }
+    const childAgents = { create: vi.fn(), get: vi.fn() }
+    const rootPresets = { mount: vi.fn() }
+    const childPresets = { mount: vi.fn() }
+
+    const rootCtx = {
+      get: vi.fn((name: string) => {
+        if (name === 'agents') return rootAgents
+        if (name === 'agentPresets') return rootPresets
+        return undefined
+      }),
+    }
+
+    // Simulate Cordis 4.2.0-alpha.1 strict inject proxy:
+    // - `ctx[Context.root]` (Symbol.for('cordis.root')) returns the root context
+    // - `'root' in ctx` is false, and reading `ctx.root` throws without inject
+    const cordis42Target: Record<PropertyKey, unknown> = {
+      [CORDIS_ROOT_SYMBOL]: rootCtx,
+      agents: childAgents,
+      get: (name: string) => (name === 'agentPresets' ? childPresets : undefined),
+    }
+    const cordis42Ctx = new Proxy(cordis42Target, {
+      has(target, prop) {
+        return Reflect.has(target, prop)
+      },
+      get(target, prop, receiver) {
+        if (typeof prop === 'symbol' || Reflect.has(target, prop)) {
+          return Reflect.get(target, prop, receiver)
+        }
+        throw new Error(`cannot get property "${String(prop)}" without inject`)
+      },
+    }) as unknown as Context
+
+    expect(resolveHostAgents(cordis42Ctx)).toBe(rootAgents)
+    expect(resolveHostAgentPresets(cordis42Ctx)).toBe(rootPresets)
+
+    // When a strict proxy omits `Symbol.for('cordis.root')` as well as `'root'`,
+    // both helpers must fall back cleanly instead of throwing `without inject`.
+    const strictNoRootTarget: Record<PropertyKey, unknown> = {
+      agents: childAgents,
+      get: (name: string) => (name === 'agentPresets' ? childPresets : undefined),
+    }
+    const strictNoRootCtx = new Proxy(strictNoRootTarget, {
+      has(target, prop) {
+        return Reflect.has(target, prop)
+      },
+      get(target, prop, receiver) {
+        if (typeof prop === 'symbol' || Reflect.has(target, prop)) {
+          return Reflect.get(target, prop, receiver)
+        }
+        throw new Error(`cannot get property "${String(prop)}" without inject`)
+      },
+    }) as unknown as Context
+
+    expect(resolveHostAgents(strictNoRootCtx)).toBe(childAgents)
+    expect(resolveHostAgentPresets(strictNoRootCtx)).toBe(childPresets)
   })
 
   it('keeps running agent alive across bridge hot-reload, skips already-sent progress, flushes gap progress, and finishes with zero prompt replay', async () => {
