@@ -19,6 +19,8 @@ param(
 
   [string]$Profile = $(if ($env:DSH_WEB_PROFILE) { $env:DSH_WEB_PROFILE } else { 'web' }),
 
+  [string]$WebHost = $(if ($env:DSH_WEB_HOST) { $env:DSH_WEB_HOST } else { 'auto' }),
+
   [switch]$WithoutExternalAgents,
 
   [string]$BridgeVersion = $(if ($env:DSH_BRIDGE_VERSION) { $env:DSH_BRIDGE_VERSION } else { '' }),
@@ -80,9 +82,29 @@ $EXT_ALIAS_ASSET = 'dsh-external-agents.tgz'
 $DSH_CLI_HOME = if ($env:DSH_CLI_HOME) { $env:DSH_CLI_HOME } else { Join-Path $env:LOCALAPPDATA 'dsh-cli' }
 $DSH_BIN_DIR = if ($env:DSH_BIN_DIR) { $env:DSH_BIN_DIR } else { Join-Path $DSH_CLI_HOME 'bin' }
 
+$WebHostExplicit = $PSBoundParameters.ContainsKey('WebHost') -or (-not [string]::IsNullOrWhiteSpace($env:DSH_WEB_HOST))
+
 if ([string]::IsNullOrWhiteSpace($Profile) -or $Profile -eq 'desktop') {
   throw "Invalid Web profile '$Profile'. Desktop profile is managed by -Mode app."
 }
+
+function Assert-ValidWebHost([string]$Raw) {
+  if ($Raw -eq 'auto' -or $Raw -eq 'loopback') { return }
+  $isLiteralShape = (-not [string]::IsNullOrWhiteSpace($Raw)) -and ($Raw -notmatch '[%\s]') -and (($Raw -match '^\d{1,3}(\.\d{1,3}){3}$') -or ($Raw -match ':'))
+  [System.Net.IPAddress]$parsed = $null
+  if (-not $isLiteralShape -or -not [System.Net.IPAddress]::TryParse($Raw, [ref]$parsed)) {
+    throw "无效的 -WebHost 值: '$Raw'（可选: auto | loopback | 具体本机 IPv4/IPv6 地址，不支持 0.0.0.0 / :: 或域名）"
+  }
+  $isWildcard = $parsed.Equals([System.Net.IPAddress]::Any) -or $parsed.Equals([System.Net.IPAddress]::IPv6Any)
+  if (-not $isWildcard -and $parsed.IsIPv4MappedToIPv6) {
+    $isWildcard = $parsed.MapToIPv4().Equals([System.Net.IPAddress]::Any)
+  }
+  if ($isWildcard) {
+    throw "无效的 -WebHost 值: '$Raw'（DSH 不允许通配地址 0.0.0.0 / ::，请使用 auto、loopback 或具体本机 IP）"
+  }
+}
+
+Assert-ValidWebHost $WebHost
 
 # ---------------------------------------------------------------------------
 # Logging helpers
@@ -642,6 +664,214 @@ function Install-WebEdition($DshInfo) {
   }
 
   Install-PluginsIntoProfile $DshInfo.Bin $Profile 'Web'
+  Configure-WebBindHost $Profile
+}
+
+function Get-LocalLanIpv4 {
+  $virtRe = '^(lo|utun|tun|tap|wg|docker|br-|veth|virbr|tailscale|zt|awdl|llw|bridge|anpi|ap|gif|stf|ipsec|feth|vethernet|vmware|virtualbox|loopback|clash|mihomo|meta|wintun|openvpn|bluetooth)'
+  $picks = New-Object System.Collections.Generic.List[object]
+  try {
+    foreach ($ni in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
+      if ($ni.OperationalStatus -ne [System.Net.NetworkInformation.OperationalStatus]::Up) { continue }
+      if ($ni.NetworkInterfaceType -eq [System.Net.NetworkInformation.NetworkInterfaceType]::Loopback) { continue }
+      $virt = ($ni.Name -imatch $virtRe) -or ($ni.Description -imatch '(virtual|vmware|virtualbox|hyper-v|wsl|tap-windows|wintun|wireguard|tailscale|zerotier|openvpn|loopback|bluetooth)')
+      foreach ($ua in $ni.GetIPProperties().UnicastAddresses) {
+        if ($ua.Address.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) { continue }
+        $ip = $ua.Address.IPAddressToString
+        if ([System.Net.IPAddress]::IsLoopback($ua.Address)) { continue }
+        if ($ip.StartsWith('169.254.') -or $ip -match '^198\.(18|19)\.') { continue }
+        $priv = $ip -match '^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)'
+        $score = $(if ($virt) { 2 } else { 0 }) + $(if ($priv) { 0 } else { 1 })
+        $picks.Add([PSCustomObject]@{ Ip = $ip; Score = $score })
+      }
+    }
+  } catch {}
+  $best = $picks | Sort-Object Score | Select-Object -First 1
+  if ($best) { return [string]$best.Ip }
+  return ''
+}
+
+function Test-WebServerPatchItem([string[]]$ItemLines) {
+  foreach ($line in $ItemLines) {
+    if ($line -match "^-\s+id:\s*['""]?webserver['""]?\s*(#.*)?$" -or $line -match "^\s{2}id:\s*['""]?webserver['""]?\s*(#.*)?$") {
+      return $true
+    }
+  }
+  return $false
+}
+
+function Test-HasWebServerPatchEntry([string]$PatchFile) {
+  if (-not (Test-Path -LiteralPath $PatchFile)) { return $false }
+  $lines = Get-Content -LiteralPath $PatchFile -Encoding UTF8
+  $item = New-Object System.Collections.Generic.List[string]
+  $inItem = $false
+  foreach ($raw in $lines) {
+    $line = $raw.TrimEnd("`r")
+    if ($line -match '^-(\s|$)') {
+      if ($inItem -and (Test-WebServerPatchItem $item.ToArray())) { return $true }
+      $item.Clear()
+      $item.Add($line)
+      $inItem = $true
+    } elseif ($inItem) {
+      $item.Add($line)
+    }
+  }
+  if ($inItem -and (Test-WebServerPatchItem $item.ToArray())) { return $true }
+  return $false
+}
+
+function Remove-WebServerPatchEntry([string]$PatchFile) {
+  $lines = Get-Content -LiteralPath $PatchFile -Encoding UTF8
+  $out = New-Object System.Collections.Generic.List[string]
+  $lead = New-Object System.Collections.Generic.List[string]
+  $item = New-Object System.Collections.Generic.List[string]
+  $trail = New-Object System.Collections.Generic.List[string]
+  $inItem = $false
+
+  $flush = {
+    if (-not $inItem) { return }
+    if (Test-WebServerPatchItem $item.ToArray()) {
+      $keepEnd = $lead.Count - 1
+      while ($keepEnd -ge 0 -and ($lead[$keepEnd] -match '^\s*$' -or $lead[$keepEnd] -match '^#\s*Managed by dsh-lark-bridge installer:')) {
+        $keepEnd--
+      }
+      for ($k = 0; $k -le $keepEnd; $k++) { $out.Add($lead[$k]) }
+    } else {
+      foreach ($l in $lead) { $out.Add($l) }
+      foreach ($l in $item) { $out.Add($l) }
+    }
+    $inItem = $false
+    $item.Clear()
+    $lead.Clear()
+    foreach ($l in $trail) { $lead.Add($l) }
+    $trail.Clear()
+  }
+
+  foreach ($raw in $lines) {
+    $line = $raw.TrimEnd("`r")
+    if (-not $inItem -and $line -match '^\s*\[\]\s*$') { continue }
+    if ($line -match '^-(\s|$)') {
+      . $flush
+      $inItem = $true
+      $item.Add($line)
+      continue
+    }
+    if (-not $inItem) {
+      $lead.Add($line)
+      continue
+    }
+    if ($line -match '^\s*$' -or $line -match '^#') {
+      $trail.Add($line)
+    } else {
+      foreach ($l in $trail) { $item.Add($l) }
+      $trail.Clear()
+      $item.Add($line)
+    }
+  }
+  . $flush
+  foreach ($l in $lead) { $out.Add($l) }
+  while ($out.Count -gt 0 -and $out[$out.Count - 1] -match '^\s*$') {
+    $out.RemoveAt($out.Count - 1)
+  }
+  return ($out.ToArray() -join "`n")
+}
+
+function Get-WebServerPatchBlock([string]$ModeSpec) {
+  if ($ModeSpec -eq 'auto') {
+    return @(
+      '# Managed by dsh-lark-bridge installer: bind local LAN IPv4 by default (override with --host).'
+      '- id: webserver'
+      "  name: '@deepseek-ai/dsh-host-webserver'"
+      '  config:'
+      '    host: !!js |-'
+      '      ctx.webStartup.host ?? (() => {'
+      "        const ifaces = process.getBuiltinModule?.('node:os')?.networkInterfaces?.() ?? {};"
+      '        const virtRe = /^(lo|utun|tun|tap|wg|docker|br-|veth|virbr|tailscale|zt|awdl|llw|bridge|anpi|ap|gif|stf|ipsec|feth|vethernet|vmware|virtualbox|loopback|clash|mihomo|meta|wintun|openvpn|bluetooth)/i;'
+      '        const picks = [];'
+      '        for (const [name, list] of Object.entries(ifaces)) {'
+      '          const virt = virtRe.test(name);'
+      '          for (const a of list ?? []) {'
+      "            if ((a.family !== 'IPv4' && a.family !== 4) || a.internal) continue;"
+      "            if (a.address.startsWith('169.254.') || /^198\.(18|19)\./.test(a.address)) continue;"
+      '            const priv = /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(a.address);'
+      '            picks.push({ ip: a.address, score: (virt ? 2 : 0) + (priv ? 0 : 1) });'
+      '          }'
+      '        }'
+      '        picks.sort((a, b) => a.score - b.score);'
+      "        return picks[0]?.ip ?? '127.0.0.1';"
+      '      })()'
+      '    port: !!js ctx.webStartup.port ?? 3080'
+      '    tls: !!js ctx.webStartup.tls'
+      '    compression: gzip'
+      '    compressionLevel: 1'
+      '    compressionThresholdBytes: 1024'
+    ) -join "`n"
+  }
+
+  $resolvedHost = if ($ModeSpec -eq 'loopback') { '127.0.0.1' } else { $ModeSpec }
+  return @(
+    '# Managed by dsh-lark-bridge installer: default Web bind host (override with --host).'
+    '- id: webserver'
+    "  name: '@deepseek-ai/dsh-host-webserver'"
+    '  config:'
+    "    host: !!js ctx.webStartup.host ?? '$resolvedHost'"
+    '    port: !!js ctx.webStartup.port ?? 3080'
+    '    tls: !!js ctx.webStartup.tls'
+    '    compression: gzip'
+    '    compressionLevel: 1'
+    '    compressionThresholdBytes: 1024'
+  ) -join "`n"
+}
+
+function Configure-WebBindHost([string]$ProfileName) {
+  $profileDir = Join-Path (Join-Path $DshHome 'profiles') $ProfileName
+  $patchFile = Join-Path $profileDir 'cordis.patch.yml'
+
+  if ((Test-Path -LiteralPath $patchFile) -and (Test-HasWebServerPatchEntry $patchFile)) {
+    if (-not $WebHostExplicit -and -not $Force) {
+      Write-Ok "[Web] cordis.patch.yml 已包含 webserver 监听配置，保留现有设置（如需修改请传 -WebHost <auto|loopback|IP>）。"
+      return
+    }
+  }
+
+  if ($DryRun) {
+    if ($WebHost -eq 'auto') {
+      Write-Info "[DRY-RUN] 将在 $patchFile 配置 Web 默认绑定本机局域网 IPv4（离线回退 127.0.0.1，支持 --host 覆盖）"
+    } else {
+      $dryHost = if ($WebHost -eq 'loopback') { '127.0.0.1' } else { $WebHost }
+      Write-Info "[DRY-RUN] 将在 $patchFile 配置 Web 默认监听地址: $dryHost（支持 --host 覆盖）"
+    }
+    return
+  }
+
+  New-Item -ItemType Directory -Force -Path $profileDir | Out-Null
+  $block = Get-WebServerPatchBlock $WebHost
+  if (Test-Path -LiteralPath $patchFile) {
+    $prefix = Remove-WebServerPatchEntry $patchFile
+    $finalText = if ($prefix) { "$prefix`n`n$block`n" } else { "$block`n" }
+  } else {
+    $header = @(
+      '# Your patch layer for this dsh profile, applied after every bundle layer:'
+      '# a top-level YAML array of loader patch entries (id-targeted config'
+      '# overrides, disables, and insert lists; `!!js` expressions allowed).'
+    ) -join "`n"
+    $finalText = "$header`n`n$block`n"
+  }
+
+  $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+  [System.IO.File]::WriteAllText($patchFile, $finalText, $utf8NoBom)
+
+  if ($WebHost -eq 'auto') {
+    $lanIp = Get-LocalLanIpv4
+    if ($lanIp) {
+      Write-Ok "[Web] 已配置默认绑定本机局域网 IPv4（当前本机 IP: $lanIp，离线自动回退 127.0.0.1，启动时可用 --host 覆盖）-> $patchFile"
+    } else {
+      Write-Ok "[Web] 已配置默认绑定本机局域网 IPv4（离线自动回退 127.0.0.1，启动时可用 --host 覆盖）-> $patchFile"
+    }
+  } else {
+    $finalHost = if ($WebHost -eq 'loopback') { '127.0.0.1' } else { $WebHost }
+    Write-Ok "[Web] 已配置默认监听地址: $finalHost（启动时可用 --host 覆盖）-> $patchFile"
+  }
 }
 
 # ---------------------------------------------------------------------------
@@ -881,11 +1111,18 @@ if ($Mode -eq 'app' -or $Mode -eq 'both') {
 if ($Mode -eq 'web' -or $Mode -eq 'both') {
   Write-Host ''
   Write-Host '[Web 版]' -ForegroundColor White
-  if ($Profile -eq 'web') {
-    Write-Host '  1. 本机启动  : dsh web'
-    Write-Host '  2. 局域网常驻: dsh --profile web --no-open --host <本机IPv4> --port 3880'
+  $lanIp = Get-LocalLanIpv4
+  if ($WebHost -eq 'auto') {
+    $bindNote = if ($lanIp) { "（已默认绑定本机 IPv4，当前: $lanIp；离线自动回退 127.0.0.1）" } else { '（已默认绑定本机局域网 IPv4，离线自动回退 127.0.0.1）' }
   } else {
-    Write-Host "  1. 启动命令  : dsh --profile $Profile"
+    $effectiveHost = if ($WebHost -eq 'loopback') { '127.0.0.1' } else { $WebHost }
+    $bindNote = "（已默认绑定 $effectiveHost）"
+  }
+  if ($Profile -eq 'web') {
+    Write-Host "  1. 启动服务  : dsh web  $bindNote"
+    Write-Host '  2. 后台常驻  : dsh --profile web --no-open --port 3880（如需指定或仅本机回环可追加 --host <IP>）'
+  } else {
+    Write-Host "  1. 启动命令  : dsh --profile $Profile  $bindNote"
   }
   Write-Host '  3. 后续免重启热更新插件: lark-bridge plugin update all'
 }
