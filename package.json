@@ -1,6 +1,6 @@
 {
   "name": "@harryzhz/dsh-lark-bridge",
-  "version": "0.4.45",
+  "version": "0.4.46",
   "description": "Turn Claude Code, Codex, TRAE & DeepSeek Harness into a 24/7 Feishu/Lark team member — zero public server, smart triage, auto-memory & proactive follow-up.",
   "license": "MIT",
   "homepage": "https://github.com/harryzhz/dsh-lark-bridge#readme",
