@@ -1342,20 +1342,47 @@ export class ProactiveReminderService {
     if (!bot) throw new Error(`未找到智能体 "${botId}"`)
 
     const explicitUser = input.userOpenId?.trim()
-    const explicitChat = input.chatId?.trim()
+    const explicitChat =
+      input.chatId?.trim() && input.chatId.trim() !== 'dream:internal'
+        ? input.chatId.trim()
+        : undefined
 
     if (
       explicitUser ||
       (!explicitChat && sessionOrigin?.chatType === 'p2p' && sessionOrigin.userOpenId)
     ) {
       const userOpenId = explicitUser || sessionOrigin!.userOpenId!
-      const userName = input.userName?.trim() || sessionOrigin?.userName
+      const sameP2pSession =
+        sessionOrigin?.chatType === 'p2p' && sessionOrigin.userOpenId === userOpenId
+      const p2pBinding =
+        typeof this.host.store.listBindings === 'function'
+          ? this.host.store
+              .listBindings()
+              .find(
+                (b) =>
+                  b.botId === bot.id &&
+                  (b.chatType === 'p2p' || b.trigger === 'p2p') &&
+                  b.userOpenId === userOpenId &&
+                  b.chatId &&
+                  b.chatId !== 'dream:internal',
+              )
+          : undefined
+      const p2pChatId =
+        explicitChat ||
+        (sameP2pSession && sessionOrigin?.chatId && sessionOrigin.chatId !== 'dream:internal'
+          ? sessionOrigin.chatId
+          : undefined) ||
+        p2pBinding?.chatId
+      const userName =
+        input.userName?.trim() ||
+        (sameP2pSession ? sessionOrigin?.userName : undefined) ||
+        p2pBinding?.userName
       return {
         botId: bot.id,
         botName: bot.name,
         larkAppId: bot.larkAppId,
         chatType: 'p2p',
-        ...(sessionOrigin?.chatId ? { chatId: sessionOrigin.chatId } : {}),
+        ...(p2pChatId ? { chatId: p2pChatId } : {}),
         deliveryMode: 'p2p',
         userOpenId,
         ...(userName ? { userName } : {}),
