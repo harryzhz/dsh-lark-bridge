@@ -564,6 +564,7 @@ export class TurnRoutingCoordinator {
       ...(msg.senderUnionId ? { senderUnionId: msg.senderUnionId } : {}),
       ...(triageSender.senderName ? { senderName: triageSender.senderName } : {}),
       ...(triageSender.senderType ? { senderType: triageSender.senderType } : {}),
+      ...(decision.listenerName ? { listenerName: decision.listenerName } : {}),
       action: result.verdict.action,
       ...(result.verdict.fallback ? { fallback: true } : {}),
       ...(result.errorCode ? { errorCode: result.errorCode } : {}),
@@ -578,14 +579,20 @@ export class TurnRoutingCoordinator {
       (result.verdict.action === 'silent' ||
         (decision.silentOnly && result.verdict.action === 'quick_reply'))
     ) {
+      const silentLatencyMs = Math.max(0, result.durationMs)
       this.host.store.recordMetric({
         botId: bot.id,
         chatId: msg.chatId,
         chatType: msg.chatType,
         ...(result.triageSessionId ? { sessionId: result.triageSessionId } : {}),
         trigger: decision.trigger,
+        ...(decision.listenerName ? { listenerName: decision.listenerName } : {}),
+        silenceSource: 'triage',
         ...triageSender,
         kind: 'silent_skip',
+        latencyMs: silentLatencyMs,
+        queueWaitMs: 0,
+        execMs: silentLatencyMs,
       })
       this.host.store.recordEvent({
         botId: bot.id,
@@ -661,6 +668,7 @@ export class TurnRoutingCoordinator {
           chatType: msg.chatType,
           ...(result.triageSessionId ? { sessionId: result.triageSessionId } : {}),
           trigger: 'triage',
+          ...(decision.listenerName ? { listenerName: decision.listenerName } : {}),
           ...triageSender,
           ...chatName,
           kind: 'replied',

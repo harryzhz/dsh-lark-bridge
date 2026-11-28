@@ -22,13 +22,17 @@ import {
   extractLarkContextMeta,
   extractPureUserIntent,
   normalizeReplyText,
+  renderListenerRuleWeeklyReport,
   renderMemoryAuditReport,
+  resolveEffectiveRouterConfig,
   resolveEffectiveWorkingDir,
   resolveEffectiveWorkspaceName,
   truncateSessionTranscriptHeadTail,
   type LarkBotConfig,
   type LarkDreamProactiveStats,
   type LarkMemoryMutationStats,
+  type ListenerRuleWeeklyDiagnosis,
+  type ListenerRuleWeeklyMetric,
 } from '@dsh-lark/lark-core'
 import type { MemoryService } from './memory-service.js'
 import type { DreamingReminderBudgetTracker, ProactiveReminderService } from './reminder-service.js'
@@ -59,6 +63,8 @@ const MAX_DREAM_NOTE_CHARS = 220
 const MAX_JOURNAL_ENTRIES = 30
 const GIT_INSPECT_TIMEOUT_MS = 3_000
 const RECENT_LOOP_WINDOW_MS = 48 * 60 * 60_000
+const WEEKLY_RULE_REFLECTION_INTERVAL_MS = 7 * 24 * 60 * 60_000
+const MAX_RULE_REFLECTION_SUMMARY_CHARS = 280
 
 export interface DreamingHost {
   readonly ctx: Context
@@ -114,8 +120,54 @@ function formatProactiveStatsBadge(stats?: LarkDreamProactiveStats): string {
   const parts: string[] = []
   if (stats.remindersCreated > 0) parts.push(`提醒 +${stats.remindersCreated}`)
   if (stats.worktreesCreated > 0) parts.push(`分支 +${stats.worktreesCreated}`)
+  if (stats.ruleReflectionRan) {
+    const sug = stats.ruleSuggestionsCount ?? 0
+    parts.push(sug > 0 ? `规则反思 ${sug} 项建议` : '规则反思健康')
+  }
   if (stats.backlogRemaining > 0) parts.push(`剩余积压 ${stats.backlogRemaining}`)
   return parts.join(' · ')
+}
+
+function extractRuleReflectionSummary(
+  replyText: string,
+  diagnoses: readonly ListenerRuleWeeklyDiagnosis[],
+): string {
+  const lines = replyText
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean)
+  const matched: string[] = []
+  let capturing = false
+  for (const line of lines) {
+    const prefixMatch = /^(?:[-*•]\s*)?(?:\*\*)?规则反思[：:](?:\*\*)?\s*(.*)$/.exec(line)
+    if (prefixMatch) {
+      capturing = true
+      const rest = prefixMatch[1]?.trim()
+      if (rest) matched.push(rest)
+      continue
+    }
+    if (capturing) {
+      if (/^#{1,4}\s/.test(line)) break
+      if (/^(?:[-*•]|\d+[.)])\s+/.test(line)) {
+        matched.push(line.replace(/^(?:[-*•]|\d+[.)])\s+/, '').trim())
+        if (matched.length >= 3) break
+      } else {
+        break
+      }
+    }
+  }
+  const raw =
+    matched.length > 0
+      ? stripMarkdownForSummary(matched.join('；'))
+      : diagnoses.length > 0
+        ? diagnoses
+            .slice(0, 2)
+            .map((d) => `${d.ruleName}（${d.chatName}）：${d.headline}`)
+            .join('；')
+        : '本周监听规则整体健康，暂无需调整。'
+  return raw.length > MAX_RULE_REFLECTION_SUMMARY_CHARS
+    ? `${raw.slice(0, MAX_RULE_REFLECTION_SUMMARY_CHARS).trimEnd()}…`
+    : raw
 }
 
 function formatDateKey(now: Date): string {
@@ -503,7 +555,11 @@ export class DreamingService {
 
   async runForBot(
     botId: string,
-    options: { readonly force?: boolean; readonly now?: Date } = {},
+    options: {
+      readonly force?: boolean
+      readonly includeRuleReflection?: boolean
+      readonly now?: Date
+    } = {},
   ): Promise<LarkDreamRunState> {
     const bot = this.host.store.getBot(botId)
     if (!bot) throw new Error(`未找到智能体 "${botId}"`)
@@ -520,6 +576,7 @@ export class DreamingService {
     const maxDurationMs =
       (cfg.maxDurationMinutes ?? DEFAULT_DREAMING_MAX_DURATION_MINUTES) * 60_000
     const deepConsolidationEnabled = cfg.deepConsolidation !== false
+    const weeklyRuleReflectionEnabled = cfg.weeklyRuleReflection !== false
 
     const prev = this.host.store.getDreamState(botId) ?? {
       botId,
@@ -535,7 +592,12 @@ export class DreamingService {
       maxSessionsPerRun,
       maxCharsPerSession,
     )
-    if (!options.force && prepared.selected.length < cfg.minNewSessions) {
+    const ruleReflectionDue =
+      deepConsolidationEnabled &&
+      weeklyRuleReflectionEnabled &&
+      this.shouldRunWeeklyRuleReflection(bot, prev, now.getTime(), options.includeRuleReflection)
+
+    if (!options.force && prepared.selected.length < cfg.minNewSessions && !ruleReflectionDue) {
       const mergedProcessed =
         prepared.skippedNoiseSessionIds.length > 0
           ? [
@@ -597,9 +659,9 @@ export class DreamingService {
     const batches = splitPreparedIntoBatches(prepared.selected)
     const activeMemoryBefore = this.host.memory?.countActiveForBot(bot.id) ?? 0
     const runDeepStage =
-      Boolean(this.host.memory) &&
       deepConsolidationEnabled &&
-      (activeMemoryBefore > 0 || prepared.selected.length > 0)
+      ((Boolean(this.host.memory) && (activeMemoryBefore > 0 || prepared.selected.length > 0)) ||
+        ruleReflectionDue)
     const runProactiveStage =
       (bot.experimental.proactive.remindersEnabled && maxRemindersPerRun > 0) ||
       bot.experimental.proactive.autoCodeEnabled
@@ -609,6 +671,10 @@ export class DreamingService {
     let sessionsProcessedCount = 0
     let deepConsolidated = false
     let openLoopsAudited = false
+    let ruleReflectionRan = false
+    let rulesEvaluated = 0
+    let ruleSuggestionsCount = 0
+    let ruleReflectionSummary = ''
     const stageSummaries: string[] = []
     const stage1NotesSections: string[] = []
     let lastDigestPath = ''
@@ -815,8 +881,12 @@ export class DreamingService {
       })
 
       try {
-        // Stage 1 inside the main session when 0 batches (manual audit) or 1 remaining batch.
-        const runStage1InMain = batches.length === 0 || separateBatchCount < batches.length
+        // Stage 1 inside the main session when 0 batches (manual audit without pure weekly reflection)
+        // or 1 remaining batch. On quiet scheduled nights where only weekly rule reflection is due,
+        // skip empty Stage 1 and proceed directly to Stage 2.
+        const runStage1InMain =
+          (batches.length === 0 && (!ruleReflectionDue || Boolean(options.force))) ||
+          (batches.length > 0 && separateBatchCount < batches.length)
         if (runStage1InMain) {
           const mainBatch =
             batches.length === 0 ? [] : batches[batches.length - 1]!
@@ -865,14 +935,19 @@ export class DreamingService {
             ? this.writeStage1Notes(bot.id, dateKey, stage1NotesSections)
             : undefined
 
-        // Stage 2: Deep Sleep (full-library codebase verification, cold-memory curation & SOP synthesis).
+        // Stage 2: Deep Sleep (full-library codebase verification, cold-memory curation,
+        // SOP synthesis & weekly listener-rule effectiveness reflection).
         if (runDeepStage && Date.now() < deadlineMs) {
           const refreshedNowMs = Date.now()
           const memoryMarkdownPath = this.host.memory?.ensureMarkdownMirror(bot.id, refreshedNowMs)
           const allActive =
             this.host.memory?.list({ botId: bot.id, status: 'active', limit: 200 }) ?? []
-          if (allActive.length > 0) {
-            const auditPath = this.writeMemoryAudit(bot, allActive, refreshedNowMs)
+          const ruleReport = ruleReflectionDue
+            ? this.writeListenerRuleWeeklyReport(bot, refreshedNowMs)
+            : undefined
+          if (allActive.length > 0 || ruleReport) {
+            const auditPath =
+              allActive.length > 0 ? this.writeMemoryAudit(bot, allActive, refreshedNowMs) : undefined
             const deepPrompt = composeDreamDeepConsolidationPrompt({
               botId: bot.id,
               botName: bot.name,
@@ -882,15 +957,29 @@ export class DreamingService {
                 : {}),
               currentDateIso: dateKey,
               ...(memoryMarkdownPath ? { memoryMarkdownPath } : {}),
-              memoryAuditPath: auditPath,
+              ...(auditPath ? { memoryAuditPath: auditPath } : {}),
               ...(stage1NotesPath ? { stage1NotesPath } : {}),
               activeMemoryCount: allActive.length,
+              ...(ruleReport
+                ? {
+                    listenerRuleReportPath: ruleReport.path,
+                    listenerRulesEvaluated: ruleReport.rulesEvaluated,
+                    listenerRuleDiagnosesCount: ruleReport.diagnoses.length,
+                  }
+                : {}),
               config: cfg,
             })
             const deepReply = await runControlledTurn(mainHandle.agent, deepPrompt)
             deepConsolidated = true
             const trimmed = deepReply.trim()
             if (trimmed) stageSummaries.push(trimmed)
+            if (ruleReport) {
+              ruleReflectionRan = true
+              rulesEvaluated = ruleReport.rulesEvaluated
+              ruleSuggestionsCount = ruleReport.diagnoses.length
+              ruleReflectionSummary = extractRuleReflectionSummary(trimmed, ruleReport.diagnoses)
+              this.appendRuleReflectionOutcome(ruleReport.path, dateKey, trimmed)
+            }
           }
         }
 
@@ -958,6 +1047,14 @@ export class DreamingService {
         worktreesCreated,
         deepConsolidated,
         openLoopsAudited,
+        ...(ruleReflectionRan
+          ? {
+              ruleReflectionRan: true,
+              rulesEvaluated,
+              ruleSuggestionsCount,
+              ...(ruleReflectionSummary ? { ruleReflectionSummary } : {}),
+            }
+          : {}),
       }
 
       const uniqueSummaries = Array.from(
@@ -969,7 +1066,8 @@ export class DreamingService {
           ? `${combinedReply.slice(0, MAX_DREAM_NOTE_CHARS).trimEnd()}…`
           : combinedReply
 
-      const hasAnyOutput = totalMutations > 0 || remindersCreated > 0 || worktreesCreated > 0
+      const hasAnyOutput =
+        totalMutations > 0 || remindersCreated > 0 || worktreesCreated > 0 || ruleReflectionRan
       const outcome: 'memory_updated' | 'no_change' = hasAnyOutput ? 'memory_updated' : 'no_change'
       const memBadge = formatMemoryStatsBadge(memoryStats)
       const proactiveBadge = formatProactiveStatsBadge(proactiveStats)
@@ -1023,6 +1121,19 @@ export class DreamingService {
         status: 'succeeded',
         lastDreamAtMs: now.getTime(),
         lastCheckedDateKey: dateKey,
+        ...(ruleReflectionRan
+          ? {
+              lastRuleReflectionDateKey: dateKey,
+              lastRuleReflectionAtMs: now.getTime(),
+            }
+          : {
+              ...(prev.lastRuleReflectionDateKey
+                ? { lastRuleReflectionDateKey: prev.lastRuleReflectionDateKey }
+                : {}),
+              ...(prev.lastRuleReflectionAtMs !== undefined
+                ? { lastRuleReflectionAtMs: prev.lastRuleReflectionAtMs }
+                : {}),
+            }),
         lastSessionId: mainSessionId,
         lastProcessedCount: sessionsProcessedCount,
         lastSummary: summaryNote,
@@ -1301,6 +1412,131 @@ export class DreamingService {
     return auditPath
   }
 
+  private shouldRunWeeklyRuleReflection(
+    bot: LarkBotConfig,
+    prev: LarkDreamRunState,
+    nowMs: number,
+    explicitOverride?: boolean,
+  ): boolean {
+    if (explicitOverride === false) return false
+    if (typeof this.host.store.queryWeeklyListenerComparison !== 'function') return false
+
+    const hasConfiguredListener = this.host.store
+      .listGroups(bot.id)
+      .some((g) => g.enabled && g.listener.enabled)
+    const weekly = this.host.store.queryWeeklyListenerComparison(bot.id, nowMs)
+    const hasAnyRuleOrTraffic = hasConfiguredListener || weekly.current.rules.length > 0
+    if (!hasAnyRuleOrTraffic) return false
+
+    if (explicitOverride === true) return true
+    if (prev.lastRuleReflectionAtMs === undefined) return true
+    return nowMs - prev.lastRuleReflectionAtMs >= WEEKLY_RULE_REFLECTION_INTERVAL_MS
+  }
+
+  private writeListenerRuleWeeklyReport(
+    bot: LarkBotConfig,
+    nowMs: number,
+  ): {
+    readonly path: string
+    readonly rulesEvaluated: number
+    readonly diagnoses: readonly ListenerRuleWeeklyDiagnosis[]
+  } | undefined {
+    if (typeof this.host.store.queryWeeklyListenerComparison !== 'function') return undefined
+    const weekly = this.host.store.queryWeeklyListenerComparison(bot.id, nowMs)
+    if (weekly.current.rules.length === 0) return undefined
+
+    const groupsByChatId = new Map(
+      this.host.store.listGroups(bot.id).map((g) => [g.chatId, g]),
+    )
+    const rules: ListenerRuleWeeklyMetric[] = weekly.current.rules.map((r) => {
+      const grp = groupsByChatId.get(r.chatId)
+      const effectiveRouter = grp ? resolveEffectiveRouterConfig(bot, grp) : undefined
+      return {
+        key: r.key,
+        chatId: r.chatId,
+        chatName: r.chatName,
+        ruleName: r.ruleName,
+        kind: r.kind,
+        enabled: r.enabled,
+        hits: r.hits,
+        replied: r.replied,
+        silentSkipped: r.silentSkipped,
+        triageSilent: r.triageSilent,
+        workerSilent: r.workerSilent,
+        errors: r.errors,
+        replyRate: r.replyRate,
+        silentRate: r.silentRate,
+        totalTokens: r.totalTokens,
+        avgLatencyMs: r.avgLatencyMs,
+        p50LatencyMs: r.p50LatencyMs,
+        p95LatencyMs: r.p95LatencyMs,
+        repliedAvgLatencyMs: r.repliedAvgLatencyMs,
+        silentAvgLatencyMs: r.silentAvgLatencyMs,
+        latencySamples: r.latencySamples,
+        ...(grp && r.kind === 'group'
+          ? {
+              config: {
+                scope: grp.listener.scope,
+                mentionFilter: grp.listener.mentionFilter,
+                debounceSeconds: grp.listener.debounceSeconds,
+                allowSilentEmptyReply: grp.listener.allowSilentEmptyReply,
+                sessionMode: grp.listener.sessionMode,
+                replyMode: grp.listener.replyMode,
+                includeKeywords: grp.listener.includeKeywords,
+                excludeKeywords: grp.listener.excludeKeywords,
+                routerEnabled: Boolean(effectiveRouter?.enabled),
+              },
+            }
+          : {}),
+      }
+    })
+
+    const rendered = renderListenerRuleWeeklyReport({
+      botId: bot.id,
+      botName: bot.name,
+      nowMs,
+      fromMs: weekly.fromMs,
+      toMs: weekly.toMs,
+      totalHits: weekly.current.totalHits,
+      totalReplied: weekly.current.totalReplied,
+      totalSilentSkipped: weekly.current.totalSilentSkipped,
+      totalTriageSilent: weekly.current.totalTriageSilent,
+      totalWorkerSilent: weekly.current.totalWorkerSilent,
+      totalErrors: weekly.current.totalErrors,
+      silentRate: weekly.current.silentRate,
+      p50LatencyMs: weekly.current.p50LatencyMs,
+      p95LatencyMs: weekly.current.p95LatencyMs,
+      totalTokens: weekly.current.totalTokens,
+      prevHits: weekly.previous.totalHits,
+      prevSilentRate: weekly.previous.silentRate,
+      rules,
+    })
+
+    const reportPath = join(this.host.dataDir, 'dreaming', bot.id, 'listener-rules-weekly.md')
+    atomicWritePrivate(reportPath, rendered.markdown)
+    return {
+      path: reportPath,
+      rulesEvaluated: rules.length,
+      diagnoses: rendered.diagnoses,
+    }
+  }
+
+  private appendRuleReflectionOutcome(
+    reportPath: string,
+    dateKey: string,
+    llmReply: string,
+  ): void {
+    const trimmed = llmReply.trim()
+    if (!trimmed) return
+    try {
+      const base = existsSync(reportPath) ? readFileSync(reportPath, 'utf8').trimEnd() : ''
+      const updated = `${base}\n\n## 3. Auto-Dream 反思与调优建议 (${dateKey})\n\n${trimmed}\n`
+      atomicWritePrivate(reportPath, updated)
+    } catch {
+      // Best-effort report enrichment.
+    }
+  }
+
   private async writeOpenLoopsSnapshot(input: {
     readonly bot: LarkBotConfig
     readonly dateKey: string
@@ -1428,6 +1664,11 @@ export class DreamingService {
         '',
         `- 覆盖：整理 ${input.sessionsProcessed} 个会话（${input.proactiveStats.batchesRun} 批，剩余积压 ${input.proactiveStats.backlogRemaining}）· 耗时 ${durationSec}s`,
         `- 产出：记忆（${memBadge}）· 深度验真 ${input.proactiveStats.deepConsolidated ? '是' : '否'} · 前瞻盘点 ${input.proactiveStats.openLoopsAudited ? '是' : '否'} · 新建提醒 ${input.proactiveStats.remindersCreated} 条 · 新建隔离分支 ${input.proactiveStats.worktreesCreated} 个`,
+        ...(input.proactiveStats.ruleReflectionRan
+          ? [
+              `- 周度监听规则反思：评估 ${input.proactiveStats.rulesEvaluated ?? 0} 条规则（识别 ${input.proactiveStats.ruleSuggestionsCount ?? 0} 项诊断）${input.proactiveStats.ruleReflectionSummary ? ` · ${input.proactiveStats.ruleReflectionSummary}` : ''}`,
+            ]
+          : []),
       ]
       if (input.createdReminders.length > 0) {
         entryLines.push('- 新建提醒：')

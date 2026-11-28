@@ -4,6 +4,8 @@ export type ObservabilityWindow = '24h' | '7d' | '30d' | '90d'
 
 export type TelemetryRecordKind = 'llm_step' | 'turn' | 'triage' | 'inbound' | 'proactive'
 
+export type TelemetrySilenceSource = 'triage' | 'control' | 'sentinel' | 'delegation' | ''
+
 export interface TelemetryUsageEventInput {
   readonly id: string
   readonly timestampMs: number
@@ -16,6 +18,8 @@ export interface TelemetryUsageEventInput {
   readonly senderName?: string
   readonly senderType?: 'user' | 'bot' | ''
   readonly trigger?: string
+  readonly listenerName?: string
+  readonly silenceSource?: TelemetrySilenceSource
   readonly agentPreset?: string
   readonly provider?: string
   readonly model?: string
@@ -114,9 +118,77 @@ export interface ObservabilityTriggerBreakdown {
   readonly count: number
   readonly sessions: number
   readonly replied: number
+  readonly silentSkipped: number
   readonly errors: number
   readonly totalTokens: number
   readonly sharePct: number
+}
+
+export interface ObservabilityListenerRuleRow {
+  readonly key: string
+  readonly botId: string
+  readonly botName: string
+  readonly chatId: string
+  readonly chatName: string
+  readonly ruleName: string
+  readonly templateKey?: string
+  readonly kind: 'group' | 'delegation'
+  readonly enabled: boolean
+  readonly hits: number
+  readonly replied: number
+  readonly silentSkipped: number
+  readonly triageSilent: number
+  readonly workerSilent: number
+  readonly errors: number
+  readonly replyRate: number
+  readonly silentRate: number
+  readonly totalTokens: number
+  readonly avgLatencyMs: number
+  readonly p50LatencyMs: number
+  readonly p95LatencyMs: number
+  readonly maxLatencyMs: number
+  readonly repliedAvgLatencyMs: number
+  readonly silentAvgLatencyMs: number
+  readonly latencySamples: number
+  readonly latencyHistogram: readonly ObservabilityLatencyBucket[]
+  readonly lastTriggeredAtMs: number
+}
+
+export interface ObservabilityListenerReflection {
+  readonly botId: string
+  readonly botName: string
+  readonly dateKey: string
+  readonly sessionId?: string
+  readonly evaluatedRules: number
+  readonly suggestionsCount: number
+  readonly summary: string
+  readonly generatedAtMs: number
+}
+
+export interface ObservabilityListenerSummary {
+  readonly configuredRules: number
+  readonly activeRules: number
+  readonly totalHits: number
+  readonly totalReplied: number
+  readonly totalSilentSkipped: number
+  readonly totalTriageSilent: number
+  readonly totalWorkerSilent: number
+  readonly totalErrors: number
+  readonly replyRate: number
+  readonly silentRate: number
+  readonly totalTokens: number
+  readonly avgLatencyMs: number
+  readonly p50LatencyMs: number
+  readonly p75LatencyMs: number
+  readonly p95LatencyMs: number
+  readonly p99LatencyMs: number
+  readonly maxLatencyMs: number
+  readonly repliedAvgLatencyMs: number
+  readonly silentAvgLatencyMs: number
+  readonly latencySamples: number
+  readonly latencyHistogram: readonly ObservabilityLatencyBucket[]
+  readonly rules: readonly ObservabilityListenerRuleRow[]
+  readonly latestReflection?: ObservabilityListenerReflection
 }
 
 export interface ObservabilityErrorBreakdown {
@@ -383,6 +455,7 @@ export interface ObservabilityPayload {
     readonly models: readonly ObservabilityModelBreakdown[]
     readonly agents: readonly ObservabilityAgentBreakdown[]
     readonly triggers: readonly ObservabilityTriggerBreakdown[]
+    readonly listeners: ObservabilityListenerSummary
     readonly heatmap: {
       readonly maxCount: number
       readonly cells: readonly ObservabilityHeatmapCell[]

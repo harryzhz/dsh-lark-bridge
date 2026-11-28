@@ -995,7 +995,16 @@ describe('DreamingService dual-gate scheduling, product dataDir isolation & nati
       deliverReminderOutput: vi.fn(async () => {}),
     })
 
-    const runNow = new Date(2026, 10, 27, 3, 5, 0)
+    const futureBase = new Date(Date.now() + 2 * 24 * 3_600_000)
+    const runNow = new Date(
+      futureBase.getFullYear(),
+      futureBase.getMonth(),
+      futureBase.getDate(),
+      3,
+      5,
+      0,
+    )
+    const runDateIso = `${runNow.getFullYear()}-${String(runNow.getMonth() + 1).padStart(2, '0')}-${String(runNow.getDate()).padStart(2, '0')}`
     const stagesSeen: string[] = []
     let capRejectionMessage = ''
 
@@ -1030,7 +1039,7 @@ describe('DreamingService dual-gate scheduling, product dataDir isolation & nati
               replyToMessageId: 'om_root_99',
               title: '复测灰度超时配置',
               prompt: '核查灰度超时配置是否已验证完成',
-              at: '2026-11-27 03:30',
+              at: `${runDateIso} 03:30`,
               mentions: [{ openId: 'ou_alex', name: '林晓' }],
             },
             runNow.getTime(),
@@ -1043,7 +1052,7 @@ describe('DreamingService dual-gate scheduling, product dataDir isolation & nati
               chatId: 'oc_dev_team',
               title: '复核连接池指标',
               prompt: '确认连接池上限调整生效',
-              at: '2026-11-27 10:00',
+              at: `${runDateIso} 10:00`,
               mentions: [{ openId: 'ou_chen', name: '陈明' }],
             },
             runNow.getTime(),
@@ -1057,7 +1066,7 @@ describe('DreamingService dual-gate scheduling, product dataDir isolation & nati
                 chatId: 'oc_dev_team',
                 title: '超限的第三条提醒',
                 prompt: '不应被创建',
-                at: '2026-11-27 10:30',
+                at: `${runDateIso} 10:30`,
                 mentions: [{ openId: 'ou_alex', name: '林晓' }],
               },
               runNow.getTime(),

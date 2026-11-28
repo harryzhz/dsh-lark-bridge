@@ -13,6 +13,7 @@ import type {
 import type {
   ObservabilityWindow,
   TelemetrySenderProfileRecord,
+  TelemetrySilenceSource,
   TelemetryUsageEventInput,
 } from './observability-types.js'
 import { CockpitProjector } from './storage/cockpit-projector.js'
@@ -557,6 +558,10 @@ export class LarkBridgeStore {
     return this.observabilityRepo.queryAggregate(options)
   }
 
+  queryWeeklyListenerComparison(botId: string, nowMs?: number) {
+    return this.observabilityRepo.queryWeeklyListenerComparison(botId, nowMs)
+  }
+
   recordMetric(input: {
     readonly botId: string
     readonly chatId?: string
@@ -567,6 +572,8 @@ export class LarkBridgeStore {
     readonly senderName?: string
     readonly senderType?: 'user' | 'bot'
     readonly trigger?: string
+    readonly listenerName?: string
+    readonly silenceSource?: TelemetrySilenceSource
     readonly errorCode?: string
     readonly kind: 'inbound' | 'replied' | 'listener' | 'silent_skip' | 'ignored' | 'error'
     readonly latencyMs?: number
@@ -613,6 +620,8 @@ export class LarkBridgeStore {
       ...(input.senderName ? { senderName: input.senderName } : {}),
       ...(input.senderType ? { senderType: input.senderType } : {}),
       ...(input.trigger ? { trigger: input.trigger } : {}),
+      ...(input.listenerName ? { listenerName: input.listenerName } : {}),
+      ...(input.silenceSource ? { silenceSource: input.silenceSource } : {}),
       ...(input.errorCode ? { errorCode: input.errorCode } : {}),
       outcome,
       ...(input.latencyMs !== undefined ? { latencyMs: input.latencyMs } : {}),

@@ -655,7 +655,7 @@ describe('SQLite WAL storage, atomic auto-migration & db CLI', () => {
     const dir = makeTempDir('dsh-lark-v6-')
     const store = new LarkBridgeStore(dir)
     try {
-      expect(store.getStorageStats().schemaVersion).toBe(13)
+      expect(store.getStorageStats().schemaVersion).toBe(14)
       const bindingCols = (
         store.db.prepare('PRAGMA table_info(session_bindings)').all() as Array<{ name: string }>
       ).map((c) => c.name)
@@ -674,6 +674,13 @@ describe('SQLite WAL storage, atomic auto-migration & db CLI', () => {
       ).map((c) => c.name)
       expect(cols).toContain('queue_wait_ms')
       expect(cols).toContain('exec_ms')
+      expect(cols).toContain('listener_name')
+      expect(cols).toContain('silence_source')
+      const dreamStateCols = (
+        store.db.prepare('PRAGMA table_info(dream_states)').all() as Array<{ name: string }>
+      ).map((c) => c.name)
+      expect(dreamStateCols).toContain('last_rule_reflection_date_key')
+      expect(dreamStateCols).toContain('last_rule_reflection_at_ms')
       const plan = store.db
         .prepare(
           'EXPLAIN QUERY PLAN SELECT scope_key, kind, payload_json, updated_at_ms FROM triage_context_scopes WHERE updated_at_ms >= ? ORDER BY updated_at_ms ASC',

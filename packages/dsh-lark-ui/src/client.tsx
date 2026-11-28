@@ -315,6 +315,7 @@ function LarkBridgePage() {
             models={data.models}
             pluginUpdates={data.pluginUpdates}
             onOpenPluginUpdates={() => setUpdateOpen(true)}
+            onOpenSession={handleOpenSession}
             onRefreshOverview={data.refresh}
             onToast={(text, ok = true) => setToast({ text, ok })}
           />

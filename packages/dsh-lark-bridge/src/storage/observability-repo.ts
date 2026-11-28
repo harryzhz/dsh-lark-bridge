@@ -6,6 +6,8 @@ import type {
   ObservabilityErrorBreakdown,
   ObservabilityHeatmapCell,
   ObservabilityLatencyBucket,
+  ObservabilityListenerRuleRow,
+  ObservabilityListenerSummary,
   ObservabilityModelBreakdown,
   ObservabilityRankModelSummary,
   ObservabilitySenderBotSummary,
@@ -194,6 +196,8 @@ interface RawUsageEventRow {
   sender_name: string
   sender_type: string
   trigger: string
+  listener_name: string
+  silence_source: string
   agent_preset: string
   provider: string
   model: string
@@ -779,6 +783,7 @@ export interface ObservabilityRepoAggregate {
   readonly models: readonly ObservabilityModelBreakdown[]
   readonly agents: readonly ObservabilityAgentBreakdown[]
   readonly triggers: readonly ObservabilityTriggerBreakdown[]
+  readonly listeners: ObservabilityListenerSummary
   readonly errors: readonly ObservabilityErrorBreakdown[]
   readonly heatmap: { readonly maxCount: number; readonly cells: readonly ObservabilityHeatmapCell[] }
   readonly botStats: ReadonlyMap<
@@ -863,6 +868,8 @@ export class ObservabilityRepo {
     const senderName = input.senderName?.trim() ?? ''
     const senderType = input.senderType ?? ''
     const trigger = input.trigger ?? ''
+    const listenerName = input.listenerName?.trim() ?? ''
+    const silenceSource = input.silenceSource ?? ''
     const agentPreset = input.agentPreset ?? ''
     const provider = input.provider ?? ''
     const model = input.model ?? ''
@@ -875,11 +882,12 @@ export class ObservabilityRepo {
           `INSERT OR IGNORE INTO telemetry_usage_events (
              id, timestamp_ms, record_kind, bot_id, chat_id, chat_type, session_id,
              sender_id, sender_name, sender_type,
-             trigger, agent_preset, provider, model, outcome, error_code, latency_ms,
+             trigger, listener_name, silence_source,
+             agent_preset, provider, model, outcome, error_code, latency_ms,
              queue_wait_ms, exec_ms,
              input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
              reasoning_tokens, total_tokens, tool_calls, tool_errors
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           id,
@@ -893,6 +901,8 @@ export class ObservabilityRepo {
           senderName,
           senderType,
           trigger,
+          listenerName,
+          silenceSource,
           agentPreset,
           provider,
           model,
@@ -1547,6 +1557,7 @@ export class ObservabilityRepo {
     const models = this.buildModelBreakdown(currentRows, current.totalTokens)
     const agents = this.buildAgentBreakdown(currentRows, current.totalTokens)
     const triggers = this.buildTriggerBreakdown(currentRows)
+    const listeners = this.buildListenerSummary(currentRows, { botId, chatId, senderId })
     const errors = this.buildErrorBreakdown(currentRows)
     const heatmap = this.buildHeatmap(currentRows)
     const botStats = this.buildBotStatsMap(currentRows)
@@ -1578,6 +1589,7 @@ export class ObservabilityRepo {
       models,
       agents,
       triggers,
+      listeners,
       errors,
       heatmap,
       botStats,
@@ -1636,7 +1648,8 @@ export class ObservabilityRepo {
     }
     const sql = `SELECT timestamp_ms, record_kind, bot_id, chat_id, chat_type, session_id,
                         sender_id, sender_name, sender_type,
-                        trigger, agent_preset, provider, model, outcome, error_code, latency_ms,
+                        trigger, listener_name, silence_source,
+                        agent_preset, provider, model, outcome, error_code, latency_ms,
                         queue_wait_ms, exec_ms,
                         input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
                         reasoning_tokens, total_tokens, tool_calls, tool_errors
@@ -2094,6 +2107,7 @@ export class ObservabilityRepo {
         count: number
         sessions: Set<string>
         replied: number
+        silentSkipped: number
         errors: number
         totalTokens: number
       }
@@ -2110,6 +2124,7 @@ export class ObservabilityRepo {
         count: 0,
         sessions: new Set<string>(),
         replied: 0,
+        silentSkipped: 0,
         errors: 0,
         totalTokens: 0,
       }
@@ -2122,6 +2137,9 @@ export class ObservabilityRepo {
         grandCount += 1
         if (row.outcome === 'replied' || row.outcome === 'quick_reply' || row.outcome === 'completed') {
           cur.replied += 1
+        }
+        if (row.outcome === 'silent_skip' || (row.record_kind === 'triage' && row.outcome === 'silent')) {
+          cur.silentSkipped += 1
         }
         if (row.outcome === 'error' || row.outcome === 'fallback') {
           cur.errors += 1
@@ -2145,11 +2163,379 @@ export class ObservabilityRepo {
           count: v.count,
           sessions: v.sessions.size,
           replied: v.replied,
+          silentSkipped: v.silentSkipped,
           errors: v.errors,
           totalTokens: v.totalTokens,
           sharePct,
         }
       })
+  }
+
+  queryWeeklyListenerComparison(
+    botId: string,
+    nowMs = Date.now(),
+  ): {
+    readonly fromMs: number
+    readonly toMs: number
+    readonly current: ObservabilityListenerSummary
+    readonly previous: ObservabilityListenerSummary
+  } {
+    const weekMs = 7 * 24 * 3_600_000
+    const toMs = nowMs
+    const fromMs = toMs - weekMs
+    const prevFromMs = fromMs - weekMs
+    const combined = this.fetchUsageEvents(prevFromMs, toMs, botId, '')
+    const currentRows: RawUsageEventRow[] = []
+    const previousRows: RawUsageEventRow[] = []
+    for (const row of combined) {
+      if (Number(row.timestamp_ms) >= fromMs) currentRows.push(row)
+      else previousRows.push(row)
+    }
+    return {
+      fromMs,
+      toMs,
+      current: this.buildListenerSummary(currentRows, { botId, chatId: '', senderId: '' }),
+      previous: this.buildListenerSummary(previousRows, { botId, chatId: '', senderId: '' }),
+    }
+  }
+
+  private buildListenerSummary(
+    rows: readonly RawUsageEventRow[],
+    filters: { readonly botId: string; readonly chatId: string; readonly senderId: string },
+  ): ObservabilityListenerSummary {
+    const botsById = new Map(this.config.listBots().map((b) => [b.id, b]))
+    const groupsByKey = new Map(this.config.listGroups().map((g) => [g.key, g]))
+    const discovered = this.config.getDiscoveredChats()
+
+    // Pre-index triage silent sessions and listener session attribution so both
+    // legacy rows (before migration 014) and llm_step token rows resolve accurately.
+    const triageSilentSessionIds = new Set<string>()
+    const sessionRuleMap = new Map<string, string>()
+
+    const resolveRuleMeta = (
+      row: RawUsageEventRow,
+    ): {
+      readonly ruleKey: string
+      readonly ruleName: string
+      readonly kind: 'group' | 'delegation'
+      readonly templateKey?: string
+      readonly enabled: boolean
+    } | null => {
+      if (!row.bot_id || row.bot_id === 'system' || !row.chat_id || row.chat_type === 'p2p') {
+        return null
+      }
+      const explicitName = (row.listener_name ?? '').trim()
+      const isListenerRow = row.trigger === 'listener' || explicitName.length > 0
+      if (!isListenerRow) return null
+
+      const groupKey = buildGroupKey(row.bot_id, row.chat_id)
+      const grp = groupsByKey.get(groupKey)
+      const isDelegation =
+        row.silence_source === 'delegation' || explicitName === '委派事项跟进'
+      const ruleName =
+        explicitName ||
+        (isDelegation ? '委派事项跟进' : grp?.listener.name?.trim() || '主动监听')
+      const kind: 'group' | 'delegation' = isDelegation ? 'delegation' : 'group'
+      const enabled = kind === 'delegation' ? true : Boolean(grp?.enabled && grp?.listener.enabled)
+      const templateKey =
+        kind === 'group' && grp?.listener.templateKey ? grp.listener.templateKey : undefined
+      return {
+        ruleKey: `${row.bot_id}:${row.chat_id}:${ruleName}`,
+        ruleName,
+        kind,
+        ...(templateKey ? { templateKey } : {}),
+        enabled,
+      }
+    }
+
+    for (const row of rows) {
+      if (row.record_kind === 'triage' && row.outcome === 'silent' && row.session_id) {
+        triageSilentSessionIds.add(row.session_id)
+      }
+      if (row.session_id && row.record_kind !== 'llm_step') {
+        const meta = resolveRuleMeta(row)
+        if (meta) sessionRuleMap.set(row.session_id, meta.ruleKey)
+      }
+    }
+
+    interface RuleAcc {
+      botId: string
+      chatId: string
+      ruleName: string
+      templateKey?: string
+      kind: 'group' | 'delegation'
+      enabled: boolean
+      inboundHits: number
+      replied: number
+      silentSkipped: number
+      triageSilent: number
+      workerSilent: number
+      errors: number
+      totalTokens: number
+      allLatencies: number[]
+      repliedLatencies: number[]
+      silentLatencies: number[]
+      lastTriggeredAtMs: number
+    }
+
+    const rulesMap = new Map<string, RuleAcc>()
+    const ensureRule = (
+      ruleKey: string,
+      seed: {
+        botId: string
+        chatId: string
+        ruleName: string
+        templateKey?: string
+        kind: 'group' | 'delegation'
+        enabled: boolean
+      },
+    ): RuleAcc => {
+      let acc = rulesMap.get(ruleKey)
+      if (!acc) {
+        acc = {
+          botId: seed.botId,
+          chatId: seed.chatId,
+          ruleName: seed.ruleName,
+          ...(seed.templateKey ? { templateKey: seed.templateKey } : {}),
+          kind: seed.kind,
+          enabled: seed.enabled,
+          inboundHits: 0,
+          replied: 0,
+          silentSkipped: 0,
+          triageSilent: 0,
+          workerSilent: 0,
+          errors: 0,
+          totalTokens: 0,
+          allLatencies: [],
+          repliedLatencies: [],
+          silentLatencies: [],
+          lastTriggeredAtMs: 0,
+        }
+        rulesMap.set(ruleKey, acc)
+      }
+      return acc
+    }
+
+    // Seed configured enabled listener rules (matching active filters) so 0-hit rules are visible.
+    let configuredRules = 0
+    if (filters.chatId !== P2P_CHAT_FILTER_VALUE) {
+      for (const grp of this.config.listGroups(filters.botId || undefined)) {
+        if (!grp.enabled || !grp.listener.enabled) continue
+        if (filters.chatId && grp.chatId !== filters.chatId) continue
+        configuredRules += 1
+        if (!filters.senderId) {
+          const ruleName = grp.listener.name.trim() || '主动监听'
+          const ruleKey = `${grp.botId}:${grp.chatId}:${ruleName}`
+          ensureRule(ruleKey, {
+            botId: grp.botId,
+            chatId: grp.chatId,
+            ruleName,
+            ...(grp.listener.templateKey ? { templateKey: grp.listener.templateKey } : {}),
+            kind: 'group',
+            enabled: true,
+          })
+        }
+      }
+    }
+
+    for (const row of rows) {
+      const tok = Number(row.total_tokens) || 0
+      const ts = Number(row.timestamp_ms) || 0
+
+      if (row.record_kind === 'llm_step') {
+        const mappedKey = row.session_id ? sessionRuleMap.get(row.session_id) : undefined
+        if (mappedKey) {
+          const acc = rulesMap.get(mappedKey)
+          if (acc) {
+            acc.totalTokens += tok
+            if (ts > acc.lastTriggeredAtMs) acc.lastTriggeredAtMs = ts
+          }
+          continue
+        }
+        const meta = resolveRuleMeta(row)
+        if (meta) {
+          const acc = ensureRule(meta.ruleKey, {
+            botId: row.bot_id,
+            chatId: row.chat_id,
+            ruleName: meta.ruleName,
+            ...(meta.templateKey ? { templateKey: meta.templateKey } : {}),
+            kind: meta.kind,
+            enabled: meta.enabled,
+          })
+          acc.totalTokens += tok
+          if (ts > acc.lastTriggeredAtMs) acc.lastTriggeredAtMs = ts
+        }
+        continue
+      }
+
+      const meta = resolveRuleMeta(row)
+      if (!meta) continue
+      const acc = ensureRule(meta.ruleKey, {
+        botId: row.bot_id,
+        chatId: row.chat_id,
+        ruleName: meta.ruleName,
+        ...(meta.templateKey ? { templateKey: meta.templateKey } : {}),
+        kind: meta.kind,
+        enabled: meta.enabled,
+      })
+
+      acc.totalTokens += tok
+      if (ts > acc.lastTriggeredAtMs) acc.lastTriggeredAtMs = ts
+
+      if (row.record_kind === 'inbound') {
+        if (row.outcome !== 'ignored') {
+          acc.inboundHits += 1
+        }
+        continue
+      }
+
+      if (row.record_kind === 'triage') {
+        // Triage outcome is already paired with a turn row (`silent_skip` or `replied`);
+        // only attribute triage token cost here to avoid double-counting hits.
+        continue
+      }
+
+      if (row.record_kind === 'turn') {
+        const lat = row.latency_ms !== null && Number(row.latency_ms) >= 0 ? Number(row.latency_ms) : null
+        if (row.outcome === 'replied' || row.outcome === 'quick_reply' || row.outcome === 'completed') {
+          acc.replied += 1
+          if (lat !== null) {
+            acc.allLatencies.push(lat)
+            acc.repliedLatencies.push(lat)
+          }
+        } else if (row.outcome === 'silent_skip') {
+          acc.silentSkipped += 1
+          const isTriageSilent =
+            row.silence_source === 'triage' ||
+            (!row.silence_source &&
+              Boolean(row.session_id) &&
+              (triageSilentSessionIds.has(row.session_id) || row.session_id.startsWith('triage-')))
+          if (isTriageSilent) acc.triageSilent += 1
+          else acc.workerSilent += 1
+          if (lat !== null) {
+            acc.allLatencies.push(lat)
+            acc.silentLatencies.push(lat)
+          }
+        } else if (row.outcome === 'error' || row.outcome === 'aborted') {
+          acc.errors += 1
+          if (lat !== null) acc.allLatencies.push(lat)
+        }
+      }
+    }
+
+    const allLatencies: number[] = []
+    const allRepliedLatencies: number[] = []
+    const allSilentLatencies: number[] = []
+    let totalHits = 0
+    let totalReplied = 0
+    let totalSilentSkipped = 0
+    let totalTriageSilent = 0
+    let totalWorkerSilent = 0
+    let totalErrors = 0
+    let totalTokens = 0
+    let activeRules = 0
+
+    const ruleRows: ObservabilityListenerRuleRow[] = []
+    for (const [key, acc] of rulesMap.entries()) {
+      const resolvedHits = acc.replied + acc.silentSkipped + acc.errors
+      const hits = Math.max(resolvedHits, acc.inboundHits)
+      if (hits > 0) activeRules += 1
+
+      const bot = botsById.get(acc.botId)
+      const groupKey = buildGroupKey(acc.botId, acc.chatId)
+      const grp = groupsByKey.get(groupKey)
+      const disc = discovered.get(groupKey)
+      const chatName =
+        grp?.chatName ||
+        disc?.name ||
+        this.config.resolveChatName(acc.botId, acc.chatId) ||
+        acc.chatId
+
+      const pct = calcPercentiles(acc.allLatencies)
+      const repPct = calcPercentiles(acc.repliedLatencies)
+      const silPct = calcPercentiles(acc.silentLatencies)
+      const replyRate = hits > 0 ? Math.round((acc.replied / hits) * 1000) / 10 : 0
+      const silentRate = hits > 0 ? Math.round((acc.silentSkipped / hits) * 1000) / 10 : 0
+
+      totalHits += hits
+      totalReplied += acc.replied
+      totalSilentSkipped += acc.silentSkipped
+      totalTriageSilent += acc.triageSilent
+      totalWorkerSilent += acc.workerSilent
+      totalErrors += acc.errors
+      totalTokens += acc.totalTokens
+      allLatencies.push(...acc.allLatencies)
+      allRepliedLatencies.push(...acc.repliedLatencies)
+      allSilentLatencies.push(...acc.silentLatencies)
+
+      ruleRows.push({
+        key,
+        botId: acc.botId,
+        botName: bot?.name ?? acc.botId,
+        chatId: acc.chatId,
+        chatName,
+        ruleName: acc.ruleName,
+        ...(acc.templateKey ? { templateKey: acc.templateKey } : {}),
+        kind: acc.kind,
+        enabled: acc.enabled,
+        hits,
+        replied: acc.replied,
+        silentSkipped: acc.silentSkipped,
+        triageSilent: acc.triageSilent,
+        workerSilent: acc.workerSilent,
+        errors: acc.errors,
+        replyRate,
+        silentRate,
+        totalTokens: acc.totalTokens,
+        avgLatencyMs: pct.avgMs,
+        p50LatencyMs: pct.p50Ms,
+        p95LatencyMs: pct.p95Ms,
+        maxLatencyMs: pct.maxMs,
+        repliedAvgLatencyMs: repPct.avgMs,
+        silentAvgLatencyMs: silPct.avgMs,
+        latencySamples: pct.samples,
+        latencyHistogram: buildLatencyHistogram(acc.allLatencies),
+        lastTriggeredAtMs: acc.lastTriggeredAtMs,
+      })
+    }
+
+    ruleRows.sort(
+      (a, b) =>
+        b.hits - a.hits ||
+        b.totalTokens - a.totalTokens ||
+        b.p95LatencyMs - a.p95LatencyMs ||
+        Number(b.enabled) - Number(a.enabled) ||
+        a.ruleName.localeCompare(b.ruleName, 'zh-CN'),
+    )
+
+    const overallLat = calcPercentiles(allLatencies)
+    const overallRepliedLat = calcPercentiles(allRepliedLatencies)
+    const overallSilentLat = calcPercentiles(allSilentLatencies)
+
+    return {
+      configuredRules,
+      activeRules,
+      totalHits,
+      totalReplied,
+      totalSilentSkipped,
+      totalTriageSilent,
+      totalWorkerSilent,
+      totalErrors,
+      replyRate: totalHits > 0 ? Math.round((totalReplied / totalHits) * 1000) / 10 : 0,
+      silentRate: totalHits > 0 ? Math.round((totalSilentSkipped / totalHits) * 1000) / 10 : 0,
+      totalTokens,
+      avgLatencyMs: overallLat.avgMs,
+      p50LatencyMs: overallLat.p50Ms,
+      p75LatencyMs: overallLat.p75Ms,
+      p95LatencyMs: overallLat.p95Ms,
+      p99LatencyMs: overallLat.p99Ms,
+      maxLatencyMs: overallLat.maxMs,
+      repliedAvgLatencyMs: overallRepliedLat.avgMs,
+      silentAvgLatencyMs: overallSilentLat.avgMs,
+      latencySamples: overallLat.samples,
+      latencyHistogram: buildLatencyHistogram(allLatencies),
+      rules: ruleRows,
+    }
   }
 
   private buildErrorBreakdown(rows: readonly RawUsageEventRow[]): ObservabilityErrorBreakdown[] {

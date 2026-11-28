@@ -124,6 +124,8 @@ export const BotDreamingConfigSchema = z.preprocess(
       .default(DEFAULT_DREAMING_MAX_DURATION_MINUTES),
     /** Enable Stage 2 deep memory audit (codebase verification, cold-memory pruning & SOP synthesis). */
     deepConsolidation: z.boolean().default(true),
+    /** Enable weekly listener-rule effectiveness reflection during Auto-Dream deep consolidation. */
+    weeklyRuleReflection: z.boolean().default(true),
     /** Optional dedicated model for overnight Dreaming (empty string = inherit bot model). */
     model: z
       .string()
@@ -150,6 +152,7 @@ export const DEFAULT_BOT_DREAMING_CONFIG: z.output<typeof BotDreamingConfigSchem
   maxRemindersPerRun: DEFAULT_DREAMING_MAX_REMINDERS_PER_RUN,
   maxDurationMinutes: DEFAULT_DREAMING_MAX_DURATION_MINUTES,
   deepConsolidation: true,
+  weeklyRuleReflection: true,
   model: '',
   reasoningEffort: '',
   scopes: [...DEFAULT_DREAMING_SCOPES],

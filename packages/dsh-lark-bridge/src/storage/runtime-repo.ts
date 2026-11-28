@@ -565,6 +565,8 @@ export class RuntimeRepo {
           status: string
           last_dream_at_ms: number | null
           last_checked_date_key: string | null
+          last_rule_reflection_date_key: string | null
+          last_rule_reflection_at_ms: number | null
           last_session_id: string | null
           last_processed_count: number | null
           last_summary: string | null
@@ -591,6 +593,12 @@ export class RuntimeRepo {
       status,
       ...(row.last_dream_at_ms !== null ? { lastDreamAtMs: Number(row.last_dream_at_ms) } : {}),
       ...(row.last_checked_date_key ? { lastCheckedDateKey: row.last_checked_date_key } : {}),
+      ...(row.last_rule_reflection_date_key
+        ? { lastRuleReflectionDateKey: row.last_rule_reflection_date_key }
+        : {}),
+      ...(row.last_rule_reflection_at_ms !== null
+        ? { lastRuleReflectionAtMs: Number(row.last_rule_reflection_at_ms) }
+        : {}),
       ...(row.last_session_id ? { lastSessionId: row.last_session_id } : {}),
       ...(row.last_processed_count !== null
         ? { lastProcessedCount: Number(row.last_processed_count) }
@@ -612,13 +620,16 @@ export class RuntimeRepo {
     this.db
       .prepare(
         `INSERT INTO dream_states (
-           bot_id, status, last_dream_at_ms, last_checked_date_key, last_session_id,
-           last_processed_count, last_summary, processed_session_ids_json
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           bot_id, status, last_dream_at_ms, last_checked_date_key,
+           last_rule_reflection_date_key, last_rule_reflection_at_ms,
+           last_session_id, last_processed_count, last_summary, processed_session_ids_json
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(bot_id) DO UPDATE SET
            status = excluded.status,
            last_dream_at_ms = excluded.last_dream_at_ms,
            last_checked_date_key = excluded.last_checked_date_key,
+           last_rule_reflection_date_key = excluded.last_rule_reflection_date_key,
+           last_rule_reflection_at_ms = excluded.last_rule_reflection_at_ms,
            last_session_id = excluded.last_session_id,
            last_processed_count = excluded.last_processed_count,
            last_summary = excluded.last_summary,
@@ -629,6 +640,8 @@ export class RuntimeRepo {
         normalized.status,
         normalized.lastDreamAtMs ?? null,
         normalized.lastCheckedDateKey ?? null,
+        normalized.lastRuleReflectionDateKey ?? null,
+        normalized.lastRuleReflectionAtMs ?? null,
         normalized.lastSessionId ?? null,
         normalized.lastProcessedCount ?? null,
         normalized.lastSummary ?? null,

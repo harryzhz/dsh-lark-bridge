@@ -162,6 +162,7 @@ Memory 严格遵守 `AGENTS.md` 与 [overview.md](./overview.md) 的产物目录
 | `memory/<botId>/MEMORY.md` | **只读派生产物（投影镜像）** | 每次记忆变更后 `tmp + chmod 0o600 + renameSync` 原子替换；Auto-Dream 启动前也会刷新 | 严格 ≤ 200 行 / 12 KB，按 `feedback → user → project → reference` 分组，超预算末尾提示使用 CLI 查全量 |
 | `dreaming/<botId>/recent-transcripts.md` | **单批增量摘要输入** | 每批执行前原子覆写（`0o600`） | 单会话预算默认 `5000` 字（可配 `1000~20000`），采用头尾保底采样（首 35% + 尾 58%），保留发言人 `open_id`、被提及成员、话题 `thread_reply_to` 与中断状态；按每批 ≤ 15 会话 / 75 KB 动态切批排空全部未处理会话（可配 `maxSessionsPerRun`，`0` = 全部） |
 | `dreaming/<botId>/memory-audit.md` | **存量记忆体检报告** | Stage 2 执行前零 LLM 预生成（`0o600`） | 标记超期未核验条目、长期零召回冷记忆候选与高重叠标签簇 |
+| `dreaming/<botId>/listener-rules-weekly.md` | **周度监听规则效果报告** | 满足 7 天节律时 Stage 2 前零 LLM 生成，反思后追加建议（`0o600`） | 汇总近 7 天及上周环比的各监听规则命中/回复/分流与运行时静默拆分/P50-P95 耗时/Token 与确定性诊断清单，供 LLM 输出调优建议（严禁自动修改群配置） |
 | `dreaming/<botId>/open-loops-snapshot.md` | **实时未闭环现场快照** | Stage 3 执行前纯代码采集（`0o600`） | 汇总当前活跃提醒、近 48h 异常/已触发提醒、活跃仓库残留 `.worktrees/` 与近期中断/报错会话 |
 | `dreaming/<botId>/DREAMS.md` | **离线复盘日记** | 每次整理结束原子倒序追加（`0o600`） | 保留最近 30 次夜间整理的批次数、记忆变更、新建提醒与隔离分支汇总 |
 

@@ -183,6 +183,7 @@ export interface ActiveTurnRecord {
   routeKey: string
   readonly replyMode: GroupReplyMode
   readonly trigger: string
+  readonly listenerName?: string
   readonly allowSilentEmptyReply: boolean
   readonly silentOnly?: boolean
   readonly reactionId?: string
@@ -241,6 +242,7 @@ export interface InboundPipelineHost {
     readonly senderUnionId?: string
     readonly senderName?: string
     readonly senderType?: 'user' | 'bot'
+    readonly listenerName?: string
     readonly action: 'silent' | 'quick_reply' | 'handoff'
     readonly fallback?: boolean
     readonly errorCode?: string

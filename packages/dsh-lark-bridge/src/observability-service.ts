@@ -16,6 +16,7 @@ import {
 import { assessWalBloat } from './diagnostics.js'
 import type {
   ObservabilityBotRow,
+  ObservabilityListenerReflection,
   ObservabilityPayload,
   ObservabilityWindow,
   ProcessVitalPoint,
@@ -494,6 +495,7 @@ export class ObservabilityService {
     readonly senderUnionId?: string
     readonly senderName?: string
     readonly senderType?: 'user' | 'bot'
+    readonly listenerName?: string
     readonly action: 'silent' | 'quick_reply' | 'handoff'
     readonly fallback?: boolean
     readonly errorCode?: string
@@ -538,6 +540,7 @@ export class ObservabilityService {
       ...(senderName ? { senderName } : {}),
       ...(senderType ? { senderType } : {}),
       trigger: 'triage',
+      ...(input.listenerName ? { listenerName: input.listenerName } : {}),
       ...(input.provider ? { provider: input.provider } : {}),
       ...(input.model ? { model: input.model } : {}),
       outcome: input.fallback ? 'fallback' : input.action,
@@ -773,6 +776,30 @@ export class ObservabilityService {
     const activeSessionsInWindow = Math.max(cur.sessions.size, agg.createdSessionsInWindow)
     const prevSessionsInWindow = Math.max(prev.sessions.size, agg.prevCreatedSessions)
 
+    let latestReflection: ObservabilityListenerReflection | undefined
+    const dreamSessions = this.host.store.listDreamSessions?.(botId || undefined) ?? []
+    for (const ds of dreamSessions) {
+      if (ds.status !== 'succeeded') continue
+      if (botId && ds.botId !== botId) continue
+      if (!ds.proactiveStats?.ruleReflectionRan) continue
+      const summary = ds.proactiveStats.ruleReflectionSummary?.trim() || ds.summary?.trim() || ''
+      if (!summary) continue
+      latestReflection = {
+        botId: ds.botId,
+        botName: ds.botName || botsById.get(ds.botId)?.name || ds.botId,
+        dateKey: ds.dateKey,
+        sessionId: ds.sessionId,
+        evaluatedRules: ds.proactiveStats.rulesEvaluated ?? 0,
+        suggestionsCount: ds.proactiveStats.ruleSuggestionsCount ?? 0,
+        summary,
+        generatedAtMs: ds.lastActivityMs,
+      }
+      break
+    }
+    const listeners = latestReflection
+      ? { ...agg.listeners, latestReflection }
+      : agg.listeners
+
     return {
       generatedAtMs: nowMs,
       window: agg.window,
@@ -851,6 +878,7 @@ export class ObservabilityService {
         models: agg.models,
         agents: agg.agents,
         triggers: agg.triggers,
+        listeners,
         heatmap: agg.heatmap,
         botRanking,
         chatRanking,

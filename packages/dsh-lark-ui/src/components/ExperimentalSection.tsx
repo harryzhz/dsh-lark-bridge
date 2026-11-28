@@ -387,6 +387,20 @@ export function ExperimentalSection({
               onChange={(deepConsolidation) => patchDreaming({ deepConsolidation })}
             />
           </SettingRow>
+          {dreaming.deepConsolidation !== false && (
+            <NestedSettings>
+              <SettingRow
+                title="周度监听规则反思"
+                desc="每周评估各主动监听规则的命中、静默与耗时效果并沉淀调优建议"
+              >
+                <Switch
+                  label="周度监听规则反思"
+                  checked={dreaming.weeklyRuleReflection !== false}
+                  onChange={(weeklyRuleReflection) => patchDreaming({ weeklyRuleReflection })}
+                />
+              </SettingRow>
+            </NestedSettings>
+          )}
           <SettingRow
             title="清理过期与纠偏"
             desc="对照当前代码与最新反馈，剔除失效路径和被推翻的旧结论"
