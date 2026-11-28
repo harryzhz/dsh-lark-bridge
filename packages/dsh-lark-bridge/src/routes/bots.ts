@@ -420,9 +420,12 @@ export const botRoutes: readonly LarkRouteDefinition[] = [
       if (!manager.dreaming) {
         return ok({ ok: false, error: 'dreaming_service_unavailable' }, 400)
       }
-      const body = bodyRecord(request.body) as { force?: boolean }
+      const body = bodyRecord(request.body) as { force?: boolean; includeRuleReflection?: boolean }
       const dreamState = await manager.dreaming.runForBot(botId, {
         force: body.force !== false,
+        ...(body.includeRuleReflection !== undefined
+          ? { includeRuleReflection: Boolean(body.includeRuleReflection) }
+          : {}),
       })
       return ok({ ok: true, dreamState })
     },

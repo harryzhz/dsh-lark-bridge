@@ -465,6 +465,13 @@ export function SessionsView({
                     {s.status === 'succeeded' && ps && ps.worktreesCreated > 0 && (
                       <Tag tone="info">{`分支 +${ps.worktreesCreated}`}</Tag>
                     )}
+                    {s.status === 'succeeded' && ps?.ruleReflectionRan && (
+                      <Tag tone={ps.ruleSuggestionsCount && ps.ruleSuggestionsCount > 0 ? 'info' : 'neutral'}>
+                        {ps.ruleSuggestionsCount && ps.ruleSuggestionsCount > 0
+                          ? `规则反思 · ${ps.ruleSuggestionsCount} 项建议`
+                          : '规则反思'}
+                      </Tag>
+                    )}
                     {s.status === 'succeeded' && s.outcome === 'no_change' && (
                       <Tag tone="neutral">无新增变更</Tag>
                     )}

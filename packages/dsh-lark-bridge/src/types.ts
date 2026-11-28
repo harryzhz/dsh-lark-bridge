@@ -198,6 +198,8 @@ export interface LarkDreamRunState {
   readonly status: 'idle' | 'running' | 'succeeded' | 'skipped' | 'failed'
   readonly lastDreamAtMs?: number
   readonly lastCheckedDateKey?: string
+  readonly lastRuleReflectionDateKey?: string
+  readonly lastRuleReflectionAtMs?: number
   readonly lastSessionId?: string
   readonly lastProcessedCount?: number
   readonly lastSummary?: string

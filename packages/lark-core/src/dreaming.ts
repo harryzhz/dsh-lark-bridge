@@ -27,6 +27,10 @@ export const LarkDreamProactiveStatsSchema = z.object({
   worktreesCreated: z.number().int().nonnegative().default(0),
   deepConsolidated: z.boolean().default(false),
   openLoopsAudited: z.boolean().default(false),
+  ruleReflectionRan: z.boolean().optional(),
+  rulesEvaluated: z.number().int().nonnegative().optional(),
+  ruleSuggestionsCount: z.number().int().nonnegative().optional(),
+  ruleReflectionSummary: z.string().optional(),
 })
 export type LarkDreamProactiveStats = z.infer<typeof LarkDreamProactiveStatsSchema>
 
@@ -278,6 +282,277 @@ export function renderMemoryAuditReport(input: MemoryAuditReportInput): string {
   return lines.join('\n')
 }
 
+export type ListenerRuleDiagnosisKind =
+  | 'high_worker_silent'
+  | 'excessive_silence'
+  | 'high_latency'
+  | 'high_error_rate'
+  | 'dormant_rule'
+
+export interface ListenerRuleWeeklyConfigSnapshot {
+  readonly scope: string
+  readonly mentionFilter: string
+  readonly debounceSeconds: number
+  readonly allowSilentEmptyReply: boolean
+  readonly sessionMode: string
+  readonly replyMode: string
+  readonly includeKeywords: readonly string[]
+  readonly excludeKeywords: readonly string[]
+  readonly routerEnabled: boolean
+}
+
+export interface ListenerRuleWeeklyMetric {
+  readonly key: string
+  readonly chatId: string
+  readonly chatName: string
+  readonly ruleName: string
+  readonly kind: 'group' | 'delegation'
+  readonly enabled: boolean
+  readonly hits: number
+  readonly replied: number
+  readonly silentSkipped: number
+  readonly triageSilent: number
+  readonly workerSilent: number
+  readonly errors: number
+  readonly replyRate: number
+  readonly silentRate: number
+  readonly totalTokens: number
+  readonly avgLatencyMs: number
+  readonly p50LatencyMs: number
+  readonly p95LatencyMs: number
+  readonly repliedAvgLatencyMs: number
+  readonly silentAvgLatencyMs: number
+  readonly latencySamples: number
+  readonly config?: ListenerRuleWeeklyConfigSnapshot
+}
+
+export interface ListenerRuleWeeklyDiagnosis {
+  readonly ruleKey: string
+  readonly chatId: string
+  readonly chatName: string
+  readonly ruleName: string
+  readonly kind: ListenerRuleDiagnosisKind
+  readonly severity: 'warn' | 'info'
+  readonly headline: string
+  readonly suggestion: string
+}
+
+export interface ListenerRuleWeeklyReportInput {
+  readonly botId: string
+  readonly botName: string
+  readonly nowMs: number
+  readonly fromMs: number
+  readonly toMs: number
+  readonly totalHits: number
+  readonly totalReplied: number
+  readonly totalSilentSkipped: number
+  readonly totalTriageSilent: number
+  readonly totalWorkerSilent: number
+  readonly totalErrors: number
+  readonly silentRate: number
+  readonly p50LatencyMs: number
+  readonly p95LatencyMs: number
+  readonly totalTokens: number
+  readonly prevHits?: number
+  readonly prevSilentRate?: number
+  readonly rules: readonly ListenerRuleWeeklyMetric[]
+}
+
+function formatDurationShort(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return '—'
+  if (ms < 1_000) return `${Math.round(ms)}ms`
+  if (ms < 60_000) return `${(ms / 1_000).toFixed(ms >= 10_000 ? 1 : 2)}s`
+  const mins = Math.floor(ms / 60_000)
+  const remSec = Math.round((ms % 60_000) / 1_000)
+  return remSec > 0 ? `${mins}m ${remSec}s` : `${mins}m`
+}
+
+function formatTokensShort(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return '0'
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
+  return String(Math.round(n))
+}
+
+/**
+ * Deterministically diagnoses weekly listener-rule inefficiencies so Auto-Dream
+ * reflects on concrete telemetry evidence rather than hallucinating rule issues.
+ */
+export function diagnoseListenerRuleWeekly(
+  rules: readonly ListenerRuleWeeklyMetric[],
+): ListenerRuleWeeklyDiagnosis[] {
+  const diagnoses: ListenerRuleWeeklyDiagnosis[] = []
+
+  for (const r of rules) {
+    if (r.kind === 'group' && r.enabled && r.hits === 0) {
+      diagnoses.push({
+        ruleKey: r.key,
+        chatId: r.chatId,
+        chatName: r.chatName,
+        ruleName: r.ruleName,
+        kind: 'dormant_rule',
+        severity: 'info',
+        headline: '近 7 天零命中',
+        suggestion:
+          r.config && r.config.includeKeywords.length > 0
+            ? '规则已启用但本周未命中，请核对包含关键词是否过严或群聊已低活跃，如不再需要可关闭。'
+            : '规则已启用但本周未命中，请核对过滤范围（消息类型 / 发言人 / 顶层限制）或确认是否可关闭。',
+      })
+      continue
+    }
+
+    if (r.hits <= 0) continue
+
+    const workerSilentRate = Math.round((r.workerSilent / r.hits) * 1000) / 10
+    if (
+      r.hits >= 5 &&
+      (workerSilentRate >= 60 || (r.silentRate >= 60 && r.silentAvgLatencyMs >= 8_000))
+    ) {
+      const routerHint =
+        r.config && !r.config.routerEnabled
+          ? '开启该群智能分流（轻量模型前置拦截）'
+          : '收紧智能分流 Prompt 或补充排除关键词（excludeKeywords）'
+      diagnoses.push({
+        ruleKey: r.key,
+        chatId: r.chatId,
+        chatName: r.chatName,
+        ruleName: r.ruleName,
+        kind: 'high_worker_silent',
+        severity: 'warn',
+        headline: `运行时空跑静默偏高（运行时静默 ${r.workerSilent}/${r.hits}，${workerSilentRate}%，静默均耗 ${formatDurationShort(r.silentAvgLatencyMs)}）`,
+        suggestion: `大量消息穿透到主运行时才判定静默，建议${routerHint}，并检查是否可收窄 scope / mentionFilter。`,
+      })
+    } else if (r.hits >= 8 && r.silentRate >= 85) {
+      const debounceHint =
+        r.config && r.config.debounceSeconds < 8
+          ? `将防抖合并窗口从 ${r.config.debounceSeconds}s 提高至 8~12s`
+          : '补充白名单/排除关键词收窄触发范围'
+      diagnoses.push({
+        ruleKey: r.key,
+        chatId: r.chatId,
+        chatName: r.chatName,
+        ruleName: r.ruleName,
+        kind: 'excessive_silence',
+        severity: 'warn',
+        headline: `静默率极高（${r.silentSkipped}/${r.hits}，${r.silentRate}%）`,
+        suggestion: `监听触发偏宽，建议${debounceHint}，并在规则 Prompt 明确仅需介入的边界条件。`,
+      })
+    }
+
+    if (r.latencySamples >= 3 && (r.p95LatencyMs >= 30_000 || r.avgLatencyMs >= 15_000)) {
+      diagnoses.push({
+        ruleKey: r.key,
+        chatId: r.chatId,
+        chatName: r.chatName,
+        ruleName: r.ruleName,
+        kind: 'high_latency',
+        severity: 'warn',
+        headline: `处理耗时偏高（均耗 ${formatDurationShort(r.avgLatencyMs)} · P95 ${formatDurationShort(r.p95LatencyMs)}）`,
+        suggestion:
+          '排查监听 Prompt 是否诱发多轮慢工具调用；对无需深度排查的监听可考虑切为轻量模型或缩短上下文。',
+      })
+    }
+
+    const errorRate = Math.round((r.errors / r.hits) * 1000) / 10
+    if (r.hits >= 3 && errorRate >= 15) {
+      diagnoses.push({
+        ruleKey: r.key,
+        chatId: r.chatId,
+        chatName: r.chatName,
+        ruleName: r.ruleName,
+        kind: 'high_error_rate',
+        severity: 'warn',
+        headline: `异常率偏高（异常 ${r.errors}/${r.hits}，${errorRate}%）`,
+        suggestion: '结合近期运行异常日志排查超时、工具失败或权限问题，必要时为规则添加降级/止损说明。',
+      })
+    }
+  }
+
+  return diagnoses
+}
+
+/**
+ * Renders a zero-LLM weekly listener-rule effectiveness & tuning report
+ * (`dreaming/<botId>/listener-rules-weekly.md`) consumed by Auto-Dream Stage 2.
+ */
+export function renderListenerRuleWeeklyReport(input: ListenerRuleWeeklyReportInput): {
+  readonly markdown: string
+  readonly diagnoses: readonly ListenerRuleWeeklyDiagnosis[]
+} {
+  const fromDate = formatMemoryDateIso(input.fromMs)
+  const toDate = formatMemoryDateIso(input.toMs)
+  const diagnoses = diagnoseListenerRuleWeekly(input.rules)
+
+  const wowParts: string[] = []
+  if (input.prevHits !== undefined) {
+    const diff = input.totalHits - input.prevHits
+    wowParts.push(`命中较上周 ${diff >= 0 ? `+${diff}` : String(diff)}（上周 ${input.prevHits}）`)
+  }
+  if (input.prevSilentRate !== undefined && input.totalHits > 0) {
+    const pp = Math.round((input.silentRate - input.prevSilentRate) * 10) / 10
+    wowParts.push(`静默率 ${pp >= 0 ? `+${pp}` : String(pp)}pp`)
+  }
+
+  const lines: string[] = [
+    `# Weekly Listener Rule Effectiveness Audit (${fromDate} ~ ${toDate})`,
+    '',
+    `- 智能体：${input.botName} (\`${input.botId}\`)`,
+    `- 统计周期：近 7 天（${fromDate} ~ ${toDate}）`,
+    `- 监听总览：共评估 **${input.rules.length}** 条规则 · 命中 **${input.totalHits}** 次 · 回复 **${input.totalReplied}** 次 · 静默 **${input.totalSilentSkipped}** 次（静默率 **${input.silentRate}%**，其中分流拦截 ${input.totalTriageSilent} / 主运行时静默 ${input.totalWorkerSilent}）· 异常 **${input.totalErrors}** 次`,
+    `- 耗时与成本：P50 **${formatDurationShort(input.p50LatencyMs)}** · P95 **${formatDurationShort(input.p95LatencyMs)}** · 消耗 Token **${formatTokensShort(input.totalTokens)}**${wowParts.length > 0 ? ` · 环比：${wowParts.join('，')}` : ''}`,
+    '',
+    '## 1. 各监听规则 7 天效果明细',
+  ]
+
+  if (input.rules.length === 0) {
+    lines.push('- 本周无已启用或触发过的主动监听规则。')
+  } else {
+    lines.push(
+      '| 规则 | 群聊 | 状态 | 命中 | 回复 | 静默(分流/运行时) | 静默率 | P50 / P95 | 回复/静默均耗 | Token |',
+      '| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
+    )
+    for (const r of input.rules.slice(0, 20)) {
+      const stateLabel = r.kind === 'delegation' ? '委派' : r.enabled ? '启用' : '停用'
+      const silentSplit = `${r.silentSkipped} (${r.triageSilent}/${r.workerSilent})`
+      const latPair = `${formatDurationShort(r.p50LatencyMs)} / ${formatDurationShort(r.p95LatencyMs)}`
+      const avgPair = `${formatDurationShort(r.repliedAvgLatencyMs)} / ${formatDurationShort(r.silentAvgLatencyMs)}`
+      lines.push(
+        `| ${r.ruleName} | ${r.chatName} (\`${r.chatId}\`) | ${stateLabel} | ${r.hits} | ${r.replied} | ${silentSplit} | ${r.silentRate}% | ${latPair} | ${avgPair} | ${formatTokensShort(r.totalTokens)} |`,
+      )
+    }
+
+    const withCfg = input.rules.filter((r) => r.config).slice(0, 15)
+    if (withCfg.length > 0) {
+      lines.push('', '### 规则当前配置快照')
+      for (const r of withCfg) {
+        const c = r.config!
+        const kwParts = [
+          c.includeKeywords.length > 0 ? `包含词=[${c.includeKeywords.slice(0, 6).join(', ')}]` : '',
+          c.excludeKeywords.length > 0 ? `排除词=[${c.excludeKeywords.slice(0, 6).join(', ')}]` : '',
+        ].filter(Boolean)
+        lines.push(
+          `- **${r.ruleName}**（${r.chatName} \`${r.chatId}\`）：scope=${c.scope} · mention=${c.mentionFilter} · debounce=${c.debounceSeconds}s · session=${c.sessionMode} · reply=${c.replyMode} · 分流=${c.routerEnabled ? '开' : '关'} · 允许静默=${c.allowSilentEmptyReply ? '是' : '否'}${kwParts.length > 0 ? ` · ${kwParts.join(' · ')}` : ''}`,
+        )
+      }
+    }
+  }
+
+  lines.push('', '## 2. 确定性异常诊断清单（零 LLM 基线）')
+  if (diagnoses.length === 0) {
+    lines.push('- 本周各监听规则命中率、静默结构、耗时与稳定性整体健康，暂无显著异常项。')
+  } else {
+    for (const d of diagnoses) {
+      const badge = d.severity === 'warn' ? '[需关注]' : '[提示]'
+      lines.push(
+        `- ${badge} **${d.ruleName}**（${d.chatName} \`${d.chatId}\`）：${d.headline}。建议：${d.suggestion}`,
+      )
+    }
+  }
+
+  lines.push('')
+  return { markdown: lines.join('\n'), diagnoses }
+}
+
 function normalizeActiveDirs(workingDir: string, activeWorkingDirs?: readonly string[]): string[] {
   const dirs = Array.from(
     new Set(
@@ -427,60 +702,112 @@ export interface DreamDeepConsolidationPromptInput {
   readonly activeWorkingDirs?: readonly string[]
   readonly currentDateIso: string
   readonly memoryMarkdownPath?: string
-  readonly memoryAuditPath: string
+  readonly memoryAuditPath?: string
   readonly stage1NotesPath?: string
   readonly activeMemoryCount: number
+  readonly listenerRuleReportPath?: string
+  readonly listenerRulesEvaluated?: number
+  readonly listenerRuleDiagnosesCount?: number
   readonly config: BotDreamingConfig
 }
 
 /**
- * Stage 2 (Deep Sleep / Memory Rethink):
+ * Stage 2 (Deep Sleep / Memory Rethink & Weekly Rule Reflection):
  * Full-library codebase verification, cold-memory curation, duplicate/fragment merging,
- * and cross-session procedural SOP synthesis.
+ * cross-session procedural SOP synthesis, and (on weekly cadence) listener-rule effectiveness reflection.
  */
 export function composeDreamDeepConsolidationPrompt(
   input: DreamDeepConsolidationPromptInput,
 ): string {
   const inspectDirLine = buildInspectDirLine(input.workingDir, input.activeWorkingDirs)
-  const dreamSection = [
-    `<dream_job agent="${escapeXmlAttr(input.botName)}" bot_id="${escapeXmlAttr(input.botId)}" date="${escapeXmlAttr(input.currentDateIso)}" stage="deep_consolidate">`,
-    '执行离线 **Auto-Dream 阶段二：深度睡眠（全库代码验真、跨会话 SOP 提炼与记忆代谢）**：',
+  const hasMemoryAudit = Boolean(input.memoryAuditPath && input.activeMemoryCount > 0)
+  const hasRuleReflection = Boolean(input.listenerRuleReportPath)
+
+  const headerDesc =
+    hasMemoryAudit && hasRuleReflection
+      ? '执行离线 **Auto-Dream 阶段二：深度睡眠（全库代码验真、跨会话 SOP 提炼、记忆代谢与周度监听规则效果反思）**：'
+      : hasRuleReflection
+        ? '执行离线 **Auto-Dream 阶段二：周度主动监听规则效果反思与调优建议**：'
+        : '执行离线 **Auto-Dream 阶段二：深度睡眠（全库代码验真、跨会话 SOP 提炼与记忆代谢）**：'
+
+  const sections: string[] = [
+    `<dream_job agent="${escapeXmlAttr(input.botName)}" bot_id="${escapeXmlAttr(input.botId)}" date="${escapeXmlAttr(input.currentDateIso)}" stage="deep_consolidate"${hasRuleReflection ? ' weekly_rule_reflection="true"' : ''}>`,
+    headerDesc,
     '',
-    '### 1. 读取体检报告与现有记忆',
-    ...(input.memoryMarkdownPath
+    '### 1. 读取体检报告与运行快照',
+    ...(input.memoryMarkdownPath && hasMemoryAudit
       ? [`- 读取当前 Memory 镜像：\`${input.memoryMarkdownPath}\`（有效 ${input.activeMemoryCount} 条）。`]
       : []),
-    `- 读取记忆健康体检报告：\`${input.memoryAuditPath}\`（已标出久未核验条目、长期零召回冷记忆与标签高重叠簇）。`,
+    ...(input.memoryAuditPath && hasMemoryAudit
+      ? [
+          `- 读取记忆健康体检报告：\`${input.memoryAuditPath}\`（已标出久未核验条目、长期零召回冷记忆与标签高重叠簇）。`,
+        ]
+      : []),
+    ...(input.listenerRuleReportPath
+      ? [
+          `- 读取周度监听规则效果报告：\`${input.listenerRuleReportPath}\`（覆盖近 7 天 ${input.listenerRulesEvaluated ?? 0} 条规则的命中、回复、分流/运行时静默拆分、P50/P95 耗时、Token 消耗及 ${input.listenerRuleDiagnosesCount ?? 0} 条诊断项）。`,
+        ]
+      : []),
     ...(input.stage1NotesPath
       ? [`- 结合阶段一全批次摘要记录：\`${input.stage1NotesPath}\`。`]
       : []),
-    '',
-    '### 2. 代码库真值验真（防 Memory Rot）',
-    inspectDirLine,
-    '- 对体检报告中涉及文件路径、配置项、接口行为或架构结论的存量记忆逐项核对真实代码与近期 `git log`：',
-    input.config.cleanupAndCorrect
-      ? `  - 已被最新代码推翻或过时：立即用 \`lark-bridge memory supersede <oldId> --bot ${input.botId} --reason "<代码事实依据>" ...\` 双时态替换，或对彻底失效条目用 \`lark-bridge memory forget <oldId> --bot ${input.botId} --reason "<原因>"\` 归档。`
-      : '  - 发现事实明显失效或冲突时，谨慎合并重复条目或补充纠偏说明。',
-    '- 若某条记忆已核验仍然准确，无需重复写入（避免无意义刷写）。',
-    '',
-    '### 3. 碎片合并、冷记忆治理与程序性 SOP 提炼',
-    '- **碎片合并**：检查高重叠标签簇，将同一主题的零散多条记忆整合为一条高密度、结构清晰的权威记忆，旧条目以 `supersede` 退场。',
-    '- **冷记忆治理**：审视长期 0 次召回的冷条目——若确实过时则 `forget` 归档；若仍有长期价值但标题/标签太泛导致白天检索命中不了，调用 `lark-bridge memory upsert` 重写自包含触发标题并补齐精准 `--tags`（中英文核心关键词）。',
-    '- **程序性 SOP 沉淀**：若多轮会话反复出现同类排障套路、发布检查清单或高频踩坑处置流程，提炼成结构化 SOP（`--type feedback --tags "sop,<领域>"`，写明“触发症状 → 核查步骤 → 根治原则”）。',
+  ]
+
+  let nextStep = 2
+  if (hasMemoryAudit) {
+    sections.push(
+      '',
+      `### ${nextStep}. 代码库真值验真（防 Memory Rot）`,
+      inspectDirLine,
+      '- 对体检报告中涉及文件路径、配置项、接口行为或架构结论的存量记忆逐项核对真实代码与近期 `git log`：',
+      input.config.cleanupAndCorrect
+        ? `  - 已被最新代码推翻或过时：立即用 \`lark-bridge memory supersede <oldId> --bot ${input.botId} --reason "<代码事实依据>" ...\` 双时态替换，或对彻底失效条目用 \`lark-bridge memory forget <oldId> --bot ${input.botId} --reason "<原因>"\` 归档。`
+        : '  - 发现事实明显失效或冲突时，谨慎合并重复条目或补充纠偏说明。',
+      '- 若某条记忆已核验仍然准确，无需重复写入（避免无意义刷写）。',
+      '',
+      `### ${nextStep + 1}. 碎片合并、冷记忆治理与程序性 SOP 提炼`,
+      '- **碎片合并**：检查高重叠标签簇，将同一主题的零散多条记忆整合为一条高密度、结构清晰的权威记忆，旧条目以 `supersede` 退场。',
+      '- **冷记忆治理**：审视长期 0 次召回的冷条目——若确实过时则 `forget` 归档；若仍有长期价值但标题/标签太泛导致白天检索命中不了，调用 `lark-bridge memory upsert` 重写自包含触发标题并补齐精准 `--tags`（中英文核心关键词）。',
+      '- **程序性 SOP 沉淀**：若多轮会话反复出现同类排障套路、发布检查清单或高频踩坑处置流程，提炼成结构化 SOP（`--type feedback --tags "sop,<领域>"`，写明“触发症状 → 核查步骤 → 根治原则”）。',
+    )
+    nextStep += 2
+  }
+
+  if (hasRuleReflection) {
+    sections.push(
+      '',
+      `### ${nextStep}. 周度监听规则效果反思与调优建议（仅提建议，严禁自动改群配置）`,
+      '- 逐条对照 `listener-rules-weekly.md` 的真实数据与当前规则配置（`scope` / `mentionFilter` / `debounceSeconds` / `includeKeywords` / `excludeKeywords` / 智能分流开关）：',
+      '  - **高运行时空跑静默**：若大量命中穿透进主运行时才静默（浪费 Token 与耗时），指出具体应补哪些排除词、是否应开启/收紧智能分流或缩小 `scope` / `mentionFilter`；',
+      '  - **高耗时规则**：若 P95 耗时偏长，结合规则场景判断是否应拆简 Prompt、缩短工具链、提高防抖窗口或切轻量模型；',
+      '  - **零命中 / 高异常规则**：判断是否关键词过严、群已沉寂可关闭，或存在稳定报错需加护栏；',
+      '  - **沉淀可复用调优结论**：仅对确有明显收益的规则调优建议，调用 `lark-bridge memory upsert --bot ' +
+        input.botId +
+        ' --type feedback --scope chat --scope-id <chatId> --title "监听规则周度优化建议：<规则名>" --content "<带本周量化数据的具体调优建议>" --tags "listener,rule-reflection"` 幂等更新（使用固定标题避免跨周重复堆积；全部规则健康则无需写入）；',
+      '  - **红线约束**：本阶段仅输出量化反思与调优建议，**严禁擅自修改群聊配置或关闭监听开关**。',
+    )
+  }
+
+  sections.push(
     '',
     '### 输出要求',
-    '- 用 3~5 行简体中文汇报本次深度验真、合并/归档、冷记忆优化与 SOP 沉淀结果；若全库健康无需变更，直接说明“全库核验健康，无需额外变更”。',
+    hasMemoryAudit && hasRuleReflection
+      ? '- 用 4~7 行简体中文分别汇报：（1）深度验真、冷记忆与 SOP 沉淀结果；（2）以 `规则反思：` 开头给出 1~3 条带具体规则名与数据依据的周度调优建议（若全部健康则写 `规则反思：本周监听规则整体健康，暂无需调整。`）。'
+      : hasRuleReflection
+        ? '- 用 3~5 行简体中文以 `规则反思：` 开头汇报本周各监听规则的量化效果评估与 1~3 条可落地的具体调优建议（若全部健康则写 `规则反思：本周监听规则整体健康，暂无需调整。`）。'
+        : '- 用 3~5 行简体中文汇报本次深度验真、合并/归档、冷记忆优化与 SOP 沉淀结果；若全库健康无需变更，直接说明“全库核验健康，无需额外变更”。',
     '</dream_job>',
-  ].join('\n')
+  )
 
-  const systemBlock = composeSystemReminder([dreamSection])!
-  return [
-    systemBlock,
-    '',
-    '<user_message>',
-    `执行 ${input.currentDateIso} 周期 Dreaming 阶段二：存量记忆代码验真、冷记忆治理与 SOP 反思。`,
-    '</user_message>',
-  ].join('\n')
+  const systemBlock = composeSystemReminder([sections.join('\n')])!
+  const userMsg =
+    hasMemoryAudit && hasRuleReflection
+      ? `执行 ${input.currentDateIso} 周期 Dreaming 阶段二：存量记忆代码验真、SOP 反思与周度监听规则效果评估。`
+      : hasRuleReflection
+        ? `执行 ${input.currentDateIso} 周期 Dreaming 阶段二：周度主动监听规则效果反思与调优建议。`
+        : `执行 ${input.currentDateIso} 周期 Dreaming 阶段二：存量记忆代码验真、冷记忆治理与 SOP 反思。`
+
+  return [systemBlock, '', '<user_message>', userMsg, '</user_message>'].join('\n')
 }
 
 export interface DreamProactiveAuditPromptInput {

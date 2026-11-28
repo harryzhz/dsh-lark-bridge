@@ -127,7 +127,9 @@ export {
   composeDreamDeepConsolidationPrompt,
   composeDreamExecutionPrompt,
   composeDreamProactivePrompt,
+  diagnoseListenerRuleWeekly,
   extractLarkContextMeta,
+  renderListenerRuleWeeklyReport,
   renderMemoryAuditReport,
   truncateSessionTranscriptHeadTail,
   type DreamDeepConsolidationPromptInput,
@@ -135,6 +137,11 @@ export {
   type DreamProactiveAuditPromptInput,
   type ExtractedLarkContextMeta,
   type LarkDreamProactiveStats,
+  type ListenerRuleDiagnosisKind,
+  type ListenerRuleWeeklyConfigSnapshot,
+  type ListenerRuleWeeklyDiagnosis,
+  type ListenerRuleWeeklyMetric,
+  type ListenerRuleWeeklyReportInput,
   type MemoryAuditReportInput,
 } from './dreaming.js'
 export {

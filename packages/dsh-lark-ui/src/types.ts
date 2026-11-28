@@ -75,6 +75,7 @@ export interface BotDreamingConfig {
   maxRemindersPerRun?: number
   maxDurationMinutes?: number
   deepConsolidation?: boolean
+  weeklyRuleReflection?: boolean
   model?: string
   reasoningEffort?: string
   scopes: string[]
@@ -159,6 +160,10 @@ export interface DreamProactiveStats {
   worktreesCreated: number
   deepConsolidated: boolean
   openLoopsAudited: boolean
+  ruleReflectionRan?: boolean
+  rulesEvaluated?: number
+  ruleSuggestionsCount?: number
+  ruleReflectionSummary?: string
 }
 
 export interface DreamRunState {
@@ -166,6 +171,8 @@ export interface DreamRunState {
   status: 'idle' | 'running' | 'succeeded' | 'skipped' | 'failed'
   lastDreamAtMs?: number
   lastCheckedDateKey?: string
+  lastRuleReflectionDateKey?: string
+  lastRuleReflectionAtMs?: number
   lastSessionId?: string
   lastProcessedCount?: number
   lastSummary?: string
@@ -1133,9 +1140,77 @@ export interface ObservabilityTriggerBreakdown {
   count: number
   sessions?: number
   replied: number
+  silentSkipped?: number
   errors: number
   totalTokens: number
   sharePct: number
+}
+
+export interface ObservabilityListenerRuleRow {
+  key: string
+  botId: string
+  botName: string
+  chatId: string
+  chatName: string
+  ruleName: string
+  templateKey?: string
+  kind: 'group' | 'delegation'
+  enabled: boolean
+  hits: number
+  replied: number
+  silentSkipped: number
+  triageSilent: number
+  workerSilent: number
+  errors: number
+  replyRate: number
+  silentRate: number
+  totalTokens: number
+  avgLatencyMs: number
+  p50LatencyMs: number
+  p95LatencyMs: number
+  maxLatencyMs: number
+  repliedAvgLatencyMs: number
+  silentAvgLatencyMs: number
+  latencySamples: number
+  latencyHistogram: ObservabilityLatencyBucket[]
+  lastTriggeredAtMs: number
+}
+
+export interface ObservabilityListenerReflection {
+  botId: string
+  botName: string
+  dateKey: string
+  sessionId?: string
+  evaluatedRules: number
+  suggestionsCount: number
+  summary: string
+  generatedAtMs: number
+}
+
+export interface ObservabilityListenerSummary {
+  configuredRules: number
+  activeRules: number
+  totalHits: number
+  totalReplied: number
+  totalSilentSkipped: number
+  totalTriageSilent: number
+  totalWorkerSilent: number
+  totalErrors: number
+  replyRate: number
+  silentRate: number
+  totalTokens: number
+  avgLatencyMs: number
+  p50LatencyMs: number
+  p75LatencyMs: number
+  p95LatencyMs: number
+  p99LatencyMs: number
+  maxLatencyMs: number
+  repliedAvgLatencyMs: number
+  silentAvgLatencyMs: number
+  latencySamples: number
+  latencyHistogram: ObservabilityLatencyBucket[]
+  rules: ObservabilityListenerRuleRow[]
+  latestReflection?: ObservabilityListenerReflection
 }
 
 export interface ObservabilityErrorBreakdown {
@@ -1392,6 +1467,7 @@ export interface ObservabilityPayload {
     models: ObservabilityModelBreakdown[]
     agents?: ObservabilityAgentBreakdown[]
     triggers: ObservabilityTriggerBreakdown[]
+    listeners?: ObservabilityListenerSummary
     heatmap: {
       maxCount: number
       cells: ObservabilityHeatmapCell[]

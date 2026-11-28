@@ -168,7 +168,7 @@ export class TurnReplyDelivery {
       | 'traceId'
       | 'inboundMsg'
       | 'senderName'
-    >
+    > & { readonly listenerName?: string }
     readonly intermediateSentCount: number
     readonly auditSummary: string
     readonly replyText: string
@@ -191,6 +191,7 @@ export class TurnReplyDelivery {
       ...(turn.inboundMsg?.chatType ? { chatType: turn.inboundMsg.chatType } : {}),
       ...(turn.sessionId ? { sessionId: turn.sessionId } : {}),
       trigger: turn.trigger,
+      ...(turn.listenerName ? { listenerName: turn.listenerName } : {}),
       ...interruptedSender,
       kind: 'error',
     })
@@ -421,15 +422,27 @@ export class TurnReplyDelivery {
       latestItem.msg,
       latestItem.senderName,
     )
+    const normalizedQueueWaitMs = Math.min(latencyMs, Math.max(0, Math.round(queueWaitMs)))
+    const normalizedExecMs = Math.min(latencyMs, Math.max(0, Math.round(execMs)))
     if (isSilentSkip) {
+      const silenceSource = silencedItem
+        ? 'control'
+        : effectiveDecision.silentOnly
+          ? 'delegation'
+          : 'sentinel'
       this.host.store.recordMetric({
         botId: bot.id,
         chatId: latestItem.msg.chatId,
         chatType: latestItem.msg.chatType,
         sessionId: acquired.sessionId,
         trigger: effectiveDecision.trigger,
+        ...(effectiveDecision.listenerName ? { listenerName: effectiveDecision.listenerName } : {}),
+        silenceSource,
         ...replySender,
         kind: 'silent_skip',
+        latencyMs,
+        queueWaitMs: normalizedQueueWaitMs,
+        execMs: normalizedExecMs,
       })
       const silentSummary = silencedItem
         ? silencedItem.activeTurn.silenceReason
@@ -500,14 +513,13 @@ export class TurnReplyDelivery {
         })
       }
       this.host.store.markBindingReplied(deliveredRouteKey)
-      const normalizedQueueWaitMs = Math.min(latencyMs, Math.max(0, Math.round(queueWaitMs)))
-      const normalizedExecMs = Math.min(latencyMs, Math.max(0, Math.round(execMs)))
       this.host.store.recordMetric({
         botId: bot.id,
         chatId: latestItem.msg.chatId,
         chatType: latestItem.msg.chatType,
         sessionId: acquired.sessionId,
         trigger: effectiveDecision.trigger,
+        ...(effectiveDecision.listenerName ? { listenerName: effectiveDecision.listenerName } : {}),
         ...replySender,
         ...chatName,
         kind: 'replied',
@@ -786,8 +798,10 @@ export class TurnReplyDelivery {
         chatType: targetMsg.chatType,
         ...(trackedSessionId ? { sessionId: trackedSessionId } : {}),
         trigger: targetDecision.trigger,
+        ...(targetDecision.listenerName ? { listenerName: targetDecision.listenerName } : {}),
         ...failSender,
         kind: 'error',
+        latencyMs: Math.max(0, Date.now() - targetTurn.startedAtMs),
       })
       this.host.store.recordEvent({
         botId: bot.id,

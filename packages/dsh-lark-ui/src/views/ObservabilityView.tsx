@@ -55,6 +55,7 @@ import {
   resolveTriggerLabel,
 } from './observability-model.js'
 import { OverviewView } from './OverviewView.js'
+import { ListenerRulesPanel } from './ListenerRulesPanel.js'
 
 export type CockpitPane = 'overview' | 'insights' | 'monitor'
 type ConsumptionTab = 'models' | 'agents'
@@ -68,10 +69,14 @@ function InsightsPane({
   payload,
   runtimes,
   models,
+  showBotName,
+  onOpenSession,
 }: {
   readonly payload: ObservabilityPayload
   readonly runtimes: readonly RuntimeOption[]
   readonly models: readonly ModelGroup[]
+  readonly showBotName: boolean
+  readonly onOpenSession?: ((sessionId: string) => void) | undefined
 }) {
   const [chartMode, setChartMode] = useState<ProductChartMode>('tokens')
   const [consumptionTab, setConsumptionTab] = useState<ConsumptionTab>('models')
@@ -884,6 +889,12 @@ function InsightsPane({
         </section>
       </div>
 
+      <ListenerRulesPanel
+        listeners={product.listeners}
+        showBotName={showBotName}
+        onOpenSession={onOpenSession}
+      />
+
       <section className="fb-card fb-obs-panel">
         <div className="fb-obs-panel-head">
           <div className="fb-obs-panel-title-wrap">
@@ -1330,6 +1341,7 @@ export function ObservabilityView({
   models,
   pluginUpdates,
   onOpenPluginUpdates,
+  onOpenSession,
   onRefreshOverview,
   onToast,
 }: {
@@ -1339,6 +1351,7 @@ export function ObservabilityView({
   readonly models: readonly ModelGroup[]
   readonly pluginUpdates?: PluginUpdatesOverview | null
   readonly onOpenPluginUpdates?: () => void
+  readonly onOpenSession?: ((sessionId: string) => void) | undefined
   readonly onRefreshOverview?: () => Promise<void>
   readonly onToast: (text: string, ok?: boolean) => void
 }) {
@@ -1588,6 +1601,8 @@ export function ObservabilityView({
           payload={payload}
           runtimes={runtimes}
           models={models}
+          showBotName={bots.length > 1 && !effectiveBotId}
+          onOpenSession={onOpenSession}
         />
       )}
 
