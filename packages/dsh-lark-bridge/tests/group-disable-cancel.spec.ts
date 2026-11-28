@@ -326,6 +326,8 @@ describe('Group/bot disable immediate turn cancellation & recovery silence guard
       method: 'PUT',
       path: '/api/lark-bridge/groups/bot-a/oc_target',
       body: { enabled: false },
+      isCliAuthenticated: false,
+      principalKind: 'owner',
     })
     expect(res.status).toBe(200)
 
@@ -570,6 +572,8 @@ describe('Group/bot disable immediate turn cancellation & recovery silence guard
       method: 'POST',
       path: '/api/lark-bridge/bots/bot-a/toggle',
       body: {},
+      isCliAuthenticated: false,
+      principalKind: 'owner',
     })
     expect(res.status).toBe(200)
     await turnPromise
