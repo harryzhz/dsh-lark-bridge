@@ -291,7 +291,7 @@ describe('Listener rules observability & Auto-Dream weekly rule reflection', () 
       },
     })
 
-    const day1 = new Date('2026-11-28T03:05:00+08:00')
+    const day1 = new Date(2026, 10, 28, 3, 5, 0)
     for (let i = 0; i < 6; i += 1) {
       store.recordMetric({
         botId: 'bot-reflect',
