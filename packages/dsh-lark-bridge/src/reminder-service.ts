@@ -291,7 +291,13 @@ export class ProactiveReminderService {
     }
   }
 
-  async stop(): Promise<void> {
+  /**
+   * Synchronously marks the service as shutting down and clears pending timers
+   * before `shutdownController.abort()` cancels in-flight reminder turns, so
+   * interrupted turns remain `running` for `recoverStaleRunningReminders()`
+   * instead of racing into `archived/error`.
+   */
+  prepareShutdown(): void {
     this.disposed = true
     this.clearStaggerTimers()
     if (this.sweepTimer) {
@@ -302,6 +308,10 @@ export class ProactiveReminderService {
       clearTimeout(this.nextDueTimer)
       this.nextDueTimer = null
     }
+  }
+
+  async stop(): Promise<void> {
+    this.prepareShutdown()
     const handles = [...this.sessionHandles.values()]
     this.sessionHandles.clear()
     await Promise.all(handles.map((h) => h.dispose().catch(() => {})))
@@ -768,6 +778,9 @@ export class ProactiveReminderService {
   async triggerNow(id: string, nowMs = Date.now()): Promise<LarkReminderItem> {
     const item = this.host.store.getReminder(id)
     if (!item) throw new Error('未找到该提醒事项')
+    if (item.status === 'pending_confirm') {
+      throw new Error('该提醒事项尚未确认，请先确认后再执行')
+    }
     if (this.runningIds.has(id)) throw new Error('该提醒事项正在执行中')
     const { runningItem } = await this.startReminderExecution(item, nowMs)
     return runningItem
@@ -776,6 +789,9 @@ export class ProactiveReminderService {
   async runNow(id: string, nowMs = Date.now()): Promise<LarkReminderItem> {
     const item = this.host.store.getReminder(id)
     if (!item) throw new Error('未找到该提醒事项')
+    if (item.status === 'pending_confirm') {
+      throw new Error('该提醒事项尚未确认，请先确认后再执行')
+    }
     if (this.runningIds.has(id)) throw new Error('该提醒事项正在执行中')
     const { completion } = await this.startReminderExecution(item, nowMs)
     return completion
@@ -972,7 +988,7 @@ export class ProactiveReminderService {
       }
       // During graceful service shutdown, leave the reminder in `running` so the restarted
       // process can recover and retry it automatically via `recoverStaleRunningReminders()`.
-      if (this.disposed) {
+      if (this.disposed || this.host.shutdownSignal?.aborted) {
         return {
           runningItem: this.host.store.getReminder(item.id) ?? item,
           completion: Promise.resolve(this.host.store.getReminder(item.id) ?? item),
@@ -1110,7 +1126,7 @@ export class ProactiveReminderService {
     } catch (err) {
       // During graceful service shutdown, leave the reminder in `running` so the restarted
       // process can recover and retry it automatically via `recoverStaleRunningReminders()`.
-      if (this.disposed) {
+      if (this.disposed || this.host.shutdownSignal?.aborted) {
         return this.host.store.getReminder(item.id) ?? item
       }
       const msg = err instanceof Error ? err.message : String(err)

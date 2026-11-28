@@ -1436,4 +1436,127 @@ describe('LarkBridgeStore, RuntimeCatalog, CLI Auth & HTTP API', () => {
       await manager.stop()
     }
   })
+
+  it('rejects CLI bearer token on owner-only admin control-plane mutations while keeping CLI routes intact', async () => {
+    const dir = makeTempDir()
+    const validDir = makeTempDir()
+    const store = new LarkBridgeStore(dir)
+    const cliAuth = ensureCliAuthEndpoint(dir, 'http://192.168.1.10:3880')
+    store.upsertBot({
+      id: 'ops-bot',
+      name: 'OpsBot',
+      enabled: true,
+      larkAppId: 'cli_ops_1',
+      larkAppSecret: 'sec_test',
+      defaultWorkingDir: validDir,
+    })
+    store.upsertGroup({
+      botId: 'ops-bot',
+      chatId: 'oc_team_ops',
+      chatName: '研发群',
+      enabled: true,
+    })
+
+    const syncBot = vi.fn().mockResolvedValue(undefined)
+    const syncBotProfile = vi.fn().mockResolvedValue({ openId: 'ou_bot', name: 'OpsBot' })
+    const syncJoinedChats = vi.fn().mockResolvedValue([])
+    const syncGroupWorkspace = vi.fn().mockResolvedValue(undefined)
+    const sweepIdleBindings = vi.fn().mockResolvedValue(0)
+    const unbindRoute = vi.fn().mockResolvedValue(true)
+    const runScheduleNow = vi.fn().mockResolvedValue({ ok: true })
+    const fakeCtx = {
+      logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn() },
+      get: () => undefined,
+      llm: { listProviders: () => [], listModels: async () => [] },
+      agents: { get: () => undefined },
+    } as unknown as Context
+
+    const manager = {
+      store,
+      cliAuth,
+      syncBot,
+      syncBotProfile,
+      syncJoinedChats,
+      syncGroupWorkspace,
+      sweepIdleBindings,
+      unbindRoute,
+      schedules: {
+        listViews: async () => ({ schedules: [], bindings: [] }),
+        refreshScheduleContextCache: vi.fn().mockResolvedValue(undefined),
+        runNow: runScheduleNow,
+      },
+    } as unknown as LarkBridgeManager
+
+    const fakeConnection: ConnectionAdmitter = {
+      admit: () => ({ peer: { principal: { kind: 'owner' } } }),
+    }
+    const handler = createLarkHttpHandler(fakeCtx, fakeConnection, manager)
+    const cliHeaders = { authorization: `Bearer ${cliAuth.token}` }
+
+    const ownerOnlyMutations: Array<{ method: string; url: string; body?: unknown }> = [
+      { method: 'POST', url: '/api/lark-bridge/listener-templates' },
+      { method: 'POST', url: '/api/lark-bridge/bots/ops-bot/toggle' },
+      { method: 'POST', url: '/api/lark-bridge/bots/ops-bot/reconnect' },
+      { method: 'POST', url: '/api/lark-bridge/bots/ops-bot/sync-profile' },
+      { method: 'POST', url: '/api/lark-bridge/bots/ops-bot/sync-chats' },
+      { method: 'POST', url: '/api/lark-bridge/sync-chats' },
+      {
+        method: 'PUT',
+        url: '/api/lark-bridge/groups/ops-bot/oc_team_ops',
+        body: { enabled: false },
+      },
+      { method: 'DELETE', url: '/api/lark-bridge/groups/ops-bot/oc_team_ops' },
+      { method: 'DELETE', url: '/api/lark-bridge/dream-sessions/session-dream-1' },
+      { method: 'POST', url: '/api/lark-bridge/sessions/sweep' },
+      { method: 'DELETE', url: '/api/lark-bridge/bindings/ops-bot:oc_team_ops:om_1' },
+      { method: 'DELETE', url: '/api/lark-bridge/schedules/sched-1' },
+    ]
+
+    for (const req of ownerOnlyMutations) {
+      const res = await invokeHandler(handler, { ...req, headers: cliHeaders })
+      expect(res.status, `${req.method} ${req.url}`).toBe(403)
+      expect(res.json.error, `${req.method} ${req.url}`).toBe('owner_web_session_required')
+    }
+
+    // State and side effects remain completely untouched
+    expect(store.getBot('ops-bot')?.enabled).toBe(true)
+    expect(store.getGroup('ops-bot', 'oc_team_ops')?.enabled).toBe(true)
+    expect(syncBot).not.toHaveBeenCalled()
+    expect(syncBotProfile).not.toHaveBeenCalled()
+    expect(syncJoinedChats).not.toHaveBeenCalled()
+    expect(sweepIdleBindings).not.toHaveBeenCalled()
+    expect(unbindRoute).not.toHaveBeenCalled()
+
+    // Legitimate CLI schedule bind & run + group listing continue to work
+    const cliGroups = await invokeHandler(handler, {
+      method: 'GET',
+      url: '/api/lark-bridge/groups',
+      headers: cliHeaders,
+    })
+    expect(cliGroups.status).toBe(200)
+
+    const cliBind = await invokeHandler(handler, {
+      method: 'PUT',
+      url: '/api/lark-bridge/schedules/sched-1',
+      headers: cliHeaders,
+      body: { enabled: true, targets: [{ botId: 'ops-bot', chatId: 'oc_team_ops' }] },
+    })
+    expect(cliBind.status).toBe(200)
+
+    const cliRun = await invokeHandler(handler, {
+      method: 'POST',
+      url: '/api/lark-bridge/schedules/sched-1/run',
+      headers: cliHeaders,
+    })
+    expect(cliRun.status).toBe(200)
+    expect(runScheduleNow).toHaveBeenCalledWith('sched-1')
+
+    // Owner web session can still execute admin mutations
+    const ownerToggle = await invokeHandler(handler, {
+      method: 'POST',
+      url: '/api/lark-bridge/bots/ops-bot/toggle',
+    })
+    expect(ownerToggle.status).toBe(200)
+    expect(store.getBot('ops-bot')?.enabled).toBe(false)
+  })
 })

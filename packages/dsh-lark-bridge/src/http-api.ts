@@ -140,17 +140,18 @@ export async function dispatchLarkApiRequest(
 ): Promise<LarkApiResponse> {
   const startedAt = performance.now()
   const method = request.method.toUpperCase()
-  const rawPath = request.path.startsWith('/') ? request.path : `/${request.path}`
-  const url = new URL(rawPath, 'http://127.0.0.1')
-  const pathname = url.pathname.replace(/^\/api\/lark-bridge\/?/, '').replace(/^\/+/, '')
-  const segments = pathname ? pathname.split('/').map(decodeURIComponent) : []
-  const routeLabel = normalizeApiRouteLabel(method, segments)
+  let routeLabel = `${method} /invalid`
   const { isCliAuthenticated, isOperatorAuthenticated, principalKind } = request
   const isOwnerWebSession =
     principalKind === 'owner' && !isCliAuthenticated && !isOperatorAuthenticated
   const isPureOperatorSession = Boolean(isOperatorAuthenticated) && !isCliAuthenticated
 
   try {
+    const rawPath = request.path.startsWith('/') ? request.path : `/${request.path}`
+    const url = new URL(rawPath, 'http://127.0.0.1')
+    const pathname = url.pathname.replace(/^\/api\/lark-bridge\/?/, '').replace(/^\/+/, '')
+    const segments = pathname ? pathname.split('/').map(decodeURIComponent) : []
+    routeLabel = normalizeApiRouteLabel(method, segments)
     if (method === 'GET' && (pathname === '' || pathname === 'health')) {
       const lifecycle = manager.getLifecycleStatus?.()
       return ok({
@@ -611,6 +612,9 @@ export async function dispatchLarkApiRequest(
         return ok({ ok: true, templates: manager.store.listListenerTemplates() })
       }
       if (method === 'POST') {
+        if (!isOwnerWebSession) {
+          return ok({ ok: false, error: 'owner_web_session_required' }, 403)
+        }
         return ok({ ok: true, templates: manager.store.resetListenerTemplates() })
       }
     }
@@ -931,6 +935,9 @@ export async function dispatchLarkApiRequest(
         return ok({ ok: existed }, existed ? 200 : 404)
       }
       if (method === 'POST' && segments[2] === 'toggle') {
+        if (!isOwnerWebSession) {
+          return ok({ ok: false, error: 'owner_web_session_required' }, 403)
+        }
         const bot = manager.store.getBot(botId)
         if (!bot) {
           return ok({ ok: false, error: 'bot_not_found' }, 404)
@@ -944,6 +951,9 @@ export async function dispatchLarkApiRequest(
         return ok({ ok: true, bot: toPublicBotView(updated) })
       }
       if (method === 'POST' && segments[2] === 'reconnect') {
+        if (!isOwnerWebSession) {
+          return ok({ ok: false, error: 'owner_web_session_required' }, 403)
+        }
         const bot = manager.store.getBot(botId)
         if (!bot) {
           return ok({ ok: false, error: 'bot_not_found' }, 404)
@@ -955,6 +965,9 @@ export async function dispatchLarkApiRequest(
         return ok({ ok: true })
       }
       if (method === 'POST' && segments[2] === 'sync-profile') {
+        if (!isOwnerWebSession) {
+          return ok({ ok: false, error: 'owner_web_session_required' }, 403)
+        }
         const profile = await manager.syncBotProfile(botId)
         if (!profile) {
           return ok({ ok: false, error: 'bot_not_found' }, 404)
@@ -962,6 +975,9 @@ export async function dispatchLarkApiRequest(
         return ok({ ok: true, profile })
       }
       if (method === 'POST' && segments[2] === 'sync-chats') {
+        if (!isOwnerWebSession) {
+          return ok({ ok: false, error: 'owner_web_session_required' }, 403)
+        }
         const chats = await manager.syncJoinedChats(botId)
         return ok({ ok: true, count: chats.length })
       }
@@ -997,6 +1013,9 @@ export async function dispatchLarkApiRequest(
     }
 
     if (method === 'POST' && pathname === 'sync-chats') {
+      if (!isOwnerWebSession) {
+        return ok({ ok: false, error: 'owner_web_session_required' }, 403)
+      }
       const chats = await manager.syncJoinedChats()
       const groups = manager.store.listGroupViews()
       return ok({ ok: true, syncedCount: chats.length, groups })
@@ -1023,6 +1042,9 @@ export async function dispatchLarkApiRequest(
         return ok({ ok: true, members })
       }
       if (method === 'PUT' && segments.length === 3) {
+        if (!isOwnerWebSession) {
+          return ok({ ok: false, error: 'owner_web_session_required' }, 403)
+        }
         const body = bodyRecord(request.body)
         const existingGroup = manager.store.getGroup(botId, chatId)
         const nextWorkingDir =
@@ -1050,6 +1072,9 @@ export async function dispatchLarkApiRequest(
         })
       }
       if (method === 'DELETE' && segments.length === 3) {
+        if (!isOwnerWebSession) {
+          return ok({ ok: false, error: 'owner_web_session_required' }, 403)
+        }
         const deleted = manager.store.deleteGroup(botId, chatId)
         manager.cancelDisabledTurns?.(botId, chatId)
         manager.sessionViewer?.invalidateAccess()
@@ -1081,6 +1106,9 @@ export async function dispatchLarkApiRequest(
     }
 
     if (method === 'DELETE' && segments[0] === 'dream-sessions' && segments[1] && segments.length === 2) {
+      if (!isOwnerWebSession) {
+        return ok({ ok: false, error: 'owner_web_session_required' }, 403)
+      }
       const sessionId = segments[1]
       const target = manager.store.listDreamSessions?.().find((s) => s.sessionId === sessionId)
       if (target?.status === 'running') {
@@ -1108,11 +1136,17 @@ export async function dispatchLarkApiRequest(
     }
 
     if (method === 'POST' && pathname === 'sessions/sweep') {
+      if (!isOwnerWebSession) {
+        return ok({ ok: false, error: 'owner_web_session_required' }, 403)
+      }
       const archivedCount = await manager.sweepIdleBindings()
       return ok({ ok: true, archivedCount })
     }
 
     if (method === 'DELETE' && segments[0] === 'bindings' && segments[1]) {
+      if (!isOwnerWebSession) {
+        return ok({ ok: false, error: 'owner_web_session_required' }, 403)
+      }
       const routeKey = segments.slice(1).join('/')
       const deleted = await manager.unbindRoute(routeKey, { archive: true })
       return ok({ ok: deleted }, deleted ? 200 : 404)
@@ -1142,6 +1176,9 @@ export async function dispatchLarkApiRequest(
         return ok({ ok: true, binding: saved })
       }
       if (method === 'DELETE' && segments.length === 2) {
+        if (!isOwnerWebSession) {
+          return ok({ ok: false, error: 'owner_web_session_required' }, 403)
+        }
         const deleted = manager.store.deleteScheduleBinding(scheduleId)
         return ok({ ok: true, deleted })
       }
@@ -1166,7 +1203,7 @@ export async function dispatchLarkApiRequest(
         const rawBody = bodyRecord(request.body) as unknown as CreateReminderInput & {
           sessionId?: string
         }
-        const { sessionId: rawSessionId, ...restBody } = rawBody
+        const { sessionId: rawSessionId, creationMode: rawCreationMode, ...restBody } = rawBody
         const identity: ResolvedCliSessionIdentity =
           typeof manager.resolveCliSessionIdentity === 'function'
             ? manager.resolveCliSessionIdentity(
@@ -1206,8 +1243,12 @@ export async function dispatchLarkApiRequest(
             400,
           )
         }
+        // CLI callers must never override the bot's configured creationMode (e.g. bypassing `confirm`).
         const body: CreateReminderInput = {
           ...restBody,
+          ...(!isCliAuthenticated && rawCreationMode !== undefined
+            ? { creationMode: rawCreationMode }
+            : {}),
           ...(identity.canonicalSessionId ? { sessionId: identity.canonicalSessionId } : {}),
         }
         const item = await manager.reminders.create(body)
@@ -1583,7 +1624,13 @@ export function createLarkHttpHandler(
   manager: LarkBridgeManager,
 ): WebRoute['handler'] {
   return async (req: IncomingMessage, res: ServerResponse) => {
-    const requestPath = new URL(req.url ?? '/', 'http://127.0.0.1').pathname
+    let requestPath: string
+    try {
+      requestPath = new URL(req.url ?? '/', 'http://127.0.0.1').pathname
+    } catch {
+      sendJson(res, 400, { ok: false, error: 'invalid_request_url' })
+      return
+    }
     const advertisedOrigin = manager.getAdvertisedWebOrigin?.() ?? ''
     if (await handlePublicNavigationEndpoint(requestPath, req, res, connection, manager)) {
       return

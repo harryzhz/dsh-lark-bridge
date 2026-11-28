@@ -1144,6 +1144,95 @@ describe('ProactiveReminderService one-shot lifecycle, origin auto-routing & con
 
     await reminders.stop()
   })
+
+  it('prevents CLI from overriding confirm creationMode, blocks running pending_confirm reminders, and returns 400 on malformed URL encoding', async () => {
+    const dataDir = makeTempDir()
+    const store = new LarkBridgeStore(dataDir)
+    const cliAuth = ensureCliAuthEndpoint(dataDir, 'http://127.0.0.1:3880')
+    store.upsertBot({
+      id: 'confirm-bot',
+      name: 'ConfirmBot',
+      larkAppId: 'cli_confirm_bot',
+      larkAppSecret: 'sec_confirm_bot',
+      defaultWorkingDir: dataDir,
+      experimental: {
+        proactive: {
+          reminderCreationMode: 'confirm',
+        },
+      },
+    })
+
+    const fakeCtx = {
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      get: () => undefined,
+    } as unknown as Context
+
+    const runTurn = vi.fn(async () => 'should not execute')
+    const reminders = new ProactiveReminderService({
+      ctx: fakeCtx,
+      store,
+      runtimes: new RuntimeCatalog(fakeCtx),
+      workspaces: {
+        attachSession: vi.fn().mockResolvedValue(undefined),
+        archiveSession: vi.fn().mockResolvedValue(true),
+      } as unknown as WorkspaceGrouping,
+      runTurn,
+      sendOriginCard: vi.fn(async () => ({ messageId: 'om_confirm_card_1' })),
+      patchOriginCard: vi.fn(async () => {}),
+      deliverReminderOutput: vi.fn(async () => ({ messageId: 'om_out_1' })),
+    })
+
+    const manager = {
+      store,
+      cliAuth,
+      reminders,
+      listBotStatuses: () => [],
+    } as unknown as LarkBridgeManager
+    const admitter: ConnectionAdmitter = { admit: () => ({ peer: { principal: { kind: 'owner' } } }) }
+    const handler = createLarkHttpHandler(fakeCtx, admitter, manager)
+
+    // 1. CLI trying to pass creationMode: 'silent' on a confirm-mode bot must NOT bypass pending_confirm
+    const cliCreate = await invokeHandler(handler, {
+      method: 'POST',
+      url: '/api/lark-bridge/reminders',
+      headers: { authorization: `Bearer ${cliAuth.token}` },
+      body: {
+        botId: 'confirm-bot',
+        chatId: 'oc_confirm_chat',
+        title: '高敏操作复核',
+        prompt: '检查状态',
+        mentions: [{ openId: 'ou_owner_test', name: 'Owner' }],
+        afterSeconds: 600,
+        creationMode: 'silent',
+      },
+    })
+    expect(cliCreate.status).toBe(201)
+    const created = cliCreate.json.reminder as { id: string; status: string }
+    expect(created.status).toBe('pending_confirm')
+
+    // 2. Attempting to execute the unapproved reminder via /run (CLI or service) must be rejected
+    const cliRun = await invokeHandler(handler, {
+      method: 'POST',
+      url: `/api/lark-bridge/reminders/${encodeURIComponent(created.id)}/run`,
+      headers: { authorization: `Bearer ${cliAuth.token}` },
+      body: { async: true },
+    })
+    expect(cliRun.status).toBe(400)
+    expect(String(cliRun.json.error ?? '')).toContain('尚未确认')
+    await expect(reminders.runNow(created.id)).rejects.toThrow('尚未确认')
+    await expect(reminders.triggerNow(created.id)).rejects.toThrow('尚未确认')
+    expect(runTurn).not.toHaveBeenCalled()
+
+    // 3. Malformed percent-encoded path must return 400 cleanly instead of throwing unhandled URIError
+    const badPath = await invokeHandler(handler, {
+      method: 'GET',
+      url: '/api/lark-bridge/%E0%A4%A',
+    })
+    expect(badPath.status).toBe(400)
+    expect(badPath.json.ok).toBe(false)
+
+    await reminders.stop()
+  })
 })
 
 describe('Local directory picker HTTP API & lark-bridge worktree CLI', () => {
@@ -1381,5 +1470,122 @@ describe('Local directory picker HTTP API & lark-bridge worktree CLI', () => {
     expect(promptWithMemory).toContain('发布回滚手册位于 docs/runbook.md')
     expect(promptWithMemory).not.toContain('其他群专属机密流程')
     expect(promptWithMemory).not.toContain('温和')
+  })
+
+  it('keeps in-flight reminders running for startup recovery when shutdownSignal aborts before reminders.stop()', async () => {
+    const dataDir = makeTempDir()
+    const workDir = makeTempDir()
+    const store = new LarkBridgeStore(dataDir)
+
+    store.upsertBot({
+      id: 'ops-bot',
+      name: 'OpsBot',
+      enabled: true,
+      larkAppId: 'cli_ops_1',
+      larkAppSecret: 'sec_test',
+      defaultWorkingDir: workDir,
+    })
+    store.upsertGroup({
+      botId: 'ops-bot',
+      chatId: 'oc_ops_shutdown',
+      chatName: '值班告警群',
+      enabled: true,
+    })
+
+    const shutdownController = new AbortController()
+    let turnStarted!: () => void
+    const turnStartedPromise = new Promise<void>((resolve) => {
+      turnStarted = resolve
+    })
+
+    const fakeCtx = {
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      agents: {
+        create: vi.fn(async ({ sessionId, setup }: { sessionId: string; setup?: (c: unknown, a: unknown) => void }) => {
+          const agent = { session: { id: sessionId, header: { cwd: workDir, agentPreset: 'codex' } } }
+          setup?.({}, agent)
+          return { agent, dispose: vi.fn().mockResolvedValue(undefined) }
+        }),
+      },
+      get: () => undefined,
+    } as unknown as Context
+
+    const runtimes = {
+      resolveAgentLaunch: vi.fn(async () => ({
+        provider: 'codex-cli',
+        model: 'gpt-6.1-sol',
+        mountPreset: vi.fn(async () => {}),
+      })),
+    } as unknown as RuntimeCatalog
+
+    const workspaces = {
+      resolveBotWorkspaceName: () => 'OpsBot',
+      resolveGroupWorkspaceName: () => 'OpsBot / 值班告警群',
+      attachSession: vi.fn(async () => {}),
+    } as unknown as WorkspaceGrouping
+
+    const reminders = new ProactiveReminderService({
+      ctx: fakeCtx,
+      store,
+      runtimes,
+      workspaces,
+      shutdownSignal: shutdownController.signal,
+      resolveMemberName: async () => undefined,
+      runTurn: () =>
+        new Promise<string>((_resolve, reject) => {
+          turnStarted()
+          shutdownController.signal.addEventListener(
+            'abort',
+            () => reject(new Error('本轮执行因服务重载或停机已中断')),
+            { once: true },
+          )
+        }),
+      sendOriginCard: vi.fn(async () => ({ messageId: 'om_card' })),
+      patchOriginCard: vi.fn(async () => {}),
+      deliverReminderOutput: vi.fn(async () => ({ messageId: 'om_out' })),
+    })
+
+    const item = await reminders.create({
+      botId: 'ops-bot',
+      chatId: 'oc_ops_shutdown',
+      title: '热更新期间在途复查提醒',
+      prompt: '检查告警是否恢复',
+      mentions: [{ openId: 'ou_ops_1', name: 'Alex' }],
+      afterSeconds: 300,
+    })
+
+    // Start execution, wait until runTurn is in-flight, then abort shutdownSignal BEFORE stop()
+    const runPromise = reminders.runNow(item.id)
+    await turnStartedPromise
+    expect(store.getReminder(item.id)?.status).toBe('running')
+
+    reminders.prepareShutdown()
+    shutdownController.abort()
+    await runPromise
+    await reminders.stop()
+
+    // Reminder must remain `running` with no false error event so next instance retries it
+    expect(store.getReminder(item.id)?.status).toBe('running')
+    expect(store.getReminder(item.id)?.resolution).toBeUndefined()
+    expect(store.listEvents(20).some((e) => e.kind === 'error' && e.summary.includes('热更新期间在途复查提醒'))).toBe(false)
+
+    // Simulated restarted instance recovers the stale running reminder cleanly
+    const restarted = new ProactiveReminderService({
+      ctx: fakeCtx,
+      store,
+      runtimes,
+      workspaces,
+      resolveMemberName: async () => undefined,
+      runTurn: async () => REMINDER_SILENT_SENTINEL,
+      sendOriginCard: vi.fn(async () => ({ messageId: 'om_card' })),
+      patchOriginCard: vi.fn(async () => {}),
+      deliverReminderOutput: vi.fn(async () => ({ messageId: 'om_out' })),
+    })
+    const recovered = await restarted.recoverStaleRunningReminders()
+    expect(recovered).toBe(1)
+    expect(store.getReminder(item.id)).toMatchObject({
+      status: 'scheduled',
+      retryCount: 1,
+    })
   })
 })
