@@ -719,6 +719,537 @@ function buildSubstituteReminder(
   ].join('\n')
 }
 
+interface ResolvedRoutingDefaults {
+  readonly workingDir: string
+  readonly workspaceName: string
+  readonly chatName?: string
+  readonly agentPreset: string
+  readonly runtimeProfileId?: string
+  readonly model?: string
+  readonly reasoningEffort?: string
+  readonly useCard: boolean
+  readonly cotEnabled: boolean
+  readonly cotToolResultEnabled: boolean
+  readonly sendIntermediateMessages: boolean
+  readonly receivedReactionEmoji?: string
+  readonly idleCloseMs?: number
+  readonly roleReminder?: string
+}
+
+interface ResolvedGroupRoutingContext {
+  readonly group?: LarkGroupConfig
+  readonly groupReplyMode: GroupReplyMode
+  readonly effectiveGroupReplyMode: GroupReplyMode
+  readonly groupSessionMode: GroupSessionMode
+  readonly mentionTriggerMode: MentionTriggerMode
+  readonly threadRouteKey: string
+  readonly chatRouteKey: string
+}
+
+interface ActiveThreadEvaluation {
+  readonly hasWorkerSession: boolean
+  readonly hasEphemeralThread: boolean
+  readonly existingThreadTrigger?: string
+  readonly allowThreadFollowup: boolean
+  readonly isActiveThreadContext: boolean
+  readonly allowSenderInActiveThread: boolean
+  readonly isBarePeerMentionOnly: boolean
+  readonly matchesSubstituteTarget: boolean
+  readonly hasDelegationCandidate: boolean
+}
+
+type AgentDecisionOverrides = Omit<
+  Extract<RoutingDecision, { action: 'agent' }>,
+  | 'action'
+  | 'workingDir'
+  | 'workspaceName'
+  | 'agentPreset'
+  | 'runtimeProfileId'
+  | 'model'
+  | 'reasoningEffort'
+  | 'useCard'
+  | 'cotEnabled'
+  | 'cotToolResultEnabled'
+  | 'sendIntermediateMessages'
+  | 'receivedReactionEmoji'
+  | 'idleCloseMs'
+  | 'roleReminder'
+  | 'promptText'
+> & {
+  readonly useCard?: boolean
+  readonly cotEnabled?: boolean
+  readonly cotToolResultEnabled?: boolean
+  readonly sendIntermediateMessages?: boolean
+  readonly receivedReactionEmoji?: string | undefined
+  readonly omitReceivedReactionEmoji?: boolean
+  readonly includeChatName?: boolean
+}
+
+function resolveRoutingDefaults(
+  bot: LarkBotConfig,
+  msg: InboundLarkMessage,
+  group: LarkGroupConfig | undefined,
+  runtime: RoutingRuntimeContext,
+): ResolvedRoutingDefaults {
+  const workingDir = resolveEffectiveWorkingDir(bot, group)
+  const chatName = group?.chatName || runtime.chatName
+  const workspaceName =
+    msg.chatType === 'group'
+      ? resolveEffectiveWorkspaceName(bot, group)
+      : resolveEffectiveWorkspaceName(bot)
+  const { agentPreset, runtimeProfileId, model, reasoningEffort } = resolveEffectiveAgentRuntime(
+    bot,
+    group,
+  )
+  const useCard = resolveUseCard(bot, group)
+  const effectiveCot = resolveEffectiveCotConfig(bot, group)
+  const sendIntermediateMessages = resolveSendIntermediateMessages(bot, group)
+  const receivedReactionEmoji = resolveEffectiveReactionEmoji(bot, group)
+  const idleCloseMs = resolveIdleCloseMs(bot, group)
+  const roleReminder = composeRoleReminder(bot, group)
+  return {
+    workingDir,
+    workspaceName,
+    ...(chatName ? { chatName } : {}),
+    agentPreset,
+    ...(runtimeProfileId ? { runtimeProfileId } : {}),
+    ...(model ? { model } : {}),
+    ...(reasoningEffort ? { reasoningEffort } : {}),
+    useCard,
+    cotEnabled: effectiveCot.enabled,
+    cotToolResultEnabled: effectiveCot.toolResultEnabled,
+    sendIntermediateMessages,
+    ...(receivedReactionEmoji ? { receivedReactionEmoji } : {}),
+    ...(idleCloseMs ? { idleCloseMs } : {}),
+    ...(roleReminder ? { roleReminder } : {}),
+  }
+}
+
+function buildAgentDecision(
+  defaults: ResolvedRoutingDefaults,
+  overrides: AgentDecisionOverrides,
+): Extract<RoutingDecision, { action: 'agent' }> {
+  const {
+    useCard,
+    cotEnabled,
+    cotToolResultEnabled,
+    sendIntermediateMessages,
+    receivedReactionEmoji,
+    omitReceivedReactionEmoji,
+    includeChatName = true,
+    ...rest
+  } = overrides
+  const effectiveReaction = omitReceivedReactionEmoji
+    ? undefined
+    : receivedReactionEmoji !== undefined
+      ? receivedReactionEmoji
+      : defaults.receivedReactionEmoji
+
+  return {
+    action: 'agent',
+    workingDir: defaults.workingDir,
+    workspaceName: defaults.workspaceName,
+    ...(includeChatName && defaults.chatName ? { chatName: defaults.chatName } : {}),
+    agentPreset: defaults.agentPreset,
+    ...(defaults.runtimeProfileId ? { runtimeProfileId: defaults.runtimeProfileId } : {}),
+    ...(defaults.model ? { model: defaults.model } : {}),
+    ...(defaults.reasoningEffort ? { reasoningEffort: defaults.reasoningEffort } : {}),
+    useCard: useCard ?? defaults.useCard,
+    cotEnabled: cotEnabled ?? defaults.cotEnabled,
+    cotToolResultEnabled: cotToolResultEnabled ?? defaults.cotToolResultEnabled,
+    sendIntermediateMessages: sendIntermediateMessages ?? defaults.sendIntermediateMessages,
+    ...(effectiveReaction ? { receivedReactionEmoji: effectiveReaction } : {}),
+    ...(defaults.idleCloseMs ? { idleCloseMs: defaults.idleCloseMs } : {}),
+    ...(defaults.roleReminder ? { roleReminder: defaults.roleReminder } : {}),
+    ...rest,
+    promptText: composeTurnPrompt(rest.turnReminders, rest.userText),
+  }
+}
+
+function routeP2pMessage(
+  bot: LarkBotConfig,
+  msg: InboundLarkMessage,
+  defaults: ResolvedRoutingDefaults,
+): RoutingDecision {
+  if (!isUserAllowedForP2p(bot, msg.senderOpenId)) {
+    return { action: 'ignore', reason: 'p2p_not_allowed' }
+  }
+  const clean = stripBotMentions(msg.text, msg.mentions, msg.botOpenId)
+  const p2pScope = bot.p2pSessionMode === 'per_message' ? `msg:${msg.messageId}` : 'p2p'
+  const routeKey = buildRouteKey(bot.larkAppId, msg.chatId, p2pScope)
+  const cmd = parseSlashCommand(clean)
+  if (cmd) {
+    return {
+      action: 'command',
+      command: cmd,
+      routeKey: buildRouteKey(bot.larkAppId, msg.chatId, 'p2p'),
+      workingDir: defaults.workingDir,
+      workspaceName: defaults.workspaceName,
+      replyMode: 'chat',
+    }
+  }
+  const p2pReaction = resolveEffectiveReactionEmoji(bot)
+  const userText = clean || (msg.imageKeys.length > 0 ? '[图片消息]' : '')
+  return buildAgentDecision(defaults, {
+    trigger: 'p2p',
+    routeKey,
+    sessionMode: bot.p2pSessionMode,
+    replyMode: 'chat',
+    useCard: bot.useInteractiveCard,
+    cotEnabled: Boolean(bot.cotEnabled),
+    cotToolResultEnabled: bot.cotToolResultEnabled !== false,
+    sendIntermediateMessages: bot.sendIntermediateMessages,
+    ...(p2pReaction ? { receivedReactionEmoji: p2pReaction } : { omitReceivedReactionEmoji: true }),
+    includeChatName: false,
+    allowSilentEmptyReply: false,
+    autoCloseAfterCompletion: bot.p2pSessionMode === 'per_message',
+    turnReminders: [],
+    userText,
+  })
+}
+
+function resolveGroupRoutingContext(
+  bot: LarkBotConfig,
+  msg: InboundLarkMessage,
+  group: LarkGroupConfig | undefined,
+  runtime: RoutingRuntimeContext,
+): ResolvedGroupRoutingContext {
+  const groupReplyMode = resolveGroupReplyMode(bot, group)
+  return {
+    ...(group ? { group } : {}),
+    groupReplyMode,
+    effectiveGroupReplyMode: resolveReplyModeInContext(groupReplyMode, msg),
+    groupSessionMode: resolveGroupSessionMode(bot, group),
+    mentionTriggerMode: resolveMentionTriggerMode(bot, group),
+    threadRouteKey: resolveActiveThreadLookupKey(bot, msg, runtime),
+    chatRouteKey: buildRouteKey(bot.larkAppId, msg.chatId, 'chat'),
+  }
+}
+
+function routeDirectMention(
+  bot: LarkBotConfig,
+  msg: InboundLarkMessage,
+  defaults: ResolvedRoutingDefaults,
+  groupCtx: ResolvedGroupRoutingContext,
+  runtime: RoutingRuntimeContext,
+): RoutingDecision | undefined {
+  const mentionedBot = Boolean(msg.botOpenId && mentionsOpenId(msg, msg.botOpenId))
+  if (!mentionedBot) return undefined
+
+  const clean = stripBotMentions(msg.text, msg.mentions, msg.botOpenId)
+  const resolvedRoute = resolveSessionRoute(
+    bot,
+    msg,
+    groupCtx.groupSessionMode,
+    groupCtx.effectiveGroupReplyMode,
+    runtime,
+  )
+  const cmd = parseSlashCommand(clean)
+  if (cmd) {
+    const cmdRouteKey =
+      groupCtx.groupSessionMode === 'chat' ? groupCtx.chatRouteKey : groupCtx.threadRouteKey
+    return {
+      action: 'command',
+      command: cmd,
+      routeKey: cmdRouteKey,
+      workingDir: defaults.workingDir,
+      workspaceName: defaults.workspaceName,
+      replyMode: groupCtx.effectiveGroupReplyMode,
+    }
+  }
+  const userText = clean || (msg.imageKeys.length > 0 ? '[图片消息]' : '')
+  return buildAgentDecision(defaults, {
+    trigger: 'mention',
+    routeKey: resolvedRoute.routeKey,
+    ...(resolvedRoute.ephemeralHandoffRouteKey
+      ? { ephemeralHandoffRouteKey: resolvedRoute.ephemeralHandoffRouteKey }
+      : {}),
+    sessionMode: groupCtx.groupSessionMode,
+    replyMode: groupCtx.effectiveGroupReplyMode,
+    allowSilentEmptyReply: false,
+    autoCloseAfterCompletion: groupCtx.groupSessionMode === 'per_message',
+    turnReminders: [],
+    userText,
+  })
+}
+
+function evaluateActiveThreadState(
+  bot: LarkBotConfig,
+  msg: InboundLarkMessage,
+  groupCtx: ResolvedGroupRoutingContext,
+  runtime: RoutingRuntimeContext,
+): ActiveThreadEvaluation {
+  const mainStreamRootAlreadyPromoted = Boolean(
+    !msg.threadId &&
+      msg.rootId &&
+      runtime.isRouteBoundToNativeThread?.(buildRouteKey(bot.larkAppId, msg.chatId, msg.rootId)),
+  )
+  const hasWorkerSession =
+    !mainStreamRootAlreadyPromoted && runtime.hasActiveSessionForRoute(groupCtx.threadRouteKey)
+  const hasEphemeralThread =
+    !mainStreamRootAlreadyPromoted &&
+    !hasWorkerSession &&
+    Boolean(runtime.hasEphemeralRouterThread?.(groupCtx.threadRouteKey))
+  const existingThreadTrigger = runtime.getRouteTrigger?.(groupCtx.threadRouteKey)
+  const hasThreadReplied = runtime.hasRouteReplied?.(groupCtx.threadRouteKey) ?? true
+  const allowThreadFollowup =
+    existingThreadTrigger === 'substitute'
+      ? bot.substituteMode.activeThreadFollowup
+      : existingThreadTrigger === 'listener'
+        ? hasThreadReplied && groupCtx.mentionTriggerMode === 'mention_and_active_thread'
+        : groupCtx.mentionTriggerMode === 'mention_and_active_thread'
+  const isActiveThreadContext = Boolean(
+    (msg.rootId || msg.threadId) &&
+      !mainStreamRootAlreadyPromoted &&
+      (hasWorkerSession || hasEphemeralThread),
+  )
+  const allowSenderInActiveThread =
+    msg.senderType !== 'bot' ||
+    (existingThreadTrigger === 'listener' &&
+      Boolean(groupCtx.group?.listener?.enabled) &&
+      isListenerSenderEnabled(groupCtx.group!.listener, msg.senderOpenId, 'bot'))
+  const isBarePeerMentionOnly =
+    msg.mentions.length > 0 &&
+    msg.imageKeys.length === 0 &&
+    stripBotMentions(msg.text, msg.mentions).length === 0
+  const matchesSubstituteTarget =
+    bot.substituteMode.enabled &&
+    bot.substituteMode.targets.length > 0 &&
+    (msg.msgType === 'text' || msg.msgType === 'post') &&
+    bot.substituteMode.targets.some(
+      (t) => mentionsOpenId(msg, t.openId) && msg.senderOpenId !== t.openId,
+    )
+  const delegationEnabled = Boolean(
+    bot.experimental.proactive.remindersEnabled &&
+      bot.experimental.proactive.delegationFollowupEnabled,
+  )
+  const peerMentions = extractPeerUserMentions(msg)
+  const hasDelegationCandidate =
+    delegationEnabled &&
+    msg.senderType === 'user' &&
+    (msg.msgType === 'text' || msg.msgType === 'post') &&
+    peerMentions.length > 0 &&
+    stripBotMentions(msg.text, msg.mentions).length > 0
+
+  return {
+    hasWorkerSession,
+    hasEphemeralThread,
+    ...(existingThreadTrigger ? { existingThreadTrigger } : {}),
+    allowThreadFollowup,
+    isActiveThreadContext,
+    allowSenderInActiveThread,
+    isBarePeerMentionOnly,
+    matchesSubstituteTarget,
+    hasDelegationCandidate,
+  }
+}
+
+function routeActiveThreadFollowup(
+  bot: LarkBotConfig,
+  msg: InboundLarkMessage,
+  defaults: ResolvedRoutingDefaults,
+  groupCtx: ResolvedGroupRoutingContext,
+  state: ActiveThreadEvaluation,
+): RoutingDecision | undefined {
+  if (state.isActiveThreadContext && msg.msgType === 'sticker') {
+    // Standalone Feishu stickers carry no text or @mention; ignore zero-cost in unmentioned threads.
+    return { action: 'ignore', reason: 'no_matching_rule' }
+  }
+  if (state.isActiveThreadContext && !state.allowSenderInActiveThread) {
+    // Never fall through to passive listeners when a peer bot posts in an active thread
+    // (otherwise a bot-enabled `scope: 'all'` listener would re-trigger a multi-bot loop).
+    return { action: 'ignore', reason: 'no_matching_rule' }
+  }
+  if (state.isActiveThreadContext && state.isBarePeerMentionOnly && !state.matchesSubstituteTarget) {
+    return { action: 'ignore', reason: 'no_matching_rule' }
+  }
+  if (
+    !state.allowThreadFollowup ||
+    !state.allowSenderInActiveThread ||
+    state.isBarePeerMentionOnly ||
+    !state.isActiveThreadContext
+  ) {
+    return undefined
+  }
+
+  const clean = replaceMentionKeysWithNames(msg.text, msg.mentions)
+  const cmd = parseSlashCommand(clean)
+  const activeThreadReplyMode: GroupReplyMode = msg.threadId
+    ? 'new-topic'
+    : state.existingThreadTrigger === 'listener' && groupCtx.group?.listener
+      ? groupCtx.group.listener.replyMode
+      : groupCtx.groupReplyMode
+  if (cmd) {
+    return {
+      action: 'command',
+      command: cmd,
+      routeKey: groupCtx.threadRouteKey,
+      workingDir: defaults.workingDir,
+      workspaceName: defaults.workspaceName,
+      replyMode: activeThreadReplyMode,
+    }
+  }
+  const userText = clean || (msg.imageKeys.length > 0 ? '[图片消息]' : '')
+  const allowSilentEmptyReply =
+    state.existingThreadTrigger === 'listener'
+      ? (groupCtx.group?.listener?.allowSilentEmptyReply ?? true)
+      : false
+  const turnReminders = state.hasDelegationCandidate
+    ? [buildDelegationFollowupReminder(msg, 'assist')]
+    : []
+  const forksEphemeralToNewTopic =
+    !msg.threadId &&
+    Boolean(msg.rootId) &&
+    activeThreadReplyMode === 'new-topic' &&
+    !state.hasWorkerSession &&
+    state.hasEphemeralThread
+  const activeRouteKey = forksEphemeralToNewTopic
+    ? buildRouteKey(bot.larkAppId, msg.chatId, msg.messageId)
+    : groupCtx.threadRouteKey
+  return buildAgentDecision(defaults, {
+    trigger: 'active-thread',
+    routeKey: activeRouteKey,
+    ...(forksEphemeralToNewTopic ? { ephemeralHandoffRouteKey: groupCtx.threadRouteKey } : {}),
+    sessionMode: 'thread',
+    replyMode: activeThreadReplyMode,
+    cotEnabled: !allowSilentEmptyReply && defaults.cotEnabled,
+    allowSilentEmptyReply,
+    autoCloseAfterCompletion: false,
+    ...(state.hasDelegationCandidate ? { delegationFollowup: true } : {}),
+    turnReminders,
+    userText,
+  })
+}
+
+function routeSubstituteMode(
+  bot: LarkBotConfig,
+  msg: InboundLarkMessage,
+  defaults: ResolvedRoutingDefaults,
+  groupCtx: ResolvedGroupRoutingContext,
+  runtime: RoutingRuntimeContext,
+): RoutingDecision | undefined {
+  const sub = bot.substituteMode
+  if (!sub.enabled || sub.targets.length === 0 || (msg.msgType !== 'text' && msg.msgType !== 'post')) {
+    return undefined
+  }
+  const matchedTarget = sub.targets.find((t) => mentionsOpenId(msg, t.openId))
+  if (!matchedTarget || msg.senderOpenId === matchedTarget.openId) {
+    return undefined
+  }
+  const effectiveSubSessionMode: GroupSessionMode =
+    sub.activeThreadFollowup && groupCtx.groupSessionMode === 'per_message'
+      ? 'thread'
+      : groupCtx.groupSessionMode
+  const resolvedSubRoute = resolveSessionRoute(
+    bot,
+    msg,
+    effectiveSubSessionMode,
+    groupCtx.effectiveGroupReplyMode,
+    runtime,
+  )
+  const userText = replaceMentionKeysWithNames(msg.text, msg.mentions) || `[${msg.msgType}]`
+  const turnReminders = [buildSubstituteReminder(matchedTarget.name, sub.disclosure, msg)]
+  return buildAgentDecision(defaults, {
+    trigger: 'substitute',
+    routeKey: resolvedSubRoute.routeKey,
+    ...(resolvedSubRoute.ephemeralHandoffRouteKey
+      ? { ephemeralHandoffRouteKey: resolvedSubRoute.ephemeralHandoffRouteKey }
+      : {}),
+    sessionMode: effectiveSubSessionMode,
+    replyMode: groupCtx.effectiveGroupReplyMode,
+    allowSilentEmptyReply: false,
+    autoCloseAfterCompletion:
+      !sub.activeThreadFollowup || effectiveSubSessionMode === 'per_message',
+    turnReminders,
+    userText,
+  })
+}
+
+function routePassiveListener(
+  bot: LarkBotConfig,
+  msg: InboundLarkMessage,
+  defaults: ResolvedRoutingDefaults,
+  groupCtx: ResolvedGroupRoutingContext,
+  hasDelegationCandidate: boolean,
+  runtime: RoutingRuntimeContext,
+): { readonly decision?: RoutingDecision; readonly ignoreReason?: string } {
+  const listener = groupCtx.group?.listener
+  if (!listener?.enabled) return {}
+  const check = matchesListenerRule(listener, msg)
+  if (!check.ok) {
+    return { ignoreReason: check.reason ?? 'listener_filtered' }
+  }
+  const effectiveListenerReplyMode = resolveReplyModeInContext(listener.replyMode, msg)
+  const resolvedListenerRoute = resolveSessionRoute(
+    bot,
+    msg,
+    listener.sessionMode,
+    effectiveListenerReplyMode,
+    runtime,
+  )
+  const userText = replaceMentionKeysWithNames(msg.text, msg.mentions) || `[${msg.msgType}]`
+  const turnReminders = [
+    buildListenerReminder(listener, msg),
+    ...(hasDelegationCandidate ? [buildDelegationFollowupReminder(msg, 'assist')] : []),
+  ]
+  return {
+    decision: buildAgentDecision(defaults, {
+      trigger: 'listener',
+      routeKey: resolvedListenerRoute.routeKey,
+      ...(resolvedListenerRoute.ephemeralHandoffRouteKey
+        ? { ephemeralHandoffRouteKey: resolvedListenerRoute.ephemeralHandoffRouteKey }
+        : {}),
+      sessionMode: listener.sessionMode,
+      replyMode: effectiveListenerReplyMode,
+      cotEnabled: !listener.allowSilentEmptyReply && defaults.cotEnabled,
+      allowSilentEmptyReply: listener.allowSilentEmptyReply,
+      autoCloseAfterCompletion:
+        listener.autoCloseAfterCompletion || listener.sessionMode === 'per_message',
+      ...(hasDelegationCandidate ? { delegationFollowup: true } : {}),
+      turnReminders,
+      userText,
+      ...(listener.name ? { listenerName: listener.name } : {}),
+      ...(!msg.threadId && listener.debounceSeconds > 0
+        ? { listenerDebounceMs: listener.debounceSeconds * 1000 }
+        : {}),
+    }),
+  }
+}
+
+function routeSilentDelegationObserver(
+  bot: LarkBotConfig,
+  msg: InboundLarkMessage,
+  defaults: ResolvedRoutingDefaults,
+  runtime: RoutingRuntimeContext,
+): RoutingDecision {
+  const resolvedDelegationRoute = resolveSessionRoute(
+    bot,
+    msg,
+    'per_message',
+    'new-topic',
+    runtime,
+  )
+  const userText = replaceMentionKeysWithNames(msg.text, msg.mentions) || `[${msg.msgType}]`
+  const turnReminders = [buildDelegationFollowupReminder(msg, 'silent_only')]
+  return buildAgentDecision(defaults, {
+    trigger: 'listener',
+    routeKey: resolvedDelegationRoute.routeKey,
+    sessionMode: 'per_message',
+    replyMode: 'new-topic',
+    cotEnabled: false,
+    cotToolResultEnabled: false,
+    sendIntermediateMessages: false,
+    omitReceivedReactionEmoji: true,
+    allowSilentEmptyReply: true,
+    autoCloseAfterCompletion: true,
+    silentOnly: true,
+    delegationFollowup: true,
+    turnReminders,
+    userText,
+    listenerName: '委派事项跟进',
+  })
+}
+
 export function decideLarkRouting(
   bot: LarkBotConfig,
   msg: InboundLarkMessage,
@@ -732,67 +1263,11 @@ export function decideLarkRouting(
   }
 
   const group = msg.chatType === 'group' ? runtime.groupConfig : undefined
-  const workingDir = resolveEffectiveWorkingDir(bot, group)
-  const resolvedChatName = group?.chatName || runtime.chatName
-  const workspaceName =
-    msg.chatType === 'group'
-      ? resolveEffectiveWorkspaceName(bot, group)
-      : resolveEffectiveWorkspaceName(bot)
-  const effectiveRuntime = resolveEffectiveAgentRuntime(bot, group)
-  const { agentPreset, runtimeProfileId, model, reasoningEffort } = effectiveRuntime
-  const useCard = resolveUseCard(bot, group)
-  const effectiveCot = resolveEffectiveCotConfig(bot, group)
-  const sendIntermediateMessages = resolveSendIntermediateMessages(bot, group)
-  const receivedReactionEmoji = resolveEffectiveReactionEmoji(bot, group)
-  const idleCloseMs = resolveIdleCloseMs(bot, group)
-  const roleReminder = composeRoleReminder(bot, group)
+  const defaults = resolveRoutingDefaults(bot, msg, group, runtime)
 
   // 1. Direct P2P chat
   if (msg.chatType === 'p2p') {
-    if (!isUserAllowedForP2p(bot, msg.senderOpenId)) {
-      return { action: 'ignore', reason: 'p2p_not_allowed' }
-    }
-    const clean = stripBotMentions(msg.text, msg.mentions, msg.botOpenId)
-    const p2pScope = bot.p2pSessionMode === 'per_message' ? `msg:${msg.messageId}` : 'p2p'
-    const routeKey = buildRouteKey(bot.larkAppId, msg.chatId, p2pScope)
-    const cmd = parseSlashCommand(clean)
-    if (cmd) {
-      return {
-        action: 'command',
-        command: cmd,
-        routeKey: buildRouteKey(bot.larkAppId, msg.chatId, 'p2p'),
-        workingDir,
-        workspaceName,
-        replyMode: 'chat',
-      }
-    }
-    const p2pReaction = resolveEffectiveReactionEmoji(bot)
-    const userText = clean || (msg.imageKeys.length > 0 ? '[图片消息]' : '')
-    return {
-      action: 'agent',
-      trigger: 'p2p',
-      routeKey,
-      workingDir,
-      workspaceName,
-      agentPreset,
-      ...(runtimeProfileId ? { runtimeProfileId } : {}),
-      ...(model ? { model } : {}),
-      ...(reasoningEffort ? { reasoningEffort } : {}),
-      sessionMode: bot.p2pSessionMode,
-      replyMode: 'chat',
-      useCard: bot.useInteractiveCard,
-      cotEnabled: Boolean(bot.cotEnabled),
-      cotToolResultEnabled: bot.cotToolResultEnabled !== false,
-      sendIntermediateMessages: bot.sendIntermediateMessages,
-      ...(p2pReaction ? { receivedReactionEmoji: p2pReaction } : {}),
-      allowSilentEmptyReply: false,
-      autoCloseAfterCompletion: bot.p2pSessionMode === 'per_message',
-      ...(idleCloseMs ? { idleCloseMs } : {}),
-      ...(roleReminder ? { roleReminder } : {}),
-      turnReminders: [],
-      userText,
-      promptText: composeTurnPrompt([], userText),
-    }
+    return routeP2pMessage(bot, msg, defaults)
   }
 
   // Group gate
@@ -800,352 +1275,42 @@ export function decideLarkRouting(
     return { action: 'ignore', reason: 'group_disabled' }
   }
 
-  const groupReplyMode = resolveGroupReplyMode(bot, group)
-  const effectiveGroupReplyMode = resolveReplyModeInContext(groupReplyMode, msg)
-  const groupSessionMode = resolveGroupSessionMode(bot, group)
-  const mentionTriggerMode = resolveMentionTriggerMode(bot, group)
-  const threadRouteKey = resolveActiveThreadLookupKey(bot, msg, runtime)
-  const chatRouteKey = buildRouteKey(bot.larkAppId, msg.chatId, 'chat')
+  const groupCtx = resolveGroupRoutingContext(bot, msg, group, runtime)
 
   // 2. Group chat: direct @bot mention
-  const mentionedBot = Boolean(msg.botOpenId && mentionsOpenId(msg, msg.botOpenId))
-  if (mentionedBot) {
-    const clean = stripBotMentions(msg.text, msg.mentions, msg.botOpenId)
-    const resolvedRoute = resolveSessionRoute(
-      bot,
-      msg,
-      groupSessionMode,
-      effectiveGroupReplyMode,
-      runtime,
-    )
-    const cmd = parseSlashCommand(clean)
-    if (cmd) {
-      const cmdRouteKey = groupSessionMode === 'chat' ? chatRouteKey : threadRouteKey
-      return {
-        action: 'command',
-        command: cmd,
-        routeKey: cmdRouteKey,
-        workingDir,
-        workspaceName,
-        replyMode: effectiveGroupReplyMode,
-      }
-    }
-    const userText = clean || (msg.imageKeys.length > 0 ? '[图片消息]' : '')
-    return {
-      action: 'agent',
-      trigger: 'mention',
-      routeKey: resolvedRoute.routeKey,
-      ...(resolvedRoute.ephemeralHandoffRouteKey
-        ? { ephemeralHandoffRouteKey: resolvedRoute.ephemeralHandoffRouteKey }
-        : {}),
-      workingDir,
-      workspaceName,
-      ...(resolvedChatName ? { chatName: resolvedChatName } : {}),
-      agentPreset,
-      ...(runtimeProfileId ? { runtimeProfileId } : {}),
-      ...(model ? { model } : {}),
-      ...(reasoningEffort ? { reasoningEffort } : {}),
-      sessionMode: groupSessionMode,
-      replyMode: effectiveGroupReplyMode,
-      useCard,
-      cotEnabled: effectiveCot.enabled,
-      cotToolResultEnabled: effectiveCot.toolResultEnabled,
-      sendIntermediateMessages,
-      ...(receivedReactionEmoji ? { receivedReactionEmoji } : {}),
-      allowSilentEmptyReply: false,
-      autoCloseAfterCompletion: groupSessionMode === 'per_message',
-      ...(idleCloseMs ? { idleCloseMs } : {}),
-      ...(roleReminder ? { roleReminder } : {}),
-      turnReminders: [],
-      userText,
-      promptText: composeTurnPrompt([], userText),
-    }
-  }
+  const mentionDecision = routeDirectMention(bot, msg, defaults, groupCtx, runtime)
+  if (mentionDecision) return mentionDecision
 
   // 3. Group chat: active thread continuation (without re-mentioning agent)
-  const mainStreamRootAlreadyPromoted = Boolean(
-    !msg.threadId &&
-      msg.rootId &&
-      runtime.isRouteBoundToNativeThread?.(buildRouteKey(bot.larkAppId, msg.chatId, msg.rootId)),
+  const activeThreadState = evaluateActiveThreadState(bot, msg, groupCtx, runtime)
+  const activeThreadDecision = routeActiveThreadFollowup(
+    bot,
+    msg,
+    defaults,
+    groupCtx,
+    activeThreadState,
   )
-  const hasWorkerSession =
-    !mainStreamRootAlreadyPromoted && runtime.hasActiveSessionForRoute(threadRouteKey)
-  const hasEphemeralThread =
-    !mainStreamRootAlreadyPromoted &&
-    !hasWorkerSession &&
-    Boolean(runtime.hasEphemeralRouterThread?.(threadRouteKey))
-  const existingThreadTrigger = runtime.getRouteTrigger?.(threadRouteKey)
-  const hasThreadReplied = runtime.hasRouteReplied?.(threadRouteKey) ?? true
-  const allowThreadFollowup =
-    existingThreadTrigger === 'substitute'
-      ? bot.substituteMode.activeThreadFollowup
-      : existingThreadTrigger === 'listener'
-        ? hasThreadReplied && mentionTriggerMode === 'mention_and_active_thread'
-        : mentionTriggerMode === 'mention_and_active_thread'
-  const isActiveThreadContext = Boolean(
-    (msg.rootId || msg.threadId) &&
-      !mainStreamRootAlreadyPromoted &&
-      (hasWorkerSession || hasEphemeralThread),
-  )
-  const allowSenderInActiveThread =
-    msg.senderType !== 'bot' ||
-    (existingThreadTrigger === 'listener' &&
-      Boolean(group?.listener?.enabled) &&
-      isListenerSenderEnabled(group!.listener, msg.senderOpenId, 'bot'))
-  const isBarePeerMentionOnly =
-    msg.mentions.length > 0 &&
-    msg.imageKeys.length === 0 &&
-    stripBotMentions(msg.text, msg.mentions).length === 0
-  if (isActiveThreadContext && msg.msgType === 'sticker') {
-    // Standalone Feishu stickers carry no text or @mention; ignore zero-cost in unmentioned threads.
-    return { action: 'ignore', reason: 'no_matching_rule' }
-  }
-  if (isActiveThreadContext && !allowSenderInActiveThread) {
-    // Never fall through to passive listeners when a peer bot posts in an active thread
-    // (otherwise a bot-enabled `scope: 'all'` listener would re-trigger a multi-bot loop).
-    return { action: 'ignore', reason: 'no_matching_rule' }
-  }
-  const matchesSubstituteTarget =
-    bot.substituteMode.enabled &&
-    bot.substituteMode.targets.length > 0 &&
-    (msg.msgType === 'text' || msg.msgType === 'post') &&
-    bot.substituteMode.targets.some(
-      (t) => mentionsOpenId(msg, t.openId) && msg.senderOpenId !== t.openId,
-    )
-  if (isActiveThreadContext && isBarePeerMentionOnly && !matchesSubstituteTarget) {
-    return { action: 'ignore', reason: 'no_matching_rule' }
-  }
-  const delegationEnabled = Boolean(
-    bot.experimental.proactive.remindersEnabled &&
-      bot.experimental.proactive.delegationFollowupEnabled,
-  )
-  const peerMentions = extractPeerUserMentions(msg)
-  const hasDelegationCandidate =
-    delegationEnabled &&
-    msg.senderType === 'user' &&
-    (msg.msgType === 'text' || msg.msgType === 'post') &&
-    peerMentions.length > 0 &&
-    stripBotMentions(msg.text, msg.mentions).length > 0
-
-  if (
-    allowThreadFollowup &&
-    allowSenderInActiveThread &&
-    !isBarePeerMentionOnly &&
-    isActiveThreadContext
-  ) {
-    const clean = replaceMentionKeysWithNames(msg.text, msg.mentions)
-    const cmd = parseSlashCommand(clean)
-    const activeThreadReplyMode: GroupReplyMode = msg.threadId
-      ? 'new-topic'
-      : existingThreadTrigger === 'listener' && group?.listener
-        ? group.listener.replyMode
-        : groupReplyMode
-    if (cmd) {
-      return {
-        action: 'command',
-        command: cmd,
-        routeKey: threadRouteKey,
-        workingDir,
-        workspaceName,
-        replyMode: activeThreadReplyMode,
-      }
-    }
-    const userText = clean || (msg.imageKeys.length > 0 ? '[图片消息]' : '')
-    const allowSilentEmptyReply =
-      existingThreadTrigger === 'listener'
-        ? (group?.listener?.allowSilentEmptyReply ?? true)
-        : false
-    const turnReminders = hasDelegationCandidate
-      ? [buildDelegationFollowupReminder(msg, 'assist')]
-      : []
-    const forksEphemeralToNewTopic =
-      !msg.threadId &&
-      Boolean(msg.rootId) &&
-      activeThreadReplyMode === 'new-topic' &&
-      !hasWorkerSession &&
-      hasEphemeralThread
-    const activeRouteKey = forksEphemeralToNewTopic
-      ? buildRouteKey(bot.larkAppId, msg.chatId, msg.messageId)
-      : threadRouteKey
-    return {
-      action: 'agent',
-      trigger: 'active-thread',
-      routeKey: activeRouteKey,
-      ...(forksEphemeralToNewTopic ? { ephemeralHandoffRouteKey: threadRouteKey } : {}),
-      workingDir,
-      workspaceName,
-      ...(resolvedChatName ? { chatName: resolvedChatName } : {}),
-      agentPreset,
-      ...(runtimeProfileId ? { runtimeProfileId } : {}),
-      ...(model ? { model } : {}),
-      ...(reasoningEffort ? { reasoningEffort } : {}),
-      sessionMode: 'thread',
-      replyMode: activeThreadReplyMode,
-      useCard,
-      cotEnabled: !allowSilentEmptyReply && effectiveCot.enabled,
-      cotToolResultEnabled: effectiveCot.toolResultEnabled,
-      sendIntermediateMessages,
-      ...(receivedReactionEmoji ? { receivedReactionEmoji } : {}),
-      allowSilentEmptyReply,
-      autoCloseAfterCompletion: false,
-      ...(hasDelegationCandidate ? { delegationFollowup: true } : {}),
-      ...(idleCloseMs ? { idleCloseMs } : {}),
-      ...(roleReminder ? { roleReminder } : {}),
-      turnReminders,
-      userText,
-      promptText: composeTurnPrompt(turnReminders, userText),
-    }
-  }
+  if (activeThreadDecision) return activeThreadDecision
 
   // 4. Group chat: substituteMode (@target human)
-  const sub = bot.substituteMode
-  if (sub.enabled && sub.targets.length > 0 && (msg.msgType === 'text' || msg.msgType === 'post')) {
-    const matchedTarget = sub.targets.find((t) => mentionsOpenId(msg, t.openId))
-    if (matchedTarget && msg.senderOpenId !== matchedTarget.openId) {
-      const effectiveSubSessionMode: GroupSessionMode =
-        sub.activeThreadFollowup && groupSessionMode === 'per_message'
-          ? 'thread'
-          : groupSessionMode
-      const resolvedSubRoute = resolveSessionRoute(
-        bot,
-        msg,
-        effectiveSubSessionMode,
-        effectiveGroupReplyMode,
-        runtime,
-      )
-      const userText = replaceMentionKeysWithNames(msg.text, msg.mentions) || `[${msg.msgType}]`
-      const turnReminders = [buildSubstituteReminder(matchedTarget.name, sub.disclosure, msg)]
-      return {
-        action: 'agent',
-        trigger: 'substitute',
-        routeKey: resolvedSubRoute.routeKey,
-        ...(resolvedSubRoute.ephemeralHandoffRouteKey
-          ? { ephemeralHandoffRouteKey: resolvedSubRoute.ephemeralHandoffRouteKey }
-          : {}),
-        workingDir,
-        workspaceName,
-        ...(resolvedChatName ? { chatName: resolvedChatName } : {}),
-        agentPreset,
-        ...(runtimeProfileId ? { runtimeProfileId } : {}),
-        ...(model ? { model } : {}),
-        ...(reasoningEffort ? { reasoningEffort } : {}),
-        sessionMode: effectiveSubSessionMode,
-        replyMode: effectiveGroupReplyMode,
-        useCard,
-        cotEnabled: effectiveCot.enabled,
-        cotToolResultEnabled: effectiveCot.toolResultEnabled,
-        sendIntermediateMessages,
-        ...(receivedReactionEmoji ? { receivedReactionEmoji } : {}),
-        allowSilentEmptyReply: false,
-        autoCloseAfterCompletion:
-          !sub.activeThreadFollowup || effectiveSubSessionMode === 'per_message',
-        ...(idleCloseMs ? { idleCloseMs } : {}),
-        ...(roleReminder ? { roleReminder } : {}),
-        turnReminders,
-        userText,
-        promptText: composeTurnPrompt(turnReminders, userText),
-      }
-    }
-  }
+  const substituteDecision = routeSubstituteMode(bot, msg, defaults, groupCtx, runtime)
+  if (substituteDecision) return substituteDecision
 
   // 5. Group chat: passive listener rule configured on group
-  let listenerIgnoreReason: string | undefined
-  if (group?.listener?.enabled) {
-    const check = matchesListenerRule(group.listener, msg)
-    if (check.ok) {
-      const listener = group.listener
-      const effectiveListenerReplyMode = resolveReplyModeInContext(listener.replyMode, msg)
-      const resolvedListenerRoute = resolveSessionRoute(
-        bot,
-        msg,
-        listener.sessionMode,
-        effectiveListenerReplyMode,
-        runtime,
-      )
-      const userText = replaceMentionKeysWithNames(msg.text, msg.mentions) || `[${msg.msgType}]`
-      const turnReminders = [
-        buildListenerReminder(listener, msg),
-        ...(hasDelegationCandidate ? [buildDelegationFollowupReminder(msg, 'assist')] : []),
-      ]
-      return {
-        action: 'agent',
-        trigger: 'listener',
-        routeKey: resolvedListenerRoute.routeKey,
-        ...(resolvedListenerRoute.ephemeralHandoffRouteKey
-          ? { ephemeralHandoffRouteKey: resolvedListenerRoute.ephemeralHandoffRouteKey }
-          : {}),
-        workingDir,
-        workspaceName,
-        ...(resolvedChatName ? { chatName: resolvedChatName } : {}),
-        agentPreset,
-        ...(runtimeProfileId ? { runtimeProfileId } : {}),
-        ...(model ? { model } : {}),
-        ...(reasoningEffort ? { reasoningEffort } : {}),
-        sessionMode: listener.sessionMode,
-        replyMode: effectiveListenerReplyMode,
-        useCard,
-        cotEnabled: !listener.allowSilentEmptyReply && effectiveCot.enabled,
-        cotToolResultEnabled: effectiveCot.toolResultEnabled,
-        sendIntermediateMessages,
-        ...(receivedReactionEmoji ? { receivedReactionEmoji } : {}),
-        allowSilentEmptyReply: listener.allowSilentEmptyReply,
-        autoCloseAfterCompletion:
-          listener.autoCloseAfterCompletion || listener.sessionMode === 'per_message',
-        ...(hasDelegationCandidate ? { delegationFollowup: true } : {}),
-        ...(idleCloseMs ? { idleCloseMs } : {}),
-        ...(roleReminder ? { roleReminder } : {}),
-        turnReminders,
-        userText,
-        promptText: composeTurnPrompt(turnReminders, userText),
-        ...(listener.name ? { listenerName: listener.name } : {}),
-        ...(!msg.threadId && listener.debounceSeconds > 0
-          ? { listenerDebounceMs: listener.debounceSeconds * 1000 }
-          : {}),
-      }
-    }
-    listenerIgnoreReason = check.reason ?? 'listener_filtered'
-  }
+  const listenerResult = routePassiveListener(
+    bot,
+    msg,
+    defaults,
+    groupCtx,
+    activeThreadState.hasDelegationCandidate,
+    runtime,
+  )
+  if (listenerResult.decision) return listenerResult.decision
 
   // 6. Group chat: silent proactive delegation observer (`A @ B <task>`)
-  if (hasDelegationCandidate) {
-    const resolvedDelegationRoute = resolveSessionRoute(
-      bot,
-      msg,
-      'per_message',
-      'new-topic',
-      runtime,
-    )
-    const userText = replaceMentionKeysWithNames(msg.text, msg.mentions) || `[${msg.msgType}]`
-    const turnReminders = [buildDelegationFollowupReminder(msg, 'silent_only')]
-    return {
-      action: 'agent',
-      trigger: 'listener',
-      routeKey: resolvedDelegationRoute.routeKey,
-      workingDir,
-      workspaceName,
-      ...(resolvedChatName ? { chatName: resolvedChatName } : {}),
-      agentPreset,
-      ...(runtimeProfileId ? { runtimeProfileId } : {}),
-      ...(model ? { model } : {}),
-      ...(reasoningEffort ? { reasoningEffort } : {}),
-      sessionMode: 'per_message',
-      replyMode: 'new-topic',
-      useCard,
-      cotEnabled: false,
-      cotToolResultEnabled: false,
-      sendIntermediateMessages: false,
-      allowSilentEmptyReply: true,
-      autoCloseAfterCompletion: true,
-      silentOnly: true,
-      delegationFollowup: true,
-      ...(idleCloseMs ? { idleCloseMs } : {}),
-      ...(roleReminder ? { roleReminder } : {}),
-      turnReminders,
-      userText,
-      promptText: composeTurnPrompt(turnReminders, userText),
-      listenerName: '委派事项跟进',
-    }
+  if (activeThreadState.hasDelegationCandidate) {
+    return routeSilentDelegationObserver(bot, msg, defaults, runtime)
   }
 
-  return { action: 'ignore', reason: listenerIgnoreReason ?? 'no_matching_rule' }
+  return { action: 'ignore', reason: listenerResult.ignoreReason ?? 'no_matching_rule' }
 }
