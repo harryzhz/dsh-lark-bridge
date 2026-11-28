@@ -1746,4 +1746,173 @@ describe('Local directory picker HTTP API & lark-bridge worktree CLI', () => {
 
     await reminders.stop()
   })
+
+  it('never leaks dream:internal or group chatId into P2P reminders and backfills known P2P chatId for chat-scoped memory recall', async () => {
+    const dataDir = makeTempDir()
+    const workDir = makeTempDir()
+    const store = new LarkBridgeStore(dataDir)
+
+    store.upsertBot({
+      id: 'dream-bot',
+      name: 'OneAssistant',
+      enabled: true,
+      larkAppId: 'cli_dream',
+      larkAppSecret: 'sec_dream',
+      defaultWorkingDir: workDir,
+      experimental: {
+        dreaming: { enabled: true },
+        proactive: {
+          remindersEnabled: true,
+          reminderCreationMode: 'silent',
+        },
+      },
+    })
+    store.upsertGroup({
+      botId: 'dream-bot',
+      chatId: 'oc_dev_group',
+      chatName: '工程群',
+      enabled: true,
+    })
+    store.upsertBinding({
+      routeKey: 'dream-bot:p2p:ou_owner_p2p',
+      botId: 'dream-bot',
+      chatId: 'oc_owner_p2p',
+      chatType: 'p2p',
+      userOpenId: 'ou_owner_p2p',
+      userName: 'Alex',
+      workspaceName: 'ws',
+      sessionId: 'sess-owner-p2p',
+      agentPreset: 'codex',
+      workingDir: workDir,
+      trigger: 'p2p',
+      lastActivityMs: Date.now(),
+    })
+    store.upsertBinding({
+      routeKey: 'dream-bot:oc_dev_group:om_grp_1',
+      botId: 'dream-bot',
+      chatId: 'oc_dev_group',
+      chatType: 'group',
+      workspaceName: 'ws',
+      sessionId: 'sess-dev-grp',
+      agentPreset: 'codex',
+      workingDir: workDir,
+      trigger: 'mention',
+      lastActivityMs: Date.now(),
+    })
+
+    const memory = new MemoryService(dataDir, store)
+    memory.upsert({
+      botId: 'dream-bot',
+      scope: 'chat',
+      scopeId: 'oc_owner_p2p',
+      type: 'feedback',
+      title: '私聊合规红线提示',
+      content: '私聊回复不得携带敏感联系字符串。',
+      pinned: true,
+    })
+    memory.upsert({
+      botId: 'dream-bot',
+      scope: 'chat',
+      scopeId: 'oc_dev_group',
+      type: 'feedback',
+      title: '工程群内部专属约定',
+      content: '仅在工程群生效的约定。',
+      pinned: true,
+    })
+
+    const submittedPrompts: string[] = []
+    const dreamSid = 'session-dream-stage3'
+    const fakeCtx = {
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      sessions: {
+        get: (sid: string) =>
+          sid === dreamSid
+            ? {
+                id: sid,
+                snapshotEvents: () => [
+                  {
+                    type: 'plugin:lark-bridge/origin',
+                    ignorable: true,
+                    data: {
+                      botId: 'dream-bot',
+                      botName: 'OneAssistant',
+                      larkAppId: 'cli_dream',
+                      chatType: 'group',
+                      chatId: 'dream:internal',
+                      workspaceName: 'ws',
+                      routeKey: 'dream:dream-bot:2026-11-29',
+                      trigger: 'dream',
+                    },
+                  },
+                ],
+              }
+            : undefined,
+      },
+      agents: {
+        create: vi.fn(async ({ sessionId, setup }: { sessionId: string; setup?: (c: unknown, a: unknown) => void }) => {
+          const agent = { session: { id: sessionId, header: { cwd: workDir, agentPreset: 'codex' } } }
+          setup?.({}, agent)
+          return { agent, dispose: vi.fn().mockResolvedValue(undefined) }
+        }),
+      },
+      get: () => undefined,
+    } as unknown as Context
+
+    const reminders = new ProactiveReminderService({
+      ctx: fakeCtx,
+      store,
+      memory,
+      runtimes: new RuntimeCatalog(fakeCtx),
+      workspaces: {
+        attachSession: vi.fn().mockResolvedValue(undefined),
+        archiveSession: vi.fn().mockResolvedValue(true),
+      } as unknown as WorkspaceGrouping,
+      runTurn: vi.fn(async (_agent, content) => {
+        submittedPrompts.push(content.map((b) => ('text' in b ? b.text : '')).join('\n'))
+        return REMINDER_SILENT_SENTINEL
+      }),
+      sendOriginCard: vi.fn().mockResolvedValue({}),
+      patchOriginCard: vi.fn().mockResolvedValue(undefined),
+      deliverReminderOutput: vi.fn().mockResolvedValue({ messageId: 'om_p2p_out' }),
+    })
+
+    // 1. Auto-Dream session creating `--user ou_owner_p2p` (without `--chat`) must NOT leak `dream:internal`,
+    //    and auto-backfills known `oc_owner_p2p` + `userName` from P2P binding so chat-scoped memory recalls!
+    const fromDream = await reminders.create({
+      sessionId: dreamSid,
+      botId: 'dream-bot',
+      userOpenId: 'ou_owner_p2p',
+      title: '核查草稿发布情况',
+      prompt: '确认草稿是否已发布',
+      afterSeconds: 600,
+    })
+    expect(fromDream.origin).toMatchObject({
+      botId: 'dream-bot',
+      chatType: 'p2p',
+      chatId: 'oc_owner_p2p',
+      deliveryMode: 'p2p',
+      userOpenId: 'ou_owner_p2p',
+      userName: 'Alex',
+      sourceSessionId: dreamSid,
+    })
+    await reminders.runNow(fromDream.id)
+    expect(submittedPrompts[0]).toContain('私聊合规红线提示')
+    expect(submittedPrompts[0]).not.toContain('工程群内部专属约定')
+
+    // 2. Group session cross-creating `--user ou_stranger_p2p` must NOT leak `oc_dev_group` chatId or memories!
+    const crossFromGroup = await reminders.create({
+      sessionId: 'sess-dev-grp',
+      botId: 'dream-bot',
+      userOpenId: 'ou_stranger_p2p',
+      title: '私聊通知外部成员',
+      prompt: '确认进展',
+      afterSeconds: 600,
+    })
+    expect(crossFromGroup.origin.chatType).toBe('p2p')
+    expect(crossFromGroup.origin.chatId).toBeUndefined()
+    await reminders.runNow(crossFromGroup.id)
+    expect(submittedPrompts[1]).not.toContain('工程群内部专属约定')
+
+    await reminders.stop()
+  })
 })
