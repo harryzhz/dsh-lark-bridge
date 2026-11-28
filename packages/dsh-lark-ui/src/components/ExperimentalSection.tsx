@@ -521,6 +521,16 @@ export function ExperimentalSection({
               </SettingRow>
             </NestedSettings>
           )}
+          <SettingRow
+            title="避开周末"
+            desc="非紧急提醒落在周六、周日时自动顺延至周一早晨"
+          >
+            <Switch
+              label="避开周末"
+              checked={Boolean(proactive.skipWeekends)}
+              onChange={(skipWeekends) => patchProactive({ skipWeekends })}
+            />
+          </SettingRow>
         </NestedSettings>
       )}
 

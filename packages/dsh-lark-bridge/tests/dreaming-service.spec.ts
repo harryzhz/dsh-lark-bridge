@@ -17,7 +17,7 @@ vi.mock('@deepseek-ai/dsh-session', async (importOriginal) => {
 
 import type { LarkBridgeManager } from '../src/bridge-manager.js'
 import { ensureCliAuthEndpoint } from '../src/cli-support.js'
-import { DreamingService } from '../src/dreaming-service.js'
+import { DreamingService, computeNextWorkdayMorning } from '../src/dreaming-service.js'
 import { createLarkHttpHandler, type ConnectionAdmitter } from '../src/http-api.js'
 import { MemoryService } from '../src/memory-service.js'
 import { ProactiveReminderService } from '../src/reminder-service.js'
@@ -1239,5 +1239,24 @@ describe('DreamingService dual-gate scheduling, product dataDir isolation & nati
     expect(drained.lastProcessedCount).toBe(17)
     expect(drained.proactiveStats).toMatchObject({ batchesRun: 2, backlogRemaining: 0 })
     expect(drained.processedSessionIds).toHaveLength(22)
+  })
+
+  it('skips weekends in computeNextWorkdayMorning when skipWeekends is enabled', () => {
+    // Saturday 03:00 -> Monday 09:30 when skipWeekends=true; Saturday 09:30 when false
+    const satNight = new Date(2026, 10, 28, 3, 0, 0)
+    expect(computeNextWorkdayMorning(satNight, '08:00', true)).toBe('2026-11-30 09:30')
+    expect(computeNextWorkdayMorning(satNight, '08:00', false)).toBe('2026-11-28 09:30')
+
+    // Friday 21:00 -> next day is Saturday -> Monday 09:30 when skipWeekends=true
+    const friEvening = new Date(2026, 10, 27, 21, 0, 0)
+    expect(computeNextWorkdayMorning(friEvening, '08:00', true)).toBe('2026-11-30 09:30')
+
+    // Saturday daytime 10:00 (+2h = Saturday 12:00) -> Monday 09:30 when skipWeekends=true
+    const satDay = new Date(2026, 10, 28, 10, 0, 0)
+    expect(computeNextWorkdayMorning(satDay, '08:00', true)).toBe('2026-11-30 09:30')
+
+    // Sunday 03:00 with quietHoursEnd 09:30 -> Monday 10:00
+    const sunNight = new Date(2026, 10, 29, 3, 0, 0)
+    expect(computeNextWorkdayMorning(sunNight, '09:30', true)).toBe('2026-11-30 10:00')
   })
 })

@@ -171,6 +171,7 @@ export const BotProactiveConfigSchema = z.object({
     .string()
     .default('08:00')
     .transform((v) => normalizeHHMM(v, '08:00')),
+  skipWeekends: z.boolean().default(false),
   autoCodeEnabled: z.boolean().default(false),
   branchPrefix: z
     .string()
@@ -185,6 +186,7 @@ export const DEFAULT_BOT_PROACTIVE_CONFIG: z.output<typeof BotProactiveConfigSch
   quietHoursEnabled: true,
   quietHoursStart: '00:00',
   quietHoursEnd: '08:00',
+  skipWeekends: false,
   autoCodeEnabled: false,
   branchPrefix: 'agent/',
 }

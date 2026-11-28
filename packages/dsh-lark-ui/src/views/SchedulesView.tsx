@@ -310,7 +310,13 @@ function RemindersList({
                   item.origin.botName ? `智能体「${item.origin.botName}」` : null,
                   `计划触发 ${formatIsoTime(item.scheduledAt)}`,
                   item.deferredFromScheduledAt
-                    ? `免打扰顺延自 ${formatIsoTime(item.deferredFromScheduledAt)}`
+                    ? `${
+                        item.deferredReason === 'weekend'
+                          ? '避开周末顺延自'
+                          : item.deferredReason === 'quiet_hours_and_weekend'
+                            ? '免打扰与避开周末顺延自'
+                            : '免打扰顺延自'
+                      } ${formatIsoTime(item.deferredFromScheduledAt)}`
                     : null,
                   item.retryCount && item.retryCount > 0 ? `重启补跑 #${item.retryCount}` : null,
                   mentionText,

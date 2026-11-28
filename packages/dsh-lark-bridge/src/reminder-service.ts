@@ -432,7 +432,10 @@ export class ProactiveReminderService {
     const urgency: ReminderUrgency = input.urgency === 'high' ? 'high' : 'normal'
     const quietConfig =
       dreamingTracker && !bot.experimental.proactive.quietHoursEnabled
-        ? DREAMING_FALLBACK_QUIET_HOURS
+        ? {
+            ...DREAMING_FALLBACK_QUIET_HOURS,
+            skipWeekends: bot.experimental.proactive.skipWeekends,
+          }
         : bot.experimental.proactive
     const quietAdjusted = applyQuietHoursDeferral(
       rawScheduledAt,
@@ -444,6 +447,7 @@ export class ProactiveReminderService {
     const chainInfo = this.validateReminderChainAndDedup({
       sourceSessionId: input.sessionId?.trim() || undefined,
       origin,
+      rawScheduledAt,
       scheduledAt,
       nowMs,
       ...(input.kind ? { requestedKind: input.kind } : {}),
@@ -506,6 +510,7 @@ export class ProactiveReminderService {
       ...(input.worktree ? { worktree: input.worktree } : {}),
       ...(urgency === 'high' ? { urgency } : {}),
       ...(quietAdjusted.deferredFrom ? { deferredFromScheduledAt: quietAdjusted.deferredFrom } : {}),
+      ...(quietAdjusted.deferredReason ? { deferredReason: quietAdjusted.deferredReason } : {}),
       ...(chainMeta
         ? {
             rootReminderId: chainMeta.rootReminderId,
@@ -542,8 +547,14 @@ export class ProactiveReminderService {
       dreamingTracker.items.push(item)
     }
 
+    const deferLabel =
+      quietAdjusted.deferredReason === 'weekend'
+        ? '避开周末顺延自'
+        : quietAdjusted.deferredReason === 'quiet_hours_and_weekend'
+          ? '命中免打扰与避开周末顺延自'
+          : '命中夜间免打扰顺延自'
     const deferSuffix = quietAdjusted.deferredFrom
-      ? `，命中夜间免打扰顺延自 ${formatFriendlyLocalTime(quietAdjusted.deferredFrom)}`
+      ? `，${deferLabel} ${formatFriendlyLocalTime(quietAdjusted.deferredFrom)}`
       : ''
     this.host.store.recordEvent({
       botId: bot.id,
@@ -591,6 +602,7 @@ export class ProactiveReminderService {
       mentions: nextMentions,
       ccMentions: nextCcMentions,
       scheduledAt: nextScheduledAt,
+      ...(patch.at ? { deferredFromScheduledAt: undefined, deferredReason: undefined } : {}),
       status: nextStatus,
       ...(nextStatus === 'scheduled' ? { resolution: undefined, archivedAtMs: undefined } : {}),
       updatedAtMs: nowMs,
@@ -1159,6 +1171,7 @@ export class ProactiveReminderService {
   private validateReminderChainAndDedup(input: {
     readonly sourceSessionId?: string
     readonly origin: LarkReminderOrigin
+    readonly rawScheduledAt: string
     readonly scheduledAt: string
     readonly nowMs: number
     readonly requestedKind?: LarkReminderKind
@@ -1172,7 +1185,7 @@ export class ProactiveReminderService {
       readonly chainStartedAtMs: number
     }
   } {
-    const { sourceSessionId, origin, scheduledAt, nowMs, requestedKind } = input
+    const { sourceSessionId, origin, rawScheduledAt, scheduledAt, nowMs, requestedKind } = input
     let parent: LarkReminderItem | undefined
     if (sourceSessionId) {
       const activeId = this.activeReminderSessions.get(sourceSessionId)?.reminderId
@@ -1206,8 +1219,9 @@ export class ProactiveReminderService {
 
       const maxWindowMs =
         effectiveKind === 'delegation' ? MAX_DELEGATION_CHAIN_WINDOW_MS : MAX_REMINDER_CHAIN_WINDOW_MS
+      const rawScheduledMs = Date.parse(rawScheduledAt)
       const scheduledMs = Date.parse(scheduledAt)
-      if (scheduledMs - chainStartedAtMs > maxWindowMs) {
+      if (rawScheduledMs - chainStartedAtMs > maxWindowMs) {
         const hours = Math.round(maxWindowMs / 3_600_000)
         throw new Error(
           `该提醒链已超过最长自动续查窗口（${hours} 小时），禁止继续自动续查；请直接向负责人同步现状并由人工决定后续动作`,

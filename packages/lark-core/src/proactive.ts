@@ -21,8 +21,17 @@ const MAX_SIBLING_REMINDERS_IN_PROMPT = 10
 export const ReminderUrgencySchema = z.enum(['normal', 'high'])
 export type ReminderUrgency = z.infer<typeof ReminderUrgencySchema>
 
+export const ReminderDeferReasonSchema = z.enum([
+  'quiet_hours',
+  'weekend',
+  'quiet_hours_and_weekend',
+])
+export type ReminderDeferReason = z.infer<typeof ReminderDeferReasonSchema>
+
 export const LarkReminderKindSchema = z.enum(['general', 'delegation'])
 export type LarkReminderKind = z.infer<typeof LarkReminderKindSchema>
+
+const DEFAULT_WEEKEND_RESUME_MINUTES = 9 * 60
 
 function parseHHMMToMinutes(hhmm: string): number | undefined {
   const m = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(hhmm.trim())
@@ -32,44 +41,83 @@ function parseHHMMToMinutes(hhmm: string): number | undefined {
 
 /**
  * Defers a `normal` urgency reminder that falls inside the bot's configured local
- * Quiet Hours window (`[start, end)`) to the window's end time. `high` urgency
- * reminders always bypass Quiet Hours so real P0 alerts are never delayed.
+ * Quiet Hours window (`[start, end)`) and/or on a local weekend (Saturday/Sunday)
+ * to the next permitted window (`quietHoursEnd` or Monday morning). `high` urgency
+ * reminders always bypass both Quiet Hours and weekend deferral so real P0 alerts
+ * are never delayed.
  */
 export function applyQuietHoursDeferral(
   targetIso: string,
-  config: Pick<BotProactiveConfig, 'quietHoursEnabled' | 'quietHoursStart' | 'quietHoursEnd'>,
+  config: Pick<BotProactiveConfig, 'quietHoursEnabled' | 'quietHoursStart' | 'quietHoursEnd'> & {
+    readonly skipWeekends?: boolean
+  },
   urgency: ReminderUrgency = 'normal',
-): { readonly scheduledAt: string; readonly deferredFrom?: string } {
-  if (!config.quietHoursEnabled || urgency === 'high') {
-    return { scheduledAt: targetIso }
-  }
-  const startMins = parseHHMMToMinutes(config.quietHoursStart)
-  const endMins = parseHHMMToMinutes(config.quietHoursEnd)
-  if (startMins === undefined || endMins === undefined || startMins === endMins) {
+): {
+  readonly scheduledAt: string
+  readonly deferredFrom?: string
+  readonly deferredReason?: ReminderDeferReason
+} {
+  if (urgency === 'high' || (!config.quietHoursEnabled && !config.skipWeekends)) {
     return { scheduledAt: targetIso }
   }
   const target = new Date(targetIso)
   if (!Number.isFinite(target.getTime())) return { scheduledAt: targetIso }
 
-  const curMins = target.getHours() * 60 + target.getMinutes()
-  const overnight = startMins > endMins
-  const inQuietWindow = overnight
-    ? curMins >= startMins || curMins < endMins
-    : curMins >= startMins && curMins < endMins
-  if (!inQuietWindow) {
+  const startMins = config.quietHoursEnabled ? parseHHMMToMinutes(config.quietHoursStart) : undefined
+  const endMins = config.quietHoursEnabled ? parseHHMMToMinutes(config.quietHoursEnd) : undefined
+  const hasQuietWindow =
+    startMins !== undefined && endMins !== undefined && startMins !== endMins
+  const overnight = hasQuietWindow ? startMins > endMins : false
+
+  const shiftOutOfQuietHours = (d: Date): boolean => {
+    if (!hasQuietWindow) return false
+    const curMins = d.getHours() * 60 + d.getMinutes()
+    const inQuietWindow = overnight
+      ? curMins >= startMins || curMins < endMins
+      : curMins >= startMins && curMins < endMins
+    if (!inQuietWindow) return false
+
+    if (overnight && curMins >= startMins) {
+      d.setDate(d.getDate() + 1)
+    }
+    d.setHours(Math.floor(endMins / 60), endMins % 60, 0, 0)
+    return true
+  }
+
+  const cursor = new Date(target.getTime())
+  const shiftedByQuiet = shiftOutOfQuietHours(cursor)
+
+  let shiftedByWeekend = false
+  if (config.skipWeekends) {
+    const day = cursor.getDay()
+    if (day === 0 || day === 6) {
+      shiftedByWeekend = true
+      const daysToMonday = day === 6 ? 2 : 1
+      cursor.setDate(cursor.getDate() + daysToMonday)
+      const resumeMins =
+        hasQuietWindow && (overnight || startMins < DEFAULT_WEEKEND_RESUME_MINUTES)
+          ? endMins
+          : DEFAULT_WEEKEND_RESUME_MINUTES
+      cursor.setHours(Math.floor(resumeMins / 60), resumeMins % 60, 0, 0)
+      shiftOutOfQuietHours(cursor)
+    }
+  }
+
+  if (!shiftedByQuiet && !shiftedByWeekend) {
     return { scheduledAt: targetIso }
   }
 
-  const endHour = Math.floor(endMins / 60)
-  const endMinute = endMins % 60
-  const deferred = new Date(target.getTime())
-  if (overnight && curMins >= startMins) {
-    deferred.setDate(deferred.getDate() + 1)
-  }
-  deferred.setHours(endHour, endMinute, 0, 0)
+  const deferredReason: ReminderDeferReason =
+    shiftedByQuiet && shiftedByWeekend
+      ? 'quiet_hours_and_weekend'
+      : shiftedByWeekend
+        ? 'weekend'
+        : 'quiet_hours'
+
   return {
-    scheduledAt: deferred.toISOString(),
+    scheduledAt: cursor.toISOString(),
     deferredFrom: targetIso,
+    deferredReason,
   }
 }
 
@@ -133,6 +181,7 @@ export const LarkReminderItemSchema = z.object({
   urgency: ReminderUrgencySchema.optional(),
   retryCount: z.number().int().nonnegative().optional(),
   deferredFromScheduledAt: z.string().optional(),
+  deferredReason: ReminderDeferReasonSchema.optional(),
   rootReminderId: z.string().optional(),
   parentReminderId: z.string().optional(),
   chainDepth: z.number().int().nonnegative().optional(),
@@ -244,9 +293,14 @@ export function composeProactiveSessionReminder(
         : config.reminderCreationMode === 'notify'
           ? '建后附可取消卡（正文勿重复说明）'
           : '后台静默生效（正文勿播报）'
-    const quietRule = config.quietHoursEnabled
-      ? `；免打扰 ${config.quietHoursStart}–${config.quietHoursEnd}（普通顺延，仅 P0 止损传 \`--urgency high\`）`
-      : ''
+    const quietRule =
+      config.quietHoursEnabled && config.skipWeekends
+        ? `；免打扰 ${config.quietHoursStart}–${config.quietHoursEnd} 且避开周末（普通顺延，仅 P0 止损传 \`--urgency high\`）`
+        : config.quietHoursEnabled
+          ? `；免打扰 ${config.quietHoursStart}–${config.quietHoursEnd}（普通顺延，仅 P0 止损传 \`--urgency high\`）`
+          : config.skipWeekends
+            ? '；避开周末（普通顺延至周一，仅 P0 止损传 `--urgency high`）'
+            : ''
     const maxChainHours = Math.round(MAX_REMINDER_CHAIN_WINDOW_MS / 3_600_000)
     lines.push(
       `- **跟进提醒（\`lark-bridge reminder\`）**：仅用于明确锚点/待闭环（发版承诺、变更止损复查、待审、错峰交付）；纯问答或已有 \`schedule\` 不建。群聊必传 \`--mention\`（按需 \`--cc\`）；先 \`list\` 去重，单链限 ${MAX_REMINDER_CHAIN_DEPTH} 次/${maxChainHours}h，闭环调 \`lark-bridge silence\`；继承当前路由，${modeRule}${quietRule}，见 \`lark-bridge\` 技能。`,

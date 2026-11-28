@@ -88,6 +88,7 @@ export interface BotProactiveConfig {
   quietHoursEnabled?: boolean
   quietHoursStart?: string
   quietHoursEnd?: string
+  skipWeekends?: boolean
   autoCodeEnabled: boolean
   branchPrefix: string
 }
@@ -307,6 +308,7 @@ export interface ReminderItem {
   urgency?: 'normal' | 'high'
   retryCount?: number
   deferredFromScheduledAt?: string
+  deferredReason?: 'quiet_hours' | 'weekend' | 'quiet_hours_and_weekend'
   chainDepth?: number
   createdAtMs: number
   updatedAtMs: number

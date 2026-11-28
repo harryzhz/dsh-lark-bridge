@@ -106,6 +106,7 @@ export const DEFAULT_PROACTIVE_CONFIG: BotProactiveConfig = {
   quietHoursEnabled: true,
   quietHoursStart: '00:00',
   quietHoursEnd: '08:00',
+  skipWeekends: false,
   autoCodeEnabled: false,
   branchPrefix: 'agent/',
 }
