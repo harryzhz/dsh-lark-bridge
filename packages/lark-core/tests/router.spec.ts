@@ -10,6 +10,7 @@ import {
   MessageDeduplicator,
   REMINDER_SILENT_SENTINEL,
   SILENT_REPLY_SENTINEL,
+  applyQuietHoursDeferral,
   buildDefaultNewBotSettings,
   buildGroupKey,
   buildLarkPostPayload,
@@ -935,6 +936,7 @@ describe('decideLarkRouting, <user_message> format, memberOverrides & title inte
       quietHoursEnabled: true,
       quietHoursStart: '00:00',
       quietHoursEnd: '08:00',
+      skipWeekends: false,
       autoCodeEnabled: false,
       branchPrefix: 'agent/',
     })
@@ -1044,6 +1046,132 @@ describe('decideLarkRouting, <user_message> format, memberOverrides & title inte
     expect(quietHoursReminder).toContain('免打扰 23:00–09:00')
     expect(quietHoursReminder).toContain('--urgency high')
     expect(quietHoursReminder).not.toContain('lark-bridge worktree')
+
+    const skipWeekendsAndQuietReminder = composeProactiveSessionReminder({
+      botId: bot.id,
+      workingDir: workDir,
+      config: {
+        ...bot.experimental.proactive,
+        reminderCreationMode: 'silent',
+        quietHoursEnabled: true,
+        quietHoursStart: '00:00',
+        quietHoursEnd: '08:00',
+        skipWeekends: true,
+        autoCodeEnabled: false,
+      },
+    })
+    expect(skipWeekendsAndQuietReminder).toContain('免打扰 00:00–08:00 且避开周末')
+    expect(skipWeekendsAndQuietReminder).toContain('--urgency high')
+
+    const skipWeekendsOnlyReminder = composeProactiveSessionReminder({
+      botId: bot.id,
+      workingDir: workDir,
+      config: {
+        ...bot.experimental.proactive,
+        reminderCreationMode: 'silent',
+        quietHoursEnabled: false,
+        skipWeekends: true,
+        autoCodeEnabled: false,
+      },
+    })
+    expect(skipWeekendsOnlyReminder).toContain('避开周末（普通顺延至周一')
+    expect(skipWeekendsOnlyReminder).toContain('--urgency high')
+
+    // Weekend deferral unit matrix (2026-11-27 Fri, 11-28 Sat, 11-29 Sun, 11-30 Mon)
+    const satDayIso = new Date(2026, 10, 28, 14, 30, 0).toISOString()
+    const satDeferWithQuiet = applyQuietHoursDeferral(satDayIso, {
+      quietHoursEnabled: true,
+      quietHoursStart: '00:00',
+      quietHoursEnd: '08:00',
+      skipWeekends: true,
+    })
+    expect(satDeferWithQuiet.deferredFrom).toBe(satDayIso)
+    expect(satDeferWithQuiet.deferredReason).toBe('weekend')
+    const satDeferDate = new Date(satDeferWithQuiet.scheduledAt)
+    expect(satDeferDate.getDay()).toBe(1)
+    expect(satDeferDate.getDate()).toBe(30)
+    expect(satDeferDate.getHours()).toBe(8)
+    expect(satDeferDate.getMinutes()).toBe(0)
+
+    const sunDayIso = new Date(2026, 10, 29, 10, 15, 0).toISOString()
+    const sunDeferWeekendOnly = applyQuietHoursDeferral(sunDayIso, {
+      quietHoursEnabled: false,
+      quietHoursStart: '00:00',
+      quietHoursEnd: '08:00',
+      skipWeekends: true,
+    })
+    expect(sunDeferWeekendOnly.deferredFrom).toBe(sunDayIso)
+    expect(sunDeferWeekendOnly.deferredReason).toBe('weekend')
+    const sunDeferDate = new Date(sunDeferWeekendOnly.scheduledAt)
+    expect(sunDeferDate.getDay()).toBe(1)
+    expect(sunDeferDate.getDate()).toBe(30)
+    expect(sunDeferDate.getHours()).toBe(9)
+    expect(sunDeferDate.getMinutes()).toBe(0)
+
+    const friNightIso = new Date(2026, 10, 27, 23, 30, 0).toISOString()
+    const friNightDefer = applyQuietHoursDeferral(friNightIso, {
+      quietHoursEnabled: true,
+      quietHoursStart: '23:00',
+      quietHoursEnd: '09:00',
+      skipWeekends: true,
+    })
+    expect(friNightDefer.deferredFrom).toBe(friNightIso)
+    expect(friNightDefer.deferredReason).toBe('quiet_hours_and_weekend')
+    const friDeferDate = new Date(friNightDefer.scheduledAt)
+    expect(friDeferDate.getDay()).toBe(1)
+    expect(friDeferDate.getDate()).toBe(30)
+    expect(friDeferDate.getHours()).toBe(9)
+    expect(friDeferDate.getMinutes()).toBe(0)
+
+    const satEarlyIso = new Date(2026, 10, 28, 1, 30, 0).toISOString()
+    const satEarlyDefer = applyQuietHoursDeferral(satEarlyIso, {
+      quietHoursEnabled: true,
+      quietHoursStart: '00:00',
+      quietHoursEnd: '08:00',
+      skipWeekends: true,
+    })
+    expect(satEarlyDefer.deferredReason).toBe('quiet_hours_and_weekend')
+    expect(new Date(satEarlyDefer.scheduledAt).getDay()).toBe(1)
+    expect(new Date(satEarlyDefer.scheduledAt).getHours()).toBe(8)
+
+    const sunNightIso = new Date(2026, 10, 29, 23, 30, 0).toISOString()
+    const sunNightDefer = applyQuietHoursDeferral(sunNightIso, {
+      quietHoursEnabled: true,
+      quietHoursStart: '23:00',
+      quietHoursEnd: '09:00',
+      skipWeekends: true,
+    })
+    expect(sunNightDefer.deferredReason).toBe('quiet_hours')
+    expect(new Date(sunNightDefer.scheduledAt).getDay()).toBe(1)
+    expect(new Date(sunNightDefer.scheduledAt).getHours()).toBe(9)
+
+    // High urgency bypasses weekend deferral; disabled skipWeekends leaves Saturday untouched
+    const satHigh = applyQuietHoursDeferral(
+      satDayIso,
+      { quietHoursEnabled: true, quietHoursStart: '00:00', quietHoursEnd: '08:00', skipWeekends: true },
+      'high',
+    )
+    expect(satHigh.scheduledAt).toBe(satDayIso)
+    expect(satHigh.deferredFrom).toBeUndefined()
+
+    const satSkipOff = applyQuietHoursDeferral(satDayIso, {
+      quietHoursEnabled: true,
+      quietHoursStart: '00:00',
+      quietHoursEnd: '08:00',
+      skipWeekends: false,
+    })
+    expect(satSkipOff.scheduledAt).toBe(satDayIso)
+    expect(satSkipOff.deferredFrom).toBeUndefined()
+
+    const wedDayIso = new Date(2026, 10, 25, 14, 0, 0).toISOString()
+    const wedSkipOn = applyQuietHoursDeferral(wedDayIso, {
+      quietHoursEnabled: true,
+      quietHoursStart: '00:00',
+      quietHoursEnd: '08:00',
+      skipWeekends: true,
+    })
+    expect(wedSkipOn.scheduledAt).toBe(wedDayIso)
+    expect(wedSkipOn.deferredFrom).toBeUndefined()
 
     const autoCodeOnlyReminder = composeProactiveSessionReminder({
       botId: bot.id,

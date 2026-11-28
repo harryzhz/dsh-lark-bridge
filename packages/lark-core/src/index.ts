@@ -195,6 +195,7 @@ export {
   MIN_DELEGATION_CHAIN_BACKOFF_SECONDS,
   REMINDER_SILENT_SENTINEL,
   RESTART_RETRY_DELAY_MS,
+  ReminderDeferReasonSchema,
   ReminderUrgencySchema,
   STALE_REMINDER_RETRY_WINDOW_MS,
   applyQuietHoursDeferral,
@@ -211,6 +212,7 @@ export {
   type LarkReminderStatus,
   type LarkReminderWorktreeMeta,
   type ProactiveSessionReminderInput,
+  type ReminderDeferReason,
   type ReminderTriggerPromptInput,
   type ReminderUrgency,
 } from './proactive.js'

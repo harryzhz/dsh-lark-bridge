@@ -549,7 +549,7 @@ export function composeDreamProactivePrompt(input: DreamProactiveAuditPromptInpu
       `- 若缺少群成员 \`open_id\`，先运行 \`lark-bridge members --bot ${input.botId} --chat <chat_id> --query <姓名>\` 查询真实 \`open_id\`（严禁编造）。`,
       `- 创建命令：\`lark-bridge reminder create --bot ${input.botId} --chat <chat_id> [--reply-to <thread_reply_to>] --mention <open_id:负责人> [--cc <open_id:关注人>] --title "<简洁事项标题>" --at "${nextWorkdayMorningIso}" --reason "<未闭环依据>" --prompt "<到点后要核查的具体状态、判断条件与汇报要点>" [--worktree <路径> --branch <分支> [--pr <链接>]]\``,
       '- 时间与礼仪约定：',
-      `  - 触发时间默认安排在白天工作时段（参考基准 \`${nextWorkdayMorningIso}\`，多条提醒请错开 15~30 分钟避免同时轰炸）；系统也会自动对凌晨时段执行免打扰顺延；`,
+      `  - 触发时间默认安排在${proactive.skipWeekends ? '工作日' : ''}白天工作时段（参考基准 \`${nextWorkdayMorningIso}\`，多条提醒请错开 15~30 分钟避免同时轰炸）；系统也会自动对凌晨时段${proactive.skipWeekends ? '与周末' : ''}执行免打扰顺延；`,
       '  - 群聊提醒优先带 `--reply-to <thread_reply_to>` 回到原话题内跟进，且必填 `--mention <open_id:姓名>`；私聊任务使用 `--user <open_id>`；',
       `  - 系统会在代码层硬拦截超过 ${config.maxRemindersPerRun} 条的新增请求，请只挑真正重要、未闭环、可验收的事项建单。`,
     )

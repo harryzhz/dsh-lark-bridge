@@ -1588,4 +1588,162 @@ describe('Local directory picker HTTP API & lark-bridge worktree CLI', () => {
       retryCount: 1,
     })
   })
+
+  it('defers normal reminders past weekends to Monday morning, preserves chain window across weekend deferral, and clears deferral metadata on manual edit', async () => {
+    const dataDir = makeTempDir()
+    const workDir = makeTempDir()
+    const store = new LarkBridgeStore(dataDir)
+
+    store.upsertBot({
+      id: 'wknd-bot',
+      name: 'WeekdayBot',
+      enabled: true,
+      larkAppId: 'cli_wknd',
+      larkAppSecret: 'sec_wknd',
+      defaultWorkingDir: workDir,
+      experimental: {
+        dreaming: { enabled: false },
+        proactive: {
+          remindersEnabled: true,
+          reminderCreationMode: 'silent',
+          quietHoursEnabled: true,
+          quietHoursStart: '23:00',
+          quietHoursEnd: '09:00',
+          skipWeekends: true,
+          autoCodeEnabled: false,
+          branchPrefix: 'agent/',
+        },
+      },
+    })
+    store.upsertGroup({
+      botId: 'wknd-bot',
+      chatId: 'oc_weekday_team',
+      chatName: '工作日研发群',
+      enabled: true,
+    })
+
+    const fakeCtx = {
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      agents: {
+        create: vi.fn(async ({ sessionId, setup }: { sessionId: string; setup?: (c: unknown, a: unknown) => void }) => {
+          const agent = { session: { id: sessionId, header: { cwd: workDir, agentPreset: 'codex' } } }
+          setup?.({}, agent)
+          return { agent, dispose: vi.fn().mockResolvedValue(undefined) }
+        }),
+      },
+      get: () => undefined,
+    } as unknown as Context
+
+    let turnHandler: (sid: string) => Promise<string> = async () => REMINDER_SILENT_SENTINEL
+    const reminders = new ProactiveReminderService({
+      ctx: fakeCtx,
+      store,
+      runtimes: new RuntimeCatalog(fakeCtx),
+      workspaces: {
+        attachSession: vi.fn().mockResolvedValue(undefined),
+        archiveSession: vi.fn().mockResolvedValue(true),
+      } as unknown as WorkspaceGrouping,
+      runTurn: vi.fn(async (agent) => turnHandler(String(agent.session.id))),
+      sendOriginCard: vi.fn().mockResolvedValue({}),
+      patchOriginCard: vi.fn().mockResolvedValue(undefined),
+      deliverReminderOutput: vi.fn().mockResolvedValue({ messageId: 'om_wknd_out' }),
+    })
+
+    const mentions = [{ openId: 'ou_wknd_owner', name: 'Alex' }]
+
+    // 1. Saturday afternoon normal reminder -> deferred to Monday 09:00 with deferredReason='weekend'
+    const satNow = new Date(2026, 10, 28, 14, 0, 0).getTime()
+    const satNormal = await reminders.create(
+      {
+        botId: 'wknd-bot',
+        chatId: 'oc_weekday_team',
+        replyToMessageId: 'om_sat_normal',
+        title: '周末常规跟进',
+        prompt: '核查灰度指标',
+        mentions,
+        afterSeconds: 1800,
+      },
+      satNow,
+    )
+    const satDeferred = new Date(satNormal.scheduledAt)
+    expect(satDeferred.getDay()).toBe(1)
+    expect(satDeferred.getDate()).toBe(30)
+    expect(satDeferred.getHours()).toBe(9)
+    expect(satDeferred.getMinutes()).toBe(0)
+    expect(satNormal.deferredReason).toBe('weekend')
+    expect(satNormal.deferredFromScheduledAt).toBe(new Date(satNow + 1800_000).toISOString())
+    expect(store.listEvents(10)[0]?.summary).toContain('避开周末顺延自')
+
+    // 2. Manual update clears deferral metadata
+    const edited = reminders.update(
+      satNormal.id,
+      { at: '2026-11-29 15:00' },
+      satNow,
+    )
+    expect(edited.deferredFromScheduledAt).toBeUndefined()
+    expect(edited.deferredReason).toBeUndefined()
+    expect(new Date(edited.scheduledAt).getDay()).toBe(0)
+
+    // 3. Saturday high urgency reminder bypasses weekend deferral
+    const satHigh = await reminders.create(
+      {
+        botId: 'wknd-bot',
+        chatId: 'oc_weekday_team',
+        replyToMessageId: 'om_sat_high',
+        title: 'P0 止损核查',
+        prompt: '核查线上止损指标',
+        mentions,
+        urgency: 'high',
+        afterSeconds: 1800,
+      },
+      satNow,
+    )
+    expect(satHigh.deferredFromScheduledAt).toBeUndefined()
+    expect(satHigh.deferredReason).toBeUndefined()
+    expect(new Date(satHigh.scheduledAt).getDay()).toBe(6)
+
+    // 4. Friday evening chain hop landing in Friday 23:30 quiet hours -> deferred to Monday 09:00
+    //    MUST NOT be falsely rejected by MAX_REMINDER_CHAIN_WINDOW_MS (6h) since raw target was within 3h!
+    const fri2000 = new Date(2026, 10, 27, 20, 0, 0).getTime()
+    const friRoot = await reminders.create(
+      {
+        botId: 'wknd-bot',
+        chatId: 'oc_weekday_team',
+        replyToMessageId: 'om_fri_chain',
+        title: '周五发版复查',
+        prompt: '核查发版状态',
+        mentions,
+        afterSeconds: 3600,
+      },
+      fri2000,
+    )
+    let hopId = ''
+    const fri2100 = fri2000 + 3600_000
+    turnHandler = async (sid) => {
+      const hop1 = await reminders.create(
+        {
+          sessionId: sid,
+          botId: 'wknd-bot',
+          chatId: 'oc_weekday_team',
+          replyToMessageId: 'om_fri_chain',
+          title: '顺延核查周五发版',
+          prompt: '确认最终发版结果',
+          afterSeconds: 9000, // Friday 23:30 -> quiet hours + weekend -> Monday 09:00
+        },
+        fri2100,
+      )
+      hopId = hop1.id
+      expect(hop1.chainDepth).toBe(1)
+      expect(hop1.deferredReason).toBe('quiet_hours_and_weekend')
+      const mon = new Date(hop1.scheduledAt)
+      expect(mon.getDay()).toBe(1)
+      expect(mon.getDate()).toBe(30)
+      expect(mon.getHours()).toBe(9)
+      return REMINDER_SILENT_SENTINEL
+    }
+    await reminders.runNow(friRoot.id, fri2100)
+    expect(hopId).toBeTruthy()
+
+    await reminders.stop()
+  })
 })

@@ -145,27 +145,41 @@ function parseMinutesOfDay(hhmm: string): number | undefined {
  * follow-up reminders so overnight runs naturally schedule for the coming morning
  * and daytime manual runs schedule 2 hours ahead (or next morning if entering quiet hours).
  */
-function computeNextWorkdayMorning(now: Date, quietHoursEnd = '08:00'): string {
+export function computeNextWorkdayMorning(
+  now: Date,
+  quietHoursEnd = '08:00',
+  skipWeekends = false,
+): string {
   const endMins = parseMinutesOfDay(quietHoursEnd) ?? 8 * 60
   const preferredMorningMins = Math.max(9 * 60 + 30, Math.min(11 * 60, endMins + 30))
   const curMins = now.getHours() * 60 + now.getMinutes()
 
+  const applyWeekendSkip = (d: Date): Date => {
+    if (!skipWeekends) return d
+    const day = d.getDay()
+    if (day === 0 || day === 6) {
+      d.setDate(d.getDate() + (day === 6 ? 2 : 1))
+      d.setHours(Math.floor(preferredMorningMins / 60), preferredMorningMins % 60, 0, 0)
+    }
+    return d
+  }
+
   const target = new Date(now.getTime())
   if (curMins < preferredMorningMins - 15) {
     target.setHours(Math.floor(preferredMorningMins / 60), preferredMorningMins % 60, 0, 0)
-    return formatLocalDateTime(target)
+    return formatLocalDateTime(applyWeekendSkip(target))
   }
 
   const twoHoursLater = new Date(now.getTime() + 2 * 60 * 60_000)
   const laterMins = twoHoursLater.getHours() * 60 + twoHoursLater.getMinutes()
   if (twoHoursLater.getDate() === now.getDate() && laterMins < 20 * 60) {
     twoHoursLater.setSeconds(0, 0)
-    return formatLocalDateTime(twoHoursLater)
+    return formatLocalDateTime(applyWeekendSkip(twoHoursLater))
   }
 
   target.setDate(target.getDate() + 1)
   target.setHours(Math.floor(preferredMorningMins / 60), preferredMorningMins % 60, 0, 0)
-  return formatLocalDateTime(target)
+  return formatLocalDateTime(applyWeekendSkip(target))
 }
 
 interface SessionParticipant {
@@ -892,6 +906,7 @@ export class DreamingService {
           const nextMorningIso = computeNextWorkdayMorning(
             now,
             bot.experimental.proactive.quietHoursEnd,
+            bot.experimental.proactive.skipWeekends,
           )
           const proactivePrompt = composeDreamProactivePrompt({
             botId: bot.id,
